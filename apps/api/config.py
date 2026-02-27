@@ -68,7 +68,9 @@ class Settings(BaseSettings):
     postgres_port: int = Field(default=5432, description="PostgreSQL port")
     postgres_db: str = Field(default="trading_bot", description="PostgreSQL database name")
     postgres_user: str = Field(default="trading", description="PostgreSQL user")
-    postgres_password: str = Field(default="", description="PostgreSQL password")
+    postgres_password: SecretStr = Field(
+        default=SecretStr(""), description="PostgreSQL password -- never logged"
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -80,7 +82,9 @@ class Settings(BaseSettings):
             port = values.get("postgres_port", 5432)
             db = values.get("postgres_db", "trading_bot")
             user = values.get("postgres_user", "trading")
-            pw = values.get("postgres_password", "")
+            pw_raw = values.get("postgres_password", "")
+            # SecretStr arrives as-is in mode="before"; extract the plain value
+            pw = pw_raw.get_secret_value() if isinstance(pw_raw, SecretStr) else pw_raw
             values["database_url"] = (
                 f"postgresql+asyncpg://{user}:{pw}@{host}:{port}/{db}"
             )

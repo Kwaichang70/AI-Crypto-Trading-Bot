@@ -108,6 +108,23 @@ class BaseStrategy(abc.ABC):
     def params(self) -> dict[str, Any]:
         return dict(self._params)
 
+    @property
+    def min_bars_required(self) -> int:
+        """
+        Minimum number of historical bars this strategy needs before it
+        can produce meaningful signals.
+
+        Subclasses MUST override this property. The backtesting engine
+        uses it to skip the warm-up period in metrics calculations, and
+        the data pipeline uses it to pre-fetch the correct history length.
+
+        Returns
+        -------
+        int
+            Minimum bar count. Default 0 (subclasses override).
+        """
+        return 0
+
     # ------------------------------------------------------------------
     # Lifecycle hooks
     # ------------------------------------------------------------------
