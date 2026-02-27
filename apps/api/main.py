@@ -6,10 +6,11 @@ FastAPI application entry point.
 Responsibilities
 ----------------
 - Bootstrap structlog on startup
-- Initialise and tear down the async database engine
+- Initialise and tear down the async database engine via lifespan
 - Mount CORS middleware with origins from settings
-- Register API routers (to be added as routes are implemented)
-- Expose the /health endpoint
+- Mount request timing middleware (X-Process-Time header)
+- Register all API routers under /api/v1/
+- Expose the /health endpoint (always available, no auth)
 
 The ``lifespan`` context manager is the recommended FastAPI pattern for
 startup/shutdown logic (replaces deprecated on_event handlers).
@@ -22,7 +23,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 import structlog
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -34,6 +35,10 @@ __all__ = ["app", "create_app"]
 logger = structlog.get_logger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Application lifespan
+# ---------------------------------------------------------------------------
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):  # type: ignore[type-arg]
     """
@@ -43,7 +48,7 @@ async def lifespan(app: FastAPI):  # type: ignore[type-arg]
     ----------------------
     1. Configure structlog with settings-driven log level and format
     2. Log application boot parameters
-    3. (Future) Initialise SQLAlchemy async engine and connection pool
+    3. Initialise SQLAlchemy async engine and connection pool
     4. (Future) Initialise Redis connection
     5. (Future) Warm up CCXT exchange connection
 
@@ -51,7 +56,7 @@ async def lifespan(app: FastAPI):  # type: ignore[type-arg]
     ----------------------
     1. (Future) Gracefully stop any running trading loops
     2. (Future) Flush pending fills / position state to database
-    3. (Future) Close database engine
+    3. Close database engine (dispose connection pool)
     4. (Future) Close Redis connection
     5. Log clean shutdown
     """
@@ -77,10 +82,17 @@ async def lifespan(app: FastAPI):  # type: ignore[type-arg]
     app.state.started_at = time.monotonic()
 
     # ------------------------------------------------------------------
-    # Future: database engine init goes here
-    # engine = create_async_engine(settings.database_url, ...)
-    # app.state.db_engine = engine
+    # 3. Initialise async database engine and connection pool
     # ------------------------------------------------------------------
+    from api.db.session import get_engine
+
+    engine = get_engine()
+    app.state.db_engine = engine
+    log.info(
+        "db.engine_initialised",
+        pool_size=settings.db_pool_size,
+        max_overflow=settings.db_max_overflow,
+    )
 
     # ------------------------------------------------------------------
     # Future: Redis connection init goes here
@@ -93,9 +105,51 @@ async def lifespan(app: FastAPI):  # type: ignore[type-arg]
     # ------------------------------------------------------------------
     log.info("api.shutting_down")
 
-    # Future: await app.state.db_engine.dispose()
+    # Close all pooled database connections gracefully
+    from api.db.session import dispose_engine
+
+    await dispose_engine()
+
     # Future: await app.state.redis.aclose()
 
+    log.info("api.stopped")
+
+
+# ---------------------------------------------------------------------------
+# Request timing middleware
+# ---------------------------------------------------------------------------
+
+async def _request_timing_middleware(request: Request, call_next: Any) -> Response:
+    """
+    Add X-Process-Time header to every response.
+
+    Measures wall-clock time from request receipt to response completion.
+    This is useful for latency monitoring and debugging slow endpoints.
+
+    The value is in milliseconds with two decimal places.
+
+    Parameters
+    ----------
+    request:
+        Incoming HTTP request.
+    call_next:
+        Next ASGI middleware / handler callable.
+
+    Returns
+    -------
+    Response
+        The response with the X-Process-Time header added.
+    """
+    start = time.monotonic()
+    response = await call_next(request)
+    elapsed_ms = round((time.monotonic() - start) * 1000, 2)
+    response.headers["X-Process-Time"] = str(elapsed_ms)
+    return response
+
+
+# ---------------------------------------------------------------------------
+# Application factory
+# ---------------------------------------------------------------------------
 
 def create_app() -> FastAPI:
     """
@@ -126,8 +180,11 @@ def create_app() -> FastAPI:
     )
 
     # ------------------------------------------------------------------
-    # Middleware
+    # Middleware — order matters: added last runs outermost (first to execute)
     # ------------------------------------------------------------------
+
+    # 1. CORS — must be outermost to handle preflight OPTIONS requests before
+    #    auth/timing middleware process them.
     application.add_middleware(
         CORSMiddleware,
         allow_origins=settings.allowed_origins,
@@ -135,6 +192,9 @@ def create_app() -> FastAPI:
         allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
         allow_headers=["*"],
     )
+
+    # 2. Request timing — wraps every request/response cycle
+    application.middleware("http")(_request_timing_middleware)
 
     # ------------------------------------------------------------------
     # Routes
@@ -148,10 +208,14 @@ def _register_routes(application: FastAPI) -> None:
     """
     Mount all API routers onto the application.
 
-    Routers are added here as they are implemented. This function is the
-    single place to see the complete URL surface of the API.
+    All versioned endpoints live under the ``/api/v1`` prefix.
+    The /health endpoint is mounted directly (no versioning — it is used
+    by Docker health checks and load balancers that should not need version
+    awareness).
     """
-    # Health check — always available, no auth required
+    # ------------------------------------------------------------------
+    # Observability — no version prefix, no auth
+    # ------------------------------------------------------------------
     @application.get(
         "/health",
         tags=["observability"],
@@ -178,10 +242,40 @@ def _register_routes(application: FastAPI) -> None:
             "timestamp": dt.now(tz=UTC).isoformat(),
         }
 
-    # Future routers — uncomment as implemented:
-    # from api.routers import runs, metrics
-    # application.include_router(runs.router, prefix="/runs", tags=["runs"])
-    # application.include_router(metrics.router, prefix="/metrics", tags=["metrics"])
+    # ------------------------------------------------------------------
+    # API v1 routers
+    # ------------------------------------------------------------------
+    from api.routers import orders, portfolio, runs, strategies
+
+    _V1 = "/api/v1"
+
+    # Run management
+    application.include_router(
+        runs.router,
+        prefix=_V1,
+        tags=["runs"],
+    )
+
+    # Order and fill queries
+    application.include_router(
+        orders.router,
+        prefix=_V1,
+        tags=["orders"],
+    )
+
+    # Portfolio: summary, equity curve, trades, positions
+    application.include_router(
+        portfolio.router,
+        prefix=_V1,
+        tags=["portfolio"],
+    )
+
+    # Strategy discovery
+    application.include_router(
+        strategies.router,
+        prefix=_V1,
+        tags=["strategies"],
+    )
 
 
 # ---------------------------------------------------------------------------

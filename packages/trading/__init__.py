@@ -1,10 +1,27 @@
 """
 packages/trading
 -----------------
-Trading engine core: strategies, execution, risk, portfolio, and orchestration.
+Trading engine core: strategies, execution, risk, portfolio, backtesting,
+and orchestration.
 """
 
+from trading.backtest import BacktestRunner
 from trading.execution import BaseExecutionEngine
+from trading.metrics import (
+    BacktestResult,
+    EquityCurvePoint,
+    TradeStatistics,
+    compute_cagr,
+    compute_calmar,
+    compute_exposure,
+    compute_max_drawdown,
+    compute_max_drawdown_duration,
+    compute_profit_factor,
+    compute_returns_from_equity,
+    compute_sharpe,
+    compute_sortino,
+    compute_trade_statistics,
+)
 from trading.models import Fill, Order, Position, Signal, TradeResult, RiskCheckResult
 from trading.portfolio import PortfolioAccounting
 from trading.risk import BaseRiskManager, RiskParameters
@@ -15,6 +32,22 @@ __all__ = [
     # Orchestrator
     "StrategyEngine",
     "EngineState",
+    # Backtesting
+    "BacktestRunner",
+    "BacktestResult",
+    "EquityCurvePoint",
+    "TradeStatistics",
+    # Metric functions
+    "compute_cagr",
+    "compute_sharpe",
+    "compute_sortino",
+    "compute_calmar",
+    "compute_profit_factor",
+    "compute_max_drawdown",
+    "compute_max_drawdown_duration",
+    "compute_exposure",
+    "compute_returns_from_equity",
+    "compute_trade_statistics",
     # Strategy
     "BaseStrategy",
     "StrategyMetadata",

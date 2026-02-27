@@ -130,6 +130,23 @@ class PortfolioAccounting:
             return 0.0
         return self._winning_trades / self._total_trades
 
+    @property
+    def current_equity(self) -> Decimal:
+        """
+        Current total portfolio equity (cash + open position value).
+
+        This is the public accessor for the equity calculation that
+        consolidates all position snapshots.  Prefer this over calling
+        ``get_equity(list(self._position_snapshots.values()))`` from
+        outside the class.
+
+        Returns
+        -------
+        Decimal:
+            Total portfolio value in quote currency.
+        """
+        return self.get_equity(list(self._position_snapshots.values()))
+
     def get_position(self, symbol: str) -> Position | None:
         """
         Return the current position snapshot for a symbol, or None if
