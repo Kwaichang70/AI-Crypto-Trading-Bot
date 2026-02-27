@@ -184,6 +184,7 @@ class BaseRiskManager(abc.ABC):
         open_positions: list[Position],
         daily_pnl: Decimal,
         peak_equity: Decimal,
+        market_price: Decimal | None = None,
     ) -> RiskCheckResult:
         """
         Evaluate all risk rules against a proposed order.
@@ -204,6 +205,10 @@ class BaseRiskManager(abc.ABC):
             Net PnL since the start of the current trading day in quote currency.
         peak_equity:
             Highest equity reached since run start, used for drawdown calculation.
+        market_price:
+            Current market price for the order's symbol. Required for MARKET
+            orders where order.price is None and no existing position provides
+            a reference price. Defaults to None for backward compatibility.
 
         Returns
         -------
@@ -278,11 +283,13 @@ class BaseRiskManager(abc.ABC):
 
         Call on every bar tick regardless of whether an order is being
         considered. Cooldown expires when ``_cooldown_bars_remaining``
-        reaches 0.
+        reaches 0, at which point ``_consecutive_losses`` is reset so
+        that the next single loss does not immediately re-trigger cooldown.
         """
         if self._cooldown_bars_remaining > 0:
             self._cooldown_bars_remaining -= 1
             if self._cooldown_bars_remaining == 0:
+                self._consecutive_losses = 0
                 self._log.info("risk.cooldown_expired")
 
     @property
