@@ -38,8 +38,8 @@ eggs/
 .eggs/
 MANIFEST
 .installed.cfg
-lib/
-lib64/
+/lib/
+/lib64/
 sdist/
 wheels/
 *.whl
