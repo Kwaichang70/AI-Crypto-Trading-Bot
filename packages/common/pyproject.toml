@@ -1,0 +1,11 @@
+[project]
+name = "common"
+version = "0.1.0"
+description = "Shared types, enums, and configuration utilities"
+requires-python = ">=3.11"
+
+dependencies = [
+    "pydantic>=2.9",
+    "pydantic-settings>=2.5",
+    "structlog>=24.4",
+]

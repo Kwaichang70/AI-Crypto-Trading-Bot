@@ -1,0 +1,82 @@
+name: review-and-fix
+description: >
+  Code review and remediation workflow. Used for reviewing existing code,
+  identifying issues, and applying fixes through the proper review chain.
+trigger_cues:
+  - "review"
+  - "audit"
+  - "fix"
+  - "bug"
+  - "refactor"
+  - "improve"
+
+steps:
+  - id: analyze
+    agent: python-backend-specialist  # or domain-appropriate specialist
+    action: Deep analysis of the code in question
+    output: reports/analysis-{task-id}.md
+    rules:
+      - Read all relevant files thoroughly
+      - Identify the root cause (for bugs) or improvement areas
+      - Document current behavior vs expected behavior
+      - List all affected files and dependencies
+    next: parallel-review
+
+  - id: parallel-review
+    parallel: true
+    agents:
+      - agent: code-critic
+        action: Code quality and correctness review
+        output: reports/code-review-{task-id}.md
+      - agent: security-audit-specialist
+        action: Security implications review
+        output: reports/security-review-{task-id}.md
+        condition: if_security_relevant
+      - agent: architecture-critic
+        action: Architectural impact review
+        output: reports/arch-review-{task-id}.md
+        condition: if_cross_module
+    next: synthesize
+
+  - id: synthesize
+    agent: synthesis-arbiter
+    action: Consolidate all review findings into unified action plan
+    output: reports/synthesis-{task-id}.md
+    rules:
+      - Evaluate quality of each reviewer's perspective
+      - Resolve any conflicting recommendations
+      - Produce prioritized remediation plan
+      - Each remediation step must have a unique ID
+    next: implement-fix
+
+  - id: implement-fix
+    agent: python-backend-specialist  # or domain-appropriate specialist
+    action: Implement the approved fixes as diffs
+    output: reports/fix-implementation-{task-id}.md
+    rules:
+      - Address all items from synthesis report
+      - Include diffs for each change
+      - DO NOT directly modify source files
+    next: verify-fix
+
+  - id: verify-fix
+    agent: code-critic
+    action: Verify the fix addresses all findings
+    output: reports/fix-verification-{task-id}.md
+    rules:
+      - Cross-reference against original findings
+      - Ensure no regressions introduced
+      - Approve or reject with specific feedback
+    next_on_approve: execute
+    next_on_reject: implement-fix
+
+  - id: execute
+    agent: code-executor
+    action: Apply verified fixes
+    next: test
+
+  - id: test
+    agent: testing-quality-specialist
+    action: Run relevant tests to confirm fix
+    output: reports/test-results-{task-id}.md
+    next: commit

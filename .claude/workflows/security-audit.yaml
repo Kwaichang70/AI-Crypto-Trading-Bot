@@ -1,0 +1,95 @@
+name: security-audit
+description: >
+  Security-focused review workflow. Essential for trading-related code,
+  API key handling, live trading gates, and any code touching external services.
+trigger_cues:
+  - "security"
+  - "audit"
+  - "api keys"
+  - "live trading"
+  - "safety gates"
+  - "secrets"
+  - "vulnerability"
+
+steps:
+  - id: security-scan
+    agent: security-audit-specialist
+    action: Comprehensive security analysis of target code
+    output: reports/security-scan-{task-id}.md
+    rules:
+      - Check for hardcoded secrets/API keys
+      - Verify .env handling and .gitignore coverage
+      - Audit authentication and authorization flows
+      - Check for injection vulnerabilities (SQL, command, XSS)
+      - Verify rate limiting and retry mechanisms
+      - Audit live trading safety gates
+      - Check idempotency key implementation
+      - Verify graceful shutdown handles open positions
+      - Reference all findings with unique IDs (SEC-001, etc.)
+    next: risk-assessment
+
+  - id: risk-assessment
+    agent: risk-management-expert
+    action: Assess trading-specific risks
+    output: reports/risk-assessment-{task-id}.md
+    rules:
+      - Verify max drawdown enforcement
+      - Check circuit breaker implementation
+      - Audit kill-switch functionality
+      - Verify position sizing limits
+      - Check daily loss limit enforcement
+      - Ensure ENABLE_LIVE_TRADING gate is enforced
+    next: synthesize
+
+  - id: synthesize
+    agent: synthesis-arbiter
+    action: Consolidate security and risk findings
+    output: reports/security-synthesis-{task-id}.md
+    rules:
+      - Prioritize findings by severity (Critical/High/Medium/Low)
+      - Create remediation roadmap
+      - Identify blocking issues vs improvements
+    next: remediate
+
+  - id: remediate
+    agent: python-backend-specialist
+    action: Implement security fixes as diffs
+    output: reports/security-fixes-{task-id}.md
+    rules:
+      - Address Critical and High severity findings first
+      - Include diffs for each fix
+      - Document rationale for each change
+    next: verify
+
+  - id: parallel-verify
+    parallel: true
+    agents:
+      - agent: code-critic
+        action: Review security fixes for code quality and correctness
+        output: reports/security-code-review-{task-id}.md
+      - agent: security-audit-specialist
+        action: Re-verify that fixes address original findings
+        output: reports/security-verification-{task-id}.md
+    rules:
+      - code-critic checks type safety, error handling, PEP 8
+      - security-audit-specialist cross-references fix against original finding IDs
+      - Both must approve for changes to proceed
+      - After 2 consecutive rejections on same issue, escalate to synthesis-arbiter
+    next_on_approve: execute
+    next_on_reject: remediate
+
+  - id: execute
+    agent: code-executor
+    action: Apply verified security fixes
+    next: test
+
+  - id: test
+    agent: testing-quality-specialist
+    action: Run tests to validate security fixes don't cause regressions
+    output: reports/security-test-results-{task-id}.md
+    next: final-scan
+
+  - id: final-scan
+    agent: security-audit-specialist
+    action: Final security scan after fixes applied
+    output: reports/final-security-scan-{task-id}.md

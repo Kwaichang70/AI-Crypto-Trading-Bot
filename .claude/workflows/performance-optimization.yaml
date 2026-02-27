@@ -1,0 +1,70 @@
+name: performance-optimization
+description: >
+  Performance analysis and optimization workflow. Used for improving
+  data pipeline throughput, reducing API latency, optimizing database
+  queries, and improving overall system performance.
+trigger_cues:
+  - "optimize"
+  - "performance"
+  - "slow"
+  - "latency"
+  - "bottleneck"
+  - "speed up"
+
+steps:
+  - id: profile
+    parallel: true
+    agents:
+      - agent: python-backend-specialist
+        action: Profile Python code performance
+        output: reports/python-profile-{task-id}.md
+      - agent: database-architect
+        action: Analyze database query performance
+        output: reports/db-profile-{task-id}.md
+        condition: if_db_related
+      - agent: data-pipeline-engineer
+        action: Analyze data pipeline throughput
+        output: reports/data-profile-{task-id}.md
+        condition: if_data_related
+    next: synthesize-findings
+
+  - id: synthesize-findings
+    agent: synthesis-arbiter
+    action: Consolidate profiling results and prioritize optimizations
+    output: reports/optimization-plan-{task-id}.md
+    rules:
+      - Rank optimizations by impact vs effort
+      - Identify quick wins vs architectural changes
+      - Ensure optimizations don't compromise correctness
+    next: implement
+
+  - id: implement
+    agent: python-backend-specialist  # or appropriate specialist
+    action: Implement optimizations as diffs
+    output: reports/optimization-impl-{task-id}.md
+    next: review
+
+  - id: review
+    agent: code-critic
+    action: Review optimizations for correctness
+    output: reports/optimization-review-{task-id}.md
+    rules:
+      - Verify optimizations don't introduce bugs
+      - Check for premature optimization
+      - Ensure code remains readable
+    next_on_approve: execute
+    next_on_reject: implement
+
+  - id: execute
+    agent: code-executor
+    action: Apply optimizations
+    next: benchmark
+
+  - id: benchmark
+    agent: testing-quality-specialist
+    action: Run benchmarks to verify improvement
+    output: reports/benchmark-results-{task-id}.md
+    rules:
+      - Compare before/after metrics
+      - Run relevant test suite to ensure no regressions
+      - Document performance gains

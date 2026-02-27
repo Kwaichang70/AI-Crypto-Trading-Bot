@@ -1,0 +1,103 @@
+name: feature-implementation
+description: >
+  Full feature lifecycle workflow for major features. Includes multi-agent
+  perspective gathering, architecture review, implementation, and comprehensive
+  testing. Use for significant new functionality.
+trigger_cues:
+  - "new feature"
+  - "major feature"
+  - "full implementation"
+  - "end-to-end"
+  - "complete module"
+
+steps:
+  - id: requirements-analysis
+    parallel: true
+    agents:
+      - agent: trading-engine-architect
+        action: Analyze feature from trading domain perspective
+        output: reports/trading-analysis-{task-id}.md
+      - agent: python-backend-specialist
+        action: Analyze feature from backend implementation perspective
+        output: reports/backend-analysis-{task-id}.md
+      - agent: database-architect
+        action: Analyze data model requirements
+        output: reports/data-model-{task-id}.md
+        condition: if_data_model_needed
+    next: architecture-plan
+
+  - id: architecture-plan
+    agent: synthesis-arbiter
+    action: Synthesize analyses into unified architecture plan
+    output: reports/architecture-plan-{task-id}.md
+    rules:
+      - Combine perspectives from all analysts
+      - Define component interfaces and data flow
+      - Identify dependencies and implementation order
+      - Produce detailed implementation roadmap
+    next: architecture-review
+
+  - id: architecture-review
+    agent: architecture-critic
+    action: Review architecture plan for soundness
+    output: reports/arch-review-{task-id}.md
+    rules:
+      - Verify alignment with KickOff.md requirements
+      - Check for SOLID principles compliance
+      - Ensure scalability and maintainability
+      - Reference findings with unique IDs (AR-001, AR-002, etc.)
+    next_on_approve: implement-backend
+    next_on_reject: architecture-plan
+
+  - id: implement-backend
+    agent: python-backend-specialist
+    action: Implement backend components as diffs
+    output: reports/backend-impl-{task-id}.md
+    next: implement-frontend
+    condition: if_backend_needed
+
+  - id: implement-frontend
+    agent: nextjs-frontend-specialist
+    action: Implement frontend components as diffs
+    output: reports/frontend-impl-{task-id}.md
+    next: write-tests
+    condition: if_frontend_needed
+
+  - id: write-tests
+    agent: testing-quality-specialist
+    action: Write comprehensive tests for the new feature
+    output: reports/tests-{task-id}.md
+    next: parallel-final-review
+
+  - id: parallel-final-review
+    parallel: true
+    agents:
+      - agent: code-critic
+        action: Review all implementation diffs
+        output: reports/final-code-review-{task-id}.md
+      - agent: security-audit-specialist
+        action: Security review of new feature
+        output: reports/final-security-review-{task-id}.md
+      - agent: risk-management-expert
+        action: Trading risk review (if trading-related)
+        output: reports/risk-review-{task-id}.md
+        condition: if_trading_related
+    next: final-synthesis
+
+  - id: final-synthesis
+    agent: synthesis-arbiter
+    action: Final consolidation of all reviews
+    output: reports/final-synthesis-{task-id}.md
+    next_on_approve: execute
+    next_on_reject: implement-backend
+
+  - id: execute
+    agent: code-executor
+    action: Apply all approved changes
+    next: integration-test
+
+  - id: integration-test
+    agent: testing-quality-specialist
+    action: Run full test suite including new tests
+    output: reports/integration-results-{task-id}.md
+    next: commit

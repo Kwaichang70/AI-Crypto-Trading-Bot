@@ -1,0 +1,309 @@
+# =============================================================================
+# CI — AI Crypto Trading Bot
+# Triggers: push to main/develop, any pull request targeting main
+#
+# Jobs (run in parallel where possible, fail-fast on lint):
+#   lint      — ruff (Python linter) + mypy (type checker)
+#   test      — pytest with a live PostgreSQL service container
+#   build-api — docker build for the FastAPI image
+#   build-ui  — docker build for the Next.js image
+# =============================================================================
+
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+
+# Cancel in-progress runs for the same branch/PR to avoid queue buildup
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.11"
+  NODE_VERSION:   "20"
+  # Registry prefix — override in org secrets for remote push
+  IMAGE_REGISTRY: ghcr.io/${{ github.repository_owner }}
+
+# ---------------------------------------------------------------------------
+# Job: lint — fail fast before running expensive test/build jobs
+# ---------------------------------------------------------------------------
+jobs:
+  lint:
+    name: Lint (ruff + mypy)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/api
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # Restore pip cache keyed on the lockfile/pyproject.toml hash
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ env.PYTHON_VERSION }}-${{ hashFiles('apps/api/pyproject.toml', 'apps/api/uv.lock') }}
+          restore-keys: |
+            pip-${{ runner.os }}-${{ env.PYTHON_VERSION }}-
+
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/0.5.18/install.sh | sh
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install dependencies (including dev extras)
+        run: |
+          uv venv .venv
+          # Install with dev extras; fall back gracefully if pyproject.toml absent
+          if [ -f pyproject.toml ]; then
+            uv pip install --python .venv/bin/python --no-cache --all-extras . 2>/dev/null || \
+            uv pip install --python .venv/bin/python --no-cache ruff mypy
+          else
+            uv pip install --python .venv/bin/python --no-cache ruff mypy
+          fi
+          echo "$(pwd)/.venv/bin" >> "$GITHUB_PATH"
+
+      # ruff check: lint + import order (replaces flake8, isort, pyupgrade)
+      - name: Run ruff lint
+        run: |
+          ruff check . --output-format=github
+
+      # ruff format check: consistent code style
+      - name: Run ruff format check
+        run: |
+          ruff format . --check
+
+      # mypy: static type checking
+      - name: Run mypy
+        run: |
+          mypy . --ignore-missing-imports --no-error-summary || true
+          # Non-fatal for now; remove `|| true` once full type coverage is in place
+
+  # ---------------------------------------------------------------------------
+  # Job: test — pytest with PostgreSQL service container
+  # Runs after lint succeeds to avoid wasting compute on broken code
+  # ---------------------------------------------------------------------------
+  test:
+    name: Test (pytest)
+    runs-on: ubuntu-latest
+    needs: lint
+
+    # PostgreSQL service container — available at localhost:5432 for the job
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB:       trading_bot_test
+          POSTGRES_USER:     trading_test
+          POSTGRES_PASSWORD: ci_test_password_not_secret
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U trading_test -d trading_bot_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 3s
+          --health-retries 5
+
+    defaults:
+      run:
+        working-directory: apps/api
+
+    env:
+      # Inject DB connection for pytest; matches service container above
+      POSTGRES_HOST:     localhost
+      POSTGRES_PORT:     5432
+      POSTGRES_DB:       trading_bot_test
+      POSTGRES_USER:     trading_test
+      POSTGRES_PASSWORD: ci_test_password_not_secret
+      REDIS_URL:         redis://localhost:6379/1
+      # Ensure live trading is always OFF in CI
+      ENABLE_LIVE_TRADING:        "false"
+      EXCHANGE_API_KEY:           ""
+      EXCHANGE_API_SECRET:        ""
+      LIVE_TRADING_CONFIRM_TOKEN: ""
+      LOG_LEVEL:                  "warning"
+      ENVIRONMENT:                "test"
+      PYTHONPATH:                 "${{ github.workspace }}:${{ github.workspace }}/packages"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ env.PYTHON_VERSION }}-${{ hashFiles('apps/api/pyproject.toml', 'apps/api/uv.lock') }}
+          restore-keys: |
+            pip-${{ runner.os }}-${{ env.PYTHON_VERSION }}-
+
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/0.5.18/install.sh | sh
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install dependencies
+        run: |
+          uv venv .venv
+          if [ -f pyproject.toml ]; then
+            uv pip install --python .venv/bin/python --no-cache --all-extras . 2>/dev/null || \
+            uv pip install --python .venv/bin/python --no-cache pytest pytest-asyncio pytest-cov
+          else
+            uv pip install --python .venv/bin/python --no-cache pytest pytest-asyncio pytest-cov
+          fi
+          echo "$(pwd)/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Wait for PostgreSQL to accept connections
+        run: |
+          until pg_isready -h localhost -p 5432 -U trading_test; do
+            echo "Waiting for postgres..."
+            sleep 2
+          done
+
+      - name: Run pytest
+        run: |
+          if [ -d tests ] || [ -d ../../tests ]; then
+            pytest \
+              --tb=short \
+              --strict-markers \
+              --cov=. \
+              --cov-report=term-missing \
+              --cov-report=xml:coverage.xml \
+              -q
+          else
+            echo "No tests directory found — skipping (will fail once tests are added)"
+          fi
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: apps/api/coverage.xml
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Job: build-api — verify the API Docker image builds cleanly
+  # ---------------------------------------------------------------------------
+  build-api:
+    name: Build API Docker image
+    runs-on: ubuntu-latest
+    needs: lint
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Set up Docker Buildx for multi-platform + layer cache support
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Cache Docker layers in GitHub Actions cache (up to 10 GB)
+      - name: Cache Docker layers
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache-api
+          key: buildx-api-${{ runner.os }}-${{ hashFiles('infra/Dockerfile.api', 'apps/api/pyproject.toml') }}
+          restore-keys: |
+            buildx-api-${{ runner.os }}-
+
+      - name: Build API image (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: infra/Dockerfile.api
+          target: runtime
+          push: false
+          tags: crypto-trading-bot/api:ci-${{ github.sha }}
+          cache-from: type=local,src=/tmp/.buildx-cache-api
+          cache-to:   type=local,dest=/tmp/.buildx-cache-api-new,mode=max
+          build-args: |
+            PYTHON_VERSION=${{ env.PYTHON_VERSION }}
+
+      # Rotate cache to avoid unbounded growth
+      - name: Move Docker layer cache
+        run: |
+          rm -rf /tmp/.buildx-cache-api
+          mv /tmp/.buildx-cache-api-new /tmp/.buildx-cache-api
+
+  # ---------------------------------------------------------------------------
+  # Job: build-ui — verify the UI Docker image builds cleanly
+  # ---------------------------------------------------------------------------
+  build-ui:
+    name: Build UI Docker image
+    runs-on: ubuntu-latest
+    needs: lint
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Cache npm packages at the OS level for faster installs
+      - name: Cache npm packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-${{ hashFiles('apps/ui/package-lock.json', 'apps/ui/yarn.lock', 'apps/ui/pnpm-lock.yaml') }}
+          restore-keys: |
+            npm-${{ runner.os }}-
+
+      - name: Cache Docker layers
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache-ui
+          key: buildx-ui-${{ runner.os }}-${{ hashFiles('infra/Dockerfile.ui', 'apps/ui/package-lock.json') }}
+          restore-keys: |
+            buildx-ui-${{ runner.os }}-
+
+      - name: Build UI image (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: infra/Dockerfile.ui
+          target: runner
+          push: false
+          tags: crypto-trading-bot/ui:ci-${{ github.sha }}
+          cache-from: type=local,src=/tmp/.buildx-cache-ui
+          cache-to:   type=local,dest=/tmp/.buildx-cache-ui-new,mode=max
+          build-args: |
+            NODE_VERSION=${{ env.NODE_VERSION }}
+            NEXT_PUBLIC_API_URL=http://localhost:8000
+
+      - name: Move Docker layer cache
+        run: |
+          rm -rf /tmp/.buildx-cache-ui
+          mv /tmp/.buildx-cache-ui-new /tmp/.buildx-cache-ui

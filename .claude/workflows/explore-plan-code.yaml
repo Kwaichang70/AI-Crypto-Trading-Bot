@@ -1,0 +1,89 @@
+name: explore-plan-code
+description: >
+  General-purpose development workflow. Suitable for most feature implementation,
+  bug fixes, and code changes. Enforces the read-first, plan-second, code-third discipline.
+trigger_cues:
+  - "implement"
+  - "build"
+  - "create"
+  - "add feature"
+  - "develop"
+
+steps:
+  - id: explore
+    agent: python-backend-specialist  # or domain-appropriate specialist
+    action: Read all relevant files and understand the current state
+    output: reports/explore-{task-id}.md
+    rules:
+      - DO NOT write any code yet
+      - Read all files related to the task
+      - Document current state and dependencies
+      - Identify potential impacts of the change
+    next: plan
+
+  - id: plan
+    agent: trading-engine-architect  # or domain-appropriate specialist
+    action: Design implementation approach based on exploration findings
+    output: reports/plan-{task-id}.md
+    rules:
+      - Produce a detailed step-by-step implementation plan
+      - Include file paths, function signatures, data flow
+      - Consider edge cases and error handling
+      - Reference KickOff.md requirements where applicable
+    next: implement
+
+  - id: implement
+    agent: python-backend-specialist  # or domain-appropriate specialist
+    action: Write code as a diff/patch in a report
+    output: reports/implementation-{task-id}.md
+    rules:
+      - Produce code changes as diffs/patches in the report
+      - DO NOT directly modify source files
+      - Include clear explanations for each change
+      - Follow project coding standards (type hints, no god files)
+    next: review
+
+  - id: review
+    agent: code-critic
+    action: Review the proposed implementation
+    output: reports/review-{task-id}.md
+    rules:
+      - Reference findings with unique IDs (e.g., CR-001)
+      - Check for correctness, edge cases, security issues
+      - Provide numbered remediation steps if issues found
+      - Approve or reject with clear rationale
+    next_on_approve: execute
+    next_on_reject: implement
+
+  - id: execute
+    agent: code-executor
+    action: Apply approved diffs to source files
+    rules:
+      - Only apply changes that passed critic review
+      - Verify file paths exist before applying
+      - Run basic syntax check after applying
+    next: test
+
+  - id: test
+    agent: testing-quality-specialist
+    action: Run relevant tests to validate applied changes
+    output: reports/test-results-{task-id}.md
+    rules:
+      - Run existing tests to check for regressions
+      - Run any new tests written as part of the implementation
+      - Report pass/fail with details
+    next_on_pass: commit
+    next_on_fail: implement
+
+  - id: commit
+    action: Commit changes with descriptive message
+    rules:
+      - Use git checkpoint branch naming
+      - Include reference to task ID in commit message
+    next: document
+
+  - id: document
+    action: Update relevant CLAUDE.md files and documentation
+    rules:
+      - Update folder-specific CLAUDE.md if behavior changed
+      - Update docs/ if architecture changed

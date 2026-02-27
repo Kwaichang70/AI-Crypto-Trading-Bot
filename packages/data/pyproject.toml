@@ -1,0 +1,17 @@
+[project]
+name = "data"
+version = "0.1.0"
+description = "Market data fetching, caching, and technical indicator computation"
+requires-python = ">=3.11"
+
+dependencies = [
+    "pandas>=2.2",
+    "numpy>=1.26",
+    "ccxt>=4.4",
+    "structlog>=24.4",
+    "pydantic>=2.9",
+    "common",
+]
+
+[tool.uv.sources]
+common  = { workspace = true }

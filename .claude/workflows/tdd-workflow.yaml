@@ -1,0 +1,93 @@
+name: tdd-workflow
+description: >
+  Test-driven development workflow. Write tests first, confirm they fail,
+  then implement code to make them pass. Prevents overfitting to tests.
+trigger_cues:
+  - "tdd"
+  - "test-driven"
+  - "write tests first"
+  - "test then implement"
+
+steps:
+  - id: write-tests
+    agent: testing-quality-specialist
+    action: Write test cases based on expected input/output pairs
+    output: reports/tests-{task-id}.md
+    rules:
+      - Write tests as diffs in a report (not directly to files)
+      - Avoid mock implementations for unimplemented functionality
+      - Cover happy path, edge cases, and error conditions
+      - Use pytest conventions and fixtures
+      - Include deterministic seed control for any randomness
+    next: review-tests
+
+  - id: review-tests
+    agent: code-critic
+    action: Review proposed test cases for completeness
+    output: reports/test-review-{task-id}.md
+    rules:
+      - Verify test coverage is adequate
+      - Check test isolation and independence
+      - Ensure no implementation leakage into tests
+      - Approve or reject with specific feedback
+    next_on_approve: apply-tests
+    next_on_reject: write-tests
+
+  - id: apply-tests
+    agent: code-executor
+    action: Apply approved test files
+    next: verify-fail
+
+  - id: verify-fail
+    agent: testing-quality-specialist
+    action: Run tests and confirm they fail as expected
+    output: reports/test-fail-verification-{task-id}.md
+    rules:
+      - All new tests MUST fail at this stage
+      - DO NOT write implementation code yet
+      - Document failure messages for reference
+    next: implement
+
+  - id: implement
+    agent: python-backend-specialist  # or domain-appropriate specialist
+    action: Write implementation code to pass the tests
+    output: reports/implementation-{task-id}.md
+    rules:
+      - DO NOT modify the tests to make them pass
+      - Write minimal code to satisfy test requirements
+      - Include all changes as diffs in the report
+    next: review-implementation
+
+  - id: review-implementation
+    agent: code-critic
+    action: Verify implementation is correct and not overfitting to tests
+    output: reports/impl-review-{task-id}.md
+    rules:
+      - Check implementation doesn't just hardcode test values
+      - Verify general correctness beyond test cases
+      - Ensure production quality (error handling, type hints)
+    next_on_approve: apply-implementation
+    next_on_reject: implement
+
+  - id: apply-implementation
+    agent: code-executor
+    action: Apply approved implementation
+    next: verify-pass
+
+  - id: verify-pass
+    agent: testing-quality-specialist
+    action: Run all tests and confirm they pass
+    output: reports/test-pass-verification-{task-id}.md
+    rules:
+      - ALL tests must pass
+      - Report any flaky or timing-dependent tests
+      - If tests fail, route back to implement step
+    next_on_pass: commit
+    next_on_fail: implement
+
+  - id: commit
+    action: Commit tests and implementation separately
+    rules:
+      - First commit: test files
+      - Second commit: implementation files
+      - Use descriptive commit messages referencing task

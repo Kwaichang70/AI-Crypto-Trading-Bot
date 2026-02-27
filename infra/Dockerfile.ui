@@ -1,0 +1,117 @@
+# =============================================================================
+# Dockerfile.ui — Multi-stage build for the Next.js TypeScript frontend
+# Build context: project root (one level above infra/)
+#
+# Stages:
+#   base        — common Node + Alpine base with package manager config
+#   deps        — install node_modules (with lockfile)
+#   builder     — run next build, produce .next/standalone output
+#   runner      — minimal runtime image, non-root user
+#
+# Build:
+#   docker build -f infra/Dockerfile.ui \
+#     --build-arg NEXT_PUBLIC_API_URL=http://api:8000 \
+#     -t crypto-trading-bot/ui:local .
+#
+# Note: NEXT_PUBLIC_* env vars are baked into the static bundle at build time.
+#       Runtime NEXT_PUBLIC_API_URL only applies to server-side rendering.
+#       For pure client-side fetching, supply the correct value at build time.
+# =============================================================================
+
+ARG NODE_VERSION=20
+
+# -----------------------------------------------------------------------------
+# Stage 1: base — pinned Alpine Node image, npm cache config
+# -----------------------------------------------------------------------------
+FROM node:${NODE_VERSION}-alpine AS base
+
+# Install minimal OS deps needed across all stages
+RUN apk add --no-cache libc6-compat curl
+
+WORKDIR /app
+
+# Enable corepack for deterministic package manager versions
+RUN corepack enable
+
+# -----------------------------------------------------------------------------
+# Stage 2: deps — install all node_modules with lockfile enforcement
+# -----------------------------------------------------------------------------
+FROM base AS deps
+
+# Copy lockfile and manifests; triggers cache invalidation only on changes
+COPY apps/ui/package.json apps/ui/package-lock.json* apps/ui/yarn.lock* \
+     apps/ui/pnpm-lock.yaml* ./
+
+# Install with frozen lockfile — fail the build if lockfile is out of sync.
+# Prefer npm ci for deterministic installs; pnpm/yarn used if lockfile present.
+RUN \
+    if [ -f yarn.lock ]; then \
+        yarn --frozen-lockfile; \
+    elif [ -f pnpm-lock.yaml ]; then \
+        corepack enable pnpm && pnpm install --frozen-lockfile; \
+    else \
+        npm ci --prefer-offline; \
+    fi
+
+# -----------------------------------------------------------------------------
+# Stage 3: builder — compile TypeScript, run next build
+# -----------------------------------------------------------------------------
+FROM base AS builder
+
+# Build-time public env vars must be present at build time
+ARG NEXT_PUBLIC_API_URL=http://localhost:8000
+ENV NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
+
+# Copy installed modules from deps stage
+COPY --from=deps /app/node_modules ./node_modules
+
+# Copy full UI source
+COPY apps/ui/ ./
+
+# Disable Next.js telemetry in CI/CD
+ENV NEXT_TELEMETRY_DISABLED=1
+
+# Build the Next.js application.
+# next.config.js should set `output: 'standalone'` for the slimmest image.
+RUN npm run build
+
+# -----------------------------------------------------------------------------
+# Stage 4: runner — production-slim image
+# Only the standalone output and public assets are copied
+# -----------------------------------------------------------------------------
+FROM node:${NODE_VERSION}-alpine AS runner
+
+# Install curl for the HEALTHCHECK
+RUN apk add --no-cache curl
+
+WORKDIR /app
+
+# Create non-root user
+RUN addgroup --system --gid 1001 nodejs \
+    && adduser  --system --uid 1001 nextjs
+
+# Set production environment
+ENV NODE_ENV=production \
+    NEXT_TELEMETRY_DISABLED=1 \
+    PORT=3000 \
+    HOSTNAME=0.0.0.0
+
+# Copy the Next.js standalone output (requires `output: 'standalone'` in next.config.js)
+# This bundles the minimal server.js without needing node_modules
+COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
+COPY --from=builder --chown=nextjs:nodejs /app/.next/static    ./.next/static
+COPY --from=builder --chown=nextjs:nodejs /app/public          ./public
+
+# Switch to non-root user
+USER nextjs
+
+# Expose the UI port
+EXPOSE 3000
+
+# Health check — Next.js exposes the root path once the server is ready.
+# The /api/health route (if implemented) gives a richer signal.
+HEALTHCHECK --interval=15s --timeout=5s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:3000 || exit 1
+
+# Start the bundled standalone server
+CMD ["node", "server.js"]

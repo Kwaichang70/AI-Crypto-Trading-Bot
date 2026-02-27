@@ -1,0 +1,15 @@
+[project]
+name = "trading"
+version = "0.1.0"
+description = "Core trading engine: strategies, execution, risk management"
+requires-python = ">=3.11"
+
+dependencies = [
+    "pydantic>=2.9",
+    "structlog>=24.4",
+    "ccxt>=4.4",
+    "common",
+]
+
+[tool.uv.sources]
+common = { workspace = true }

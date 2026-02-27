@@ -1,0 +1,269 @@
+# =============================================================================
+# .gitignore — AI Crypto Trading Bot
+# Covers: Python, Node.js, Docker, IDE, OS, and project-specific artifacts
+# =============================================================================
+
+
+# =============================================================================
+# SECURITY — NEVER commit these
+# =============================================================================
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+# Keep .env.example — it documents required variables without real values
+!.env.example
+
+
+# =============================================================================
+# PYTHON
+# =============================================================================
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# Distribution / packaging
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+.eggs/
+MANIFEST
+.installed.cfg
+lib/
+lib64/
+sdist/
+wheels/
+*.whl
+*.tar.gz
+
+# Virtual environments — use .venv by convention
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+coverage.json
+htmlcov/
+.tox/
+.nox/
+nosetests.xml
+test-results.xml
+pytest.ini
+# Keep conftest.py and fixtures
+
+# Type checking
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pytype/
+.pyre/
+
+# Linting
+.ruff_cache/
+
+# IPython / Jupyter
+.ipython/
+*.ipynb
+.ipynb_checkpoints/
+profile_default/
+
+# Celery
+celerybeat-schedule
+celerybeat.pid
+
+# Profiling
+*.prof
+
+
+# =============================================================================
+# NODE.JS / NEXT.JS
+# =============================================================================
+
+# Dependencies
+node_modules/
+jspm_packages/
+
+# Next.js build output
+.next/
+out/
+
+# Nuxt.js
+.nuxt/
+
+# Gatsby
+.cache/
+# Note: bare 'public/' removed — it matches apps/ui/public/ which is committed.
+# If using Gatsby, scope this to the Gatsby project directory.
+
+# Vite
+dist/
+dist-ssr/
+
+# Parcel cache
+.parcel-cache/
+
+# Serverless
+.serverless/
+
+# Snowpack
+.snowpack/
+
+# TypeScript compiled output
+*.tsbuildinfo
+
+# npm / yarn / pnpm caches
+.npm/
+.yarn/
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/sdks
+!.yarn/versions
+.pnp.*
+.pnp.js
+
+# Storybook
+storybook-static/
+
+# Testing
+coverage/
+
+
+# =============================================================================
+# DOCKER
+# =============================================================================
+# Local Docker override files (used for dev customisation)
+docker-compose.override.yml
+docker-compose.local.yml
+
+
+# =============================================================================
+# DATABASE & CACHES
+# =============================================================================
+*.db
+*.sqlite
+*.sqlite3
+*.db-shm
+*.db-wal
+# Postgres data dir if accidentally mounted to a local path
+postgres_data/
+redis_data/
+
+
+# =============================================================================
+# LOGS & REPORTS
+# =============================================================================
+*.log
+logs/
+# Generated agent report files; keep the template
+reports/*.md
+!reports/README.md
+
+
+# =============================================================================
+# IDE & EDITOR
+# =============================================================================
+
+# VS Code
+.vscode/
+!.vscode/extensions.json
+!.vscode/settings.json.example
+
+# JetBrains (PyCharm, WebStorm, IntelliJ)
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# Vim / Neovim
+*.swp
+*.swo
+*~
+Session.vim
+.netrwhist
+
+# Emacs
+\#*\#
+.\#*
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+
+# =============================================================================
+# OPERATING SYSTEM
+# =============================================================================
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+Icon?
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# Linux
+.directory
+.Trash-*
+
+
+# =============================================================================
+# MISC PROJECT-SPECIFIC
+# =============================================================================
+
+# Model artifacts (large binary files — store in DVC/S3 instead)
+*.pkl
+*.pickle
+*.joblib
+*.h5
+*.hdf5
+*.onnx
+*.pt
+*.pth
+models/
+model_artifacts/
+
+# Data files downloaded at runtime
+data/raw/
+data/cache/
+*.csv
+*.parquet
+
+# Backtest result exports
+backtest_results/
+*.json.gz

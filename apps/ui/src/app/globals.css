@@ -1,0 +1,89 @@
+/* Tailwind base layers */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+  CSS custom properties for dark-mode-ready theming.
+  The `dark` class on <html> (set in layout.tsx) activates the dark variants.
+  Tailwind's `dark:` utilities handle most overrides; these vars cover
+  component-level primitives that are hard to express as utilities alone.
+*/
+@layer base {
+  :root {
+    /* Surface colours (light mode) */
+    --color-bg: 248 250 252;        /* slate-50  */
+    --color-surface: 255 255 255;   /* white     */
+    --color-border: 226 232 240;    /* slate-200 */
+
+    /* Text colours */
+    --color-text-primary: 15 23 42;   /* slate-900 */
+    --color-text-secondary: 71 85 105; /* slate-500 */
+    --color-text-muted: 148 163 184;  /* slate-400 */
+
+    /* Accent */
+    --color-accent: 99 102 241;       /* indigo-500 */
+    --color-accent-hover: 79 70 229;  /* indigo-600 */
+  }
+
+  .dark {
+    /* Surface colours (dark mode) */
+    --color-bg: 2 6 23;             /* slate-950 */
+    --color-surface: 15 23 42;      /* slate-900 */
+    --color-border: 30 41 59;       /* slate-800 */
+
+    /* Text colours */
+    --color-text-primary: 241 245 249;  /* slate-100 */
+    --color-text-secondary: 148 163 184; /* slate-400 */
+    --color-text-muted: 71 85 105;      /* slate-600 */
+
+    /* Accent (stays the same in dark) */
+    --color-accent: 99 102 241;
+    --color-accent-hover: 129 140 248;  /* indigo-400 */
+  }
+
+  /* Smooth transitions when toggling dark mode */
+  html {
+    color-scheme: light dark;
+  }
+
+  body {
+    @apply bg-slate-50 text-slate-900 antialiased;
+    @apply dark:bg-slate-950 dark:text-slate-100;
+  }
+
+  /* Consistent focus ring for keyboard navigation — WCAG 2.1 AA */
+  *:focus-visible {
+    @apply outline-none ring-2 ring-indigo-500 ring-offset-2;
+    @apply dark:ring-offset-slate-900;
+  }
+}
+
+@layer components {
+  /* Card primitive — reused across dashboard panels */
+  .card {
+    @apply rounded-xl border border-slate-200 bg-white p-4 shadow-sm;
+    @apply dark:border-slate-800 dark:bg-slate-900;
+  }
+
+  /* Status badge colours — kept as component utilities for reuse */
+  .badge-success {
+    @apply inline-flex items-center rounded-full bg-green-100 px-2.5 py-0.5 text-xs font-medium text-green-800;
+    @apply dark:bg-green-900/30 dark:text-green-400;
+  }
+
+  .badge-danger {
+    @apply inline-flex items-center rounded-full bg-red-100 px-2.5 py-0.5 text-xs font-medium text-red-800;
+    @apply dark:bg-red-900/30 dark:text-red-400;
+  }
+
+  .badge-warning {
+    @apply inline-flex items-center rounded-full bg-amber-100 px-2.5 py-0.5 text-xs font-medium text-amber-800;
+    @apply dark:bg-amber-900/30 dark:text-amber-400;
+  }
+
+  .badge-neutral {
+    @apply inline-flex items-center rounded-full bg-slate-100 px-2.5 py-0.5 text-xs font-medium text-slate-600;
+    @apply dark:bg-slate-800 dark:text-slate-400;
+  }
+}

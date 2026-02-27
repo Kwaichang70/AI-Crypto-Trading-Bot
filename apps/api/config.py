@@ -1,0 +1,171 @@
+"""
+apps/api/config.py
+------------------
+Application configuration loaded from environment variables and .env file.
+Uses Pydantic Settings v2 for strict validation and type safety.
+Environment variables always take priority over .env file values.
+"""
+
+from __future__ import annotations
+
+from functools import lru_cache
+from typing import Literal
+
+from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+__all__ = ["Settings", "get_settings"]
+
+
+class Settings(BaseSettings):
+    """
+    Central application settings.
+
+    All values are read from environment variables first, then from the
+    .env file at project root. SecretStr fields are never serialised to
+    logs or JSON by default.
+    """
+
+    model_config = SettingsConfigDict(
+        env_file=(".env", ".env.local"),
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore",
+    )
+
+    # ------------------------------------------------------------------
+    # Application
+    # ------------------------------------------------------------------
+    app_name: str = Field(default="AI Crypto Trading Bot", description="Human-readable app name")
+    app_version: str = Field(default="0.1.0", description="Semantic version string")
+    debug: bool = Field(default=False, description="Enable debug mode — never True in production")
+    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = Field(
+        default="INFO", description="Structured log level"
+    )
+
+    # ------------------------------------------------------------------
+    # API server
+    # ------------------------------------------------------------------
+    host: str = Field(default="0.0.0.0", description="Uvicorn bind host")  # noqa: S104
+    port: int = Field(default=8000, ge=1024, le=65535, description="Uvicorn bind port")
+    allowed_origins: list[str] = Field(
+        default=["http://localhost:3000"],
+        description="CORS allowed origins for the Next.js frontend",
+    )
+
+    # ------------------------------------------------------------------
+    # Database (PostgreSQL via asyncpg)
+    # ------------------------------------------------------------------
+    database_url: str = Field(
+        default="",
+        description=(
+            "Async PostgreSQL DSN. "
+            "Format: postgresql+asyncpg://user:pass@host:5432/dbname. "
+            "If empty, assembled from POSTGRES_* environment variables."
+        ),
+    )
+    postgres_host: str = Field(default="localhost", description="PostgreSQL host")
+    postgres_port: int = Field(default=5432, description="PostgreSQL port")
+    postgres_db: str = Field(default="trading_bot", description="PostgreSQL database name")
+    postgres_user: str = Field(default="trading", description="PostgreSQL user")
+    postgres_password: str = Field(default="", description="PostgreSQL password")
+
+    @model_validator(mode="before")
+    @classmethod
+    def assemble_database_url(cls, values: dict) -> dict:
+        """Build database_url from POSTGRES_* vars if not provided directly."""
+        db_url = values.get("database_url", "")
+        if not db_url:
+            host = values.get("postgres_host", "localhost")
+            port = values.get("postgres_port", 5432)
+            db = values.get("postgres_db", "trading_bot")
+            user = values.get("postgres_user", "trading")
+            pw = values.get("postgres_password", "")
+            values["database_url"] = (
+                f"postgresql+asyncpg://{user}:{pw}@{host}:{port}/{db}"
+            )
+        return values
+    db_pool_size: int = Field(default=10, ge=1, le=50, description="SQLAlchemy connection pool size")
+    db_max_overflow: int = Field(
+        default=20, ge=0, le=100, description="SQLAlchemy max overflow connections"
+    )
+    db_pool_timeout: float = Field(
+        default=30.0, gt=0, description="Seconds to wait for a pool connection"
+    )
+
+    # ------------------------------------------------------------------
+    # Redis (optional caching / job queue)
+    # ------------------------------------------------------------------
+    redis_url: str | None = Field(
+        default=None,
+        description="Redis DSN. Omit to disable Redis integration.",
+    )
+
+    # ------------------------------------------------------------------
+    # Exchange / CCXT
+    # ------------------------------------------------------------------
+    exchange_id: str = Field(
+        default="kraken",
+        description="CCXT exchange ID (e.g. 'kraken', 'binance')",
+    )
+    exchange_api_key: SecretStr | None = Field(
+        default=None,
+        description="Exchange API key — never logged",
+    )
+    exchange_api_secret: SecretStr | None = Field(
+        default=None,
+        description="Exchange API secret — never logged",
+    )
+
+    # ------------------------------------------------------------------
+    # Live trading safety gates (all three must be satisfied)
+    # ------------------------------------------------------------------
+    enable_live_trading: bool = Field(
+        default=False,
+        description=(
+            "Master switch for live order placement. Must be True to place real orders. "
+            "Enforcement happens in ExecutionEngine, not here."
+        ),
+    )
+    live_trading_confirm_token: SecretStr | None = Field(
+        default=None,
+        description="Extra safety token required alongside enable_live_trading=True",
+    )
+
+    # ------------------------------------------------------------------
+    # Risk defaults (overridable per-run)
+    # ------------------------------------------------------------------
+    default_max_open_positions: int = Field(default=3, ge=1, le=20)
+    default_per_trade_risk_pct: float = Field(
+        default=0.01, gt=0.0, le=0.05, description="Fraction of equity risked per trade (0.01 = 1%)"
+    )
+    default_max_daily_loss_pct: float = Field(
+        default=0.05, gt=0.0, le=0.25, description="Max daily loss as fraction of equity before halt"
+    )
+    default_max_drawdown_pct: float = Field(
+        default=0.15, gt=0.0, le=0.50, description="Max drawdown before circuit breaker fires"
+    )
+
+    # ------------------------------------------------------------------
+    # Validators
+    # ------------------------------------------------------------------
+    @field_validator("database_url")
+    @classmethod
+    def validate_database_url(cls, v: str) -> str:
+        if not v.startswith("postgresql+asyncpg://"):
+            raise ValueError(
+                "database_url must use the 'postgresql+asyncpg://' scheme for async support"
+            )
+        return v
+
+
+
+@lru_cache(maxsize=1)
+def get_settings() -> Settings:
+    """
+    Return the singleton Settings instance.
+
+    Uses lru_cache so the .env file is parsed exactly once per process.
+    In tests, call get_settings.cache_clear() before patching env vars.
+    """
+    return Settings()

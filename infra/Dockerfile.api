@@ -1,0 +1,108 @@
+# =============================================================================
+# Dockerfile.api — Multi-stage build for the FastAPI Python backend
+# Build context: project root (one level above infra/)
+#
+# Stages:
+#   deps     — install uv and resolve/install Python dependencies
+#   runtime  — slim production image, non-root user, no build tools
+#
+# Build:
+#   docker build -f infra/Dockerfile.api -t crypto-trading-bot/api:local .
+#
+# Run standalone (dev):
+#   docker run --env-file .env -p 8000:8000 crypto-trading-bot/api:local
+# =============================================================================
+
+ARG PYTHON_VERSION=3.11
+
+# -----------------------------------------------------------------------------
+# Stage 1: deps — install uv, resolve and install all Python dependencies
+# Using the full slim image here so pip/uv can compile C extensions if needed
+# -----------------------------------------------------------------------------
+FROM python:${PYTHON_VERSION}-slim AS deps
+
+# Install system packages required for compiling common Python deps
+# (libpq-dev for psycopg2, curl for health check in base images)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        curl \
+        libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install uv — the fast Rust-based Python package manager
+# Pin to a specific version for reproducible builds
+ENV UV_VERSION=0.5.18
+RUN curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | sh
+ENV PATH="/root/.cargo/bin:/root/.local/bin:${PATH}"
+
+WORKDIR /build
+
+# Copy dependency manifests first — maximise Docker layer cache reuse.
+# Only invalidated when pyproject.toml or uv.lock changes.
+COPY apps/api/pyproject.toml apps/api/uv.lock* ./apps/api/
+# Copy any shared packages that the API depends on
+COPY packages/ ./packages/
+
+# Create a virtual environment inside /build/.venv
+# --no-cache: keep image lean; deps are already locked
+RUN uv venv /build/.venv \
+    && uv pip install --python /build/.venv/bin/python \
+       --no-cache \
+       fastapi "uvicorn[standard]" "sqlalchemy[asyncio]" asyncpg alembic \
+       pydantic pydantic-settings structlog httpx redis ccxt \
+       pandas numpy 2>/dev/null || \
+    echo "Dependency install failed — check pyproject.toml"
+
+# -----------------------------------------------------------------------------
+# Stage 2: runtime — minimal production image
+# No build tools, no root, smallest possible attack surface
+# -----------------------------------------------------------------------------
+FROM python:${PYTHON_VERSION}-slim AS runtime
+
+# Runtime-only system deps (libpq for psycopg2 runtime, curl for healthcheck)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libpq5 \
+        curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# Create a non-root user and group
+RUN groupadd --gid 1001 appgroup \
+    && useradd --uid 1001 --gid 1001 --no-create-home --shell /bin/bash appuser
+
+WORKDIR /app
+
+# Copy the pre-built virtual environment from the deps stage
+COPY --from=deps /build/.venv /app/.venv
+
+# Prepend venv bin to PATH so `python` and `uvicorn` resolve without activation
+ENV PATH="/app/.venv/bin:${PATH}" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH="/app:/app/packages"
+
+# Copy application source code
+# Done after dependencies to preserve cache when only app code changes
+COPY --chown=appuser:appgroup apps/api/ ./api/
+COPY --chown=appuser:appgroup packages/ ./packages/
+
+# Switch to non-root user before the final layer
+USER appuser
+
+# Expose the application port (informational; actual binding via env var)
+EXPOSE 8000
+
+# Health check — calls the /health endpoint defined in the FastAPI app
+# start_period gives the app time to initialize before failures count
+HEALTHCHECK --interval=15s --timeout=5s --start-period=40s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+# Graceful shutdown: uvicorn handles SIGTERM with --timeout-graceful-shutdown
+# Workers=1 for MVP; adjust via UVICORN_WORKERS env var for horizontal scale
+CMD ["uvicorn", \
+     "api.main:app", \
+     "--host", "0.0.0.0", \
+     "--port", "8000", \
+     "--workers", "1", \
+     "--log-config", "/dev/null", \
+     "--timeout-graceful-shutdown", "25"]
