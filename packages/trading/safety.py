@@ -31,6 +31,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
+import hmac
 import structlog
 from pydantic import BaseModel, Field
 
@@ -274,8 +275,8 @@ class LiveTradingGate:
                        "Set LIVE_TRADING_CONFIRM_TOKEN to enable token verification.",
             )
 
-        # Both present — compare
-        if stored == confirm_token:
+        # Both present — constant-time comparison to prevent timing attacks
+        if hmac.compare_digest(stored, confirm_token):
             return GateLayer(
                 name="confirmation",
                 passed=True,
