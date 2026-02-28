@@ -75,6 +75,55 @@ class Settings(BaseSettings):
     )
 
     # ------------------------------------------------------------------
+    # Rate limiting (SEC-S2-001)
+    # ------------------------------------------------------------------
+    rate_limit_enabled: bool = Field(
+        default=True,
+        description=(
+            "Master switch for API rate limiting. "
+            "True = enforce per-IP rate limits on all non-exempt endpoints. "
+            "False = disable rate limiting (only for local dev/testing). "
+            "MUST be True in production."
+        ),
+    )
+    rate_limit_auth_failures: str = Field(
+        default="5/minute",
+        description=(
+            "Rate limit for authentication failures per IP. "
+            "Uses limits library syntax: '5/minute', '10/hour', etc. "
+            "Tight limit to prevent brute-force API key guessing."
+        ),
+    )
+    rate_limit_write: str = Field(
+        default="30/minute",
+        description=(
+            "Rate limit for write endpoints (POST, PUT, PATCH, DELETE) per IP. "
+            "Uses limits library syntax: '30/minute', '60/hour', etc."
+        ),
+    )
+    rate_limit_read: str = Field(
+        default="120/minute",
+        description=(
+            "Rate limit for read endpoints (GET) per IP. "
+            "Uses limits library syntax: '120/minute', '300/hour', etc."
+        ),
+    )
+    trusted_proxy_count: int = Field(
+        default=0,
+        ge=0,
+        le=10,
+        description=(
+            "Number of trusted reverse proxy hops between the internet and this service. "
+            "0 (default) = direct connection mode — X-Forwarded-For is ignored entirely. "
+            "This is the safe default and prevents IP spoofing via forged XFF headers. "
+            "Set to 1 if behind a single nginx/ALB/Cloudflare proxy. "
+            "SECURITY: Never set higher than the actual number of controlled proxy hops. "
+            "Clients can inject arbitrary entries at the left of XFF; only the "
+            "proxy-appended rightmost entries are trustworthy. (CR-RL-002)"
+        ),
+    )
+
+    # ------------------------------------------------------------------
     # Database (PostgreSQL via asyncpg)
     # ------------------------------------------------------------------
     database_url: str = Field(
