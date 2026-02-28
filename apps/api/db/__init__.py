@@ -5,18 +5,18 @@ Public surface of the database package.
 
 Import from here rather than reaching into submodules:
 
-    from api.db import Base, engine, AsyncSessionFactory, get_db
+    from api.db import Base, get_engine, get_session_factory, get_db
 
 Re-exports
 ----------
 Base
     SQLAlchemy ``DeclarativeBase`` — import this in Alembic ``env.py``
     for autogenerate to discover all ORM models.
-engine
-    Singleton ``AsyncEngine`` bound to the PostgreSQL DSN from settings.
-AsyncSessionFactory
-    ``async_sessionmaker`` — use directly when a FastAPI Depends() is
-    not appropriate (e.g., background tasks, startup jobs).
+get_engine
+    Factory returning the singleton ``AsyncEngine`` bound to the PostgreSQL DSN.
+get_session_factory
+    Factory returning the ``async_sessionmaker`` — use directly when a
+    FastAPI Depends() is not appropriate (e.g., background tasks, startup jobs).
 get_db
     Async generator FastAPI dependency for session-per-request pattern.
 dispose_engine
@@ -41,18 +41,18 @@ from api.db.models import (  # noqa: F401 — side-effect import registers model
     TradeORM,
 )
 from api.db.session import (
-    AsyncSessionFactory,
     dispose_engine,
-    engine,
     get_db,
+    get_engine,
+    get_session_factory,
 )
 
 __all__ = [
     # Base & metadata
     "Base",
     # Engine & session
-    "engine",
-    "AsyncSessionFactory",
+    "get_engine",
+    "get_session_factory",
     "get_db",
     "dispose_engine",
     # ORM models
