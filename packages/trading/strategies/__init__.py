@@ -11,6 +11,7 @@ Available strategies
 - **MACrossoverStrategy** -- Dual SMA crossover (trend-following)
 - **RSIMeanReversionStrategy** -- RSI overbought/oversold mean-reversion
 - **BreakoutStrategy** -- Donchian channel breakout with ATR scaling
+- **ModelStrategy** -- ML model-based strategy (Sprint 2 placeholder)
 
 Usage::
 
@@ -24,10 +25,12 @@ Usage::
 
 from trading.strategies.breakout import BreakoutStrategy
 from trading.strategies.ma_crossover import MACrossoverStrategy
+from trading.strategies.model_strategy import ModelStrategy
 from trading.strategies.rsi_mean_reversion import RSIMeanReversionStrategy
 
 __all__ = [
     "MACrossoverStrategy",
     "RSIMeanReversionStrategy",
     "BreakoutStrategy",
+    "ModelStrategy",
 ]

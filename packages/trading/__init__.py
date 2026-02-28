@@ -25,6 +25,13 @@ from trading.metrics import (
 from trading.models import Fill, Order, Position, Signal, TradeResult, RiskCheckResult
 from trading.portfolio import PortfolioAccounting
 from trading.risk import BaseRiskManager, RiskParameters
+from trading.safety import (
+    CircuitBreaker,
+    CircuitBreakerConfig,
+    GateCheckResult,
+    LiveTradingGate,
+    LiveTradingGateError,
+)
 from trading.strategy import BaseStrategy, StrategyMetadata
 from trading.strategy_engine import EngineState, StrategyEngine
 
@@ -56,6 +63,12 @@ __all__ = [
     # Risk
     "BaseRiskManager",
     "RiskParameters",
+    # Safety
+    "LiveTradingGate",
+    "LiveTradingGateError",
+    "GateCheckResult",
+    "CircuitBreaker",
+    "CircuitBreakerConfig",
     # Portfolio
     "PortfolioAccounting",
     # Models

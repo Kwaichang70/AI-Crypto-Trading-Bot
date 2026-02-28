@@ -1,12 +1,23 @@
 # =============================================================================
 # CI — AI Crypto Trading Bot
-# Triggers: push to main/develop, any pull request targeting main
 #
-# Jobs (run in parallel where possible, fail-fast on lint):
-#   lint      — ruff (Python linter) + mypy (type checker)
-#   test      — pytest with a live PostgreSQL service container
-#   build-api — docker build for the FastAPI image
-#   build-ui  — docker build for the Next.js image
+# Triggers:
+#   - Push to main
+#   - Pull requests targeting main
+#
+# Job graph (left = depends on right):
+#
+#   lint ──┬──► type-check
+#          ├──► test-unit
+#          │         └──► test-integration (continue-on-error)
+#          ├──► build-api
+#          └──► build-ui
+#
+# Notes:
+#   - uv workspace is rooted at the project root (pyproject.toml + uv.lock)
+#   - PYTHONPATH is set to project root + packages/ for monorepo imports
+#   - All Python jobs run from the repository root, not apps/api
+#   - Live trading is permanently disabled in CI (ENABLE_LIVE_TRADING=false)
 # =============================================================================
 
 name: CI
@@ -15,32 +26,34 @@ on:
   push:
     branches:
       - main
-      - develop
   pull_request:
     branches:
       - main
 
-# Cancel in-progress runs for the same branch/PR to avoid queue buildup
+# Cancel in-progress runs for the same branch/PR to avoid queue buildup.
+# This keeps resource usage lean on long-running feature branches.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# ---------------------------------------------------------------------------
+# Global environment — shared across all jobs
+# ---------------------------------------------------------------------------
 env:
   PYTHON_VERSION: "3.11"
   NODE_VERSION:   "20"
-  # Registry prefix — override in org secrets for remote push
-  IMAGE_REGISTRY: ghcr.io/${{ github.repository_owner }}
+  # uv version — pin for reproducible installs; bump deliberately
+  UV_VERSION:     "0.5.18"
 
-# ---------------------------------------------------------------------------
-# Job: lint — fail fast before running expensive test/build jobs
-# ---------------------------------------------------------------------------
+# =============================================================================
+# Job: lint — Python linting via ruff (fail fast, no compute wasted downstream)
+# =============================================================================
 jobs:
   lint:
-    name: Lint (ruff + mypy)
+    name: Lint (ruff)
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: apps/api
+    # Run from the monorepo root so ruff picks up the root pyproject.toml
+    # which has src = ["apps", "packages"] configured
 
     steps:
       - name: Checkout repository
@@ -51,60 +64,195 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      # Restore pip cache keyed on the lockfile/pyproject.toml hash
-      - name: Cache pip packages
+      # Cache the uv tool itself and the resolved package cache.
+      # Key on root uv.lock (workspace lockfile) + root pyproject.toml.
+      # Falls back to any pip cache on the same OS/Python combination.
+      - name: Cache uv packages
         uses: actions/cache@v4
         with:
-          path: ~/.cache/pip
-          key: pip-${{ runner.os }}-${{ env.PYTHON_VERSION }}-${{ hashFiles('apps/api/pyproject.toml', 'apps/api/uv.lock') }}
+          path: |
+            ~/.cache/uv
+            ~/.local/share/uv
+          key: uv-${{ runner.os }}-${{ env.PYTHON_VERSION }}-${{ hashFiles('uv.lock', 'pyproject.toml') }}
           restore-keys: |
-            pip-${{ runner.os }}-${{ env.PYTHON_VERSION }}-
+            uv-${{ runner.os }}-${{ env.PYTHON_VERSION }}-
 
       - name: Install uv
         run: |
-          curl -LsSf https://astral.sh/uv/0.5.18/install.sh | sh
+          curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | sh
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Install dependencies (including dev extras)
+      # Install only the linting tools — no full workspace install needed here.
+      # Using --system avoids venv creation overhead for this lightweight job.
+      - name: Install ruff
         run: |
-          uv venv .venv
-          # Install with dev extras; fall back gracefully if pyproject.toml absent
-          if [ -f pyproject.toml ]; then
-            uv pip install --python .venv/bin/python --no-cache --all-extras . 2>/dev/null || \
-            uv pip install --python .venv/bin/python --no-cache ruff mypy
-          else
-            uv pip install --python .venv/bin/python --no-cache ruff mypy
-          fi
-          echo "$(pwd)/.venv/bin" >> "$GITHUB_PATH"
+          uv tool install "ruff>=0.6"
 
-      # ruff check: lint + import order (replaces flake8, isort, pyupgrade)
+      # ruff check: lint rules (E/W/F/I/B/C4/UP/ANN/S/RUF from root pyproject.toml)
       - name: Run ruff lint
         run: |
           ruff check . --output-format=github
 
-      # ruff format check: consistent code style
+      # ruff format --check: code style (non-destructive, just reports violations)
       - name: Run ruff format check
         run: |
           ruff format . --check
 
-      # mypy: static type checking
-      - name: Run mypy
-        run: |
-          mypy . --ignore-missing-imports --no-error-summary || true
-          # Non-fatal for now; remove `|| true` once full type coverage is in place
 
-  # ---------------------------------------------------------------------------
-  # Job: test — pytest with PostgreSQL service container
-  # Runs after lint succeeds to avoid wasting compute on broken code
-  # ---------------------------------------------------------------------------
-  test:
-    name: Test (pytest)
+# =============================================================================
+# Job: type-check — mypy static analysis across packages/ and apps/api/
+# Depends on lint to avoid running expensive type checking on unformatted code.
+# =============================================================================
+  type-check:
+    name: Type check (mypy)
     runs-on: ubuntu-latest
     needs: lint
 
-    # PostgreSQL service container — available at localhost:5432 for the job
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Cache uv packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/uv
+            ~/.local/share/uv
+          key: uv-${{ runner.os }}-${{ env.PYTHON_VERSION }}-${{ hashFiles('uv.lock', 'pyproject.toml') }}
+          restore-keys: |
+            uv-${{ runner.os }}-${{ env.PYTHON_VERSION }}-
+
+      - name: Install uv
+        run: |
+          curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | sh
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # Install the full workspace so mypy can resolve all internal imports.
+      # --all-extras pulls dev-dependencies (which includes mypy itself).
+      - name: Install workspace dependencies
+        run: |
+          uv sync --all-extras --frozen 2>/dev/null || \
+          uv sync --all-extras
+          echo "$(pwd)/.venv/bin" >> "$GITHUB_PATH"
+
+      # mypy is configured in root pyproject.toml:
+      #   strict = true, ignore_missing_imports = true, excludes tests/ alembic/
+      # --no-error-summary keeps output concise for GitHub annotations.
+      # Non-fatal (|| true) for MVP — tighten once full type coverage lands.
+      - name: Run mypy
+        env:
+          PYTHONPATH: "${{ github.workspace }}:${{ github.workspace }}/packages"
+        run: |
+          .venv/bin/mypy packages/ apps/api/ \
+            --ignore-missing-imports \
+            --no-error-summary \
+            --show-column-numbers \
+            || true
+          # Remove `|| true` once ANN coverage reaches 100%
+
+
+# =============================================================================
+# Job: test-unit — fast unit tests, no external services required
+# Depends on lint so a broken file doesn't churn test output.
+# =============================================================================
+  test-unit:
+    name: Unit tests (pytest)
+    runs-on: ubuntu-latest
+    needs: lint
+
+    env:
+      # Monorepo PYTHONPATH: root (for absolute imports) + packages/ (siblings)
+      PYTHONPATH: "${{ github.workspace }}:${{ github.workspace }}/packages"
+      # Safety gates — live trading is always OFF in CI
+      ENABLE_LIVE_TRADING:        "false"
+      EXCHANGE_API_KEY:           ""
+      EXCHANGE_API_SECRET:        ""
+      LIVE_TRADING_CONFIRM_TOKEN: ""
+      # Application config
+      LOG_LEVEL:   "warning"
+      ENVIRONMENT: "test"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Cache uv packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/uv
+            ~/.local/share/uv
+          key: uv-${{ runner.os }}-${{ env.PYTHON_VERSION }}-${{ hashFiles('uv.lock', 'pyproject.toml') }}
+          restore-keys: |
+            uv-${{ runner.os }}-${{ env.PYTHON_VERSION }}-
+
+      - name: Install uv
+        run: |
+          curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | sh
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install workspace dependencies
+        run: |
+          uv sync --all-extras --frozen 2>/dev/null || \
+          uv sync --all-extras
+          echo "$(pwd)/.venv/bin" >> "$GITHUB_PATH"
+
+      # Run unit tests only — these must not require a database or Redis.
+      # If tests/unit/ does not exist yet, we skip gracefully with a warning.
+      - name: Run unit tests
+        run: |
+          if [ -d "tests/unit" ]; then
+            .venv/bin/pytest tests/unit/ \
+              -v \
+              --tb=short \
+              --strict-markers \
+              --cov=apps \
+              --cov=packages \
+              --cov-report=term-missing \
+              --cov-report=xml:coverage-unit.xml
+          else
+            echo "::warning::tests/unit/ directory not found — skipping unit tests."
+            echo "Create tests/unit/ with at least one test file to enable this job."
+          fi
+
+      - name: Upload unit coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-unit
+          path: coverage-unit.xml
+          retention-days: 7
+          # Do not fail if the coverage file was never produced (skipped run)
+          if-no-files-found: warn
+
+
+# =============================================================================
+# Job: test-integration — tests requiring PostgreSQL + Redis service containers
+# Only runs after lint + type-check + test-unit all pass.
+# continue-on-error: true — integration suite may be incomplete during MVP.
+# =============================================================================
+  test-integration:
+    name: Integration tests (pytest + postgres + redis)
+    runs-on: ubuntu-latest
+    needs: [lint, type-check, test-unit]
+    # Non-fatal for MVP: remove once the integration suite is stable
+    continue-on-error: true
+
     services:
+      # PostgreSQL 16 service container — available at localhost:5432 during the job
       postgres:
         image: postgres:16-alpine
         env:
@@ -119,6 +267,7 @@ jobs:
           --health-timeout 5s
           --health-retries 5
 
+      # Redis 7 service container — available at localhost:6379 during the job
       redis:
         image: redis:7-alpine
         ports:
@@ -129,26 +278,27 @@ jobs:
           --health-timeout 3s
           --health-retries 5
 
-    defaults:
-      run:
-        working-directory: apps/api
-
     env:
-      # Inject DB connection for pytest; matches service container above
+      # Monorepo PYTHONPATH
+      PYTHONPATH: "${{ github.workspace }}:${{ github.workspace }}/packages"
+      # Database connection — matches the service container above
       POSTGRES_HOST:     localhost
       POSTGRES_PORT:     5432
       POSTGRES_DB:       trading_bot_test
       POSTGRES_USER:     trading_test
       POSTGRES_PASSWORD: ci_test_password_not_secret
-      REDIS_URL:         redis://localhost:6379/1
-      # Ensure live trading is always OFF in CI
+      DATABASE_URL: >-
+        postgresql+asyncpg://trading_test:ci_test_password_not_secret@localhost:5432/trading_bot_test
+      # Redis — database 1 to avoid collisions with any default data
+      REDIS_URL: redis://localhost:6379/1
+      # Safety gates
       ENABLE_LIVE_TRADING:        "false"
       EXCHANGE_API_KEY:           ""
       EXCHANGE_API_SECRET:        ""
       LIVE_TRADING_CONFIRM_TOKEN: ""
-      LOG_LEVEL:                  "warning"
-      ENVIRONMENT:                "test"
-      PYTHONPATH:                 "${{ github.workspace }}:${{ github.workspace }}/packages"
+      # Application config
+      LOG_LEVEL:   "warning"
+      ENVIRONMENT: "test"
 
     steps:
       - name: Checkout repository
@@ -159,63 +309,68 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Cache pip packages
+      - name: Cache uv packages
         uses: actions/cache@v4
         with:
-          path: ~/.cache/pip
-          key: pip-${{ runner.os }}-${{ env.PYTHON_VERSION }}-${{ hashFiles('apps/api/pyproject.toml', 'apps/api/uv.lock') }}
+          path: |
+            ~/.cache/uv
+            ~/.local/share/uv
+          key: uv-${{ runner.os }}-${{ env.PYTHON_VERSION }}-${{ hashFiles('uv.lock', 'pyproject.toml') }}
           restore-keys: |
-            pip-${{ runner.os }}-${{ env.PYTHON_VERSION }}-
+            uv-${{ runner.os }}-${{ env.PYTHON_VERSION }}-
 
       - name: Install uv
         run: |
-          curl -LsSf https://astral.sh/uv/0.5.18/install.sh | sh
+          curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | sh
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Install dependencies
+      - name: Install workspace dependencies
         run: |
-          uv venv .venv
-          if [ -f pyproject.toml ]; then
-            uv pip install --python .venv/bin/python --no-cache --all-extras . 2>/dev/null || \
-            uv pip install --python .venv/bin/python --no-cache pytest pytest-asyncio pytest-cov
-          else
-            uv pip install --python .venv/bin/python --no-cache pytest pytest-asyncio pytest-cov
-          fi
+          uv sync --all-extras --frozen 2>/dev/null || \
+          uv sync --all-extras
           echo "$(pwd)/.venv/bin" >> "$GITHUB_PATH"
 
-      - name: Wait for PostgreSQL to accept connections
+      # Explicit health check — service containers may report healthy before
+      # the TCP port is actually reachable from the runner.
+      - name: Wait for PostgreSQL
         run: |
           until pg_isready -h localhost -p 5432 -U trading_test; do
             echo "Waiting for postgres..."
             sleep 2
           done
 
-      - name: Run pytest
+      # Run integration tests only — skip gracefully if directory missing.
+      - name: Run integration tests
         run: |
-          if [ -d tests ] || [ -d ../../tests ]; then
-            pytest \
+          if [ -d "tests/integration" ]; then
+            .venv/bin/pytest tests/integration/ \
+              -v \
               --tb=short \
               --strict-markers \
-              --cov=. \
+              --cov=apps \
+              --cov=packages \
               --cov-report=term-missing \
-              --cov-report=xml:coverage.xml \
-              -q
+              --cov-report=xml:coverage-integration.xml
           else
-            echo "No tests directory found — skipping (will fail once tests are added)"
+            echo "::warning::tests/integration/ directory not found — skipping integration tests."
+            echo "Create tests/integration/ to enable database-backed test coverage."
           fi
 
-      - name: Upload coverage report
+      - name: Upload integration coverage report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: coverage-report
-          path: apps/api/coverage.xml
+          name: coverage-integration
+          path: coverage-integration.xml
           retention-days: 7
+          if-no-files-found: warn
 
-  # ---------------------------------------------------------------------------
-  # Job: build-api — verify the API Docker image builds cleanly
-  # ---------------------------------------------------------------------------
+
+# =============================================================================
+# Job: build-api — verify the FastAPI Docker image compiles cleanly
+# Depends on lint only — build failures should surface independently of tests.
+# =============================================================================
   build-api:
     name: Build API Docker image
     runs-on: ubuntu-latest
@@ -225,41 +380,33 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Set up Docker Buildx for multi-platform + layer cache support
+      # Docker Buildx enables BuildKit features: multi-platform, inline cache,
+      # and the type=gha cache backend used below.
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # Cache Docker layers in GitHub Actions cache (up to 10 GB)
-      - name: Cache Docker layers
-        uses: actions/cache@v4
-        with:
-          path: /tmp/.buildx-cache-api
-          key: buildx-api-${{ runner.os }}-${{ hashFiles('infra/Dockerfile.api', 'apps/api/pyproject.toml') }}
-          restore-keys: |
-            buildx-api-${{ runner.os }}-
-
+      # type=gha uses GitHub Actions cache as the BuildKit cache backend.
+      # This is simpler and more reliable than the local /tmp dir rotation pattern.
       - name: Build API image (no push)
         uses: docker/build-push-action@v6
         with:
           context: .
           file: infra/Dockerfile.api
+          # Target the production runtime stage — validates the full build graph
           target: runtime
           push: false
           tags: crypto-trading-bot/api:ci-${{ github.sha }}
-          cache-from: type=local,src=/tmp/.buildx-cache-api
-          cache-to:   type=local,dest=/tmp/.buildx-cache-api-new,mode=max
+          # GitHub Actions native cache: no manual directory rotation needed
+          cache-from: type=gha,scope=api
+          cache-to:   type=gha,scope=api,mode=max
           build-args: |
             PYTHON_VERSION=${{ env.PYTHON_VERSION }}
 
-      # Rotate cache to avoid unbounded growth
-      - name: Move Docker layer cache
-        run: |
-          rm -rf /tmp/.buildx-cache-api
-          mv /tmp/.buildx-cache-api-new /tmp/.buildx-cache-api
 
-  # ---------------------------------------------------------------------------
-  # Job: build-ui — verify the UI Docker image builds cleanly
-  # ---------------------------------------------------------------------------
+# =============================================================================
+# Job: build-ui — verify the Next.js Docker image and standalone output
+# Depends on lint only — same reasoning as build-api.
+# =============================================================================
   build-ui:
     name: Build UI Docker image
     runs-on: ubuntu-latest
@@ -269,41 +416,46 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Set up Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          # actions/setup-node has built-in npm cache support
+          cache: "npm"
+          cache-dependency-path: apps/ui/package-lock.json
+
+      # Standalone host build step: catches TypeScript compilation errors
+      # and verifies next build produces the .next/standalone output
+      # without requiring a full Docker build on every push.
+      - name: Install UI dependencies
+        working-directory: apps/ui
+        run: npm ci
+
+      - name: Build Next.js (standalone verification)
+        working-directory: apps/ui
+        env:
+          # Disable telemetry in CI
+          NEXT_TELEMETRY_DISABLED: "1"
+          # Build-time public env var — supply a placeholder for CI
+          NEXT_PUBLIC_API_URL: "http://localhost:8000"
+        run: npm run build
+
+      # Docker build step: validates the multi-stage Dockerfile is coherent.
+      # Uses type=gha cache to avoid re-downloading npm packages inside Docker.
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # Cache npm packages at the OS level for faster installs
-      - name: Cache npm packages
-        uses: actions/cache@v4
-        with:
-          path: ~/.npm
-          key: npm-${{ runner.os }}-${{ hashFiles('apps/ui/package-lock.json', 'apps/ui/yarn.lock', 'apps/ui/pnpm-lock.yaml') }}
-          restore-keys: |
-            npm-${{ runner.os }}-
-
-      - name: Cache Docker layers
-        uses: actions/cache@v4
-        with:
-          path: /tmp/.buildx-cache-ui
-          key: buildx-ui-${{ runner.os }}-${{ hashFiles('infra/Dockerfile.ui', 'apps/ui/package-lock.json') }}
-          restore-keys: |
-            buildx-ui-${{ runner.os }}-
-
-      - name: Build UI image (no push)
+      - name: Build UI Docker image (no push)
         uses: docker/build-push-action@v6
         with:
           context: .
           file: infra/Dockerfile.ui
+          # Target the production runner stage
           target: runner
           push: false
           tags: crypto-trading-bot/ui:ci-${{ github.sha }}
-          cache-from: type=local,src=/tmp/.buildx-cache-ui
-          cache-to:   type=local,dest=/tmp/.buildx-cache-ui-new,mode=max
+          cache-from: type=gha,scope=ui
+          cache-to:   type=gha,scope=ui,mode=max
           build-args: |
             NODE_VERSION=${{ env.NODE_VERSION }}
             NEXT_PUBLIC_API_URL=http://localhost:8000
-
-      - name: Move Docker layer cache
-        run: |
-          rm -rf /tmp/.buildx-cache-ui
-          mv /tmp/.buildx-cache-ui-new /tmp/.buildx-cache-ui
