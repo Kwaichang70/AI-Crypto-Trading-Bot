@@ -5,12 +5,13 @@ FastAPI application entry point.
 
 Responsibilities
 ----------------
-- Bootstrap structlog on startup
+- Bootstrap structured logging on startup via ``common.logging.configure_logging``
 - Initialise and tear down the async database engine via lifespan
 - Mount CORS middleware with origins from settings
-- Mount request timing middleware (X-Process-Time header)
+- Mount request timing + logging middleware (X-Process-Time header, structured log)
 - Register all API routers under /api/v1/
 - Expose the /health endpoint (always available, no auth)
+- Expose the /api/v1/metrics endpoint (in-memory metrics snapshot)
 
 The ``lifespan`` context manager is the recommended FastAPI pattern for
 startup/shutdown logic (replaces deprecated on_event handlers).
@@ -28,7 +29,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from api.config import get_settings
-from common.config import configure_structlog
+from common.logging import configure_logging
+from common.metrics import metrics
 
 __all__ = ["app", "create_app"]
 
@@ -46,7 +48,7 @@ async def lifespan(app: FastAPI):  # type: ignore[type-arg]
 
     Startup (before yield)
     ----------------------
-    1. Configure structlog with settings-driven log level and format
+    1. Configure structured logging with service-level context fields
     2. Log application boot parameters
     3. Initialise SQLAlchemy async engine and connection pool
     4. (Future) Initialise Redis connection
@@ -62,10 +64,12 @@ async def lifespan(app: FastAPI):  # type: ignore[type-arg]
     """
     settings = get_settings()
 
-    # 1. Configure structured logging
-    configure_structlog(
+    # 1. Configure structured logging with service-level context
+    configure_logging(
         log_level=settings.log_level,
-        json_logs=not settings.debug,
+        json_output=not settings.debug,
+        service_name=settings.app_name,
+        environment="development" if settings.debug else "production",
     )
 
     log = structlog.get_logger(__name__)
@@ -116,17 +120,24 @@ async def lifespan(app: FastAPI):  # type: ignore[type-arg]
 
 
 # ---------------------------------------------------------------------------
-# Request timing middleware
+# Request timing + logging middleware
 # ---------------------------------------------------------------------------
+
+# Paths that are polled frequently by health checkers and Prometheus scrapers.
+# Log at DEBUG to avoid drowning production logs with probe noise.
+_PROBE_PATHS: frozenset[str] = frozenset({"/health", "/api/v1/metrics"})
+
 
 async def _request_timing_middleware(request: Request, call_next: Any) -> Response:
     """
-    Add X-Process-Time header to every response.
+    Add X-Process-Time header and emit a structured HTTP request log entry.
 
     Measures wall-clock time from request receipt to response completion.
-    This is useful for latency monitoring and debugging slow endpoints.
+    Emits a structured ``http.request`` log entry after each response,
+    including the HTTP method, path, status code, and duration in milliseconds.
 
-    The value is in milliseconds with two decimal places.
+    Health-check and metrics probe paths are logged at DEBUG level to
+    prevent high-frequency polling from flooding production log streams.
 
     Parameters
     ----------
@@ -144,6 +155,17 @@ async def _request_timing_middleware(request: Request, call_next: Any) -> Respon
     response = await call_next(request)
     elapsed_ms = round((time.monotonic() - start) * 1000, 2)
     response.headers["X-Process-Time"] = str(elapsed_ms)
+
+    path = request.url.path
+    log_fn = logger.debug if path in _PROBE_PATHS else logger.info
+    log_fn(
+        "http.request",
+        method=request.method,
+        path=path,
+        status_code=response.status_code,
+        duration_ms=elapsed_ms,
+    )
+
     return response
 
 
@@ -193,7 +215,7 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
-    # 2. Request timing — wraps every request/response cycle
+    # 2. Request timing + logging — wraps every request/response cycle
     application.middleware("http")(_request_timing_middleware)
 
     # ------------------------------------------------------------------
@@ -239,6 +261,40 @@ def _register_routes(application: FastAPI) -> None:
             "status": "ok",
             "uptime_seconds": uptime_seconds,
             "version": get_settings().app_version,
+            "timestamp": dt.now(tz=UTC).isoformat(),
+        }
+
+    # ------------------------------------------------------------------
+    # In-memory metrics snapshot
+    # ------------------------------------------------------------------
+    @application.get(
+        "/api/v1/metrics",
+        tags=["observability"],
+        summary="In-memory metrics snapshot",
+        response_class=JSONResponse,
+    )
+    async def get_metrics() -> dict[str, Any]:
+        """
+        Return a point-in-time snapshot of all in-memory trading metrics.
+
+        Includes:
+
+        - **counters** — bars processed, signals generated, orders submitted,
+          fills executed (with optional per-strategy / per-side label breakdowns).
+        - **gauges** — portfolio equity, drawdown percentage, active positions.
+        - **histograms** — bar processing duration summary statistics.
+
+        All values reflect the state since last process restart.  No
+        authentication is required for MVP; add auth in Sprint 2 if the
+        endpoint is exposed publicly.
+
+        Sprint 2 plan: complement or replace with a Prometheus ``/metrics``
+        scrape endpoint for Grafana integration.
+        """
+        from datetime import UTC, datetime as dt
+
+        return {
+            "metrics": metrics.get_all(),
             "timestamp": dt.now(tz=UTC).isoformat(),
         }
 
