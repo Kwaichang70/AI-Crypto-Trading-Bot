@@ -38,6 +38,8 @@ __all__ = [
     "RunCreateRequest",
     "RunResponse",
     "RunListResponse",
+    "BacktestMetricsResponse",
+    "RunDetailResponse",
     # Orders
     "OrderResponse",
     "OrderListResponse",
@@ -160,6 +162,10 @@ class RunCreateRequest(BaseModel):
         ISO-8601 datetime string for backtest start (required when mode=backtest).
     backtest_end:
         ISO-8601 datetime string for backtest end (required when mode=backtest).
+    confirm_token:
+        Live trading confirmation token (required when mode=live). Must match
+        the LIVE_TRADING_CONFIRM_TOKEN environment variable. Ignored for
+        backtest and paper modes.
     """
 
     model_config = ConfigDict(
@@ -195,6 +201,13 @@ class RunCreateRequest(BaseModel):
     backtest_end: datetime | None = Field(
         default=None,
         description="Backtest end timestamp (required for mode=backtest)",
+    )
+    confirm_token: str | None = Field(
+        default=None,
+        description=(
+            "Required for LIVE mode. Must match the LIVE_TRADING_CONFIRM_TOKEN "
+            "environment variable. Ignored for backtest and paper modes."
+        ),
     )
 
     @field_validator("initial_capital")
@@ -248,6 +261,77 @@ class RunResponse(BaseModel):
 class RunListResponse(PaginatedResponse[RunResponse]):
     """Paginated list of trading runs."""
     pass
+
+
+class BacktestMetricsResponse(BaseModel):
+    """
+    Backtest performance metrics included in RunDetailResponse.
+
+    All percentage/ratio fields are decimal fractions (0.12 = 12%).
+    Monetary fields are serialised as strings for Decimal precision.
+    """
+
+    model_config = _API_MODEL_CONFIG
+
+    # Returns
+    total_return_pct: float = Field(description="(final - initial) / initial")
+    cagr: float = Field(description="Compound Annual Growth Rate")
+    initial_capital: str = Field(description="Starting capital (quote)")
+    final_equity: str = Field(description="Ending equity (quote)")
+    total_fees_paid: str = Field(description="Total fees paid (quote)")
+
+    # Risk
+    sharpe_ratio: float = Field(description="Annualised Sharpe ratio")
+    sortino_ratio: float = Field(description="Annualised Sortino ratio")
+    calmar_ratio: float = Field(description="CAGR / max_drawdown")
+    max_drawdown_pct: float = Field(description="Maximum peak-to-trough decline")
+    max_drawdown_duration_bars: int = Field(description="Longest recovery span in bars")
+
+    # Trade statistics
+    total_trades: int
+    winning_trades: int
+    losing_trades: int
+    win_rate: float
+    profit_factor: float
+    average_trade_pnl: str
+    average_win: str
+    average_loss: str
+    largest_win: str
+    largest_loss: str
+
+    # Exposure
+    total_bars: int
+    bars_in_market: int
+    exposure_pct: float
+
+    # Date range
+    start_date: datetime
+    end_date: datetime
+    duration_days: int
+
+    @field_serializer(
+        "initial_capital", "final_equity", "total_fees_paid",
+        "average_trade_pnl", "average_win", "average_loss",
+        "largest_win", "largest_loss",
+    )
+    def serialise_decimal(self, v: Decimal | str) -> str:
+        return str(v)
+
+
+class RunDetailResponse(RunResponse):
+    """
+    Extended run response that includes backtest metrics when available.
+
+    Returned by POST /api/v1/runs (all modes) and GET /api/v1/runs/{run_id}.
+    The ``backtest_metrics`` field is populated only for completed backtest runs.
+    """
+
+    model_config = _API_MODEL_CONFIG
+
+    backtest_metrics: BacktestMetricsResponse | None = Field(
+        default=None,
+        description="Populated for mode=backtest after successful execution",
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -9,12 +9,19 @@ Responsibilities
 - Initialise and tear down the async database engine via lifespan
 - Mount CORS middleware with origins from settings
 - Mount request timing + logging middleware (X-Process-Time header, structured log)
-- Register all API routers under /api/v1/
+- Register all API routers under /api/v1/ with API key authentication
 - Expose the /health endpoint (always available, no auth)
-- Expose the /api/v1/metrics endpoint (in-memory metrics snapshot)
+- Expose the /api/v1/metrics endpoint (always available, no auth)
 
 The ``lifespan`` context manager is the recommended FastAPI pattern for
 startup/shutdown logic (replaces deprecated on_event handlers).
+
+Authentication
+--------------
+When ``require_api_auth=True`` in settings, all /api/v1/* endpoints
+(except /health and /api/v1/metrics) require a valid API key via the
+``X-API-Key`` header or ``?api_key=`` query parameter.
+See ``api.auth`` for implementation details.
 """
 
 from __future__ import annotations
@@ -24,10 +31,11 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 import structlog
-from fastapi import FastAPI, Request, Response
+from fastapi import Depends, FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from api.auth import require_api_key
 from api.config import get_settings
 from common.logging import configure_logging
 from common.metrics import metrics
@@ -80,6 +88,7 @@ async def lifespan(app: FastAPI):  # type: ignore[type-arg]
         debug=settings.debug,
         exchange=settings.exchange_id,
         live_trading_enabled=settings.enable_live_trading,
+        api_auth_enabled=settings.require_api_auth,
     )
 
     # Store boot timestamp on app state so /health can report uptime.
@@ -234,6 +243,12 @@ def _register_routes(application: FastAPI) -> None:
     The /health endpoint is mounted directly (no versioning — it is used
     by Docker health checks and load balancers that should not need version
     awareness).
+
+    Authentication
+    ^^^^^^^^^^^^^^
+    - ``/health`` and ``/api/v1/metrics`` are **always public** (no auth).
+    - All other ``/api/v1/*`` routers use the ``require_api_key`` dependency
+      which enforces API key validation when ``require_api_auth=True``.
     """
     # ------------------------------------------------------------------
     # Observability — no version prefix, no auth
@@ -250,6 +265,7 @@ def _register_routes(application: FastAPI) -> None:
 
         Used by Docker health checks, load balancers, and monitoring.
         Responds 200 OK when the service is ready to accept requests.
+        Always public — no authentication required.
 
         Future: include database connectivity check, Redis ping, and
         exchange reachability in the response body.
@@ -265,7 +281,7 @@ def _register_routes(application: FastAPI) -> None:
         }
 
     # ------------------------------------------------------------------
-    # In-memory metrics snapshot
+    # In-memory metrics snapshot — always public (for monitoring/Prometheus)
     # ------------------------------------------------------------------
     @application.get(
         "/api/v1/metrics",
@@ -284,9 +300,8 @@ def _register_routes(application: FastAPI) -> None:
         - **gauges** — portfolio equity, drawdown percentage, active positions.
         - **histograms** — bar processing duration summary statistics.
 
-        All values reflect the state since last process restart.  No
-        authentication is required for MVP; add auth in Sprint 2 if the
-        endpoint is exposed publicly.
+        All values reflect the state since last process restart.
+        Always public — no authentication required (monitoring endpoint).
 
         Sprint 2 plan: complement or replace with a Prometheus ``/metrics``
         scrape endpoint for Grafana integration.
@@ -299,7 +314,7 @@ def _register_routes(application: FastAPI) -> None:
         }
 
     # ------------------------------------------------------------------
-    # API v1 routers
+    # API v1 routers — protected by API key auth when enabled
     # ------------------------------------------------------------------
     from api.routers import orders, portfolio, runs, strategies
 
@@ -310,6 +325,7 @@ def _register_routes(application: FastAPI) -> None:
         runs.router,
         prefix=_V1,
         tags=["runs"],
+        dependencies=[Depends(require_api_key)],
     )
 
     # Order and fill queries
@@ -317,6 +333,7 @@ def _register_routes(application: FastAPI) -> None:
         orders.router,
         prefix=_V1,
         tags=["orders"],
+        dependencies=[Depends(require_api_key)],
     )
 
     # Portfolio: summary, equity curve, trades, positions
@@ -324,6 +341,7 @@ def _register_routes(application: FastAPI) -> None:
         portfolio.router,
         prefix=_V1,
         tags=["portfolio"],
+        dependencies=[Depends(require_api_key)],
     )
 
     # Strategy discovery
@@ -331,6 +349,7 @@ def _register_routes(application: FastAPI) -> None:
         strategies.router,
         prefix=_V1,
         tags=["strategies"],
+        dependencies=[Depends(require_api_key)],
     )
 
 

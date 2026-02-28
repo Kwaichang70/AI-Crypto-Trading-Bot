@@ -54,6 +54,27 @@ class Settings(BaseSettings):
     )
 
     # ------------------------------------------------------------------
+    # API authentication
+    # ------------------------------------------------------------------
+    api_key_hash: str = Field(
+        default="",
+        description=(
+            "SHA-256 hex digest of the valid API key. "
+            "Generate with: echo -n 'my-secret-key' | sha256sum | awk '{print $1}'. "
+            "When empty and require_api_auth=False, auth is disabled (dev mode). "
+            "NEVER store the raw API key here — only the hash."
+        ),
+    )
+    require_api_auth: bool = Field(
+        default=False,
+        description=(
+            "Master switch for API key authentication. "
+            "False = all endpoints open (local dev). "
+            "True = all non-public endpoints require a valid API key."
+        ),
+    )
+
+    # ------------------------------------------------------------------
     # Database (PostgreSQL via asyncpg)
     # ------------------------------------------------------------------
     database_url: str = Field(
@@ -161,6 +182,21 @@ class Settings(BaseSettings):
                 "database_url must use the 'postgresql+asyncpg://' scheme for async support"
             )
         return v
+
+    @field_validator("api_key_hash")
+    @classmethod
+    def validate_api_key_hash(cls, v: str) -> str:
+        """Validate that api_key_hash is either empty or a valid SHA-256 hex digest."""
+        if v and len(v) != 64:
+            raise ValueError(
+                "api_key_hash must be a 64-character SHA-256 hex digest. "
+                "Generate with: echo -n 'my-key' | sha256sum"
+            )
+        if v and not all(c in "0123456789abcdef" for c in v.lower()):
+            raise ValueError(
+                "api_key_hash must contain only hexadecimal characters (0-9, a-f)"
+            )
+        return v.lower()  # Normalise to lowercase for consistent comparison
 
 
 

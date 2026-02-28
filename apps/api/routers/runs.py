@@ -13,15 +13,22 @@ DELETE /api/v1/runs/{run_id}     -- Stop a running run
 MVP notes
 ---------
 - Backtest mode runs synchronously in the POST handler (fast enough for MVP).
+  The BacktestRunner is wired up and results are persisted before returning.
 - Paper/Live run creation is stub-level: the run record is created with
   status="running", but the engine is not wired up until Sprint 2.
 - Strategy parameter validation occurs at request time via ``parameter_schema()``.
 - The ``config`` JSONB snapshot captures all run parameters at creation time
   so historical runs are fully self-contained even if strategy defaults change.
+- Backtest metrics are written into ``config["backtest_metrics"]`` so they are
+  available on ``GET /runs/{run_id}`` without a schema migration.
+- LIVE mode requires passing the 3-layer safety gate:
+  (1) ENABLE_LIVE_TRADING=true, (2) exchange API keys configured,
+  (3) valid confirm_token matching LIVE_TRADING_CONFIRM_TOKEN.
 """
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -32,16 +39,18 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from api.db.models import RunORM
+from api.db.models import EquitySnapshotORM, RunORM, TradeORM
 from api.db.session import get_db
 from api.schemas import (
+    BacktestMetricsResponse,
     ErrorResponse,
     PaginationParams,
     RunCreateRequest,
+    RunDetailResponse,
     RunListResponse,
     RunResponse,
 )
-from common.types import RunMode
+from common.types import TimeFrame
 
 __all__ = ["router"]
 
@@ -103,6 +112,305 @@ def _run_orm_to_response(run: RunORM) -> RunResponse:
     return RunResponse.model_validate(run)
 
 
+def _run_orm_to_detail_response(run: RunORM) -> RunDetailResponse:
+    """
+    Convert a ``RunORM`` instance to a ``RunDetailResponse`` Pydantic model.
+
+    Extracts ``backtest_metrics`` from ``run.config`` when present.
+
+    Parameters
+    ----------
+    run:
+        The ORM model instance to convert.
+
+    Returns
+    -------
+    RunDetailResponse
+        The extended API response model with optional backtest metrics.
+    """
+    base = RunDetailResponse.model_validate(run)
+
+    # Attempt to populate backtest_metrics from the JSONB config blob
+    raw_metrics: dict[str, Any] | None = (run.config or {}).get("backtest_metrics")
+    if raw_metrics is not None:
+        try:
+            base = base.model_copy(
+                update={"backtest_metrics": BacktestMetricsResponse.model_validate(raw_metrics)}
+            )
+        except Exception:  # noqa: BLE001 — best-effort; never fail a GET on bad stored data
+            logger.warning(
+                "runs.backtest_metrics_parse_error",
+                run_id=str(run.id),
+                exc_info=True,
+            )
+
+    return base
+
+
+# ---------------------------------------------------------------------------
+# Helper: fetch historical bars via CCXTMarketDataService
+# ---------------------------------------------------------------------------
+
+async def _fetch_bars_for_backtest(
+    symbols: list[str],
+    timeframe: TimeFrame,
+    start: datetime,
+    end: datetime,
+    log: Any,
+) -> dict[str, list[Any]]:
+    """
+    Fetch historical OHLCV bars for all symbols in the requested date range.
+
+    Creates a transient ``CCXTMarketDataService`` instance, fetches bars for
+    all symbols concurrently (within the service's semaphore limit), and
+    closes the connection in a ``finally`` block.
+
+    Parameters
+    ----------
+    symbols:
+        CCXT-format trading pairs to fetch.
+    timeframe:
+        Candle timeframe.
+    start:
+        Inclusive start datetime (UTC).
+    end:
+        Exclusive end datetime (UTC).
+    log:
+        Bound structlog logger for contextual logging.
+
+    Returns
+    -------
+    dict[str, list[OHLCVBar]]
+        Bars keyed by symbol, sorted ascending by timestamp.
+
+    Raises
+    ------
+    HTTPException 502:
+        When the exchange is unreachable or returns an error.
+    HTTPException 400:
+        When a symbol is not supported by the configured exchange.
+    """
+    from api.config import get_settings
+    from data.market_data import DataNotAvailableError, MarketDataError
+    from data.services.ccxt_market_data import CCXTMarketDataService
+
+    settings = get_settings()
+
+    api_key: str | None = None
+    api_secret: str | None = None
+    if settings.exchange_api_key is not None:
+        api_key = settings.exchange_api_key.get_secret_value()
+    if settings.exchange_api_secret is not None:
+        api_secret = settings.exchange_api_secret.get_secret_value()
+
+    service = CCXTMarketDataService(
+        exchange_id=settings.exchange_id,
+        api_key=api_key,
+        api_secret=api_secret,
+        cache_ttl_seconds=0,  # No caching for backtest data fetches
+    )
+
+    log.info(
+        "runs.backtest_fetching_bars",
+        exchange=settings.exchange_id,
+        symbols=symbols,
+        start=start.isoformat(),
+        end=end.isoformat(),
+    )
+
+    try:
+        await service.connect()
+
+        # Fetch all symbols concurrently using asyncio.gather.
+        # CCXTMarketDataService's internal semaphore already throttles
+        # concurrent exchange requests safely.
+        tasks = [
+            service.fetch_ohlcv_range(
+                symbol=symbol,
+                timeframe=timeframe,
+                start=start,
+                end=end,
+            )
+            for symbol in symbols
+        ]
+        results = await asyncio.gather(*tasks)
+
+        bars_by_symbol: dict[str, list[Any]] = {
+            symbol: bars
+            for symbol, bars in zip(symbols, results, strict=True)
+        }
+
+        for symbol, bars in bars_by_symbol.items():
+            log.info(
+                "runs.backtest_bars_fetched",
+                symbol=symbol,
+                bar_count=len(bars),
+            )
+
+        return bars_by_symbol
+
+    except DataNotAvailableError as exc:
+        log.warning("runs.backtest_data_not_available", error=str(exc))
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Data not available for the requested range: {exc}",
+        ) from exc
+    except MarketDataError as exc:
+        log.error("runs.backtest_market_data_error", error=str(exc))
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Exchange error fetching historical data: {exc}",
+        ) from exc
+    finally:
+        await service.close()
+
+
+# ---------------------------------------------------------------------------
+# Helper: build BacktestMetricsResponse from BacktestResult
+# ---------------------------------------------------------------------------
+
+def _build_backtest_metrics(result: Any) -> BacktestMetricsResponse:
+    """
+    Convert a ``BacktestResult`` into a ``BacktestMetricsResponse``.
+
+    Parameters
+    ----------
+    result:
+        The fully-populated ``BacktestResult`` returned by ``BacktestRunner.run()``.
+
+    Returns
+    -------
+    BacktestMetricsResponse
+        Typed schema ready for API serialisation.
+    """
+    return BacktestMetricsResponse(
+        total_return_pct=result.total_return_pct,
+        cagr=result.cagr,
+        initial_capital=str(result.initial_capital),
+        final_equity=str(result.final_equity),
+        total_fees_paid=str(result.total_fees_paid),
+        sharpe_ratio=result.sharpe_ratio,
+        sortino_ratio=result.sortino_ratio,
+        calmar_ratio=result.calmar_ratio,
+        max_drawdown_pct=result.max_drawdown_pct,
+        max_drawdown_duration_bars=result.max_drawdown_duration_bars,
+        total_trades=result.total_trades,
+        winning_trades=result.winning_trades,
+        losing_trades=result.losing_trades,
+        win_rate=result.win_rate,
+        profit_factor=result.profit_factor,
+        average_trade_pnl=str(result.average_trade_pnl),
+        average_win=str(result.average_win),
+        average_loss=str(result.average_loss),
+        largest_win=str(result.largest_win),
+        largest_loss=str(result.largest_loss),
+        total_bars=result.total_bars,
+        bars_in_market=result.bars_in_market,
+        exposure_pct=result.exposure_pct,
+        start_date=result.start_date,
+        end_date=result.end_date,
+        duration_days=result.duration_days,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Helper: persist backtest results to DB
+# ---------------------------------------------------------------------------
+
+async def _persist_backtest_results(
+    db: AsyncSession,
+    run_id: uuid.UUID,
+    run_orm: RunORM,
+    result: Any,
+    log: Any,
+) -> None:
+    """
+    Write all backtest result records to the database.
+
+    Persists:
+    - ``TradeORM`` rows for every completed round-trip trade.
+    - ``EquitySnapshotORM`` rows for every equity curve point.
+    - Backtest metrics summary into ``run_orm.config["backtest_metrics"]``.
+
+    Parameters
+    ----------
+    db:
+        Active async SQLAlchemy session.
+    run_id:
+        UUID of the run being persisted.
+    run_orm:
+        The ``RunORM`` instance to update with metrics.
+    result:
+        The ``BacktestResult`` from ``BacktestRunner.run()``.
+    log:
+        Bound structlog logger.
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+
+    # --- Persist trades ---
+    trade_orms: list[TradeORM] = []
+    for trade in result.trades:
+        trade_orm = TradeORM(
+            id=trade.trade_id,
+            run_id=run_id,
+            symbol=trade.symbol,
+            side=trade.side.value if hasattr(trade.side, "value") else str(trade.side),
+            entry_price=trade.entry_price,
+            exit_price=trade.exit_price,
+            quantity=trade.quantity,
+            realised_pnl=trade.realised_pnl,
+            total_fees=trade.total_fees,
+            entry_at=trade.entry_at,
+            exit_at=trade.exit_at,
+            strategy_id=trade.strategy_id,
+        )
+        trade_orms.append(trade_orm)
+
+    if trade_orms:
+        db.add_all(trade_orms)
+        log.info("runs.backtest_trades_inserted", count=len(trade_orms))
+
+    # --- Persist equity curve ---
+    equity_orms: list[EquitySnapshotORM] = []
+    for bar_index, point in enumerate(result.equity_curve):
+        snapshot = EquitySnapshotORM(
+            run_id=run_id,
+            equity=point.equity,
+            # MVP approximation: cash and unrealised_pnl are not individually
+            # tracked per bar in the current EquityCurvePoint model.
+            # equity = cash + unrealised_pnl; we store equity as cash and
+            # 0 for unrealised/realised until Sprint 2 enhances the model.
+            cash=Decimal("0"),  # MVP: per-bar cash not tracked; see Sprint 2
+            unrealised_pnl=Decimal("0"),
+            realised_pnl=Decimal("0"),
+            drawdown_pct=Decimal(str(point.drawdown_pct)),
+            bar_index=bar_index,
+            timestamp=point.timestamp,
+        )
+        equity_orms.append(snapshot)
+
+    if equity_orms:
+        db.add_all(equity_orms)
+        log.info("runs.backtest_equity_snapshots_inserted", count=len(equity_orms))
+
+    # --- Merge metrics into run.config JSONB ---
+    metrics_response = _build_backtest_metrics(result)
+    updated_config = dict(run_orm.config or {})
+    updated_config["backtest_metrics"] = metrics_response.model_dump(mode="json")
+    run_orm.config = updated_config
+    # Explicitly flag the JSONB column as modified so SQLAlchemy tracks the
+    # in-place dict mutation through its change-detection mechanism.
+    flag_modified(run_orm, "config")
+
+    log.info(
+        "runs.backtest_results_persisted",
+        trades=len(trade_orms),
+        equity_points=len(equity_orms),
+        total_return=f"{result.total_return_pct:.4%}",
+        sharpe=f"{result.sharpe_ratio:.3f}",
+    )
+
+
 # ---------------------------------------------------------------------------
 # POST /api/v1/runs — start a new trading run
 # ---------------------------------------------------------------------------
@@ -110,23 +418,29 @@ def _run_orm_to_response(run: RunORM) -> RunResponse:
 @router.post(
     "",
     status_code=status.HTTP_201_CREATED,
-    response_model=RunResponse,
+    response_model=RunDetailResponse,
     responses={
         400: {"model": ErrorResponse, "description": "Invalid request (unknown strategy, bad params)"},
+        403: {"description": "Live trading gate check failed (one or more safety layers not satisfied)"},
         422: {"model": ErrorResponse, "description": "Validation error"},
+        502: {"model": ErrorResponse, "description": "Exchange unreachable (backtest data fetch)"},
     },
     summary="Start a new trading run",
     description=(
         "Create and start a new backtest, paper, or live trading run. "
-        "Backtest runs execute synchronously and complete before the response is returned. "
+        "Backtest runs execute synchronously, persist results, and complete "
+        "before the response is returned. "
         "Paper and live runs are created in the database with status='running'; "
-        "the live engine wiring is Sprint 2."
+        "the live engine wiring is Sprint 2. "
+        "LIVE mode requires passing the 3-layer safety gate: "
+        "(1) ENABLE_LIVE_TRADING=true, (2) exchange API keys configured, "
+        "(3) valid confirm_token matching LIVE_TRADING_CONFIRM_TOKEN."
     ),
 )
 async def create_run(
     body: RunCreateRequest,
     db: Annotated[AsyncSession, Depends(get_db)],
-) -> RunResponse:
+) -> RunDetailResponse:
     """
     Start a new trading run.
 
@@ -139,14 +453,19 @@ async def create_run(
 
     Returns
     -------
-    RunResponse
-        The newly created run record.
+    RunDetailResponse
+        The newly created run record, including backtest metrics for
+        completed backtest runs.
 
     Raises
     ------
     HTTPException 400:
-        When the strategy name is unknown or strategy parameters fail
-        schema validation.
+        When the strategy name is unknown, strategy parameters fail schema
+        validation, or backtest data is unavailable for the date range.
+    HTTPException 403:
+        When live trading gate check fails (one or more safety layers not satisfied).
+    HTTPException 502:
+        When the configured exchange cannot be reached to fetch historical data.
     """
     log = logger.bind(
         endpoint="create_run",
@@ -188,7 +507,8 @@ async def create_run(
         )
 
     # Additional validation for backtest mode
-    if body.mode == RunMode.BACKTEST or body.mode == "backtest":
+    is_backtest = body.mode == "backtest"
+    if is_backtest:
         if body.backtest_start is None or body.backtest_end is None:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -200,19 +520,54 @@ async def create_run(
                 detail="backtest_start must be before backtest_end",
             )
 
-    # Enforce live trading safety gate
-    if body.mode == RunMode.LIVE or body.mode == "live":
+    # ------------------------------------------------------------------
+    # 3-Layer Live Trading Safety Gate (SEC-003)
+    # ------------------------------------------------------------------
+    # All three layers must pass before a LIVE mode run is permitted:
+    #
+    #   Layer 1 — Environment: ENABLE_LIVE_TRADING must be True.
+    #   Layer 2 — API Keys: EXCHANGE_API_KEY and EXCHANGE_API_SECRET must be non-empty.
+    #   Layer 3 — Confirmation Token: A runtime token provided in the request body
+    #             must match LIVE_TRADING_CONFIRM_TOKEN (hmac.compare_digest).
+    #
+    # If any layer fails, the endpoint returns HTTP 403 with a structured
+    # response identifying which layer(s) failed.
+    # ------------------------------------------------------------------
+    if body.mode == "live":
         from api.config import get_settings
+        from trading.safety import LiveTradingGate
+
         settings = get_settings()
-        if not settings.enable_live_trading:
-            log.warning("runs.live_trading_disabled")
+        gate = LiveTradingGate()
+        gate_result = gate.check_gate(
+            settings=settings,
+            confirm_token=body.confirm_token or "",
+        )
+
+        if not gate_result.passed:
+            log.warning(
+                "runs.live_trading_gate_failed",
+                failures=gate_result.failures,
+                layer_results=gate_result.layer_results,
+            )
+            failed_layers = [
+                layer.name for layer in gate_result.layers if not layer.passed
+            ]
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
+                status_code=status.HTTP_403_FORBIDDEN,
                 detail=(
-                    "Live trading is disabled. "
-                    "Set ENABLE_LIVE_TRADING=true and provide a confirm token."
+                    "Live trading gate check failed. "
+                    f"Failed layers: {', '.join(failed_layers)}. "
+                    "See server logs for details."
                 ),
             )
+
+        log.info(
+            "runs.live_trading_gate_passed",
+            layer_results=gate_result.layer_results,
+        )
+
+    timeframe = TimeFrame(str(body.timeframe))
 
     # Build the config snapshot stored immutably on the run record
     run_id = uuid.uuid4()
@@ -232,7 +587,7 @@ async def create_run(
     now = datetime.now(tz=UTC)
 
     # Determine mode string for ORM
-    mode_value = body.mode if isinstance(body.mode, str) else body.mode.value
+    mode_value = str(body.mode)
 
     run_orm = RunORM(
         id=run_id,
@@ -247,21 +602,6 @@ async def create_run(
     db.add(run_orm)
     await db.flush()  # Assign the PK within the transaction without committing
 
-    # TODO Sprint 2 — BACKTEST: Call BacktestRunner.run() here (synchronously
-    # or via an asyncio background task) with the bars fetched from the data
-    # pipeline, then update run.status to "stopped" on success or "error" on
-    # failure, and call await db.flush() again before returning.  Until this is
-    # wired, every backtest request creates a "zombie" run record that remains
-    # in status="running" permanently.
-    #
-    # TODO Sprint 2 — PAPER MODE: Launch the StrategyEngine in paper mode as a
-    # long-running background task and update run.status to "stopped" or
-    # "error" when the task terminates.  The record returned here is a stub.
-    #
-    # TODO Sprint 2 — LIVE MODE: Same as paper mode stub above.  Additionally,
-    # enforce the live_trading_confirm_token from settings before allowing
-    # execution (the 3-layer activation gate is currently only 1 layer deep).
-
     log.info(
         "runs.created",
         run_id=str(run_id),
@@ -269,7 +609,118 @@ async def create_run(
         strategy=strategy_name,
     )
 
-    return _run_orm_to_response(run_orm)
+    # ------------------------------------------------------------------
+    # BACKTEST MODE — execute synchronously, persist results, finish run
+    # ------------------------------------------------------------------
+    if is_backtest:
+        try:
+            # Step 1: Fetch historical OHLCV bars
+            bars_by_symbol = await _fetch_bars_for_backtest(
+                symbols=body.symbols,
+                timeframe=timeframe,
+                start=body.backtest_start,  # type: ignore[arg-type]
+                end=body.backtest_end,       # type: ignore[arg-type]
+                log=log,
+            )
+
+            # Step 2: Instantiate strategy
+            strategy_instance = strategy_cls(
+                strategy_id=f"{strategy_name}-{run_id.hex[:8]}",
+                params=body.strategy_params,
+            )
+
+            # Step 3: Instantiate and run BacktestRunner
+            from trading.backtest import BacktestRunner
+
+            runner = BacktestRunner(
+                strategies=[strategy_instance],
+                symbols=body.symbols,
+                timeframe=timeframe,
+                initial_capital=Decimal(body.initial_capital),
+            )
+
+            log.info("runs.backtest_execution_starting", run_id=str(run_id))
+            result = await runner.run(bars_by_symbol)
+
+            # Step 4: Persist results (trades + equity curve + metrics in config)
+            await _persist_backtest_results(
+                db=db,
+                run_id=run_id,
+                run_orm=run_orm,
+                result=result,
+                log=log,
+            )
+
+            # Step 5: Mark run as stopped
+            finish_time = datetime.now(tz=UTC)
+            run_orm.status = "stopped"
+            run_orm.stopped_at = finish_time
+            run_orm.updated_at = finish_time
+
+            await db.flush()
+
+            log.info(
+                "runs.backtest_completed",
+                run_id=str(run_id),
+                total_return=f"{result.total_return_pct:.4%}",
+                sharpe=f"{result.sharpe_ratio:.3f}",
+                total_trades=result.total_trades,
+            )
+
+        except HTTPException:
+            # Data fetch errors (400, 502) — mark run as error and re-raise
+            error_time = datetime.now(tz=UTC)
+            run_orm.status = "error"
+            run_orm.stopped_at = error_time
+            run_orm.updated_at = error_time
+            await db.flush()
+            raise
+
+        except Exception as exc:
+            # Unexpected backtest execution errors
+            error_time = datetime.now(tz=UTC)
+            run_orm.status = "error"
+            run_orm.stopped_at = error_time
+            run_orm.updated_at = error_time
+            await db.flush()
+
+            log.error(
+                "runs.backtest_execution_error",
+                run_id=str(run_id),
+                error=str(exc),
+                exc_info=True,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Backtest execution failed. See server logs for details.",
+            ) from exc
+
+    # ------------------------------------------------------------------
+    # PAPER MODE — stub: record created with status="running"
+    # TODO Sprint 2: Launch StrategyEngine in paper mode as a background
+    # task using asyncio.create_task() or a task queue (Celery/ARQ).
+    # Update run.status to "stopped" or "error" when the task terminates.
+    # ------------------------------------------------------------------
+    elif mode_value == "paper":
+        log.info(
+            "runs.paper_mode_stub",
+            run_id=str(run_id),
+            note="Paper mode engine not yet wired — Sprint 2",
+        )
+
+    # ------------------------------------------------------------------
+    # LIVE MODE — stub: record created with status="running"
+    # The 3-layer LiveTradingGate is now fully enforced at the API level
+    # (SEC-003 remediation). Sprint 2 must wire the StrategyEngine launch.
+    # ------------------------------------------------------------------
+    elif mode_value == "live":
+        log.info(
+            "runs.live_mode_stub",
+            run_id=str(run_id),
+            note="Live mode engine not yet wired — Sprint 2",
+        )
+
+    return _run_orm_to_detail_response(run_orm)
 
 
 # ---------------------------------------------------------------------------
@@ -337,16 +788,20 @@ async def list_runs(
 
 @router.get(
     "/{run_id}",
-    response_model=RunResponse,
+    response_model=RunDetailResponse,
     responses={
         404: {"model": ErrorResponse, "description": "Run not found"},
     },
     summary="Get a single run's details",
+    description=(
+        "Returns full run details. For completed backtest runs the response "
+        "includes a ``backtest_metrics`` object with all performance metrics."
+    ),
 )
 async def get_run(
     run_id: uuid.UUID,
     db: Annotated[AsyncSession, Depends(get_db)],
-) -> RunResponse:
+) -> RunDetailResponse:
     """
     Retrieve details of a specific trading run.
 
@@ -359,8 +814,8 @@ async def get_run(
 
     Returns
     -------
-    RunResponse
-        The run record.
+    RunDetailResponse
+        The run record, with backtest_metrics populated for backtest runs.
 
     Raises
     ------
@@ -382,7 +837,7 @@ async def get_run(
         )
 
     log.info("runs.found", status=run.status)
-    return _run_orm_to_response(run)
+    return _run_orm_to_detail_response(run)
 
 
 # ---------------------------------------------------------------------------
@@ -392,7 +847,7 @@ async def get_run(
 @router.delete(
     "/{run_id}",
     status_code=status.HTTP_200_OK,
-    response_model=RunResponse,
+    response_model=RunDetailResponse,
     responses={
         404: {"model": ErrorResponse, "description": "Run not found"},
         409: {"model": ErrorResponse, "description": "Run is not in a stoppable state"},
@@ -406,7 +861,7 @@ async def get_run(
 async def stop_run(
     run_id: uuid.UUID,
     db: Annotated[AsyncSession, Depends(get_db)],
-) -> RunResponse:
+) -> RunDetailResponse:
     """
     Stop a running trading run.
 
@@ -419,7 +874,7 @@ async def stop_run(
 
     Returns
     -------
-    RunResponse
+    RunDetailResponse
         The updated run record with status='stopped'.
 
     Raises
@@ -461,7 +916,7 @@ async def stop_run(
     await db.flush()
 
     log.info("runs.stopped", run_id=str(run_id))
-    return _run_orm_to_response(run)
+    return _run_orm_to_detail_response(run)
 
 
 # ---------------------------------------------------------------------------
