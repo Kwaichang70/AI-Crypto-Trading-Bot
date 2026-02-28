@@ -92,7 +92,8 @@ def _get_database_url() -> str:
     """
     try:
         settings = get_settings()
-        return settings.database_url
+        url = settings.database_url
+        return url.get_secret_value() if hasattr(url, "get_secret_value") else str(url)
     except Exception:
         # Fallback: read from alembic.ini [alembic] sqlalchemy.url
         url = config.get_main_option("sqlalchemy.url")

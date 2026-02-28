@@ -223,7 +223,8 @@ def create_app() -> FastAPI:
         allow_origins=settings.allowed_origins,
         allow_credentials=True,
         allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-        allow_headers=["*"],
+        allow_headers=["Content-Type", "Accept", "Authorization", "X-API-Key", "X-Requested-With"],
+        expose_headers=["X-Process-Time"],
     )
 
     # 2. Request timing + logging — wraps every request/response cycle

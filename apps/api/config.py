@@ -139,8 +139,8 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     # Database (PostgreSQL via asyncpg)
     # ------------------------------------------------------------------
-    database_url: str = Field(
-        default="",
+    database_url: SecretStr = Field(
+        default=SecretStr(""),
         description=(
             "Async PostgreSQL DSN. "
             "Format: postgresql+asyncpg://user:pass@host:5432/dbname. "
@@ -238,8 +238,9 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     @field_validator("database_url")
     @classmethod
-    def validate_database_url(cls, v: str) -> str:
-        if not v.startswith("postgresql+asyncpg://"):
+    def validate_database_url(cls, v: SecretStr) -> SecretStr:
+        raw = v.get_secret_value()
+        if not raw.startswith("postgresql+asyncpg://"):
             raise ValueError(
                 "database_url must use the 'postgresql+asyncpg://' scheme for async support"
             )
