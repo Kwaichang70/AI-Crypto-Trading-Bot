@@ -37,6 +37,7 @@ from pydantic import BaseModel, Field
 
 __all__ = [
     "LiveTradingGate",
+    "LiveTradingGateError",
     "GateCheckResult",
     "GateLayer",
     "CircuitBreaker",
