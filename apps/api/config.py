@@ -124,6 +124,19 @@ class Settings(BaseSettings):
     )
 
     # ------------------------------------------------------------------
+    # Observability — Prometheus
+    # ------------------------------------------------------------------
+    prometheus_enabled: bool = Field(
+        default=True,
+        description=(
+            "Master switch for the Prometheus /metrics scrape endpoint. "
+            "True = register GET /metrics with Prometheus text exposition format. "
+            "False = endpoint is not mounted (useful for minimal deployments). "
+            "Controlled by PROMETHEUS_ENABLED environment variable."
+        ),
+    )
+
+    # ------------------------------------------------------------------
     # Database (PostgreSQL via asyncpg)
     # ------------------------------------------------------------------
     database_url: str = Field(

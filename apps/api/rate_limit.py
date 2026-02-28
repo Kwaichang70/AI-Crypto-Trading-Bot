@@ -184,6 +184,7 @@ limiter = Limiter(
 
 _EXEMPT_PATHS: frozenset[str] = frozenset({
     "/health",
+    "/metrics",
     "/api/v1/metrics",
     # The following paths only exist when DEBUG=true (docs_url/redoc_url/openapi_url
     # are set to None in production). They are exempt here as a convenience for

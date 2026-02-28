@@ -37,6 +37,7 @@ from fastapi.responses import JSONResponse
 
 from api.auth import require_api_key
 from api.config import get_settings
+from api.prometheus import setup_prometheus
 from api.rate_limit import setup_rate_limiting
 from common.logging import configure_logging
 from common.metrics import metrics
@@ -135,7 +136,7 @@ async def lifespan(app: FastAPI):  # type: ignore[type-arg]
 
 # Paths that are polled frequently by health checkers and Prometheus scrapers.
 # Log at DEBUG to avoid drowning production logs with probe noise.
-_PROBE_PATHS: frozenset[str] = frozenset({"/health", "/api/v1/metrics"})
+_PROBE_PATHS: frozenset[str] = frozenset({"/health", "/metrics", "/api/v1/metrics"})
 
 
 async def _request_timing_middleware(request: Request, call_next: Any) -> Response:
@@ -239,6 +240,11 @@ def create_app() -> FastAPI:
     # Routes
     # ------------------------------------------------------------------
     _register_routes(application)
+
+    # ------------------------------------------------------------------
+    # Prometheus scrape endpoint — controlled by PROMETHEUS_ENABLED
+    # ------------------------------------------------------------------
+    setup_prometheus(application)
 
     return application
 
