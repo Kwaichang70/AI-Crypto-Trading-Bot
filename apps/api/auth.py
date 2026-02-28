@@ -40,6 +40,7 @@ from fastapi import Depends, HTTPException, Query, Request, status
 from fastapi.security import APIKeyHeader
 
 from api.config import Settings, get_settings
+from api.rate_limit import check_auth_failure_rate
 
 __all__ = ["require_api_key"]
 
@@ -152,6 +153,9 @@ async def require_api_key(
     HTTPException 500:
         When authentication is required but no API key hash is configured
         (server misconfiguration).
+    RateLimitExceeded:
+        When the client IP has exceeded the auth failure rate limit.
+        Caught by the 429 handler registered in ``setup_rate_limiting``.
     """
     # Dev mode: auth disabled
     if not settings.require_api_auth:
@@ -182,6 +186,9 @@ async def require_api_key(
             path=request.url.path,
             method=request.method,
         )
+        # Check auth failure rate limit after logging but before returning 401.
+        # This prevents brute-force enumeration of valid endpoints.
+        check_auth_failure_rate(request)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or missing API key",
@@ -197,6 +204,9 @@ async def require_api_key(
             method=request.method,
             auth_method=auth_method,
         )
+        # Check auth failure rate limit after logging but before returning 401.
+        # This is the critical path for brute-force API key guessing prevention.
+        check_auth_failure_rate(request)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or missing API key",

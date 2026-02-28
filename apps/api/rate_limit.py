@@ -77,6 +77,7 @@ __all__ = [
     "limiter",
     "get_client_ip",
     "setup_rate_limiting",
+    "check_auth_failure_rate",
     "AUTH_FAILURE_LIMIT",
     "WRITE_LIMIT",
     "READ_LIMIT",

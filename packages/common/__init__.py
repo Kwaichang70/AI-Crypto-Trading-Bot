@@ -21,6 +21,10 @@ From ``common.logging``:
 
 From ``common.metrics``:
     MetricsCollector, metrics
+
+From ``common.events``:
+    BaseEvent, EventPriority, BarEvent, SignalEvent, OrderEvent, FillEvent,
+    RiskEvent, EventBus
 """
 
 from common.config import BaseAppConfig, configure_structlog, generate_run_id
@@ -41,6 +45,16 @@ from common.types import (
     RunMode,
     SignalDirection,
     TimeFrame,
+)
+from common.events import (
+    BaseEvent,
+    EventPriority,
+    BarEvent,
+    SignalEvent,
+    OrderEvent,
+    FillEvent,
+    RiskEvent,
+    EventBus,
 )
 
 __all__ = [
@@ -67,4 +81,13 @@ __all__ = [
     # metrics
     "MetricsCollector",
     "metrics",
+    # events
+    "BaseEvent",
+    "EventPriority",
+    "BarEvent",
+    "SignalEvent",
+    "OrderEvent",
+    "FillEvent",
+    "RiskEvent",
+    "EventBus",
 ]

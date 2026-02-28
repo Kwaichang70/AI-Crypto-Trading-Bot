@@ -37,6 +37,7 @@ from fastapi.responses import JSONResponse
 
 from api.auth import require_api_key
 from api.config import get_settings
+from api.rate_limit import setup_rate_limiting
 from common.logging import configure_logging
 from common.metrics import metrics
 
@@ -226,6 +227,13 @@ def create_app() -> FastAPI:
 
     # 2. Request timing + logging — wraps every request/response cycle
     application.middleware("http")(_request_timing_middleware)
+
+    # 3. Rate limiting — per-IP tiered limits (SEC-S2-001)
+    #    Registered after timing middleware, so it runs outermost (Starlette
+    #    reverse order). Rate-limited 429s are rejected cheaply without
+    #    timing overhead; the rate_limit.exceeded log event provides
+    #    security observability instead.
+    setup_rate_limiting(application)
 
     # ------------------------------------------------------------------
     # Routes
