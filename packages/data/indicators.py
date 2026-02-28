@@ -13,13 +13,13 @@ Design rules
 - This module is the only place indicator logic is implemented — strategies
   import from here, never reimplement their own indicator calculations.
 
-All implementations here are stubs that raise ``NotImplementedError``.
-Full implementations land in the subsequent sprint.
+Vectorized implementations use pandas and NumPy for efficient batch
+computation. RSI and ATR use SMA-seeded Wilder's smoothing to match
+the canonical formula used by TradingView, TA-Lib, and the inline
+strategy helpers in ``packages/trading/strategies/``.
 """
 
 from __future__ import annotations
-
-from typing import overload
 
 import numpy as np
 import pandas as pd
@@ -68,7 +68,36 @@ def rsi(
         raise ValueError(f"RSI period must be >= 2, got {period}")
     if close.empty:
         raise ValueError("close series must not be empty")
-    raise NotImplementedError("RSI implementation pending sprint 2")
+    if len(close) <= period:
+        return pd.Series(np.nan, index=close.index)
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = (-delta).clip(lower=0)
+
+    # Wilder's smoothing with SMA seed (matches _compute_rsi in strategies).
+    # Step 1: SMA of first `period` deltas as the initial avg_gain / avg_loss.
+    # Step 2: Recursive Wilder: avg = (prev_avg * (period-1) + current) / period.
+    n = len(close)
+    avg_gain_arr = np.full(n, np.nan)
+    avg_loss_arr = np.full(n, np.nan)
+
+    # SMA seed at index `period` (deltas start at index 1, so first period deltas are [1..period])
+    avg_gain_arr[period] = gain.iloc[1 : period + 1].mean()
+    avg_loss_arr[period] = loss.iloc[1 : period + 1].mean()
+
+    # Wilder recursion forward
+    for i in range(period + 1, n):
+        avg_gain_arr[i] = (avg_gain_arr[i - 1] * (period - 1) + gain.iloc[i]) / period
+        avg_loss_arr[i] = (avg_loss_arr[i - 1] * (period - 1) + loss.iloc[i]) / period
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rs = avg_gain_arr / avg_loss_arr
+        result_arr = 100.0 - (100.0 / (1.0 + rs))
+
+    result = pd.Series(result_arr, index=close.index)
+    # NaN for warmup; all-gains (avg_loss=0) → rs=inf → RSI=100 (correct via float math)
+    result.iloc[:period] = np.nan
+    return result
 
 
 def ema(
@@ -97,7 +126,9 @@ def ema(
     """
     if period < 1:
         raise ValueError(f"EMA period must be >= 1, got {period}")
-    raise NotImplementedError("EMA implementation pending sprint 2")
+    result = series.ewm(span=period, adjust=adjust).mean()
+    result.iloc[:period - 1] = np.nan
+    return result
 
 
 def sma(
@@ -121,7 +152,7 @@ def sma(
     """
     if period < 1:
         raise ValueError(f"SMA period must be >= 1, got {period}")
-    raise NotImplementedError("SMA implementation pending sprint 2")
+    return series.rolling(window=period, min_periods=period).mean()
 
 
 def macd(
@@ -161,7 +192,16 @@ def macd(
         raise ValueError(
             f"slow_period ({slow_period}) must be > fast_period ({fast_period})"
         )
-    raise NotImplementedError("MACD implementation pending sprint 2")
+    fast_ema = close.ewm(span=fast_period, adjust=False).mean()
+    slow_ema = close.ewm(span=slow_period, adjust=False).mean()
+    macd_line = fast_ema - slow_ema
+    signal_line = macd_line.ewm(span=signal_period, adjust=False).mean()
+    histogram = macd_line - signal_line
+    # Mask warmup: slow EMA needs slow_period bars to stabilise
+    macd_line.iloc[: slow_period - 1] = np.nan
+    signal_line.iloc[: slow_period - 1] = np.nan
+    histogram.iloc[: slow_period - 1] = np.nan
+    return macd_line, signal_line, histogram
 
 
 def atr(
@@ -191,9 +231,29 @@ def atr(
     pd.Series:
         ATR values in price units. NaN for the first ``period`` elements.
     """
-    if period < 1:
-        raise ValueError(f"ATR period must be >= 1, got {period}")
-    raise NotImplementedError("ATR implementation pending sprint 2")
+    if period < 2:
+        raise ValueError(f"ATR period must be >= 2, got {period}")
+    if len(close) <= period:
+        return pd.Series(np.nan, index=close.index)
+    prev_close = close.shift(1)
+    tr1 = high - low
+    tr2 = (high - prev_close).abs()
+    tr3 = (low - prev_close).abs()
+    true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+    # Wilder's smoothing with SMA seed (matches _compute_atr in strategies).
+    # TR values start at index 1 (index 0 has no prev_close).
+    n = len(close)
+    atr_arr = np.full(n, np.nan)
+
+    # SMA seed: average of first `period` TR values (indices 1..period)
+    atr_arr[period] = true_range.iloc[1 : period + 1].mean()
+
+    # Wilder recursion forward
+    for i in range(period + 1, n):
+        atr_arr[i] = (atr_arr[i - 1] * (period - 1) + true_range.iloc[i]) / period
+
+    return pd.Series(atr_arr, index=close.index)
 
 
 def bollinger_bands(
@@ -222,7 +282,11 @@ def bollinger_bands(
         raise ValueError(f"Bollinger Bands period must be >= 2, got {period}")
     if num_std <= 0:
         raise ValueError(f"num_std must be > 0, got {num_std}")
-    raise NotImplementedError("Bollinger Bands implementation pending sprint 2")
+    middle = sma(close, period)
+    rolling_std = close.rolling(window=period, min_periods=period).std(ddof=0)
+    upper = middle + num_std * rolling_std
+    lower = middle - num_std * rolling_std
+    return upper, middle, lower
 
 
 def donchian_channel(
@@ -252,7 +316,10 @@ def donchian_channel(
     """
     if period < 1:
         raise ValueError(f"Donchian period must be >= 1, got {period}")
-    raise NotImplementedError("Donchian Channel implementation pending sprint 2")
+    upper = high.rolling(window=period, min_periods=period).max()
+    lower = low.rolling(window=period, min_periods=period).min()
+    middle = (upper + lower) / 2
+    return upper, middle, lower
 
 
 def returns(
@@ -275,8 +342,17 @@ def returns(
     -------
     pd.Series:
         Return series. First element is NaN.
+
+    Raises
+    ------
+    ValueError:
+        If ``close`` is empty.
     """
-    raise NotImplementedError("Returns implementation pending sprint 2")
+    if close.empty:
+        raise ValueError("close series must not be empty")
+    if log_returns:
+        return np.log(close / close.shift(1))
+    return close.pct_change()
 
 
 def rolling_volatility(
@@ -308,7 +384,12 @@ def rolling_volatility(
     """
     if period < 2:
         raise ValueError(f"Volatility period must be >= 2, got {period}")
-    raise NotImplementedError("Rolling volatility implementation pending sprint 2")
+    log_ret = np.log(close / close.shift(1))
+    vol = log_ret.rolling(window=period, min_periods=period).std(ddof=1)
+    if annualise:
+        vol = vol * np.sqrt(periods_per_year)
+    vol.iloc[:period] = np.nan
+    return vol
 
 
 def compute_features(
@@ -355,4 +436,19 @@ def compute_features(
     missing = required_cols - set(df.columns)
     if missing:
         raise ValueError(f"DataFrame missing required columns: {missing}")
-    raise NotImplementedError("Feature computation implementation pending sprint 2")
+    result = df.copy()
+    result["rsi"] = rsi(df["close"], period=rsi_period)
+    macd_line, macd_sig, macd_h = macd(df["close"], macd_fast, macd_slow, macd_signal)
+    result["macd"] = macd_line
+    result["macd_signal"] = macd_sig
+    result["macd_hist"] = macd_h
+    result["atr"] = atr(df["high"], df["low"], df["close"], period=atr_period)
+    bb_upper, bb_mid, bb_lower = bollinger_bands(df["close"], period=bb_period)
+    result["bb_upper"] = bb_upper
+    result["bb_mid"] = bb_mid
+    result["bb_lower"] = bb_lower
+    result["returns"] = returns(df["close"])
+    result["log_returns"] = returns(df["close"], log_returns=True)
+    result["volatility"] = rolling_volatility(df["close"], period=vol_period)
+    result["volume_sma"] = sma(df["volume"], 20)
+    return result

@@ -1,0 +1,180 @@
+# =============================================================================
+# .dockerignore — AI Crypto Trading Bot
+#
+# Build context: project root (used by both infra/Dockerfile.api and
+# infra/Dockerfile.ui with `docker build -f infra/Dockerfile.* .`)
+#
+# Principle: exclude everything that is NOT explicitly copied by a Dockerfile
+# stage. Both Dockerfiles use selective COPY directives, so this file's job
+# is defence-in-depth: prevent large or sensitive directories from ever being
+# transferred to the Docker daemon, which directly impacts build speed and
+# image security.
+#
+# What IS needed in the build context (do NOT exclude):
+#   Dockerfile.api:  apps/api/pyproject.toml  apps/api/uv.lock
+#                    packages/
+#                    apps/api/  (app source in runtime stage)
+#   Dockerfile.ui:   apps/ui/package.json  apps/ui/package-lock.json
+#                    apps/ui/pnpm-lock.yaml  apps/ui/yarn.lock
+#                    apps/ui/  (full UI source in builder stage)
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Version control
+# Never send VCS metadata into the build context — adds hundreds of MB on
+# large repos and leaks commit history and potentially sensitive config.
+# -----------------------------------------------------------------------------
+.git
+.gitignore
+.gitattributes
+
+# -----------------------------------------------------------------------------
+# Python artifacts
+# __pycache__ and compiled bytecode are CPU-arch and Python-version specific;
+# they would be stale or incorrect inside the container image.
+# Build venvs and caches are re-created inside the Dockerfile by uv.
+# -----------------------------------------------------------------------------
+**/__pycache__
+**/*.py[cod]
+**/*.pyo
+**/*.pyd
+**/*.so
+**/*.egg
+**/*.egg-info
+**/*.dist-info
+**/.eggs
+
+# Python virtual environments
+.venv
+venv
+env
+ENV
+.env.local
+.virtualenv
+
+# Python tool caches
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.dmypy.json
+dmypy.json
+
+# -----------------------------------------------------------------------------
+# Test coverage artifacts
+# Coverage data and HTML reports are large and irrelevant at build time.
+# -----------------------------------------------------------------------------
+.coverage
+.coverage.*
+coverage.xml
+coverage.json
+htmlcov
+
+# -----------------------------------------------------------------------------
+# Node / Next.js artifacts
+# node_modules are installed fresh inside the deps stage; shipping them in
+# context would be wasteful (can exceed 500 MB) and may contain wrong-arch
+# binaries.  .next and out are intermediate/output build directories.
+# -----------------------------------------------------------------------------
+**/node_modules
+apps/ui/.next
+apps/ui/out
+
+# -----------------------------------------------------------------------------
+# IDE and editor files
+# Project-level IDE configs have no function inside a container.
+# -----------------------------------------------------------------------------
+.vscode
+.idea
+*.swp
+*.swo
+*.bak
+*.orig
+*~
+
+# -----------------------------------------------------------------------------
+# OS-generated files
+# macOS Finder, Windows Explorer, and Linux desktop metadata files.
+# -----------------------------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+desktop.ini
+
+# -----------------------------------------------------------------------------
+# Project documentation and planning artifacts
+# Heavy markdown, diagrams, and planning docs are never referenced by any
+# COPY directive in either Dockerfile.
+# -----------------------------------------------------------------------------
+docs/
+Documentation/
+reports/
+*.md
+# Exception: README.md is conventionally useful in the image for inspection
+!README.md
+
+# -----------------------------------------------------------------------------
+# Claude agent configuration and workflows
+# Internal tooling that has no role in the production container.
+# -----------------------------------------------------------------------------
+.claude/
+memory/
+
+# -----------------------------------------------------------------------------
+# GitHub / CI configuration
+# GitHub Actions workflows, issue templates, and PR config are not needed
+# inside a container image.
+# -----------------------------------------------------------------------------
+.github/
+
+# -----------------------------------------------------------------------------
+# Test suites
+# Tests are executed in CI, not inside the production image.
+# The conftest.py at project root is also excluded.
+# -----------------------------------------------------------------------------
+tests/
+conftest.py
+
+# -----------------------------------------------------------------------------
+# Environment / secret files
+# Only .env.example (no real secrets) is safe to include.
+# Actual .env files must NEVER enter the build context.
+# -----------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+
+# -----------------------------------------------------------------------------
+# Log files and directories
+# Runtime logs belong on mounted volumes or a log aggregator, not in the image.
+# -----------------------------------------------------------------------------
+*.log
+*.log.*
+logs/
+
+# -----------------------------------------------------------------------------
+# ML model artifacts
+# Large binary blobs — models are loaded at runtime from object storage or a
+# mounted volume, not baked into the image.
+# -----------------------------------------------------------------------------
+models/
+model_artifacts/
+*.pkl
+*.joblib
+*.onnx
+*.pt
+*.pth
+*.h5
+
+# -----------------------------------------------------------------------------
+# Miscellaneous build and CI artifacts
+# Temporary files, local overrides, and infra-as-code state files.
+# -----------------------------------------------------------------------------
+*.tmp
+*.temp
+dist/
+build/
+.build/
