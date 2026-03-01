@@ -49,12 +49,12 @@ from trading.metrics import BacktestResult
 from trading.models import Signal
 from trading.strategy import BaseStrategy, StrategyMetadata
 
-# Import the shared bar factory from the root conftest.
+# Import the shared bar factory from tests/conftest.py.
 # pytest resolves conftest fixtures automatically, but ``make_bars`` is a
 # plain function (not a fixture), so we import it directly.
-# pytest adds ``tests/`` to sys.path via testpaths in pyproject.toml,
-# so conftest is importable without the package prefix.
-from conftest import make_bars
+# Use the ``tests.conftest`` qualified path to avoid resolving to the
+# root conftest.py (which only sets up sys.path).
+from tests.conftest import make_bars
 
 
 # ---------------------------------------------------------------------------
@@ -405,8 +405,8 @@ class TestBacktestRunNoSignals:
         r = no_signal_result
         # Non-empty after a 200-bar run
         assert len(r.equity_curve) > 0
-        # Cannot exceed total bars supplied
-        assert len(r.equity_curve) <= 200
+        # Cannot exceed total bars supplied + 1 initial snapshot
+        assert len(r.equity_curve) <= 201
 
     @pytest.mark.asyncio
     async def test_initial_capital_matches_input(

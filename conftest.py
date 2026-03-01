@@ -33,3 +33,8 @@ for _pkg_dir in [
     _pkg_str = str(_pkg_dir.parent)  # add the 'packages/' directory itself
     if _pkg_str not in sys.path:
         sys.path.insert(0, _pkg_str)
+
+# Add apps/ so that ``from api.config import ...`` works without editable install
+_APPS_DIR = str(_REPO_ROOT / "apps")
+if _APPS_DIR not in sys.path:
+    sys.path.insert(0, _APPS_DIR)
