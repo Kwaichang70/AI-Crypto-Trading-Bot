@@ -223,7 +223,7 @@ class RSIMeanReversionStrategy(BaseStrategy):
     @property
     def min_bars_required(self) -> int:
         """Wilder convergence (3x period) + 2 for previous-bar detection."""
-        return self._params["rsi_period"] * 3 + 2
+        return int(self._params["rsi_period"]) * 3 + 2
 
     # ------------------------------------------------------------------ #
     # Core signal generation

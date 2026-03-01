@@ -47,7 +47,7 @@ from __future__ import annotations
 
 import re
 import time
-from typing import Any
+from typing import Any, Iterator
 
 import structlog
 from fastapi import FastAPI
@@ -153,7 +153,7 @@ _SUMMARY_MAP: dict[str, str] = {
 # Custom collector — pull-on-scrape bridge
 # ---------------------------------------------------------------------------
 
-class TradingBotCollector(Collector):
+class TradingBotCollector(Collector):  # type: ignore[misc]  # prometheus_client ships no stubs
     """
     Prometheus collector that bridges MetricsCollector to Prometheus format.
 
@@ -170,11 +170,11 @@ class TradingBotCollector(Collector):
     def __init__(self, app_start_time: float) -> None:
         self._app_start_time = app_start_time
 
-    def describe(self) -> list:
+    def describe(self) -> list[Any]:
         """Return empty list — defers to collect() at registration time."""
         return []
 
-    def collect(self):
+    def collect(self) -> Iterator[Any]:
         """
         Yield Prometheus metric families from MetricsCollector state.
 
@@ -200,7 +200,7 @@ class TradingBotCollector(Collector):
         uptime.add_metric([], time.monotonic() - self._app_start_time)
         yield uptime
 
-    def _collect_counters(self, counters: dict[str, int]):
+    def _collect_counters(self, counters: dict[str, int]) -> Iterator[Any]:
         """Convert MetricsCollector counters to Prometheus counter families."""
         # Group by base metric name (may have different label sets)
         grouped: dict[str, list[tuple[dict[str, str], float]]] = {}
@@ -219,12 +219,12 @@ class TradingBotCollector(Collector):
                 f"Counter: {prom_name}",
                 labels=label_names,
             )
-            for labels, value in samples:
+            for labels, sample_value in samples:
                 label_values = [labels.get(k, "") for k in label_names]
-                family.add_metric(label_values, value)
+                family.add_metric(label_values, sample_value)
             yield family
 
-    def _collect_gauges(self, gauges: dict[str, float]):
+    def _collect_gauges(self, gauges: dict[str, float]) -> Iterator[Any]:
         """Convert MetricsCollector gauges to Prometheus gauge families."""
         grouped: dict[str, list[tuple[dict[str, str], float]]] = {}
         for key, value in gauges.items():
@@ -246,7 +246,7 @@ class TradingBotCollector(Collector):
                 family.add_metric(label_values, value)
             yield family
 
-    def _collect_histograms(self, histograms: dict[str, dict[str, Any]]):
+    def _collect_histograms(self, histograms: dict[str, dict[str, Any]]) -> Iterator[Any]:
         """Convert MetricsCollector histogram summaries to Prometheus summary families."""
         for key, summary_data in histograms.items():
             name, labels = _parse_label_key(key)
@@ -311,7 +311,7 @@ def setup_prometheus(app: FastAPI) -> None:
         include_in_schema=False,
         tags=["observability"],
     )
-    async def prometheus_metrics():
+    async def prometheus_metrics() -> PlainTextResponse:
         """Prometheus text exposition format scrape endpoint."""
         output = generate_latest(PROMETHEUS_REGISTRY)
         return PlainTextResponse(

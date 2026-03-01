@@ -34,6 +34,7 @@ from typing import Any
 import hmac
 import structlog
 from pydantic import BaseModel, Field
+from pydantic import SecretStr
 
 __all__ = [
     "LiveTradingGate",
@@ -181,15 +182,15 @@ class LiveTradingGate:
         api_secret_raw = getattr(settings, "exchange_api_secret", None)
 
         # Unwrap SecretStr if needed
-        api_key = (
+        api_key: str | None = (
             api_key_raw.get_secret_value()
-            if hasattr(api_key_raw, "get_secret_value")
-            else api_key_raw
+            if isinstance(api_key_raw, SecretStr)
+            else (api_key_raw if isinstance(api_key_raw, str) else None)
         )
-        api_secret = (
+        api_secret: str | None = (
             api_secret_raw.get_secret_value()
-            if hasattr(api_secret_raw, "get_secret_value")
-            else api_secret_raw
+            if isinstance(api_secret_raw, SecretStr)
+            else (api_secret_raw if isinstance(api_secret_raw, str) else None)
         )
 
         key_ok = bool(api_key and api_key.strip())
@@ -242,10 +243,10 @@ class LiveTradingGate:
         GateLayer
         """
         stored_raw = getattr(settings, "live_trading_confirm_token", None)
-        stored = (
+        stored: str | None = (
             stored_raw.get_secret_value()
-            if hasattr(stored_raw, "get_secret_value")
-            else stored_raw
+            if isinstance(stored_raw, SecretStr)
+            else (stored_raw if isinstance(stored_raw, str) else None)
         )
 
         # No token configured in settings and none provided
@@ -276,7 +277,11 @@ class LiveTradingGate:
                        "Set LIVE_TRADING_CONFIRM_TOKEN to enable token verification.",
             )
 
-        # Both present — constant-time comparison to prevent timing attacks
+        # Both present — constant-time comparison to prevent timing attacks.
+        # Guards above guarantee both are non-None; assert to enforce the
+        # invariant and fail loudly rather than silently matching empty strings.
+        assert stored is not None, "stored token must be non-None at this point"
+        assert confirm_token is not None, "confirm_token must be non-None at this point"
         if hmac.compare_digest(stored, confirm_token):
             return GateLayer(
                 name="confirmation",

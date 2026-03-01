@@ -9,7 +9,7 @@ Environment variables always take priority over .env file values.
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -157,7 +157,7 @@ class Settings(BaseSettings):
 
     @model_validator(mode="before")
     @classmethod
-    def assemble_database_url(cls, values: dict) -> dict:
+    def assemble_database_url(cls, values: dict[str, Any]) -> dict[str, Any]:
         """Build database_url from POSTGRES_* vars if not provided directly."""
         db_url = values.get("database_url", "")
         if not db_url:

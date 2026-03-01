@@ -45,7 +45,7 @@ import inspect
 from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum, auto
-from typing import Any, Callable, Coroutine, Literal, TypeAlias, TypeVar
+from typing import Any, Callable, Coroutine, Literal, TypeAlias, TypeVar, cast
 from uuid import UUID, uuid4
 
 import structlog
@@ -586,7 +586,7 @@ class EventBus:
         for sub in subs:
             try:
                 if sub.is_async:
-                    await sub.handler(event)
+                    await cast(Coroutine[Any, Any, None], sub.handler(event))
                 else:
                     # Wrap sync handlers in asyncio.to_thread to avoid blocking
                     # the event loop (CR-EB-001). The event is a frozen Pydantic

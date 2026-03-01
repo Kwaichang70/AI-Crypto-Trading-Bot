@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import time
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, AsyncIterator, cast
 
 import structlog
 from fastapi import Depends, FastAPI, Request, Response
@@ -52,7 +52,7 @@ logger = structlog.get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):  # type: ignore[type-arg]
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """
     Application lifespan manager.
 
@@ -177,7 +177,7 @@ async def _request_timing_middleware(request: Request, call_next: Any) -> Respon
         duration_ms=elapsed_ms,
     )
 
-    return response
+    return cast(Response, response)
 
 
 # ---------------------------------------------------------------------------

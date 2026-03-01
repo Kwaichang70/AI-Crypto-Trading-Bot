@@ -51,6 +51,7 @@ from typing import Any
 import structlog
 
 from common.models import OHLCVBar
+from data.market_data import BaseMarketDataService
 from common.types import RunMode, TimeFrame
 from trading.engines.paper import PaperExecutionEngine
 from trading.metrics import (
@@ -652,7 +653,7 @@ class BacktestRunner:
 # Market data stub for backtest mode
 # ---------------------------------------------------------------------------
 
-class _BacktestMarketDataStub:
+class _BacktestMarketDataStub(BaseMarketDataService):
     """
     Minimal stub that satisfies StrategyEngine's market_data dependency
     in BACKTEST mode.
@@ -661,6 +662,9 @@ class _BacktestMarketDataStub:
     the market data service is never called.  This stub raises if any
     method is invoked, signalling a bug in the backtest flow.
     """
+
+    def __init__(self) -> None:
+        super().__init__(exchange_id="backtest-stub", cache_ttl_seconds=0)
 
     async def connect(self) -> None:
         raise RuntimeError(
@@ -672,12 +676,39 @@ class _BacktestMarketDataStub:
             "MarketDataService.close() should not be called in BACKTEST mode"
         )
 
-    async def fetch_ohlcv(self, **kwargs: Any) -> list[OHLCVBar]:
+    async def fetch_ohlcv(
+        self,
+        symbol: str,
+        timeframe: TimeFrame,
+        since: datetime | None = None,
+        limit: int = 500,
+    ) -> list[OHLCVBar]:
         raise RuntimeError(
             "MarketDataService.fetch_ohlcv() should not be called in BACKTEST mode"
         )
 
-    async def get_latest_bar(self, **kwargs: Any) -> OHLCVBar:
+    async def fetch_ohlcv_range(
+        self,
+        symbol: str,
+        timeframe: TimeFrame,
+        start: datetime,
+        end: datetime,
+    ) -> list[OHLCVBar]:
+        raise RuntimeError(
+            "MarketDataService.fetch_ohlcv_range() should not be called in BACKTEST mode"
+        )
+
+    async def get_latest_bar(self, symbol: str, timeframe: TimeFrame) -> OHLCVBar:
         raise RuntimeError(
             "MarketDataService.get_latest_bar() should not be called in BACKTEST mode"
+        )
+
+    async def get_supported_symbols(self) -> list[str]:
+        raise RuntimeError(
+            "MarketDataService.get_supported_symbols() should not be called in BACKTEST mode"
+        )
+
+    async def get_supported_timeframes(self) -> list[TimeFrame]:
+        raise RuntimeError(
+            "MarketDataService.get_supported_timeframes() should not be called in BACKTEST mode"
         )

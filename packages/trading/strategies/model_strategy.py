@@ -229,7 +229,7 @@ class ModelStrategy(BaseStrategy):
     @property
     def min_bars_required(self) -> int:
         """Feature window determines minimum history needed."""
-        return self._params.get("feature_window", 100)
+        return int(self._params.get("feature_window", 100))
 
     # ------------------------------------------------------------------ #
     # Lifecycle hooks
@@ -263,7 +263,7 @@ class ModelStrategy(BaseStrategy):
             return
 
         try:
-            import joblib  # type: ignore[import-untyped]
+            import joblib
 
             self._model = joblib.load(model_path)
             self._model_loaded = True
@@ -436,7 +436,7 @@ class ModelStrategy(BaseStrategy):
 
         # Predict — wrap in 2D array for scikit-learn API
         try:
-            import numpy as np  # type: ignore[import-untyped]
+            import numpy as np
 
             X = np.array([feature_vector])  # shape (1, 10)
 

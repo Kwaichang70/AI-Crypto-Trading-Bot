@@ -180,7 +180,7 @@ class MACrossoverStrategy(BaseStrategy):
     @property
     def min_bars_required(self) -> int:
         """Slow SMA window + 1 bar for previous-bar crossover detection."""
-        return self._params["slow_period"] + 1
+        return int(self._params["slow_period"]) + 1
 
     # ------------------------------------------------------------------ #
     # Core signal generation

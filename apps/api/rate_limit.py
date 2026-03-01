@@ -61,7 +61,7 @@ access is sensitive to internal API changes across minor releases.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 import structlog
 from fastapi import FastAPI, Request, Response
@@ -329,12 +329,12 @@ async def _rate_limit_middleware(request: Request, call_next: Any) -> Response:
 
     # Skip rate limiting if globally disabled
     if not settings.rate_limit_enabled:
-        return await call_next(request)
+        return cast(Response, await call_next(request))
 
     # Skip exempt paths
     path = request.url.path
     if path in _EXEMPT_PATHS:
-        return await call_next(request)
+        return cast(Response, await call_next(request))
 
     # Determine the appropriate limit tier
     method = request.method.upper()
@@ -344,7 +344,7 @@ async def _rate_limit_middleware(request: Request, call_next: Any) -> Response:
         limit_string = settings.rate_limit_write
     else:
         # OPTIONS, HEAD, etc. — no rate limit
-        return await call_next(request)
+        return cast(Response, await call_next(request))
 
     # Apply the rate limit check using the limiter
     client_ip = get_client_ip(request, trusted_proxy_count=settings.trusted_proxy_count)
@@ -383,7 +383,7 @@ async def _rate_limit_middleware(request: Request, call_next: Any) -> Response:
             exc_info=True,
         )
 
-    return await call_next(request)
+    return cast(Response, await call_next(request))
 
 
 def _normalize_path_key(path: str) -> str:

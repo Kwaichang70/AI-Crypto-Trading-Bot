@@ -268,8 +268,8 @@ class BreakoutStrategy(BaseStrategy):
     @property
     def min_bars_required(self) -> int:
         """Max of Donchian window and ATR convergence (3x period)."""
-        lookback = self._params["lookback_period"]
-        atr_p = self._params["atr_period"]
+        lookback = int(self._params["lookback_period"])
+        atr_p = int(self._params["atr_period"])
         return max(lookback + 1, atr_p * 3 + 1)
 
     # ------------------------------------------------------------------ #

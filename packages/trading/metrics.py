@@ -272,7 +272,7 @@ def compute_cagr(
         return -1.0
 
     exponent = 365.25 / days
-    return ratio ** exponent - 1.0
+    return float(ratio ** exponent) - 1.0
 
 
 def compute_sharpe(
