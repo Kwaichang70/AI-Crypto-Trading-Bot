@@ -102,3 +102,13 @@
   - [x] P0: Fix ExchangeNotAvailable dead except clause in production code (pending commit)
   - [x] P1: RiskManager edge-case tests — 11 tests, 97% coverage (pending commit)
   - [x] P2: README.md + .env.example (pending commit)
+
+### 9. AI Crypto Trading Bot — Sprint 9 (Docker Fix, Bar-Loop Tests, Paper Engine Wiring)
+- **Plan:** `.claude/plans/eventual-wandering-lecun.md`
+- **Status:** COMPLETE
+- **Orchestration Checklist:**
+  - [x] P0: Fix Dockerfile.api — uv sync --frozen --no-dev --no-editable + alembic entrypoint
+  - [x] P0: StrategyEngine bar-loop tests — 32 tests (5 classes)
+  - [x] P1: Wire paper engine as background asyncio.Task with cancel on DELETE
+  - [x] P1: Paper engine wiring integration tests — 6 tests
+  - [x] P1: Update MEMORY.md to Sprint 9 state
