@@ -112,3 +112,13 @@
   - [x] P1: Wire paper engine as background asyncio.Task with cancel on DELETE
   - [x] P1: Paper engine wiring integration tests — 6 tests
   - [x] P1: Update MEMORY.md to Sprint 9 state
+
+### 10. AI Crypto Trading Bot — Sprint 10 (Integration Test Fixes, Mypy Zero)
+- **Plan:** `.claude/plans/eventual-wandering-lecun.md`
+- **Status:** COMPLETE
+- **Orchestration Checklist:**
+  - [x] P0: Replace ORM __new__() with SimpleNamespace in 3 integration test files — fixes 29 tests + 1 error
+  - [x] P0: Fix strategies fixture isolation bug (settings cache contamination) — fixes 1 test
+  - [x] P0: Fix RateLimitExceeded constructor + rate_limit mypy errors — fixes 2 tests + 3 mypy errors
+  - [x] P0: Fix prometheus.py count_value kwarg + runs.py initial_capital type — fixes 3 mypy errors
+  - [x] P0: Update MEMORY.md + CLAUDE.local.md for Sprint 10
