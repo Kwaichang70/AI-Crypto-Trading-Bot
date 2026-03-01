@@ -9,7 +9,7 @@
 #
 #   lint ──┬──► type-check
 #          ├──► test-unit
-#          │         └──► test-integration (continue-on-error)
+#          │         └──► test-integration
 #          ├──► build-api
 #          └──► build-ui
 #
@@ -145,7 +145,7 @@ jobs:
       # mypy is configured in root pyproject.toml:
       #   strict = true, ignore_missing_imports = true, excludes tests/ alembic/
       # --no-error-summary keeps output concise for GitHub annotations.
-      # Non-fatal (|| true) for MVP — tighten once full type coverage lands.
+      # Non-fatal (|| true) — 29 errors remain as of Sprint 6; fix in Sprint 7+
       - name: Run mypy
         env:
           PYTHONPATH: "${{ github.workspace }}:${{ github.workspace }}/packages"
@@ -155,7 +155,7 @@ jobs:
             --no-error-summary \
             --show-column-numbers \
             || true
-          # Remove `|| true` once ANN coverage reaches 100%
+          # Remove || true once error count reaches 0 (29 as of Sprint 6)
 
 
 # =============================================================================
@@ -222,7 +222,8 @@ jobs:
               --cov=apps \
               --cov=packages \
               --cov-report=term-missing \
-              --cov-report=xml:coverage-unit.xml
+              --cov-report=xml:coverage-unit.xml \
+              --cov-fail-under=60
           else
             echo "::warning::tests/unit/ directory not found — skipping unit tests."
             echo "Create tests/unit/ with at least one test file to enable this job."
@@ -242,14 +243,12 @@ jobs:
 # =============================================================================
 # Job: test-integration — tests requiring PostgreSQL + Redis service containers
 # Only runs after lint + type-check + test-unit all pass.
-# continue-on-error: true — integration suite may be incomplete during MVP.
+# Integration suite covers 100+ tests across 5 router files — failures block CI.
 # =============================================================================
   test-integration:
     name: Integration tests (pytest + postgres + redis)
     runs-on: ubuntu-latest
     needs: [lint, type-check, test-unit]
-    # Non-fatal for MVP: remove once the integration suite is stable
-    continue-on-error: true
 
     services:
       # PostgreSQL 16 service container — available at localhost:5432 during the job
