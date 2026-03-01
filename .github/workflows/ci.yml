@@ -145,7 +145,7 @@ jobs:
       # mypy is configured in root pyproject.toml:
       #   strict = true, ignore_missing_imports = true, excludes tests/ alembic/
       # --no-error-summary keeps output concise for GitHub annotations.
-      # Non-fatal (|| true) — 29 errors remain as of Sprint 6; fix in Sprint 7+
+      # All 29 errors resolved in Sprint 7 — mypy failures now block CI.
       - name: Run mypy
         env:
           PYTHONPATH: "${{ github.workspace }}:${{ github.workspace }}/packages"
@@ -153,9 +153,7 @@ jobs:
           .venv/bin/mypy packages/ apps/api/ \
             --ignore-missing-imports \
             --no-error-summary \
-            --show-column-numbers \
-            || true
-          # Remove || true once error count reaches 0 (29 as of Sprint 6)
+            --show-column-numbers
 
 
 # =============================================================================
