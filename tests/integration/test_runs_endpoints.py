@@ -41,9 +41,11 @@ Mock wiring summary
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import UTC, datetime
-from unittest.mock import AsyncMock, MagicMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -618,3 +620,326 @@ class TestRunsEndpointAuth:
             assert resp.status_code != 401
         finally:
             app_prod_mode.dependency_overrides.pop(get_db, None)
+
+
+# ---------------------------------------------------------------------------
+# Paper engine background task wiring tests
+# ---------------------------------------------------------------------------
+
+# Standard payload reused across task-wiring tests.
+_PAPER_PAYLOAD = {
+    "strategyName": "ma_crossover",
+    "strategyParams": {"fast_period": 10, "slow_period": 50},
+    "symbols": ["BTC/USDT"],
+    "timeframe": "1h",
+    "mode": "paper",
+    "initialCapital": "10000.00",
+}
+
+
+@pytest.mark.integration
+class TestPaperEngineTaskWiring:
+    """
+    Tests for the asyncio.Task lifecycle wired into POST /api/v1/runs (paper mode)
+    and DELETE /api/v1/runs/{run_id}.
+
+    Background
+    ----------
+    The paper-mode branch of create_run() calls asyncio.create_task() to launch
+    _run_paper_engine() in the background and stores the Task object in the
+    module-level _RUN_TASKS dict keyed by run_id string.  The stop_run() handler
+    pops the Task from _RUN_TASKS and calls task.cancel() if the task is not done.
+
+    Test isolation strategy
+    -----------------------
+    Each test patches ``api.routers.runs._run_paper_engine`` to replace the real
+    coroutine (which connects to exchanges and a database) with a controlled stub.
+    Two stub variants are used:
+
+    1. ``_sleeping_engine`` — an infinite-sleep coroutine.  The task is created and
+       registered but never completes during the test.  Used to verify that the task
+       appears in _RUN_TASKS immediately after POST returns.
+
+    2. ``_immediate_engine`` — a coroutine that returns immediately after removing
+       itself from _RUN_TASKS (simulating the finally-block cleanup in the real
+       implementation).  Used to verify the self-removal mechanic.
+
+    Cleanup
+    -------
+    The ``_cancel_all_tasks`` autouse fixture cancels every task left in _RUN_TASKS
+    after each test.  This prevents task-leaked warnings from the asyncio event loop
+    and keeps tests fully independent.
+
+    MagicMock tasks (test_stop_run_cancels_task)
+    --------------------------------------------
+    For the cancellation test we inject a plain MagicMock into _RUN_TASKS instead of
+    a real asyncio.Task.  The stop_run handler only calls task.done() and task.cancel()
+    on the object it pops from the dict, so a MagicMock is sufficient and avoids the
+    complexity of creating a real running task from synchronous test code.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _cancel_all_tasks(self) -> None:
+        """
+        Autouse teardown fixture: cancel every task lingering in _RUN_TASKS
+        after each test completes.
+
+        This prevents unhandled-task warnings (which fail tests under
+        filterwarnings = ["error"]) and ensures _RUN_TASKS is clean for the
+        next test, even when a test raises an assertion error mid-flight.
+        """
+        yield  # test runs here
+        from api.routers.runs import _RUN_TASKS
+        for task in list(_RUN_TASKS.values()):
+            # MagicMock objects (injected in test_stop_run_cancels_task) and
+            # real asyncio.Task objects are both handled gracefully here.
+            if hasattr(task, "cancel") and callable(task.cancel):
+                try:
+                    task.cancel()
+                except Exception:
+                    pass
+        _RUN_TASKS.clear()
+
+    def test_paper_run_registers_task(
+        self, client_dev_with_db: TestClient
+    ) -> None:
+        """
+        POST /api/v1/runs in paper mode must add an entry to _RUN_TASKS keyed
+        by the returned run_id string before the HTTP response is returned.
+
+        The patched coroutine sleeps indefinitely so the task stays alive
+        (and therefore present in _RUN_TASKS) when we inspect the dict
+        after the synchronous TestClient call returns.
+        """
+        from api.routers.runs import _RUN_TASKS
+
+        async def _sleeping_engine(**kwargs):
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                raise
+
+        with patch("api.routers.runs._run_paper_engine", side_effect=_sleeping_engine):
+            resp = client_dev_with_db.post("/api/v1/runs", json=_PAPER_PAYLOAD)
+
+        assert resp.status_code == 201
+        run_id_str = resp.json()["id"]
+
+        # The task must be registered under the run's UUID string.
+        assert run_id_str in _RUN_TASKS, (
+            f"Expected run_id '{run_id_str}' in _RUN_TASKS; "
+            f"actual keys: {list(_RUN_TASKS.keys())}"
+        )
+
+    def test_paper_run_task_has_correct_name(
+        self, client_dev_with_db: TestClient
+    ) -> None:
+        """
+        The asyncio.Task created for a paper run must carry the name
+        ``paper-engine-{run_id}`` so it is identifiable in event-loop
+        introspection and log messages.
+        """
+        from api.routers.runs import _RUN_TASKS
+
+        async def _sleeping_engine(**kwargs):
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                raise
+
+        with patch("api.routers.runs._run_paper_engine", side_effect=_sleeping_engine):
+            resp = client_dev_with_db.post("/api/v1/runs", json=_PAPER_PAYLOAD)
+
+        assert resp.status_code == 201
+        run_id_str = resp.json()["id"]
+
+        task = _RUN_TASKS.get(run_id_str)
+        assert task is not None, f"No task found for run_id '{run_id_str}'"
+
+        expected_name = f"paper-engine-{run_id_str}"
+        assert task.get_name() == expected_name, (
+            f"Expected task name '{expected_name}', got '{task.get_name()}'"
+        )
+
+    def test_stop_run_cancels_task(
+        self, client_dev_with_db: TestClient, mock_db_session: AsyncMock
+    ) -> None:
+        """
+        DELETE /api/v1/runs/{run_id} must call task.cancel() on the task stored
+        in _RUN_TASKS for that run_id, and must remove the entry from _RUN_TASKS.
+
+        A MagicMock is injected directly into _RUN_TASKS to simulate a live
+        background task without requiring a real asyncio.Task from synchronous
+        test code.  The mock's .done() method returns False (task is running),
+        so the handler's cancellation branch is exercised.
+
+        The mock DB session is configured to return a 'running' RunORM so the
+        stop_run handler proceeds past the 404/409 guards.
+        """
+        from api.routers.runs import _RUN_TASKS
+
+        target_run_id = uuid.UUID("cccccccc-cccc-cccc-cccc-cccccccccccc")
+        target_run_id_str = str(target_run_id)
+
+        # Wire the DB mock to return a running run for the DELETE query.
+        # SimpleNamespace is used instead of _make_run_orm() to avoid the
+        # SQLAlchemy mapper initialisation dependency that _make_run_orm has
+        # when called with a non-default run_id in an isolated test context.
+        run_ns = SimpleNamespace(
+            id=target_run_id,
+            run_mode="paper",
+            status="running",
+            config={
+                "strategy_name": "ma_crossover",
+                "strategy_params": {},
+                "symbols": ["BTC/USDT"],
+                "timeframe": "1h",
+                "mode": "paper",
+                "initial_capital": "10000.00",
+            },
+            started_at=_FIXED_NOW,
+            stopped_at=None,
+            created_at=_FIXED_NOW,
+            updated_at=_FIXED_NOW,
+        )
+        mock_db_session.execute.return_value = _make_scalar_one_or_none_result(run_ns)
+
+        # Inject a MagicMock task that reports itself as still running.
+        mock_task = MagicMock()
+        mock_task.done.return_value = False
+        _RUN_TASKS[target_run_id_str] = mock_task
+
+        resp = client_dev_with_db.delete(f"/api/v1/runs/{target_run_id}")
+
+        assert resp.status_code == 200
+        # cancel() must have been called exactly once.
+        mock_task.cancel.assert_called_once()
+        # The entry must be removed from the registry after cancellation.
+        assert target_run_id_str not in _RUN_TASKS, (
+            "Expected _RUN_TASKS to be empty for this run_id after stop_run"
+        )
+
+    def test_stop_run_without_task_still_succeeds(
+        self, client_dev_with_db: TestClient, mock_db_session: AsyncMock
+    ) -> None:
+        """
+        DELETE /api/v1/runs/{run_id} must return 200 even when _RUN_TASKS has
+        no entry for the run_id (e.g. the task already completed naturally).
+
+        This covers the path where ``_RUN_TASKS.pop(run_id, None)`` returns None
+        and the cancellation branch is skipped entirely.
+        """
+        from api.routers.runs import _RUN_TASKS
+
+        target_run_id = uuid.UUID("dddddddd-dddd-dddd-dddd-dddddddddddd")
+        target_run_id_str = str(target_run_id)
+
+        # Confirm no task is present for this run_id.
+        assert target_run_id_str not in _RUN_TASKS
+
+        # SimpleNamespace avoids the SQLAlchemy mapper initialisation dependency.
+        run_ns = SimpleNamespace(
+            id=target_run_id,
+            run_mode="paper",
+            status="running",
+            config={
+                "strategy_name": "ma_crossover",
+                "strategy_params": {},
+                "symbols": ["BTC/USDT"],
+                "timeframe": "1h",
+                "mode": "paper",
+                "initial_capital": "10000.00",
+            },
+            started_at=_FIXED_NOW,
+            stopped_at=None,
+            created_at=_FIXED_NOW,
+            updated_at=_FIXED_NOW,
+        )
+        mock_db_session.execute.return_value = _make_scalar_one_or_none_result(run_ns)
+
+        resp = client_dev_with_db.delete(f"/api/v1/runs/{target_run_id}")
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "stopped"
+        # No task entry should exist after the stop (pop on missing key is a no-op).
+        assert target_run_id_str not in _RUN_TASKS
+
+    def test_task_registry_empty_after_task_completes(
+        self, client_dev_with_db: TestClient
+    ) -> None:
+        """
+        When the paper engine coroutine completes (or returns early), its
+        finally block must remove the run_id entry from _RUN_TASKS.
+
+        The patched coroutine returns immediately after performing the same
+        _RUN_TASKS.pop() that the real finally block performs.  After giving
+        the event loop one iteration to drain the completed task (via a small
+        asyncio.sleep(0) executed by the TestClient on a subsequent request),
+        _RUN_TASKS must be empty for the run.
+
+        Implementation note: TestClient runs the event loop between synchronous
+        calls.  We trigger an additional GET request to /health after POST so
+        the event loop has an opportunity to run the completed coroutine's
+        cleanup before we inspect _RUN_TASKS.
+        """
+        from api.routers.runs import _RUN_TASKS
+
+        async def _immediate_engine(**kwargs):
+            # Mimic the real finally block: remove self from the task registry.
+            _RUN_TASKS.pop(kwargs["run_id_str"], None)
+
+        with patch("api.routers.runs._run_paper_engine", side_effect=_immediate_engine):
+            resp = client_dev_with_db.post("/api/v1/runs", json=_PAPER_PAYLOAD)
+            assert resp.status_code == 201
+            run_id_str = resp.json()["id"]
+
+            # Issue a second HTTP call so the TestClient's internal event loop
+            # gets a full iteration to execute and finalize the completed task.
+            client_dev_with_db.get("/health")
+
+        assert run_id_str not in _RUN_TASKS, (
+            f"Expected _RUN_TASKS to not contain '{run_id_str}' after task "
+            f"completion; actual keys: {list(_RUN_TASKS.keys())}"
+        )
+
+    def test_multiple_paper_runs_each_get_own_task(
+        self, client_dev_with_db: TestClient
+    ) -> None:
+        """
+        Each POST /api/v1/runs (paper mode) must create an independent Task
+        registered under a unique run_id in _RUN_TASKS.
+
+        Two sequential paper-mode POSTs must produce two distinct _RUN_TASKS
+        entries with different keys.  This verifies that the task registry
+        does not accidentally overwrite entries or re-use run IDs.
+        """
+        from api.routers.runs import _RUN_TASKS
+
+        async def _sleeping_engine(**kwargs):
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                raise
+
+        with patch("api.routers.runs._run_paper_engine", side_effect=_sleeping_engine):
+            resp_a = client_dev_with_db.post("/api/v1/runs", json=_PAPER_PAYLOAD)
+            resp_b = client_dev_with_db.post("/api/v1/runs", json=_PAPER_PAYLOAD)
+
+        assert resp_a.status_code == 201
+        assert resp_b.status_code == 201
+
+        run_id_a = resp_a.json()["id"]
+        run_id_b = resp_b.json()["id"]
+
+        # The two runs must have been assigned different UUIDs.
+        assert run_id_a != run_id_b, "Two paper runs received identical run IDs"
+
+        # Both must have entries in _RUN_TASKS.
+        assert run_id_a in _RUN_TASKS, f"No task registered for first run '{run_id_a}'"
+        assert run_id_b in _RUN_TASKS, f"No task registered for second run '{run_id_b}'"
+
+        # The two tasks must be distinct objects.
+        assert _RUN_TASKS[run_id_a] is not _RUN_TASKS[run_id_b], (
+            "Both paper runs share the same Task object — expected independent tasks"
+        )
