@@ -8,8 +8,8 @@ Modules under test
 - packages/trading/risk.py       — BaseRiskManager, RiskParameters, helpers
 - packages/trading/risk_manager.py — DefaultRiskManager implementation
 
-Test coverage
--------------
+Test coverage  (44 tests total)
+---------------------------------
 - Kill switch blocks ALL orders
 - Cooldown period blocks orders until expiry
 - FIX-12 regression: consecutive_losses resets when cooldown expires
@@ -17,10 +17,20 @@ Test coverage
 - Daily loss limit
 - Drawdown limit
 - Order size / notional cap (warning, not block)
+- Notional cap reduced to zero → blocking rejection
 - Concentration cap (blocking when fully saturated)
+- Concentration cap (partial room → quantity reduced, not rejected)
 - Position sizing formula: risk_amount / (entry * distance)
 - Position sizing caps: max_order_size_quote, max_position_size_pct
+- Position sizing: tight stop-loss distance floored at 0.1%
+- Position sizing: negative equity guard returns zero
+- Position sizing: concentration cap dominates when tighter than risk formula
 - update_after_fill: win resets streak; loss increments streak; streak triggers cooldown
+- pre_trade_check: price unknown blocks MARKET order
+- pre_trade_check: market_price used when order.price is None
+- pre_trade_check: price resolved from existing position.current_price
+- pre_trade_check: multiple simultaneous violations all collected
+- RiskParameters validation: per_trade_risk_pct and max_drawdown_pct bounds
 """
 
 from __future__ import annotations
@@ -83,6 +93,25 @@ def _make_limit_order(
         order_type=OrderType.LIMIT,
         quantity=quantity,
         price=price,
+    )
+
+
+def _make_market_order(
+    *,
+    symbol: str = "BTC/USDT",
+    side: OrderSide = OrderSide.BUY,
+    quantity: Decimal = Decimal("0.01"),
+    run_id: str = "test-run",
+) -> Order:
+    """Build a MARKET order (price=None) suitable for pre_trade_check."""
+    return Order(
+        client_order_id=f"{run_id}-{uuid4().hex[:12]}",
+        run_id=run_id,
+        symbol=symbol,
+        side=side,
+        order_type=OrderType.MARKET,
+        quantity=quantity,
+        price=None,
     )
 
 
@@ -383,7 +412,7 @@ class TestDrawdownLimit:
     def test_drawdown_at_limit_blocks_order(self) -> None:
         """
         Drawdown >= max_drawdown_pct blocks orders.
-        Peak=10_000, current=8_400 → drawdown=16% ≥ 15%.
+        Peak=10_000, current=8_400 → drawdown=16% >= 15%.
         """
         manager = _make_manager(max_drawdown_pct=0.15)
         order = _make_limit_order()
@@ -630,3 +659,404 @@ class TestUpdateAfterFill:
         for _ in range(2):  # only 2 losses, threshold is 3
             manager.update_after_fill(Decimal("-50"), is_loss=True)
         assert manager.in_cooldown is False
+
+
+# ===========================================================================
+# Position sizing — edge cases (new coverage)
+# ===========================================================================
+
+
+class TestPositionSizingEdgeCases:
+    """Edge-case tests for calculate_position_size covering previously uncovered paths."""
+
+    def test_sizing_tight_stop_loss_floored_at_minimum_distance(self) -> None:
+        """
+        Stop-loss distance < 0.1% is floored at 0.001 to prevent inflated
+        position sizes (line 190-191 of risk_manager.py).
+
+        With entry=50000 and stop=49999.99 the raw distance is
+        0.0000002, far below the 0.001 floor.  The result must equal
+        the size produced when the stop is placed at exactly 0.1% away
+        (entry=50000, stop=49950), which uses the same 0.001 distance.
+        """
+        manager = _make_manager(
+            per_trade_risk_pct=0.01,
+            max_order_size_quote=Decimal("1000000"),
+            max_position_size_pct=1.0,
+        )
+        # Stop so close that raw distance = 0.0000002 → floored to 0.001
+        tight = manager.calculate_position_size(
+            equity=Decimal("10000"),
+            entry_price=Decimal("50000"),
+            stop_loss_price=Decimal("49999.99"),
+            confidence=1.0,
+        )
+        # Stop exactly at 0.1% distance → distance = 0.001 (no floor needed)
+        normal = manager.calculate_position_size(
+            equity=Decimal("10000"),
+            entry_price=Decimal("50000"),
+            stop_loss_price=Decimal("49950"),
+            confidence=1.0,
+        )
+        # Both paths use 0.001 distance, so the results must be identical
+        assert tight == normal
+
+    def test_sizing_negative_equity_returns_zero(self) -> None:
+        """
+        Negative equity triggers the guard at line 177 of risk_manager.py
+        (``if equity <= Decimal(0)``) and returns Decimal(0).
+        """
+        manager = _make_manager()
+        size = manager.calculate_position_size(
+            equity=Decimal("-1000"),
+            entry_price=Decimal("50000"),
+            stop_loss_price=None,
+            confidence=1.0,
+        )
+        assert size == Decimal("0")
+
+    def test_sizing_capped_by_concentration_limit(self) -> None:
+        """
+        When max_position_size_pct * equity / entry_price is the binding
+        constraint, the returned size must not exceed that ceiling
+        (lines 202-207 of risk_manager.py).
+
+        With equity=10000, entry=50000, and max_position_size_pct=0.01:
+            concentration_cap = 0.01 * 10000 / 50000 = 0.002 BTC
+        The uncapped risk-formula result (0.2 BTC) is far above this.
+        """
+        manager = _make_manager(
+            per_trade_risk_pct=0.01,
+            max_order_size_quote=Decimal("1000000"),  # non-binding
+            max_position_size_pct=0.01,               # very tight: 1% of equity
+        )
+        size = manager.calculate_position_size(
+            equity=Decimal("10000"),
+            entry_price=Decimal("50000"),
+            stop_loss_price=None,
+            confidence=1.0,
+        )
+        # concentration cap = 0.01 * 10000 / 50000 = 0.002
+        assert size <= Decimal("0.002")
+        assert size > Decimal("0")
+
+
+# ===========================================================================
+# pre_trade_check — MARKET order price resolution (new coverage)
+# ===========================================================================
+
+
+class TestPreTradeCheckMarketOrderPriceResolution:
+    """
+    Tests for the _resolve_effective_price fallback chain used when a MARKET
+    order has no limit price (lines 286-297, 413-421 of risk_manager.py).
+    """
+
+    def test_price_unknown_blocks_market_order(self) -> None:
+        """
+        When no effective price can be resolved (order.price is None, no
+        matching open position, and market_price is None), the order must
+        be blocked with a price-related rejection reason (lines 286-297).
+        """
+        manager = _make_manager()
+        order = _make_market_order(
+            symbol="BTC/USDT",
+            quantity=Decimal("0.01"),
+        )
+        result = manager.pre_trade_check(
+            order=order,
+            current_equity=Decimal("10000"),
+            open_positions=[],
+            daily_pnl=Decimal("0"),
+            peak_equity=Decimal("10000"),
+            market_price=None,
+        )
+        assert result.approved is False
+        assert any(
+            "price" in r.lower() for r in result.rejection_reasons
+        ), f"Expected price-related rejection, got: {result.rejection_reasons}"
+
+    def test_market_price_used_when_order_has_no_price(self) -> None:
+        """
+        When order.price is None and no open position exists for the symbol,
+        the caller-supplied market_price is used (line 420-421 of risk_manager.py).
+        A small, well-within-cap order must be approved.
+        """
+        manager = _make_manager(
+            max_order_size_quote=Decimal("100000"),
+            max_position_size_pct=1.0,
+            max_open_positions=5,
+        )
+        order = _make_market_order(
+            symbol="BTC/USDT",
+            quantity=Decimal("0.001"),  # 0.001 * 50000 = 50 USDT — well within caps
+        )
+        result = manager.pre_trade_check(
+            order=order,
+            current_equity=Decimal("100000"),
+            open_positions=[],
+            daily_pnl=Decimal("0"),
+            peak_equity=Decimal("100000"),
+            market_price=Decimal("50000"),
+        )
+        assert result.approved is True
+
+    def test_price_resolved_from_existing_position_current_price(self) -> None:
+        """
+        When order.price is None but an open position exists for the same
+        symbol with a valid current_price, that price is used instead of
+        market_price (line 416-418 of risk_manager.py).
+        A small order must be approved.
+        """
+        manager = _make_manager(
+            max_order_size_quote=Decimal("100000"),
+            max_position_size_pct=1.0,
+            max_open_positions=5,
+        )
+        # Existing open position provides the price reference
+        existing = _make_position(symbol="BTC/USDT", current_price=Decimal("50000"))
+        order = _make_market_order(
+            symbol="BTC/USDT",
+            quantity=Decimal("0.001"),  # 50 USDT notional
+        )
+        result = manager.pre_trade_check(
+            order=order,
+            current_equity=Decimal("100000"),
+            open_positions=[existing],
+            daily_pnl=Decimal("0"),
+            peak_equity=Decimal("100000"),
+            market_price=None,  # no market_price; should fall back to position price
+        )
+        assert result.approved is True
+
+
+# ===========================================================================
+# Concentration cap — additional edge cases (new coverage)
+# ===========================================================================
+
+
+class TestConcentrationCapEdgeCases:
+    """
+    Edge cases for the per-symbol concentration cap inside _check_order_size
+    (lines 334-394 of risk_manager.py).
+    """
+
+    def test_existing_position_at_ceiling_blocks_additional_order(self) -> None:
+        """
+        When the existing position already equals the concentration ceiling,
+        remaining_value == 0, so the new order is blocked (lines 349-363).
+
+        Setup:
+            equity = 100 000 USDT
+            max_position_size_pct = 10%  → cap = 10 000 USDT
+            existing: 0.2 BTC * 50 000 = 10 000 USDT  (exactly at cap)
+        Any additional quantity has zero room and must be rejected.
+        """
+        manager = _make_manager(
+            max_position_size_pct=0.10,
+            max_order_size_quote=Decimal("100000"),
+            max_open_positions=5,
+        )
+        existing = _make_position(
+            symbol="BTC/USDT",
+            quantity=Decimal("0.2"),
+            current_price=Decimal("50000"),
+        )
+        order = _make_limit_order(
+            symbol="BTC/USDT",
+            quantity=Decimal("0.01"),
+            price=Decimal("50000"),
+        )
+        result = manager.pre_trade_check(
+            order=order,
+            current_equity=Decimal("100000"),
+            open_positions=[existing],
+            daily_pnl=Decimal("0"),
+            peak_equity=Decimal("100000"),
+        )
+        assert result.approved is False
+        assert any(
+            "concentration" in r.lower() for r in result.rejection_reasons
+        ), f"Expected concentration rejection, got: {result.rejection_reasons}"
+
+    def test_partial_concentration_room_reduces_quantity(self) -> None:
+        """
+        When some room remains under the concentration cap, quantity is
+        reduced to fit (lines 365-394 of risk_manager.py).  The order is
+        approved (warning, not block) with a smaller adjusted_quantity.
+
+        Setup:
+            equity = 100 000 USDT
+            max_position_size_pct = 10%  → cap = 10 000 USDT
+            existing: 0.16 BTC * 50 000 = 8 000 USDT  (room = 2 000)
+            order:    0.1  BTC * 50 000 = 5 000 USDT  (exceeds room)
+        Expected: approved=True, adjusted_quantity <= 0.04 BTC (2000/50000)
+        """
+        manager = _make_manager(
+            max_position_size_pct=0.10,
+            max_order_size_quote=Decimal("100000"),
+            max_open_positions=5,
+        )
+        existing = _make_position(
+            symbol="BTC/USDT",
+            quantity=Decimal("0.16"),
+            current_price=Decimal("50000"),
+        )
+        order = _make_limit_order(
+            symbol="BTC/USDT",
+            quantity=Decimal("0.1"),
+            price=Decimal("50000"),
+        )
+        result = manager.pre_trade_check(
+            order=order,
+            current_equity=Decimal("100000"),
+            open_positions=[existing],
+            daily_pnl=Decimal("0"),
+            peak_equity=Decimal("100000"),
+        )
+        assert result.approved is True
+        # Room = 2000 USDT → max quantity = 2000 / 50000 = 0.04 BTC
+        assert result.adjusted_quantity <= Decimal("0.04")
+        assert result.adjusted_quantity > Decimal("0")
+
+
+# ===========================================================================
+# Notional cap → zero (new coverage)
+# ===========================================================================
+
+
+class TestNotionalCapToZero:
+    """Tests for the blocking path when notional cap forces quantity to zero."""
+
+    def test_notional_cap_shrinks_quantity_to_zero_blocks_order(self) -> None:
+        """
+        When max_order_size_quote is so tight that quantizing the capped
+        quantity to 8 decimal places yields 0, the order is blocked with a
+        descriptive rejection reason (lines 307-319 of risk_manager.py).
+
+        max_order_size_quote = 0.000000001 USDT (1 nano-USDT)
+        capped_qty = 1e-9 / 50000 = 2e-14
+        2e-14 rounds DOWN to 0.00000000 at 8 d.p. → blocking.
+
+        Note: 0.001 USDT would give 0.00000002 BTC (2E-8) which is a valid
+        8-decimal quantity and only generates a warning, not a block.
+        """
+        manager = _make_manager(
+            max_order_size_quote=Decimal("0.000000001"),  # 1 nano-USDT: rounds to zero at 8 d.p.
+            max_open_positions=5,
+        )
+        order = _make_limit_order(
+            quantity=Decimal("1"),
+            price=Decimal("50000"),
+        )
+        result = manager.pre_trade_check(
+            order=order,
+            current_equity=Decimal("100000"),
+            open_positions=[],
+            daily_pnl=Decimal("0"),
+            peak_equity=Decimal("100000"),
+        )
+        assert result.approved is False
+        assert any(
+            "max_order_size" in r.lower()
+            or "notional" in r.lower()
+            or "cannot be reduced" in r.lower()
+            for r in result.rejection_reasons
+        ), f"Expected notional-cap blocking reason, got: {result.rejection_reasons}"
+
+
+# ===========================================================================
+# Multiple simultaneous violations (new coverage)
+# ===========================================================================
+
+
+class TestMultipleSimultaneousViolations:
+    """
+    Verify that pre_trade_check collects ALL blocking violations rather than
+    short-circuiting after the first one (lines 83-114 of risk_manager.py).
+    """
+
+    def test_multiple_violations_all_collected(self) -> None:
+        """
+        When kill switch, cooldown, max_positions, and daily_loss all fire
+        simultaneously, every violation must appear in rejection_reasons.
+
+        Setup:
+            - kill switch triggered manually
+            - cooldown active (loss_streak_count=1 → one loss triggers it)
+            - max_open_positions=1 with one existing position
+            - daily_pnl=-1000 vs threshold of -(0.05 * 10000) = -500
+        Expected: approved=False, at least 4 rejection reasons.
+        """
+        manager = _make_manager(
+            max_open_positions=1,
+            max_daily_loss_pct=0.05,
+            cooldown_after_loss_streak=5,
+            loss_streak_count=1,
+        )
+        # Activate kill switch
+        manager.trigger_kill_switch("test halt")
+        # Activate cooldown via one loss (loss_streak_count=1 means threshold is 1)
+        manager.update_after_fill(Decimal("-100"), is_loss=True)
+        assert manager.in_cooldown is True
+
+        order = _make_limit_order()
+        existing = _make_position(symbol="ETH/USDT")  # fills the single slot
+
+        result = manager.pre_trade_check(
+            order=order,
+            current_equity=Decimal("10000"),
+            open_positions=[existing],
+            daily_pnl=Decimal("-1000"),  # exceeds -500 threshold
+            peak_equity=Decimal("10000"),
+        )
+        assert result.approved is False
+        # All four checks must have fired: kill_switch + cooldown + max_positions + daily_loss
+        assert len(result.rejection_reasons) >= 4, (
+            f"Expected >= 4 rejection reasons, got {len(result.rejection_reasons)}: "
+            f"{result.rejection_reasons}"
+        )
+
+
+# ===========================================================================
+# RiskParameters validation (new coverage)
+# ===========================================================================
+
+
+class TestRiskParametersValidation:
+    """
+    Tests for the __post_init__ validator in RiskParameters
+    (lines 69-81 of risk.py).
+    """
+
+    def test_per_trade_risk_pct_above_maximum_raises(self) -> None:
+        """
+        per_trade_risk_pct > 0.05 (5%) is unsafe and must raise ValueError.
+        The error message must identify the field name.
+        """
+        with pytest.raises(ValueError, match="per_trade_risk_pct"):
+            RiskParameters(per_trade_risk_pct=0.10)
+
+    def test_per_trade_risk_pct_zero_raises(self) -> None:
+        """
+        per_trade_risk_pct == 0 is not allowed (must be strictly positive).
+        """
+        with pytest.raises(ValueError, match="per_trade_risk_pct"):
+            RiskParameters(per_trade_risk_pct=0.0)
+
+    def test_max_drawdown_pct_above_maximum_raises(self) -> None:
+        """
+        max_drawdown_pct > 0.50 (50%) is unsafe and must raise ValueError.
+        The error message must identify the field name.
+        """
+        with pytest.raises(ValueError, match="max_drawdown_pct"):
+            RiskParameters(max_drawdown_pct=0.60)
+
+    def test_valid_boundary_values_do_not_raise(self) -> None:
+        """
+        Boundary values at exactly the allowed maximums must not raise.
+        per_trade_risk_pct=0.05 and max_drawdown_pct=0.50 are both in range.
+        """
+        params = RiskParameters(per_trade_risk_pct=0.05, max_drawdown_pct=0.50)
+        assert params.per_trade_risk_pct == 0.05
+        assert params.max_drawdown_pct == 0.50
