@@ -59,6 +59,11 @@ router = APIRouter(prefix="/runs", tags=["runs"])
 logger = structlog.get_logger(__name__)
 
 # ---------------------------------------------------------------------------
+# Background task registry for paper/live trading engines
+# ---------------------------------------------------------------------------
+_RUN_TASKS: dict[str, asyncio.Task[None]] = {}
+
+# ---------------------------------------------------------------------------
 # Strategy registry — maps API names to strategy classes
 # Imported lazily inside the handler to avoid circular import issues.
 # ---------------------------------------------------------------------------
@@ -145,6 +150,157 @@ def _run_orm_to_detail_response(run: RunORM) -> RunDetailResponse:
             )
 
     return base
+
+
+async def _run_paper_engine(
+    *,
+    run_id_str: str,
+    strategy_cls: type,
+    strategy_name: str,
+    strategy_params: dict[str, Any],
+    symbols: list[str],
+    timeframe: TimeFrame,
+    initial_capital: float,
+) -> None:
+    """
+    Background coroutine that runs a paper trading engine for a single run.
+
+    Creates all trading components, starts the StrategyEngine, and runs the
+    live loop until stopped or errored. On exit, updates the run record in
+    the database with the final status.
+
+    This function uses its own database session (not the request session)
+    because the POST handler's session is closed before this coroutine runs.
+
+    Parameters
+    ----------
+    run_id_str:
+        String representation of the run UUID.
+    strategy_cls:
+        Strategy class to instantiate.
+    strategy_name:
+        Human-readable strategy name (used for strategy_id construction).
+    strategy_params:
+        Parameters to pass to the strategy constructor.
+    symbols:
+        CCXT-format trading pairs to trade.
+    timeframe:
+        Candle timeframe for the strategy.
+    initial_capital:
+        Starting capital in quote currency (will be converted to Decimal).
+    """
+    from api.config import get_settings
+    from api.db.models import RunORM
+    from api.db.session import get_session_factory
+    from common.types import RunMode
+    from data.services.ccxt_market_data import CCXTMarketDataService
+    from trading.engines.paper import PaperExecutionEngine
+    from trading.portfolio import PortfolioAccounting
+    from trading.risk_manager import DefaultRiskManager
+    from trading.strategy_engine import StrategyEngine
+
+    log = logger.bind(run_id=run_id_str, mode="paper")
+    log.info("runs.paper_engine_starting")
+
+    final_status = "stopped"
+    engine: StrategyEngine | None = None
+
+    try:
+        settings = get_settings()
+        capital = Decimal(str(initial_capital))
+
+        # Extract exchange credentials
+        api_key: str | None = None
+        api_secret: str | None = None
+        if settings.exchange_api_key is not None:
+            api_key = settings.exchange_api_key.get_secret_value()
+        if settings.exchange_api_secret is not None:
+            api_secret = settings.exchange_api_secret.get_secret_value()
+
+        # Instantiate components
+        market_data = CCXTMarketDataService(
+            exchange_id=settings.exchange_id,
+            api_key=api_key,
+            api_secret=api_secret,
+            cache_ttl_seconds=60,
+        )
+        risk_manager = DefaultRiskManager(run_id=run_id_str)
+        execution = PaperExecutionEngine(
+            run_id=run_id_str,
+            risk_manager=risk_manager,
+            initial_cash=capital,
+        )
+        portfolio = PortfolioAccounting(
+            run_id=run_id_str,
+            initial_cash=capital,
+        )
+        strategy_instance = strategy_cls(
+            strategy_id=f"{strategy_name}-{run_id_str.replace('-', '')[:8]}",
+            params=strategy_params,
+        )
+
+        engine = StrategyEngine(
+            strategies=[strategy_instance],
+            execution_engine=execution,
+            risk_manager=risk_manager,
+            market_data=market_data,
+            portfolio=portfolio,
+            symbols=symbols,
+            timeframe=timeframe,
+            run_mode=RunMode.PAPER,
+        )
+
+        await engine.start(run_id_str)
+        log.info("runs.paper_engine_running")
+        await engine.run_live_loop()
+
+    except asyncio.CancelledError:
+        log.info("runs.paper_engine_cancelled")
+        if engine is not None:
+            try:
+                await engine.stop()
+            except Exception:
+                log.exception("runs.paper_engine_stop_error")
+        raise  # Must re-raise CancelledError for asyncio bookkeeping
+
+    except Exception:
+        final_status = "error"
+        log.exception("runs.paper_engine_error")
+        if engine is not None:
+            try:
+                await engine.stop()
+            except Exception:
+                log.exception("runs.paper_engine_stop_error")
+
+    finally:
+        # Remove from task registry
+        _RUN_TASKS.pop(run_id_str, None)
+
+        # Update run status in DB using an isolated session
+        try:
+            factory = get_session_factory()
+            async with factory() as db:
+                try:
+                    from sqlalchemy import select as sa_select
+                    result = await db.execute(
+                        sa_select(RunORM).where(RunORM.id == uuid.UUID(run_id_str))
+                    )
+                    run = result.scalar_one_or_none()
+                    if run is not None and run.status == "running":
+                        now = datetime.now(tz=UTC)
+                        run.status = final_status
+                        run.stopped_at = now
+                        run.updated_at = now
+                        await db.commit()
+                        log.info(
+                            "runs.paper_engine_status_updated",
+                            final_status=final_status,
+                        )
+                except Exception:
+                    await db.rollback()
+                    log.exception("runs.paper_engine_db_update_failed")
+        except Exception:
+            log.exception("runs.paper_engine_db_session_failed")
 
 
 # ---------------------------------------------------------------------------
@@ -696,17 +852,23 @@ async def create_run(
             ) from exc
 
     # ------------------------------------------------------------------
-    # PAPER MODE — stub: record created with status="running"
-    # TODO Sprint 2: Launch StrategyEngine in paper mode as a background
-    # task using asyncio.create_task() or a task queue (Celery/ARQ).
-    # Update run.status to "stopped" or "error" when the task terminates.
+    # PAPER MODE — launch StrategyEngine as a background asyncio.Task
     # ------------------------------------------------------------------
     elif mode_value == "paper":
-        log.info(
-            "runs.paper_mode_stub",
-            run_id=str(run_id),
-            note="Paper mode engine not yet wired — Sprint 2",
+        task = asyncio.create_task(
+            _run_paper_engine(
+                run_id_str=str(run_id),
+                strategy_cls=strategy_cls,
+                strategy_name=strategy_name,
+                strategy_params=body.strategy_params,
+                symbols=body.symbols,
+                timeframe=timeframe,
+                initial_capital=body.initial_capital,
+            ),
+            name=f"paper-engine-{run_id}",
         )
+        _RUN_TASKS[str(run_id)] = task
+        log.info("runs.paper_engine_task_created", run_id=str(run_id))
 
     # ------------------------------------------------------------------
     # LIVE MODE — stub: record created with status="running"
@@ -914,6 +1076,12 @@ async def stop_run(
     run.updated_at = now
 
     await db.flush()
+
+    # Cancel the background task if one exists for this run
+    task = _RUN_TASKS.pop(str(run_id), None)
+    if task is not None and not task.done():
+        task.cancel()
+        log.info("runs.paper_engine_task_cancelled", run_id=str(run_id))
 
     log.info("runs.stopped", run_id=str(run_id))
     return _run_orm_to_detail_response(run)

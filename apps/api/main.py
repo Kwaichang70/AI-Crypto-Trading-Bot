@@ -120,6 +120,23 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # ------------------------------------------------------------------
     log.info("api.shutting_down")
 
+    # Cancel all active paper/live trading engine tasks
+    import asyncio
+
+    from api.routers.runs import _RUN_TASKS
+
+    active_tasks = [t for t in _RUN_TASKS.values() if not t.done()]
+    if active_tasks:
+        log.info("api.cancelling_engine_tasks", count=len(active_tasks))
+        for task in active_tasks:
+            task.cancel()
+        done, pending = await asyncio.wait(active_tasks, timeout=30.0)
+        if pending:
+            log.warning(
+                "api.engine_tasks_timeout",
+                pending_count=len(pending),
+            )
+
     # Close all pooled database connections gracefully
     from api.db.session import dispose_engine
 
