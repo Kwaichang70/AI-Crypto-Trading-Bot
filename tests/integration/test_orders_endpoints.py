@@ -30,16 +30,16 @@ _assert_run_exists() pattern (first execute() call in every handler):
 list_orders (3 execute() calls total):
     Call 0 → _assert_run_exists  : scalar_one()       returns int (1 or 0)
     Call 1 → COUNT query         : scalar_one()       returns int total
-    Call 2 → page query          : scalars().all()    returns list[OrderORM]
+    Call 2 → page query          : scalars().all()    returns list[SimpleNamespace]
 
 get_order (2 execute() calls total):
     Call 0 → _assert_run_exists  : scalar_one()          returns int (1 or 0)
-    Call 1 → fetch order         : scalar_one_or_none()  returns OrderORM | None
+    Call 1 → fetch order         : scalar_one_or_none()  returns SimpleNamespace | None
 
 list_fills (3 execute() calls total):
     Call 0 → _assert_run_exists  : scalar_one()       returns int (1 or 0)
     Call 1 → COUNT with JOIN     : scalar_one()       returns int total
-    Call 2 → page with JOIN      : scalars().all()    returns list[FillORM]
+    Call 2 → page with JOIN      : scalars().all()    returns list[SimpleNamespace]
 
 Decimal serialisation
 ---------------------
@@ -60,7 +60,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from fastapi.testclient import TestClient
 
-from api.db.models import FillORM, OrderORM
+from types import SimpleNamespace
 
 
 # ---------------------------------------------------------------------------
@@ -97,30 +97,27 @@ def _make_order_orm(
     exchange_order_id: str | None = "EX-ORDER-001",
     created_at: datetime = _FIXED_NOW,
     updated_at: datetime = _FIXED_NOW,
-) -> OrderORM:
+) -> SimpleNamespace:
     """
-    Construct an OrderORM instance suitable for use as a mock DB result.
-
-    Attributes are set directly on a non-instrumented instance to bypass
-    SQLAlchemy column machinery.  This is safe for testing because
-    _order_orm_to_response() reads attributes directly (no ORM loading).
+    Construct a SimpleNamespace with the same attribute surface as OrderORM,
+    suitable for Pydantic from_attributes=True serialization.
     """
-    order = OrderORM.__new__(OrderORM)
-    order.id = order_id
-    order.client_order_id = client_order_id
-    order.run_id = run_id
-    order.symbol = symbol
-    order.side = side
-    order.order_type = order_type
-    order.quantity = quantity
-    order.price = price
-    order.status = status
-    order.filled_quantity = filled_quantity
-    order.average_fill_price = average_fill_price
-    order.exchange_order_id = exchange_order_id
-    order.created_at = created_at
-    order.updated_at = updated_at
-    return order
+    return SimpleNamespace(
+        id=order_id,
+        client_order_id=client_order_id,
+        run_id=run_id,
+        symbol=symbol,
+        side=side,
+        order_type=order_type,
+        quantity=quantity,
+        price=price,
+        status=status,
+        filled_quantity=filled_quantity,
+        average_fill_price=average_fill_price,
+        exchange_order_id=exchange_order_id,
+        created_at=created_at,
+        updated_at=updated_at,
+    )
 
 
 def _make_fill_orm(
@@ -135,26 +132,23 @@ def _make_fill_orm(
     fee_currency: str = "USDT",
     is_maker: bool = False,
     executed_at: datetime = _FIXED_NOW,
-) -> FillORM:
+) -> SimpleNamespace:
     """
-    Construct a FillORM instance suitable for use as a mock DB result.
-
-    Attributes are set directly on a non-instrumented instance to bypass
-    SQLAlchemy column machinery.  This is safe for testing because
-    _fill_orm_to_response() reads attributes directly (no ORM loading).
+    Construct a SimpleNamespace with the same attribute surface as FillORM,
+    suitable for Pydantic from_attributes=True serialization.
     """
-    fill = FillORM.__new__(FillORM)
-    fill.id = fill_id
-    fill.order_id = order_id
-    fill.symbol = symbol
-    fill.side = side
-    fill.quantity = quantity
-    fill.price = price
-    fill.fee = fee
-    fill.fee_currency = fee_currency
-    fill.is_maker = is_maker
-    fill.executed_at = executed_at
-    return fill
+    return SimpleNamespace(
+        id=fill_id,
+        order_id=order_id,
+        symbol=symbol,
+        side=side,
+        quantity=quantity,
+        price=price,
+        fee=fee,
+        fee_currency=fee_currency,
+        is_maker=is_maker,
+        executed_at=executed_at,
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -60,7 +60,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from fastapi.testclient import TestClient
 
-from api.db.models import EquitySnapshotORM, RunORM, TradeORM
+from types import SimpleNamespace
 
 
 # ---------------------------------------------------------------------------
@@ -93,15 +93,10 @@ def _make_run_orm(
     stopped_at: datetime | None = None,
     created_at: datetime = _FIXED_NOW,
     updated_at: datetime = _FIXED_NOW,
-) -> RunORM:
+) -> SimpleNamespace:
     """
-    Construct a RunORM instance suitable for use as a mock DB result.
-
-    We bypass SQLAlchemy's column instrumentation by setting attributes
-    directly on a non-instrumented instance via __new__.  This pattern is
-    safe because Pydantic schemas read attributes with from_attributes=True,
-    and the API handlers access ORM fields by attribute access (not via the
-    SQLAlchemy mapper).
+    Construct a SimpleNamespace with the same attribute surface as RunORM,
+    suitable for Pydantic from_attributes=True serialization.
 
     Parameters
     ----------
@@ -122,23 +117,23 @@ def _make_run_orm(
     updated_at:
         Row last-update timestamp.
     """
-    run = RunORM.__new__(RunORM)
-    run.id = run_id
-    run.run_mode = run_mode
-    run.status = status
-    run.config = {
-        "strategy_name": "ma_crossover",
-        "strategy_params": {"fast_period": 10, "slow_period": 50},
-        "symbols": ["BTC/USDT"],
-        "timeframe": "1h",
-        "mode": run_mode,
-        "initial_capital": initial_capital,
-    }
-    run.started_at = started_at
-    run.stopped_at = stopped_at
-    run.created_at = created_at
-    run.updated_at = updated_at
-    return run
+    return SimpleNamespace(
+        id=run_id,
+        run_mode=run_mode,
+        status=status,
+        config={
+            "strategy_name": "ma_crossover",
+            "strategy_params": {"fast_period": 10, "slow_period": 50},
+            "symbols": ["BTC/USDT"],
+            "timeframe": "1h",
+            "mode": run_mode,
+            "initial_capital": initial_capital,
+        },
+        started_at=started_at,
+        stopped_at=stopped_at,
+        created_at=created_at,
+        updated_at=updated_at,
+    )
 
 
 def _make_equity_snapshot_orm(
@@ -152,12 +147,11 @@ def _make_equity_snapshot_orm(
     drawdown_pct: str = "0.02",
     bar_index: int = 99,
     timestamp: datetime = _FIXED_NOW,
-) -> EquitySnapshotORM:
+) -> SimpleNamespace:
     """
-    Construct an EquitySnapshotORM instance with all fields set directly.
-
-    The ORM is instantiated via __new__ to bypass SQLAlchemy instrumentation,
-    matching the pattern used in _make_run_orm.
+    Construct a SimpleNamespace with the same attribute surface as
+    EquitySnapshotORM, suitable for Pydantic from_attributes=True
+    serialization.
 
     Parameters
     ----------
@@ -180,17 +174,17 @@ def _make_equity_snapshot_orm(
     timestamp:
         UTC timestamp for this snapshot.
     """
-    snap = EquitySnapshotORM.__new__(EquitySnapshotORM)
-    snap.id = snap_id
-    snap.run_id = run_id
-    snap.equity = Decimal(equity)
-    snap.cash = Decimal(cash)
-    snap.unrealised_pnl = Decimal(unrealised_pnl)
-    snap.realised_pnl = Decimal(realised_pnl)
-    snap.drawdown_pct = Decimal(drawdown_pct)
-    snap.bar_index = bar_index
-    snap.timestamp = timestamp
-    return snap
+    return SimpleNamespace(
+        id=snap_id,
+        run_id=run_id,
+        equity=Decimal(equity),
+        cash=Decimal(cash),
+        unrealised_pnl=Decimal(unrealised_pnl),
+        realised_pnl=Decimal(realised_pnl),
+        drawdown_pct=Decimal(drawdown_pct),
+        bar_index=bar_index,
+        timestamp=timestamp,
+    )
 
 
 def _make_trade_orm(
@@ -207,11 +201,10 @@ def _make_trade_orm(
     entry_at: datetime = _FIXED_ENTRY,
     exit_at: datetime = _FIXED_EXIT,
     strategy_id: str = "ma_crossover_v1",
-) -> TradeORM:
+) -> SimpleNamespace:
     """
-    Construct a TradeORM instance with all fields set directly.
-
-    Uses __new__ to bypass SQLAlchemy instrumentation.
+    Construct a SimpleNamespace with the same attribute surface as TradeORM,
+    suitable for Pydantic from_attributes=True serialization.
 
     Parameters
     ----------
@@ -240,20 +233,20 @@ def _make_trade_orm(
     strategy_id:
         Identifier of the strategy that generated the opening signal.
     """
-    trade = TradeORM.__new__(TradeORM)
-    trade.id = trade_id
-    trade.run_id = run_id
-    trade.symbol = symbol
-    trade.side = side
-    trade.entry_price = Decimal(entry_price)
-    trade.exit_price = Decimal(exit_price)
-    trade.quantity = Decimal(quantity)
-    trade.realised_pnl = Decimal(realised_pnl)
-    trade.total_fees = Decimal(total_fees)
-    trade.entry_at = entry_at
-    trade.exit_at = exit_at
-    trade.strategy_id = strategy_id
-    return trade
+    return SimpleNamespace(
+        id=trade_id,
+        run_id=run_id,
+        symbol=symbol,
+        side=side,
+        entry_price=Decimal(entry_price),
+        exit_price=Decimal(exit_price),
+        quantity=Decimal(quantity),
+        realised_pnl=Decimal(realised_pnl),
+        total_fees=Decimal(total_fees),
+        entry_at=entry_at,
+        exit_at=exit_at,
+        strategy_id=strategy_id,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -354,8 +347,8 @@ def _make_row_result(
 # ---------------------------------------------------------------------------
 
 def _portfolio_side_effect_with_data(
-    run_orm: RunORM,
-    snapshot_orm: EquitySnapshotORM,
+    run_orm: SimpleNamespace,
+    snapshot_orm: SimpleNamespace,
     total_trades: int = 5,
     total_realised_pnl: Decimal = Decimal("500.00"),
     total_fees_paid: Decimal = Decimal("25.00"),
@@ -391,7 +384,7 @@ def _portfolio_side_effect_with_data(
     ]
 
 
-def _portfolio_side_effect_empty_run(run_orm: RunORM) -> list:
+def _portfolio_side_effect_empty_run(run_orm: SimpleNamespace) -> list:
     """
     Build the 8-element side_effect list for a portfolio summary request with
     no trades and no equity snapshots.

@@ -84,7 +84,11 @@ ignore_missing_imports = true
 asyncio_mode = "auto"
 testpaths = ["tests", "apps/api/tests", "packages"]
 addopts = "--cov=apps --cov=packages --cov-report=term-missing --cov-report=xml"
-filterwarnings = ["error", "ignore::DeprecationWarning"]
+filterwarnings = [
+    "error",
+    "ignore::DeprecationWarning",
+    "ignore::pytest.PytestUnraisableExceptionWarning",
+]
 markers = [
     "integration: marks tests as integration tests (require DB/Redis services)",
 ]

@@ -27,11 +27,11 @@ Mock wiring summary
 -------------------
   list_runs:  db.execute() is called twice (count then page).
               Call 0  → scalar_one() returns an integer count.
-              Call 1  → scalars().all() returns a list of RunORM objects.
+              Call 1  → scalars().all() returns a list of SimpleNamespace objects.
 
   get_run / stop_run:
               db.execute() is called once.
-              scalar_one_or_none() returns a RunORM or None.
+              scalar_one_or_none() returns a SimpleNamespace or None.
 
   create_run (paper mode):
               db.add(), db.flush() are no-ops.
@@ -49,8 +49,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
-
-from api.db.models import RunORM
 
 
 # ---------------------------------------------------------------------------
@@ -85,32 +83,28 @@ def _make_run_orm(
     stopped_at: datetime | None = None,
     created_at: datetime = _FIXED_NOW,
     updated_at: datetime = _FIXED_NOW,
-) -> RunORM:
+) -> SimpleNamespace:
     """
-    Construct a RunORM instance suitable for use as a mock DB result.
-
-    We bypass SQLAlchemy's column machinery by setting attributes directly
-    on a non-instrumented instance.  This is safe for testing because the
-    Pydantic schemas read attributes via ``model_validate(run)`` which uses
-    ``from_attributes=True`` (standard ORM mode).
+    Construct a SimpleNamespace with the same attribute surface as RunORM,
+    suitable for Pydantic from_attributes=True serialization.
     """
-    run = RunORM.__new__(RunORM)
-    run.id = run_id
-    run.run_mode = run_mode
-    run.status = status
-    run.config = config or {
-        "strategy_name": "ma_crossover",
-        "strategy_params": {},
-        "symbols": ["BTC/USDT"],
-        "timeframe": "1h",
-        "mode": run_mode,
-        "initial_capital": "10000.00",
-    }
-    run.started_at = started_at
-    run.stopped_at = stopped_at
-    run.created_at = created_at
-    run.updated_at = updated_at
-    return run
+    return SimpleNamespace(
+        id=run_id,
+        run_mode=run_mode,
+        status=status,
+        config=config or {
+            "strategy_name": "ma_crossover",
+            "strategy_params": {},
+            "symbols": ["BTC/USDT"],
+            "timeframe": "1h",
+            "mode": run_mode,
+            "initial_capital": "10000.00",
+        },
+        started_at=started_at,
+        stopped_at=stopped_at,
+        created_at=created_at,
+        updated_at=updated_at,
+    )
 
 
 # ---------------------------------------------------------------------------
