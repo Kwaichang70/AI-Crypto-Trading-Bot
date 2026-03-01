@@ -69,6 +69,7 @@ from fastapi.responses import JSONResponse
 from limits import parse as parse_limit  # CR-RL-009: module-level import
 from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
+from slowapi.wrappers import Limit
 from starlette.status import HTTP_429_TOO_MANY_REQUESTS
 
 from api.config import Settings, get_settings
@@ -196,12 +197,36 @@ _EXEMPT_PATHS: frozenset[str] = frozenset({
 
 
 # ---------------------------------------------------------------------------
+# Limit wrapper — bridges limits.RateLimitItem to slowapi.wrappers.Limit
+# ---------------------------------------------------------------------------
+
+def _make_slowapi_limit(parsed_limit: Any) -> Limit:
+    """Wrap a ``limits.RateLimitItem`` in a ``slowapi.wrappers.Limit``.
+
+    ``RateLimitExceeded.__init__`` requires a ``Limit`` object (not a raw
+    ``RateLimitItem``).  Passing the wrong type causes an ``AttributeError``
+    on ``limit.error_message`` inside the constructor.
+    """
+    return Limit(
+        limit=parsed_limit,
+        key_func=get_client_ip,
+        scope="",
+        per_method=False,
+        methods=None,
+        error_message=None,
+        exempt_when=None,
+        cost=1,
+        override_defaults=False,
+    )
+
+
+# ---------------------------------------------------------------------------
 # 429 error handler — structured JSON response with Retry-After
 # ---------------------------------------------------------------------------
 
 def _rate_limit_exceeded_handler(
     request: Request,
-    exc: RateLimitExceeded,
+    exc: Exception,
 ) -> Response:
     """
     Custom handler for 429 Too Many Requests responses.
@@ -228,8 +253,10 @@ def _rate_limit_exceeded_handler(
     JSONResponse
         A 429 response with structured error body and Retry-After header.
     """
+    rate_exc = cast(RateLimitExceeded, exc)
+
     # Parse retry window from the exception's limit string
-    retry_after = _parse_retry_after(str(exc.detail))
+    retry_after = _parse_retry_after(str(rate_exc.detail))
 
     settings = get_settings()
     client_ip = get_client_ip(request, trusted_proxy_count=settings.trusted_proxy_count)
@@ -239,7 +266,7 @@ def _rate_limit_exceeded_handler(
         client=client_ip,
         path=request.url.path,
         method=request.method,
-        limit=str(exc.detail),
+        limit=str(rate_exc.detail),
         retry_after=retry_after,
     )
 
@@ -247,7 +274,7 @@ def _rate_limit_exceeded_handler(
         status_code=HTTP_429_TOO_MANY_REQUESTS,
         content={
             "error": "rate_limit_exceeded",
-            "detail": f"Rate limit exceeded: {exc.detail}",
+            "detail": f"Rate limit exceeded: {rate_exc.detail}",
             "retry_after": retry_after,
         },
         headers={
@@ -366,8 +393,8 @@ async def _rate_limit_middleware(request: Request, call_next: Any) -> Response:
         hit = strategy.hit(parsed_limit, rate_key)
 
         if not hit:
-            # CR-RL-003: Pass the RateLimitItem object, not a plain string.
-            raise RateLimitExceeded(parsed_limit)
+            # CR-RL-003: Wrap in a Limit object as RateLimitExceeded requires.
+            raise RateLimitExceeded(_make_slowapi_limit(parsed_limit))
 
     except RateLimitExceeded as exc:
         return _rate_limit_exceeded_handler(request, exc)
@@ -473,7 +500,7 @@ def check_auth_failure_rate(request: Request) -> None:
                 path=request.url.path,
                 limit=settings.rate_limit_auth_failures,
             )
-            raise RateLimitExceeded(parsed_limit)
+            raise RateLimitExceeded(_make_slowapi_limit(parsed_limit))
 
     except RateLimitExceeded:
         raise
