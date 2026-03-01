@@ -153,7 +153,7 @@ _SUMMARY_MAP: dict[str, str] = {
 # Custom collector — pull-on-scrape bridge
 # ---------------------------------------------------------------------------
 
-class TradingBotCollector(Collector):  # type: ignore[misc]  # prometheus_client ships no stubs
+class TradingBotCollector(Collector):
     """
     Prometheus collector that bridges MetricsCollector to Prometheus format.
 
@@ -262,7 +262,7 @@ class TradingBotCollector(Collector):  # type: ignore[misc]  # prometheus_client
                 labels=label_names,
             )
             label_values = [labels.get(k, "") for k in label_names]
-            family.add_metric(label_values, count=count, sum_value=total)
+            family.add_metric(label_values, count_value=count, sum_value=total)
             yield family
 
 

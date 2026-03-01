@@ -160,7 +160,7 @@ async def _run_paper_engine(
     strategy_params: dict[str, Any],
     symbols: list[str],
     timeframe: TimeFrame,
-    initial_capital: float,
+    initial_capital: str,
 ) -> None:
     """
     Background coroutine that runs a paper trading engine for a single run.
@@ -207,7 +207,7 @@ async def _run_paper_engine(
 
     try:
         settings = get_settings()
-        capital = Decimal(str(initial_capital))
+        capital = Decimal(initial_capital)
 
         # Extract exchange credentials
         api_key: str | None = None
