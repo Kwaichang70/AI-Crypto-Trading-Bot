@@ -560,6 +560,11 @@ class CCXTMarketDataService(BaseMarketDataService):
                 await asyncio.sleep(wait)
                 last_exc = exc
 
+            except ccxt_async.ExchangeNotAvailable as exc:
+                raise MarketDataError(
+                    f"Exchange '{self._exchange_id}' is currently unavailable: {exc}"
+                ) from exc
+
             except ccxt_async.NetworkError as exc:
                 wait = self._backoff(attempt)
                 self._log.warning(
@@ -586,11 +591,6 @@ class CCXTMarketDataService(BaseMarketDataService):
             except ccxt_async.BadRequest as exc:
                 raise DataNotAvailableError(
                     f"Bad request for {symbol!r} / {timeframe.value}: {exc}"
-                ) from exc
-
-            except ccxt_async.ExchangeNotAvailable as exc:
-                raise MarketDataError(
-                    f"Exchange '{self._exchange_id}' is currently unavailable: {exc}"
                 ) from exc
 
             except ccxt_async.ExchangeError as exc:
