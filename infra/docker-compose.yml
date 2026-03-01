@@ -149,7 +149,7 @@ services:
       interval: 15s
       timeout: 5s
       retries: 5
-      start_period: 40s
+      start_period: 60s
     # Graceful shutdown — give FastAPI time to drain in-flight requests
     stop_grace_period: 30s
     deploy:

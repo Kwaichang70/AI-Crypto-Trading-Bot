@@ -3,7 +3,8 @@
 # Build context: project root (one level above infra/)
 #
 # Stages:
-#   deps     — install uv and resolve/install Python dependencies
+#   deps     — install uv and resolve/install all Python dependencies
+#              via `uv sync --frozen` using the workspace lockfile
 #   runtime  — slim production image, non-root user, no build tools
 #
 # Build:
@@ -17,88 +18,126 @@ ARG PYTHON_VERSION=3.11
 
 # -----------------------------------------------------------------------------
 # Stage 1: deps — install uv, resolve and install all Python dependencies
-# Using the full slim image here so pip/uv can compile C extensions if needed
+# Using the full slim image here so uv can compile C extensions if needed.
+# All three workspace packages (common, trading, data) are installed alongside
+# the api package's third-party deps using `uv sync --frozen --no-dev`.
 # -----------------------------------------------------------------------------
 FROM python:${PYTHON_VERSION}-slim AS deps
 
-# Install system packages required for compiling common Python deps
-# (libpq-dev for psycopg2, curl for health check in base images)
+# Install system packages required for compiling common Python deps.
+# build-essential: C compiler for native extensions
+# libpq-dev: asyncpg/psycopg2 C extension compilation
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         curl \
         libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Install uv — the fast Rust-based Python package manager
-# Pin to a specific version for reproducible builds
+# Install uv — the fast Rust-based Python package manager.
+# Pin to a specific version for reproducible builds across CI and local dev.
 ENV UV_VERSION=0.5.18
 RUN curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | sh
 ENV PATH="/root/.cargo/bin:/root/.local/bin:${PATH}"
 
+# Tell uv where to create/use the virtual environment.
+# This makes the subsequent COPY --from=deps predictable regardless of
+# which directory uv sync is invoked from.
+ENV UV_PROJECT_ENVIRONMENT=/build/.venv
+
 WORKDIR /build
 
+# ---------------------------------------------------------------------------
 # Copy dependency manifests first — maximise Docker layer cache reuse.
-# Only invalidated when pyproject.toml or uv.lock changes.
-COPY apps/api/pyproject.toml apps/api/uv.lock* ./apps/api/
-# Copy any shared packages that the API depends on
-COPY packages/ ./packages/
+# This layer is only invalidated when pyproject.toml or uv.lock changes.
+# The workspace root pyproject.toml is required for [tool.uv.workspace]
+# member discovery. The root uv.lock pins all transitive deps.
+# ---------------------------------------------------------------------------
+COPY pyproject.toml uv.lock ./
+COPY apps/api/pyproject.toml ./apps/api/
+COPY packages/common/pyproject.toml ./packages/common/
+COPY packages/trading/pyproject.toml ./packages/trading/
+COPY packages/data/pyproject.toml ./packages/data/
 
-# Create a virtual environment inside /build/.venv
-# --no-cache: keep image lean; deps are already locked
-RUN uv venv /build/.venv \
-    && uv pip install --python /build/.venv/bin/python \
-       --no-cache \
-       fastapi "uvicorn[standard]" "sqlalchemy[asyncio]" asyncpg alembic \
-       pydantic pydantic-settings structlog httpx redis ccxt \
-       pandas numpy 2>/dev/null || \
-    echo "Dependency install failed — check pyproject.toml"
+# ---------------------------------------------------------------------------
+# Copy workspace member source trees.
+# uv installs workspace packages (common, trading, data, api) from their
+# local source trees — they are not on PyPI. Source must be present before
+# uv sync runs.
+# ---------------------------------------------------------------------------
+COPY packages/ ./packages/
+COPY apps/api/ ./apps/api/
+
+# ---------------------------------------------------------------------------
+# Install all dependencies from the frozen lockfile.
+# --frozen:       do not re-resolve or update uv.lock; fail if lock is stale
+# --no-dev:       exclude root [tool.uv] dev-dependencies (pytest, ruff, mypy)
+# --no-editable:  install workspace packages as proper wheels into site-packages
+#                 (editable installs embed /build/ paths that break across stages)
+# --project:      workspace root is /build (contains pyproject.toml + uv.lock)
+#
+# NOTE: No error swallowing. If this RUN step fails, the Docker build fails.
+# This is intentional — a broken venv must never reach the runtime stage.
+# ---------------------------------------------------------------------------
+RUN uv sync --frozen --no-dev --no-editable --project /build
 
 # -----------------------------------------------------------------------------
 # Stage 2: runtime — minimal production image
-# No build tools, no root, smallest possible attack surface
+# No build tools, no root, smallest possible attack surface.
+# Only runtime system libs, the pre-built venv, and application source.
 # -----------------------------------------------------------------------------
 FROM python:${PYTHON_VERSION}-slim AS runtime
 
-# Runtime-only system deps (libpq for psycopg2 runtime, curl for healthcheck)
+# Runtime-only system deps.
+# libpq5: asyncpg runtime (links against libpq at runtime, not compile time)
+# curl: used by HEALTHCHECK CMD
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libpq5 \
         curl \
-    && rm -rf /var/lib/apt/lists/* \
-    && apt-get clean
+    && rm -rf /var/lib/apt/lists/*
 
-# Create a non-root user and group
+# Create a non-root user and group.
+# UID/GID 1001 avoids conflict with common system UIDs.
 RUN groupadd --gid 1001 appgroup \
-    && useradd --uid 1001 --gid 1001 --no-create-home --shell /bin/bash appuser
+    && useradd --uid 1001 --gid 1001 --no-create-home --shell /sbin/nologin appuser
 
 WORKDIR /app
 
-# Copy the pre-built virtual environment from the deps stage
+# Copy the pre-built virtual environment from the deps stage.
 COPY --from=deps /build/.venv /app/.venv
 
-# Prepend venv bin to PATH so `python` and `uvicorn` resolve without activation
+# Prepend venv bin to PATH so `python` and `uvicorn` resolve without activation.
 ENV PATH="/app/.venv/bin:${PATH}" \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH="/app:/app/packages"
 
-# Copy application source code
-# Done after dependencies to preserve cache when only app code changes
+# Copy application source — after venv copy to preserve layer cache
+# when only app code changes (not dependencies).
 COPY --chown=appuser:appgroup apps/api/ ./api/
 COPY --chown=appuser:appgroup packages/ ./packages/
 
-# Switch to non-root user before the final layer
+# Copy Alembic migration configuration and scripts.
+# The entrypoint runs `alembic upgrade head` before starting uvicorn,
+# ensuring fresh deployments never hit UndefinedTableError.
+COPY --chown=appuser:appgroup infra/alembic/ ./infra/alembic/
+
+# Copy the Docker entrypoint script and make it executable.
+COPY --chown=appuser:appgroup infra/docker-entrypoint.sh ./entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
+# Switch to non-root user. Alembic only needs DB credentials via env var.
 USER appuser
 
-# Expose the application port (informational; actual binding via env var)
 EXPOSE 8000
 
-# Health check — calls the /health endpoint defined in the FastAPI app
-# start_period gives the app time to initialize before failures count
-HEALTHCHECK --interval=15s --timeout=5s --start-period=40s --retries=3 \
+# start_period accounts for migration time on first deploy.
+HEALTHCHECK --interval=15s --timeout=5s --start-period=60s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
-# Graceful shutdown: uvicorn handles SIGTERM with --timeout-graceful-shutdown
-# Workers=1 for MVP; adjust via UVICORN_WORKERS env var for horizontal scale
+# ENTRYPOINT runs migrations then exec's CMD (uvicorn), making uvicorn PID 1.
+ENTRYPOINT ["/app/entrypoint.sh"]
+
+# Graceful shutdown: uvicorn handles SIGTERM with --timeout-graceful-shutdown.
 CMD ["uvicorn", \
      "api.main:app", \
      "--host", "0.0.0.0", \
