@@ -55,9 +55,16 @@ def configure_structlog(log_level: str = "INFO", *, json_logs: bool = True) -> N
         When True, renders logs as JSON suitable for log aggregators.
         When False, renders coloured console output for local development.
     """
+    def _add_logger_name_safe(
+        logger: Any, method_name: str, event_dict: dict[str, Any],
+    ) -> dict[str, Any]:
+        """add_logger_name that tolerates PrintLogger (no .name attr)."""
+        event_dict.setdefault("logger", getattr(logger, "name", None))
+        return event_dict
+
     shared_processors: list[Any] = [
         structlog.contextvars.merge_contextvars,
-        structlog.stdlib.add_logger_name,
+        _add_logger_name_safe,
         structlog.stdlib.add_log_level,
         structlog.processors.TimeStamper(fmt="iso", utc=True),
         structlog.processors.StackInfoRenderer(),
