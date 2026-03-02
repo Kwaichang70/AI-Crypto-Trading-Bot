@@ -122,3 +122,14 @@
   - [x] P0: Fix RateLimitExceeded constructor + rate_limit mypy errors — fixes 2 tests + 3 mypy errors
   - [x] P0: Fix prometheus.py count_value kwarg + runs.py initial_capital type — fixes 3 mypy errors
   - [x] P0: Update MEMORY.md + CLAUDE.local.md for Sprint 10
+
+### 11. AI Crypto Trading Bot — Sprint 11 (Paper Engine Equity Persistence + Portfolio Fix)
+- **Plan:** `.claude/plans/eventual-wandering-lecun.md`
+- **Status:** COMPLETE
+- **Orchestration Checklist:**
+  - [x] P0: Persist paper engine equity curve + trades to DB on stop (_persist_paper_results in runs.py)
+  - [x] P0: Fix portfolio endpoint daily_pnl (real DB query) + open_positions (unrealised_pnl heuristic)
+  - [x] P1: Unit tests for _persist_paper_results — 6 tests
+  - [x] P1: Portfolio integration tests for daily_pnl + open_positions — 4 new tests (22 total)
+  - [x] P2: Code critic remediations (equity clamp, UTC date boundary, redundant import, docstring update)
+  - [x] P2: Update MEMORY.md + CLAUDE.local.md for Sprint 11
