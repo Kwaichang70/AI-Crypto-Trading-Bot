@@ -73,7 +73,7 @@ function RecentRunsTable({ runs }: { runs: readonly Run[] }) {
                 </Link>
               </td>
               <td className="px-4 py-3 text-slate-400">{run.runMode}</td>
-              <td className="px-4 py-3 text-slate-300">{run.config?.strategyName ?? "—"}</td>
+              <td className="px-4 py-3 text-slate-300">{run.config?.strategy_name ?? "—"}</td>
               <td className="px-4 py-3">
                 <RunStatusBadge status={run.status} />
               </td>

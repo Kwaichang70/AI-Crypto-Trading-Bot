@@ -20,14 +20,14 @@ export type RunMode = "backtest" | "paper" | "live";
 export type RunStatus = "running" | "stopped" | "error";
 
 export interface RunConfig {
-  strategyName: string;
-  strategyParams: Record<string, unknown>;
+  strategy_name: string;
+  strategy_params: Record<string, unknown>;
   symbols: readonly string[];
   timeframe: string;
   mode: RunMode;
-  initialCapital: string;
-  backtestStart?: string;
-  backtestEnd?: string;
+  initial_capital: string;
+  backtest_start?: string;
+  backtest_end?: string;
 }
 
 export interface Run {

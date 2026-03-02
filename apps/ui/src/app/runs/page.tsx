@@ -44,7 +44,7 @@ const COLUMNS: Column<Run>[] = [
     key: "strategy",
     header: "Strategy",
     render: (run) => (
-      <span className="text-slate-300">{run.config?.strategyName ?? "—"}</span>
+      <span className="text-slate-300">{run.config?.strategy_name ?? "—"}</span>
     ),
   },
   {

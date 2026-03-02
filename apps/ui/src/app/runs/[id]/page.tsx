@@ -286,7 +286,7 @@ export default function RunDetailPage() {
     );
   }
 
-  const strategyName = run.config?.strategyName ?? "Unknown strategy";
+  const strategyName = run.config?.strategy_name ?? "Unknown strategy";
   const symbols = run.config?.symbols?.join(", ") ?? "—";
 
   return (
