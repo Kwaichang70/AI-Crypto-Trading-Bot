@@ -165,3 +165,14 @@
   - [x] P2: ModelStrategy unit tests — 66 tests, 100% coverage (054c3bb)
   - [x] P2: Code critic remediations (ImportError mock fix, SMA ratio fallback test)
   - [x] P2: Update MEMORY.md + CLAUDE.local.md for Sprint 14
+
+### 15. AI Crypto Trading Bot — Sprint 15 (LiveExecution Tests, Pagination, Home Cards)
+- **Plan:** `.claude/plans/eventual-wandering-lecun.md`
+- **Status:** COMPLETE
+- **Orchestration Checklist:**
+  - [x] P0: LiveExecutionEngine unit tests — 65 tests across 12 classes (test_live_execution.py)
+  - [x] P0: Code critic remediations (CR-001 reconcile map seeding, CR-004 sync_positions, CR-006 on_start reraise)
+  - [x] P1: Runs page server-side pagination — page/pageSize state, offset param, controls bar
+  - [x] P1: Code critic remediations (CR-003 mode+pagination coherence, CR-004 NaN guard, CR-006/007 parseFloat guards)
+  - [x] P1: Home page portfolio equity + realized PnL summary cards (fetchPortfolio from latest run)
+  - [x] P2: Update MEMORY.md + CLAUDE.local.md for Sprint 15
