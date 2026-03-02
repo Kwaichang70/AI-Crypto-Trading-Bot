@@ -142,3 +142,13 @@
   - [x] P0: Code critic remediations (double fee fix, run_id guard, dead branch cleanup, entry_price comment)
   - [x] P1: Trade recording unit tests — 16 tests (3 classes)
   - [x] P2: Update MEMORY.md + CLAUDE.local.md for Sprint 12
+
+### 13. AI Crypto Trading Bot — Sprint 13 (Advanced Metrics UI + Pipeline Tests)
+- **Plan:** `.claude/plans/eventual-wandering-lecun.md`
+- **Status:** COMPLETE
+- **Orchestration Checklist:**
+  - [x] P0: Add BacktestMetrics TypeScript interface + backtestMetrics field to Run type
+  - [x] P0: Add Sharpe/Sortino/Calmar/ProfitFactor/Exposure StatCards to run detail page
+  - [x] P0: Fix pre-existing TSC error (api.ts body undefined, stat-card.tsx subValue type)
+  - [x] P1: Paper engine pipeline integration tests — 4 tests (TestPaperEnginePersistencePipeline)
+  - [x] P2: Update MEMORY.md + CLAUDE.local.md for Sprint 13
