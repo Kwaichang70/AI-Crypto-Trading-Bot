@@ -133,3 +133,12 @@
   - [x] P1: Portfolio integration tests for daily_pnl + open_positions — 4 new tests (22 total)
   - [x] P2: Code critic remediations (equity clamp, UTC date boundary, redundant import, docstring update)
   - [x] P2: Update MEMORY.md + CLAUDE.local.md for Sprint 11
+
+### 12. AI Crypto Trading Bot — Sprint 12 (Wire record_trade into StrategyEngine)
+- **Plan:** `.claude/plans/eventual-wandering-lecun.md`
+- **Status:** COMPLETE
+- **Orchestration Checklist:**
+  - [x] P0: Add _record_trade_if_closed() to StrategyEngine + modify fill loops in _process_bar and _check_resting_orders
+  - [x] P0: Code critic remediations (double fee fix, run_id guard, dead branch cleanup, entry_price comment)
+  - [x] P1: Trade recording unit tests — 16 tests (3 classes)
+  - [x] P2: Update MEMORY.md + CLAUDE.local.md for Sprint 12
