@@ -152,6 +152,115 @@ def _run_orm_to_detail_response(run: RunORM) -> RunDetailResponse:
     return base
 
 
+# ---------------------------------------------------------------------------
+# Helper: persist paper engine results to DB
+# ---------------------------------------------------------------------------
+
+async def _persist_paper_results(
+    *,
+    run_id_str: str,
+    portfolio: Any,
+    log: Any,
+) -> None:
+    """
+    Persist paper engine equity curve and completed trades to DB.
+
+    Called from ``_run_paper_engine``'s ``finally`` block. Uses its own
+    isolated DB session. Skipped when both equity curve and trade history
+    are empty (engine stopped before generating any fills).
+    """
+    from api.db.session import get_session_factory
+
+    equity_curve = portfolio.get_equity_curve()
+    trade_history = portfolio.get_trade_history()
+
+    if not equity_curve and not trade_history:
+        log.debug("runs.paper_persist_skipped", reason="no_data")
+        return
+
+    run_id = uuid.UUID(run_id_str)
+
+    # Build EquitySnapshotORM rows with peak-tracking drawdown
+    equity_orms: list[EquitySnapshotORM] = []
+    peak = Decimal("0")
+    for bar_index, (timestamp, equity) in enumerate(equity_curve):
+        if equity > peak:
+            peak = equity
+        if peak > Decimal("0"):
+            dd_pct = ((peak - equity) / peak).quantize(Decimal("0.00000001"))
+        else:
+            dd_pct = Decimal("0")
+        # Clamp to [0, 1] to satisfy DB CHECK constraint
+        dd_pct = max(Decimal("0"), min(dd_pct, Decimal("1")))
+
+        # Clamp equity to 0 to satisfy ck_equity_snapshots_equity_non_negative
+        if equity < Decimal("0"):
+            log.warning(
+                "runs.paper_persist_negative_equity_clamped",
+                bar_index=bar_index,
+                raw_equity=str(equity),
+            )
+            equity = Decimal("0")
+
+        equity_orms.append(
+            EquitySnapshotORM(
+                run_id=run_id,
+                equity=equity,
+                cash=Decimal("0"),           # MVP: per-bar cash not tracked
+                unrealised_pnl=Decimal("0"), # MVP: per-bar unrealised not tracked
+                realised_pnl=Decimal("0"),   # MVP: per-bar realised not tracked
+                drawdown_pct=dd_pct,
+                bar_index=bar_index,
+                timestamp=timestamp,
+            )
+        )
+
+    # Build TradeORM rows from completed round-trips
+    trade_orms: list[TradeORM] = []
+    for trade in trade_history:
+        trade_orms.append(
+            TradeORM(
+                id=trade.trade_id,
+                run_id=run_id,
+                symbol=trade.symbol,
+                side=(
+                    trade.side.value
+                    if hasattr(trade.side, "value")
+                    else str(trade.side)
+                ),
+                entry_price=trade.entry_price,
+                exit_price=trade.exit_price,
+                quantity=trade.quantity,
+                realised_pnl=trade.realised_pnl,
+                total_fees=trade.total_fees,
+                entry_at=trade.entry_at,
+                exit_at=trade.exit_at,
+                strategy_id=trade.strategy_id or "unknown",
+            )
+        )
+
+    # Persist in isolated session
+    try:
+        factory = get_session_factory()
+        async with factory() as db:
+            try:
+                if trade_orms:
+                    db.add_all(trade_orms)
+                if equity_orms:
+                    db.add_all(equity_orms)
+                await db.commit()
+                log.info(
+                    "runs.paper_results_persisted",
+                    equity_snapshots=len(equity_orms),
+                    trades=len(trade_orms),
+                )
+            except Exception:
+                await db.rollback()
+                log.exception("runs.paper_persist_db_error")
+    except Exception:
+        log.exception("runs.paper_persist_session_failed")
+
+
 async def _run_paper_engine(
     *,
     run_id_str: str,
@@ -204,6 +313,7 @@ async def _run_paper_engine(
 
     final_status = "stopped"
     engine: StrategyEngine | None = None
+    portfolio: Any = None
 
     try:
         settings = get_settings()
@@ -281,9 +391,8 @@ async def _run_paper_engine(
             factory = get_session_factory()
             async with factory() as db:
                 try:
-                    from sqlalchemy import select as sa_select
                     result = await db.execute(
-                        sa_select(RunORM).where(RunORM.id == uuid.UUID(run_id_str))
+                        select(RunORM).where(RunORM.id == uuid.UUID(run_id_str))
                     )
                     run = result.scalar_one_or_none()
                     if run is not None and run.status == "running":
@@ -301,6 +410,14 @@ async def _run_paper_engine(
                     log.exception("runs.paper_engine_db_update_failed")
         except Exception:
             log.exception("runs.paper_engine_db_session_failed")
+
+        # Persist equity curve and trades collected during the run
+        if portfolio is not None:
+            await _persist_paper_results(
+                run_id_str=run_id_str,
+                portfolio=portfolio,
+                log=log,
+            )
 
 
 # ---------------------------------------------------------------------------
