@@ -18,6 +18,7 @@ from typing import Sequence
 
 import structlog
 
+from common.types import OrderSide
 from trading.models import Order, Position, RiskCheckResult
 from trading.risk import BaseRiskManager, RiskParameters, RiskViolation
 
@@ -266,8 +267,11 @@ class DefaultRiskManager(BaseRiskManager):
 
         Two sub-checks:
             a) Absolute notional cap: order value vs ``max_order_size_quote``
+               (applies to all orders).
             b) Concentration cap: resulting position value vs
-               ``max_position_size_pct * equity``
+               ``max_position_size_pct * equity`` (BUY orders only — SELL
+               orders reduce position size and therefore bypass this check
+               to avoid trapping capital).
 
         If neither cap is breached the adjusted quantity equals the original
         order quantity.  If a cap IS breached the quantity is reduced to the
@@ -330,8 +334,10 @@ class DefaultRiskManager(BaseRiskManager):
             )
             adjusted_qty = capped_qty_a
 
-        # (b) Concentration cap -----------------------------------------------
-        if current_equity > Decimal(0):
+        # (b) Concentration cap -- only applies to BUY orders.
+        # SELL orders reduce the position, so they can never exceed
+        # concentration limits.  Blocking SELLs would trap capital.
+        if order.side == OrderSide.BUY and current_equity > Decimal(0):
             # Find existing position for this symbol (if any)
             existing_value = Decimal(0)
             for pos in open_positions:

@@ -8,7 +8,7 @@ Modules under test
 - packages/trading/risk.py       — BaseRiskManager, RiskParameters, helpers
 - packages/trading/risk_manager.py — DefaultRiskManager implementation
 
-Test coverage  (44 tests total)
+Test coverage  (48 tests total)
 ---------------------------------
 - Kill switch blocks ALL orders
 - Cooldown period blocks orders until expiry
@@ -31,6 +31,7 @@ Test coverage  (44 tests total)
 - pre_trade_check: price resolved from existing position.current_price
 - pre_trade_check: multiple simultaneous violations all collected
 - RiskParameters validation: per_trade_risk_pct and max_drawdown_pct bounds
+- SELL orders bypass concentration cap; BUY orders still blocked (bug-fix regression)
 """
 
 from __future__ import annotations
@@ -1060,3 +1061,228 @@ class TestRiskParametersValidation:
         params = RiskParameters(per_trade_risk_pct=0.05, max_drawdown_pct=0.50)
         assert params.per_trade_risk_pct == 0.05
         assert params.max_drawdown_pct == 0.50
+
+
+# ===========================================================================
+# SELL order concentration bypass (bug-fix regression tests)
+# ===========================================================================
+
+
+class TestSellOrderConcentrationBypass:
+    """
+    Regression tests for the fix that adds an ``order.side == OrderSide.BUY``
+    guard on the concentration cap check (section b of _check_order_size).
+
+    Before the fix, SELL orders were incorrectly blocked by the concentration
+    cap when the existing position was at or above the cap.  This trapped
+    capital: a trader holding a fully-concentrated position could not exit.
+
+    Test matrix
+    -----------
+    1. SELL when position is at exactly the concentration ceiling → APPROVED.
+    2. SELL when position has grown above the ceiling (price increase) → APPROVED.
+    3. BUY when position is at the ceiling → still BLOCKED (regression guard).
+    4. SELL with quantity so large it exceeds the absolute notional cap
+       (section a) → quantity is capped / order blocked per notional rules,
+       confirming section a still applies to SELL orders.
+    """
+
+    # Shared risk configuration for all four tests in this class.
+    # equity=100 000, cap=10% → concentration ceiling = 10 000 USDT.
+    _EQUITY = Decimal("100000")
+    _PEAK = Decimal("100000")
+    _CAP_PCT = 0.10   # 10% → max position value = 10 000 USDT
+
+    def _make_concentrated_manager(self) -> DefaultRiskManager:
+        """Return a manager configured with a 10% concentration cap."""
+        return _make_manager(
+            max_position_size_pct=self._CAP_PCT,
+            max_order_size_quote=Decimal("100000"),  # non-binding for tests 1-3
+            max_open_positions=5,
+        )
+
+    def _make_position_at_cap(self) -> Position:
+        """
+        Position whose notional value equals the concentration ceiling exactly.
+
+        0.2 BTC * 50 000 USDT = 10 000 USDT = 10% of 100 000 equity.
+        """
+        return _make_position(
+            symbol="BTC/USDT",
+            quantity=Decimal("0.2"),
+            current_price=Decimal("50000"),
+        )
+
+    def test_sell_bypasses_concentration_cap(self) -> None:
+        """
+        When an existing BTC position is at exactly the concentration ceiling
+        (10 000 USDT), a SELL order for 0.01 BTC must be APPROVED.
+
+        Without the ``order.side == OrderSide.BUY`` guard, the concentration
+        check would compute:
+            existing_value = 10 000
+            proposed_value = 10 000 + (0.01 * 50 000) = 10 500  > cap
+        and block the order.  With the fix, SELL orders skip section b entirely.
+
+        Setup:
+            equity          = 100 000 USDT
+            concentration   = 10% → cap = 10 000 USDT
+            existing pos    = 0.2 BTC * 50 000 = 10 000 USDT  (at cap)
+            order           = SELL 0.01 BTC @ 50 000
+        Expected: approved=True
+        """
+        manager = self._make_concentrated_manager()
+        existing = self._make_position_at_cap()
+        order = _make_limit_order(
+            symbol="BTC/USDT",
+            side=OrderSide.SELL,
+            quantity=Decimal("0.01"),
+            price=Decimal("50000"),
+        )
+        result = manager.pre_trade_check(
+            order=order,
+            current_equity=self._EQUITY,
+            open_positions=[existing],
+            daily_pnl=Decimal("0"),
+            peak_equity=self._PEAK,
+        )
+        assert result.approved is True, (
+            f"SELL order must bypass concentration cap; "
+            f"rejection_reasons={result.rejection_reasons}"
+        )
+
+    def test_sell_beyond_concentration_cap_still_approved(self) -> None:
+        """
+        When a position has grown above the concentration ceiling due to
+        unrealised gains (price increased from 50 000 to 60 000), a SELL
+        order must still be APPROVED.
+
+        The position's notional value is now 0.2 * 60 000 = 12 000 USDT,
+        which is 20% above the 10 000 USDT cap.  Without the fix, ANY
+        further buy would be blocked — but more critically the broken code
+        also blocked sells because it treated the SELL qty as additive to
+        existing_value rather than checking order.side.
+
+        Setup:
+            equity          = 100 000 USDT
+            concentration   = 10% → cap = 10 000 USDT
+            existing pos    = 0.2 BTC * 60 000 = 12 000 USDT  (above cap)
+            order           = SELL 0.01 BTC @ 60 000
+        Expected: approved=True
+        """
+        manager = self._make_concentrated_manager()
+        # Price has risen: position now exceeds cap
+        existing = _make_position(
+            symbol="BTC/USDT",
+            quantity=Decimal("0.2"),
+            current_price=Decimal("60000"),
+        )
+        order = _make_limit_order(
+            symbol="BTC/USDT",
+            side=OrderSide.SELL,
+            quantity=Decimal("0.01"),
+            price=Decimal("60000"),
+        )
+        result = manager.pre_trade_check(
+            order=order,
+            current_equity=self._EQUITY,
+            open_positions=[existing],
+            daily_pnl=Decimal("0"),
+            peak_equity=self._PEAK,
+        )
+        assert result.approved is True, (
+            f"SELL order must bypass concentration cap even when position "
+            f"exceeds cap; rejection_reasons={result.rejection_reasons}"
+        )
+
+    def test_buy_still_blocked_by_concentration_cap(self) -> None:
+        """
+        Regression guard: BUY orders must still be blocked by the
+        concentration cap when the existing position is at the ceiling.
+
+        This test ensures the ``order.side == OrderSide.BUY`` guard did NOT
+        accidentally disable concentration enforcement for BUY orders.
+
+        Setup:
+            equity          = 100 000 USDT
+            concentration   = 10% → cap = 10 000 USDT
+            existing pos    = 0.2 BTC * 50 000 = 10 000 USDT  (at cap)
+            order           = BUY 0.01 BTC @ 50 000
+        Expected: approved=False, rejection contains "concentration"
+        """
+        manager = self._make_concentrated_manager()
+        existing = self._make_position_at_cap()
+        order = _make_limit_order(
+            symbol="BTC/USDT",
+            side=OrderSide.BUY,
+            quantity=Decimal("0.01"),
+            price=Decimal("50000"),
+        )
+        result = manager.pre_trade_check(
+            order=order,
+            current_equity=self._EQUITY,
+            open_positions=[existing],
+            daily_pnl=Decimal("0"),
+            peak_equity=self._PEAK,
+        )
+        assert result.approved is False, (
+            "BUY order must still be blocked by the concentration cap"
+        )
+        assert any(
+            "concentration" in r.lower() for r in result.rejection_reasons
+        ), (
+            f"Expected concentration rejection for BUY, "
+            f"got: {result.rejection_reasons}"
+        )
+
+    def test_sell_still_checked_by_notional_cap(self) -> None:
+        """
+        SELL orders bypass the concentration cap (section b) but are still
+        subject to the absolute notional cap (section a).
+
+        With max_order_size_quote = 0.000000001 USDT (1 nano-USDT) any
+        meaningful SELL quantity has its notional value quantized down to
+        zero at 8 decimal places, which triggers the blocking path in
+        section a (lines 307-323 of risk_manager.py).
+
+        Setup:
+            equity              = 100 000 USDT
+            max_order_size_quote = 0.000000001 USDT  (1 nano-USDT)
+            order               = SELL 0.5 BTC @ 50 000  (25 000 USDT notional)
+        Expected: approved=False, rejection contains notional-cap language.
+
+        This confirms section a still runs for SELL orders, preserving the
+        absolute order-size safety net regardless of direction.
+        """
+        manager = _make_manager(
+            max_position_size_pct=self._CAP_PCT,
+            max_order_size_quote=Decimal("0.000000001"),  # 1 nano-USDT: forces qty to 0
+            max_open_positions=5,
+        )
+        existing = self._make_position_at_cap()
+        order = _make_limit_order(
+            symbol="BTC/USDT",
+            side=OrderSide.SELL,
+            quantity=Decimal("0.5"),
+            price=Decimal("50000"),
+        )
+        result = manager.pre_trade_check(
+            order=order,
+            current_equity=self._EQUITY,
+            open_positions=[existing],
+            daily_pnl=Decimal("0"),
+            peak_equity=self._PEAK,
+        )
+        assert result.approved is False, (
+            "SELL order must be blocked by the notional cap when "
+            "max_order_size_quote forces quantity to zero"
+        )
+        assert any(
+            "max_order_size" in r.lower()
+            or "notional" in r.lower()
+            or "cannot be reduced" in r.lower()
+            for r in result.rejection_reasons
+        ), (
+            f"Expected notional-cap blocking reason for SELL, "
+            f"got: {result.rejection_reasons}"
+        )
