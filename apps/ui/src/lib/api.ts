@@ -173,7 +173,7 @@ export function apiPost<T>(
   return apiFetch<T>(path, {
     ...init,
     method: "POST",
-    body: body !== undefined ? JSON.stringify(body) : undefined,
+    body: body !== undefined ? JSON.stringify(body) : null,
   });
 }
 

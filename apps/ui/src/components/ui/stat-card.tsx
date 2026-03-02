@@ -1,7 +1,7 @@
 interface StatCardProps {
   label: string;
   value: string | number;
-  subValue?: string;
+  subValue?: string | undefined;
   trend?: "up" | "down" | "neutral";
   isLoading?: boolean;
 }

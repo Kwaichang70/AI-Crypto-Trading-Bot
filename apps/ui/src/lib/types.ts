@@ -39,6 +39,42 @@ export interface Run {
   stoppedAt: string | null;
   createdAt: string;
   updatedAt: string;
+  backtestMetrics?: BacktestMetrics | null;
+}
+
+/**
+ * Backtest performance metrics returned in RunDetailResponse.
+ * Mirrors BacktestMetricsResponse in apps/api/schemas.py.
+ * All percentage/ratio fields are decimal fractions (0.12 = 12%).
+ * Monetary fields are strings for Decimal precision.
+ */
+export interface BacktestMetrics {
+  totalReturnPct: number;
+  cagr: number;
+  initialCapital: string;
+  finalEquity: string;
+  totalFeesPaid: string;
+  sharpeRatio: number;
+  sortinoRatio: number;
+  calmarRatio: number;
+  maxDrawdownPct: number;
+  maxDrawdownDurationBars: number;
+  totalTrades: number;
+  winningTrades: number;
+  losingTrades: number;
+  winRate: number;
+  profitFactor: number;
+  averageTradePnl: string;
+  averageWin: string;
+  averageLoss: string;
+  largestWin: string;
+  largestLoss: string;
+  totalBars: number;
+  barsInMarket: number;
+  exposurePct: number;
+  startDate: string;
+  endDate: string;
+  durationDays: number;
 }
 
 export interface RunListResponse {

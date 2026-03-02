@@ -307,6 +307,40 @@ export default function RunDetailPage() {
                   <h3 className="mb-3 text-sm font-semibold text-slate-300">Equity Curve</h3>
                   <EquityCurveChart points={equityPoints} height={260} />
                 </div>
+
+                {/* Backtest performance metrics — shown only for completed backtests */}
+                {run.runMode === "backtest" && run.backtestMetrics && (
+                  <div className="card">
+                    <h3 className="mb-3 text-sm font-semibold text-slate-300">Backtest Performance</h3>
+                    <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
+                      <StatCard
+                        label="Sharpe Ratio"
+                        value={run.backtestMetrics.sharpeRatio.toFixed(3)}
+                        trend={run.backtestMetrics.sharpeRatio >= 1.0 ? "up" : run.backtestMetrics.sharpeRatio < 0 ? "down" : "neutral"}
+                      />
+                      <StatCard
+                        label="Sortino Ratio"
+                        value={run.backtestMetrics.sortinoRatio.toFixed(3)}
+                        trend={run.backtestMetrics.sortinoRatio >= 1.5 ? "up" : run.backtestMetrics.sortinoRatio < 0 ? "down" : "neutral"}
+                      />
+                      <StatCard
+                        label="Calmar Ratio"
+                        value={run.backtestMetrics.calmarRatio.toFixed(3)}
+                        trend={run.backtestMetrics.calmarRatio >= 1.0 ? "up" : "neutral"}
+                      />
+                      <StatCard
+                        label="Profit Factor"
+                        value={run.backtestMetrics.profitFactor.toFixed(2)}
+                        trend={run.backtestMetrics.profitFactor >= 1.5 ? "up" : run.backtestMetrics.profitFactor < 1.0 ? "down" : "neutral"}
+                      />
+                      <StatCard
+                        label="Exposure"
+                        value={formatPct(run.backtestMetrics.exposurePct)}
+                        subValue={`${run.backtestMetrics.barsInMarket} / ${run.backtestMetrics.totalBars} bars`}
+                      />
+                    </div>
+                  </div>
+                )}
               </div>
             )}
 
