@@ -12,6 +12,7 @@
 
 import type {
   EquityCurveResponse,
+  FillListResponse,
   OrderListResponse,
   Portfolio,
   PositionListResponse,
@@ -277,6 +278,21 @@ export async function fetchOrders(
   if (params?.status) qs.set("status", params.status);
   const query = qs.toString() ? `?${qs.toString()}` : "";
   return apiGet<OrderListResponse>(`/api/v1/runs/${runId}/orders${query}`, {
+    cache: "no-store",
+  });
+}
+
+/** GET /api/v1/runs/{id}/fills — execution fills for a run. */
+export async function fetchFills(
+  runId: string,
+  params?: { offset?: number; limit?: number; symbol?: string },
+): Promise<ApiResult<FillListResponse>> {
+  const qs = new URLSearchParams();
+  if (params?.offset !== undefined) qs.set("offset", String(params.offset));
+  if (params?.limit !== undefined) qs.set("limit", String(params.limit));
+  if (params?.symbol) qs.set("symbol", params.symbol);
+  const query = qs.toString() ? `?${qs.toString()}` : "";
+  return apiGet<FillListResponse>(`/api/v1/runs/${runId}/fills${query}`, {
     cache: "no-store",
   });
 }

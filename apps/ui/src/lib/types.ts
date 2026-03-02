@@ -136,6 +136,30 @@ export interface OrderListResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Fills
+// ---------------------------------------------------------------------------
+
+export interface Fill {
+  id: string;
+  orderId: string;
+  symbol: string;
+  side: OrderSide;
+  quantity: string;
+  price: string;
+  fee: string;
+  feeCurrency: string;
+  isMaker: boolean;
+  executedAt: string;
+}
+
+export interface FillListResponse {
+  total: number;
+  offset: number;
+  limit: number;
+  items: readonly Fill[];
+}
+
+// ---------------------------------------------------------------------------
 // Trades
 // ---------------------------------------------------------------------------
 
