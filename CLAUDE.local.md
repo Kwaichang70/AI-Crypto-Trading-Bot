@@ -152,3 +152,16 @@
   - [x] P0: Fix pre-existing TSC error (api.ts body undefined, stat-card.tsx subValue type)
   - [x] P1: Paper engine pipeline integration tests — 4 tests (TestPaperEnginePersistencePipeline)
   - [x] P2: Update MEMORY.md + CLAUDE.local.md for Sprint 13
+
+### 14. AI Crypto Trading Bot — Sprint 14 (Fills Tab, DataTable Sort, Expanded Metrics, ModelStrategy Tests)
+- **Plan:** `.claude/plans/eventual-wandering-lecun.md`
+- **Status:** COMPLETE
+- **Orchestration Checklist:**
+  - [x] P0: Add Fill/FillListResponse TS types + fetchFills API function (e9c6315)
+  - [x] P0: Add Fills tab on run detail page with FILL_COLUMNS (75618a7)
+  - [x] P1: Fix DataTable sort — sortValue accessor + displayData computation (75618a7)
+  - [x] P1: Add sortable columns to Trades (PnL, Closed), Orders (Status, Created), Fills (Price, Executed) (75618a7)
+  - [x] P1: Expand backtest metrics with second row — CAGR, Duration, Avg Trade PnL, Largest Win/Loss (75618a7)
+  - [x] P2: ModelStrategy unit tests — 66 tests, 100% coverage (054c3bb)
+  - [x] P2: Code critic remediations (ImportError mock fix, SMA ratio fallback test)
+  - [x] P2: Update MEMORY.md + CLAUDE.local.md for Sprint 14
