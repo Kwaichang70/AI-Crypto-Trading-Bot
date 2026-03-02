@@ -1,13 +1,13 @@
 /**
  * Dashboard Home — Server Component.
- * Fetches health + recent runs at request time.
+ * Fetches health + recent runs + portfolio at request time.
  */
 
 import type { Metadata } from "next";
 import Link from "next/link";
-import { fetchHealth, fetchRuns } from "@/lib/api";
+import { fetchHealth, fetchRuns, fetchPortfolio, formatCurrency } from "@/lib/api";
 import type { HealthResponse } from "@/lib/api";
-import type { Run } from "@/lib/types";
+import type { Run, Portfolio } from "@/lib/types";
 import { StatCard } from "@/components/ui/stat-card";
 import { RunStatusBadge } from "@/components/ui/status-badge";
 import { Header } from "@/components/layout/header";
@@ -95,13 +95,20 @@ function RecentRunsTable({ runs }: { runs: readonly Run[] }) {
 export default async function DashboardPage() {
   const [healthResult, runsResult] = await Promise.all([
     fetchHealth(),
-    fetchRuns({ limit: 10 }),
+    fetchRuns({ limit: 25 }),
   ]);
 
   const runs: readonly Run[] = runsResult.ok ? runsResult.data.items : [];
   const totalRuns = runsResult.ok ? runsResult.data.total : 0;
   const activeRuns = runs.filter((r) => r.status === "running").length;
   const errorRuns = runs.filter((r) => r.status === "error").length;
+
+  // Fetch portfolio for the most relevant run: prefer a running run, fall back
+  // to the most recently created run in the page.
+  const latestRun = runs.find((r) => r.status === "running") ?? runs[0];
+  const portfolioResult = latestRun ? await fetchPortfolio(latestRun.id) : null;
+  const portfolio: Portfolio | null =
+    portfolioResult?.ok === true ? portfolioResult.data : null;
 
   return (
     <div className="space-y-6">
@@ -118,8 +125,8 @@ export default async function DashboardPage() {
         }
       />
 
-      {/* Summary cards */}
-      <section aria-label="Summary metrics" className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+      {/* Summary cards — 2 rows of 3 */}
+      <section aria-label="Summary metrics" className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
         <StatCard
           label="Total Runs"
           value={totalRuns}
@@ -154,6 +161,53 @@ export default async function DashboardPage() {
             </p>
           )}
         </div>
+        {(() => {
+          const equity = portfolio ? parseFloat(portfolio.currentEquity) : NaN;
+          const initial = portfolio ? parseFloat(portfolio.initialCash) : NaN;
+          const equityTrend: "up" | "down" | "neutral" =
+            !isNaN(equity) && !isNaN(initial)
+              ? equity > initial ? "up" : equity < initial ? "down" : "neutral"
+              : "neutral";
+          return (
+            <StatCard
+              label="Portfolio Equity"
+              value={
+                portfolio
+                  ? `$${formatCurrency(portfolio.currentEquity)}`
+                  : "—"
+              }
+              subValue={
+                latestRun
+                  ? `run ${latestRun.id.slice(0, 8)}…`
+                  : "no runs yet"
+              }
+              trend={equityTrend}
+            />
+          );
+        })()}
+        {(() => {
+          const pnl = portfolio ? parseFloat(portfolio.totalRealisedPnl) : NaN;
+          const pnlTrend: "up" | "down" | "neutral" =
+            !isNaN(pnl)
+              ? pnl > 0 ? "up" : pnl < 0 ? "down" : "neutral"
+              : "neutral";
+          return (
+            <StatCard
+              label="Realized PnL"
+              value={
+                portfolio
+                  ? `$${formatCurrency(portfolio.totalRealisedPnl)}`
+                  : "—"
+              }
+              subValue={
+                portfolio
+                  ? `${portfolio.totalTrades} trade${portfolio.totalTrades !== 1 ? "s" : ""}`
+                  : "no data"
+              }
+              trend={pnlTrend}
+            />
+          );
+        })()}
       </section>
 
       {/* Recent runs */}
