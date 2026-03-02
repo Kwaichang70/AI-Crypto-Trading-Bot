@@ -44,7 +44,7 @@ from common.models import OHLCVBar
 from common.types import OrderSide, RunMode, TimeFrame
 from data.market_data import BaseMarketDataService, MarketDataError
 from trading.execution import BaseExecutionEngine
-from trading.models import Fill, Signal
+from trading.models import Fill, Position, Signal, TradeResult
 from trading.portfolio import PortfolioAccounting
 from trading.risk import BaseRiskManager
 from trading.strategy import BaseStrategy
@@ -616,7 +616,18 @@ class StrategyEngine:
                             )
                             continue
                         current_price = symbol_bar.close
+
+                        # Capture position BEFORE fill for trade recording
+                        pre_fill_pos = self._portfolio.get_position(fill.symbol)
+
                         self._portfolio.update_position(fill, current_price)
+
+                        # Record trade if this fill closed/reduced a position
+                        self._record_trade_if_closed(
+                            fill=fill,
+                            pre_fill_position=pre_fill_pos,
+                            strategy_id=signal.strategy_id,
+                        )
 
                         # Determine if this fill closed a position (for risk
                         # manager loss tracking). A SELL fill on a position
@@ -732,6 +743,84 @@ class StrategyEngine:
                     symbol=fill.symbol,
                 )
 
+    def _record_trade_if_closed(
+        self,
+        fill: Fill,
+        pre_fill_position: Position | None,
+        strategy_id: str,
+    ) -> None:
+        """
+        Detect round-trip completion and record a TradeResult.
+
+        Called after update_position() has applied the fill. Compares the
+        pre-fill position state with the post-fill state to determine
+        whether a position was fully or partially closed.
+
+        Parameters
+        ----------
+        fill :
+            The fill event that was just applied.
+        pre_fill_position :
+            The position snapshot captured BEFORE update_position() was called.
+            None if no position existed for this symbol.
+        strategy_id :
+            The strategy that generated the signal leading to this fill.
+        """
+        # Only SELL fills can close long positions (spot-only MVP)
+        if fill.side != OrderSide.SELL:
+            return
+        # No pre-existing position to close
+        if pre_fill_position is None or pre_fill_position.is_flat:
+            return
+
+        closed_qty = min(fill.quantity, pre_fill_position.quantity)
+        if closed_qty <= Decimal("0"):
+            return
+
+        # PnL for the closed portion
+        pnl = (fill.price - pre_fill_position.average_entry_price) * closed_qty - fill.fee
+
+        # Total fees for this trade: exit fill fee only.
+        # Entry fees are already embedded in average_entry_price (all-in cost
+        # basis), so adding them again would double-count.
+        total_fees = fill.fee
+
+        if self._run_id is None:
+            self._log.error("engine.trade_record_no_run_id", symbol=fill.symbol)
+            return
+
+        now = datetime.now(tz=UTC)
+
+        try:
+            trade = TradeResult(
+                run_id=self._run_id,
+                symbol=fill.symbol,
+                side=OrderSide.BUY,  # Opening side for long position (spot-only)
+                # entry_price is the all-in cost basis (includes entry fees),
+                # not the raw execution price. Matches portfolio VWAP calculation.
+                entry_price=pre_fill_position.average_entry_price,
+                exit_price=fill.price,
+                quantity=closed_qty,
+                realised_pnl=pnl,
+                total_fees=total_fees,
+                entry_at=pre_fill_position.opened_at,
+                exit_at=now,
+                strategy_id=strategy_id,
+            )
+            self._portfolio.record_trade(trade)
+            self._log.info(
+                "engine.trade_recorded",
+                trade_id=str(trade.trade_id),
+                symbol=trade.symbol,
+                pnl=str(trade.realised_pnl),
+                quantity=str(trade.quantity),
+            )
+        except Exception:
+            self._log.exception(
+                "engine.trade_record_error",
+                symbol=fill.symbol,
+            )
+
     # ------------------------------------------------------------------
     # Resting order check (paper engine)
     # ------------------------------------------------------------------
@@ -766,8 +855,18 @@ class StrategyEngine:
                             order.order_id
                         )
                         for fill in fills:
+                            pre_fill_pos = self._portfolio.get_position(
+                                fill.symbol
+                            )
                             self._portfolio.update_position(
                                 fill, bar.close
+                            )
+                            # TODO: track Order→strategy_id mapping for
+                            # correct multi-strategy attribution on resting fills.
+                            self._record_trade_if_closed(
+                                fill=fill,
+                                pre_fill_position=pre_fill_pos,
+                                strategy_id=self._strategies[0].strategy_id,
                             )
                             self._route_fill_to_risk_manager(
                                 fill, bar.close
