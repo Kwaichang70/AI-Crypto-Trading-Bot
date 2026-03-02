@@ -1085,6 +1085,329 @@ class TestGetPositions:
 
 
 # ---------------------------------------------------------------------------
+# Paper engine persistence pipeline tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.integration
+class TestPaperEnginePersistencePipeline:
+    """
+    Integration tests verifying that paper-mode runs return real persisted data
+    through the portfolio, equity-curve, and trades endpoints.
+
+    Sprint 11 added _persist_paper_results() which writes equity snapshots and
+    trades to the DB when a paper engine stops.  Sprint 12 wired record_trade()
+    so trades are recorded during the run.  These tests confirm the full pipeline
+    from persisted DB rows back to API responses.
+
+    All four tests use the exact same mock patterns as the surrounding test
+    classes:
+    - _make_run_orm(run_mode="paper", status="stopped") -- stopped paper run
+    - _make_equity_snapshot_orm() with paper-realistic values
+    - _make_trade_orm() with paper-realistic values
+    - _portfolio_side_effect_with_data() / _portfolio_side_effect_empty_run()
+      for the 9-call portfolio summary sequence
+    - [run, count, scalars] 3-element side_effect for equity-curve and trades
+    """
+
+    def test_paper_run_portfolio_with_equity_and_trades(
+        self, client_dev_with_db: TestClient, mock_db_session: AsyncMock
+    ) -> None:
+        """
+        A stopped paper-mode run with persisted equity snapshots and trades
+        must return HTTP 200 with portfolio values sourced from DB rows.
+
+        Verifies:
+        - HTTP 200 status
+        - currentEquity comes from the persisted EquitySnapshotORM (not initial_capital)
+        - totalRealisedPnl reflects the trade aggregate SUM from the DB
+        - dailyPnl reflects the summed realised_pnl for trades exiting today
+        - openPositions is 0 -- paper engine persists unrealised_pnl=0 (MVP
+          hard-code, see _persist_paper_results in apps/api/routers/runs.py)
+        - initialCash matches the run config initial_capital
+        """
+        run_orm = _make_run_orm(
+            run_id=_RUN_UUID,
+            run_mode="paper",
+            status="stopped",
+            initial_capital="10000.00",
+            stopped_at=_FIXED_NOW,
+        )
+        # Paper engine persists unrealised_pnl=0 per the MVP hard-code in
+        # _persist_paper_results -- openPositions will therefore be 0.
+        snapshot_orm = _make_equity_snapshot_orm(
+            snap_id=1,
+            run_id=_RUN_UUID,
+            equity="10250.00",
+            cash="7500.00",
+            unrealised_pnl="0.00",
+            realised_pnl="350.00",
+            drawdown_pct="0.01",
+            bar_index=49,
+        )
+        mock_db_session.execute.side_effect = _portfolio_side_effect_with_data(
+            run_orm=run_orm,
+            snapshot_orm=snapshot_orm,
+            total_trades=3,
+            total_realised_pnl=Decimal("350.00"),
+            total_fees_paid=Decimal("10.50"),
+            winning_trades=2,
+            losing_trades=1,
+            peak_equity=Decimal("10300.00"),
+            max_drawdown=Decimal("0.01"),
+            equity_curve_length=50,
+            daily_pnl=Decimal("75.50"),
+        )
+
+        resp = client_dev_with_db.get(f"/api/v1/runs/{_RUN_UUID}/portfolio")
+
+        assert resp.status_code == 200
+        body = resp.json()
+
+        # Identity
+        assert body["runId"] == str(_RUN_UUID)
+        assert body["initialCash"] == "10000.00"
+
+        # Current state from persisted paper-engine snapshot
+        assert body["currentEquity"] == "10250.00"
+        assert body["currentCash"] == "7500.00"
+        assert body["drawdownPct"] == pytest.approx(0.01, abs=1e-9)
+
+        # Trade aggregates from DB
+        assert body["totalRealisedPnl"] == "350.00"
+        assert body["totalFeesPaid"] == "10.50"
+        assert body["totalTrades"] == 3
+        assert body["winningTrades"] == 2
+        assert body["losingTrades"] == 1
+
+        # Daily PnL from today's trades
+        assert body["dailyPnl"] == "75.50"
+
+        # MVP: paper engine persists unrealised_pnl=0 so openPositions is 0
+        assert body["openPositions"] == 0
+
+        # Equity curve and peak from DB aggregate
+        assert body["equityCurveLength"] == 50
+        assert body["peakEquity"] == "10300.00"
+
+    def test_paper_run_equity_curve_returns_snapshots(
+        self, client_dev_with_db: TestClient, mock_db_session: AsyncMock
+    ) -> None:
+        """
+        A stopped paper-mode run with two persisted EquitySnapshotORM rows
+        must return HTTP 200 with totalPoints=2 and a points list containing
+        the correct equity and drawdownPct values.
+
+        Verifies:
+        - HTTP 200 status
+        - totalPoints equals the COUNT(*) mock return (2)
+        - points list length equals 2
+        - First point (bar_index=0) has the paper-run opening values
+        - Second point (bar_index=1) reflects the first bar equity change
+        - All camelCase field names are present on each point
+        """
+        run_orm = _make_run_orm(
+            run_id=_RUN_UUID,
+            run_mode="paper",
+            status="stopped",
+            stopped_at=_FIXED_NOW,
+        )
+        snap1 = _make_equity_snapshot_orm(
+            snap_id=1,
+            run_id=_RUN_UUID,
+            bar_index=0,
+            equity="10000.00",
+            cash="10000.00",
+            unrealised_pnl="0.00",
+            realised_pnl="0.00",
+            drawdown_pct="0.00",
+        )
+        snap2 = _make_equity_snapshot_orm(
+            snap_id=2,
+            run_id=_RUN_UUID,
+            bar_index=1,
+            equity="10125.00",
+            cash="7500.00",
+            unrealised_pnl="0.00",
+            realised_pnl="125.00",
+            drawdown_pct="0.00",
+        )
+
+        mock_db_session.execute.side_effect = [
+            _make_scalar_one_or_none_result(run_orm),  # _get_run_or_404
+            _make_scalar_result(2),                     # COUNT(*)
+            _make_scalars_result([snap1, snap2]),        # page SELECT
+        ]
+
+        resp = client_dev_with_db.get(f"/api/v1/runs/{_RUN_UUID}/equity-curve")
+
+        assert resp.status_code == 200
+        body = resp.json()
+
+        assert body["runId"] == str(_RUN_UUID)
+        assert body["totalPoints"] == 2
+        assert len(body["points"]) == 2
+
+        # Verify all camelCase field names are present on first point
+        first_point = body["points"][0]
+        assert "barIndex" in first_point
+        assert "equity" in first_point
+        assert "cash" in first_point
+        assert "unrealisedPnl" in first_point
+        assert "realisedPnl" in first_point
+        assert "drawdownPct" in first_point
+        assert "timestamp" in first_point
+
+        # Opening snapshot values (bar 0)
+        assert first_point["equity"] == "10000.00"
+        assert first_point["barIndex"] == 0
+        assert first_point["drawdownPct"] == pytest.approx(0.00, abs=1e-9)
+
+        # Second snapshot reflects first-bar trade outcome
+        second_point = body["points"][1]
+        assert second_point["equity"] == "10125.00"
+        assert second_point["barIndex"] == 1
+        assert second_point["realisedPnl"] == "125.00"
+        assert second_point["unrealisedPnl"] == "0.00"
+
+    def test_paper_run_trades_returns_recorded_trades(
+        self, client_dev_with_db: TestClient, mock_db_session: AsyncMock
+    ) -> None:
+        """
+        A stopped paper-mode run with one persisted TradeORM record must
+        return HTTP 200 with total=1 and an items list containing the correct
+        trade data.
+
+        Sprint 12 wired record_trade() so completed trades are written to the
+        DB during paper-engine execution.  This test confirms the trades
+        endpoint reflects those persisted records.
+
+        Verifies:
+        - HTTP 200 status
+        - total == 1 (COUNT(*) mock)
+        - items[0] fields use camelCase
+        - entryPrice and exitPrice match the paper-engine fill values
+        - realisedPnl reflects the net PnL after fees
+        - strategyId matches "ma_crossover" (the paper run strategy)
+        - symbol matches "BTC/USDT"
+        """
+        run_orm = _make_run_orm(
+            run_id=_RUN_UUID,
+            run_mode="paper",
+            status="stopped",
+            stopped_at=_FIXED_NOW,
+        )
+        trade_orm = _make_trade_orm(
+            trade_id=_TRADE_UUID_1,
+            run_id=_RUN_UUID,
+            symbol="BTC/USDT",
+            side="buy",
+            entry_price="42000.00",
+            exit_price="43500.00",
+            quantity="0.05",
+            realised_pnl="72.50",
+            total_fees="2.50",
+            entry_at=_FIXED_ENTRY,
+            exit_at=_FIXED_EXIT,
+            strategy_id="ma_crossover",
+        )
+
+        mock_db_session.execute.side_effect = [
+            _make_scalar_one_or_none_result(run_orm),   # _get_run_or_404
+            _make_scalar_result(1),                      # COUNT(*)
+            _make_scalars_result([trade_orm]),            # page SELECT
+        ]
+
+        resp = client_dev_with_db.get(f"/api/v1/runs/{_RUN_UUID}/trades")
+
+        assert resp.status_code == 200
+        body = resp.json()
+
+        # Pagination envelope
+        assert body["total"] == 1
+        assert body["offset"] == 0
+        assert body["limit"] == 50  # default limit
+
+        # Single trade item
+        assert len(body["items"]) == 1
+        item = body["items"][0]
+
+        # camelCase field names must be present
+        assert "runId" in item
+        assert "entryPrice" in item
+        assert "exitPrice" in item
+        assert "realisedPnl" in item
+        assert "totalFees" in item
+        assert "strategyId" in item
+
+        # Paper-engine realistic values
+        assert item["symbol"] == "BTC/USDT"
+        assert item["side"] == "buy"
+        assert item["entryPrice"] == "42000.00"
+        assert item["exitPrice"] == "43500.00"
+        assert item["realisedPnl"] == "72.50"
+        assert item["totalFees"] == "2.50"
+        assert item["strategyId"] == "ma_crossover"
+        assert item["runId"] == str(_RUN_UUID)
+
+    def test_paper_run_portfolio_with_no_data_returns_initial_capital(
+        self, client_dev_with_db: TestClient, mock_db_session: AsyncMock
+    ) -> None:
+        """
+        A stopped paper-mode run with no persisted snapshots or trades must
+        return HTTP 200 with portfolio values falling back to the
+        initial_capital stored in the run config.
+
+        This covers the edge case where the engine was stopped before any bar
+        completed (e.g., exchange unreachable on first poll), so
+        _persist_paper_results() writes no rows.
+
+        Verifies:
+        - HTTP 200 status
+        - initialCash == "5000.00" (non-default initial_capital from config)
+        - currentEquity == "5000.00" (fallback: no snapshot exists)
+        - currentCash == "5000.00" (fallback: no snapshot exists)
+        - totalTrades == 0
+        - dailyPnl == "0" (SQL SUM returns None with no rows)
+        - openPositions == 0 (no snapshot, no unrealised_pnl heuristic)
+        - equityCurveLength == 0 (no snapshots persisted)
+        - totalReturnPct == 0.0 (no equity change from initial_capital)
+        """
+        run_orm = _make_run_orm(
+            run_id=_RUN_UUID,
+            run_mode="paper",
+            status="stopped",
+            initial_capital="5000.00",
+            stopped_at=_FIXED_NOW,
+        )
+        mock_db_session.execute.side_effect = _portfolio_side_effect_empty_run(run_orm)
+
+        resp = client_dev_with_db.get(f"/api/v1/runs/{_RUN_UUID}/portfolio")
+
+        assert resp.status_code == 200
+        body = resp.json()
+
+        # Non-default initial capital must flow through from config
+        assert body["initialCash"] == "5000.00"
+        # No snapshot: both equity and cash fall back to initial_capital
+        assert body["currentEquity"] == "5000.00"
+        assert body["currentCash"] == "5000.00"
+
+        # No trades persisted
+        assert body["totalTrades"] == 0
+        # SQL SUM returns None when no rows; handler serialises to "0"
+        assert body["dailyPnl"] == "0"
+
+        # No snapshot means no unrealised_pnl heuristic fires
+        assert body["openPositions"] == 0
+
+        # No snapshots written at all
+        assert body["equityCurveLength"] == 0
+
+        # No equity growth from initial_capital
+        assert body["totalReturnPct"] == pytest.approx(0.0, abs=1e-9)
+
+
+# ---------------------------------------------------------------------------
 # Authentication tests (production mode)
 # ---------------------------------------------------------------------------
 
