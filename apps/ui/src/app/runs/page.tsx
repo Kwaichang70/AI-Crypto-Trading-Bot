@@ -18,6 +18,8 @@ const MODE_OPTIONS: { value: RunMode | "all"; label: string }[] = [
   { value: "live", label: "Live" },
 ];
 
+const PAGE_SIZE_OPTIONS = [10, 25, 50, 100] as const;
+
 const COLUMNS: Column<Run>[] = [
   {
     key: "id",
@@ -77,11 +79,15 @@ export default function RunsPage() {
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
+  // Pagination state — page is 0-indexed.
+  const [page, setPage] = useState(0);
+  const [pageSize, setPageSize] = useState<number>(25);
+
   useEffect(() => {
     async function load() {
       setIsLoading(true);
       setError(null);
-      const result = await fetchRuns({ limit: 100 });
+      const result = await fetchRuns({ offset: page * pageSize, limit: pageSize });
       if (result.ok) {
         setRuns(result.data.items);
         setTotal(result.data.total);
@@ -91,12 +97,26 @@ export default function RunsPage() {
       setIsLoading(false);
     }
     void load();
-  }, []);
+  }, [page, pageSize]);
 
+  // Client-side mode filter applied to the current fetched page only.
   const filtered =
     modeFilter === "all"
       ? runs
       : runs.filter((r) => r.runMode === modeFilter);
+
+  // Pagination derived values.
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  const rangeStart = total === 0 ? 0 : page * pageSize + 1;
+  const rangeEnd = Math.min((page + 1) * pageSize, total);
+
+  // When a mode filter is active, show the filtered row count for the range display.
+  const displayCount = modeFilter === "all" ? total : filtered.length;
+
+  function handleModeFilter(value: RunMode | "all") {
+    setModeFilter(value);
+    setPage(0);
+  }
 
   return (
     <div className="space-y-6">
@@ -118,7 +138,7 @@ export default function RunsPage() {
         {MODE_OPTIONS.map((opt) => (
           <button
             key={opt.value}
-            onClick={() => setModeFilter(opt.value)}
+            onClick={() => handleModeFilter(opt.value)}
             className={[
               "rounded-full px-3 py-1 text-xs font-medium transition-colors",
               modeFilter === opt.value
@@ -144,6 +164,64 @@ export default function RunsPage() {
         emptyMessage="No runs found. Create your first backtest."
         isLoading={isLoading}
       />
+
+      {/* Pagination controls */}
+      <div className="flex flex-wrap items-center justify-between gap-4 rounded-lg bg-slate-800 px-4 py-3 text-sm">
+        {/* Left: rows per page */}
+        <div className="flex items-center gap-2">
+          <span className="text-slate-400">Rows per page</span>
+          <select
+            value={pageSize}
+            onChange={(e) => {
+              const parsed = Number(e.target.value);
+              if (!isNaN(parsed) && parsed > 0) {
+                setPageSize(parsed);
+                setPage(0);
+              }
+            }}
+            className="rounded bg-slate-700 px-2 py-1 text-xs text-slate-200 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+            aria-label="Rows per page"
+          >
+            {PAGE_SIZE_OPTIONS.map((size) => (
+              <option key={size} value={size}>
+                {size}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        {/* Center: range display */}
+        <span className="text-slate-400 tabular-nums">
+          {displayCount === 0
+            ? "No results"
+            : modeFilter === "all"
+              ? `${rangeStart}–${rangeEnd} of ${total}`
+              : `${filtered.length} of ${total} (filtered)`}
+        </span>
+
+        {/* Right: prev / next buttons */}
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setPage((p) => Math.max(0, p - 1))}
+            disabled={page === 0}
+            className="rounded px-3 py-1 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:text-slate-600 enabled:text-slate-300 enabled:hover:bg-slate-700 enabled:hover:text-slate-100"
+            aria-label="Previous page"
+          >
+            Prev
+          </button>
+          <span className="text-slate-500 tabular-nums">
+            {page + 1} / {totalPages}
+          </span>
+          <button
+            onClick={() => setPage((p) => Math.min(totalPages - 1, p + 1))}
+            disabled={page >= totalPages - 1}
+            className="rounded px-3 py-1 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:text-slate-600 enabled:text-slate-300 enabled:hover:bg-slate-700 enabled:hover:text-slate-100"
+            aria-label="Next page"
+          >
+            Next
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
