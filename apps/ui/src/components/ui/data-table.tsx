@@ -7,6 +7,7 @@ export interface Column<T> {
   header: string;
   render: (row: T) => React.ReactNode;
   sortable?: boolean;
+  sortValue?: (row: T) => string | number;
   className?: string;
 }
 
@@ -50,6 +51,17 @@ export function DataTable<T>({
     );
   }
 
+  const activeCol = sortKey ? columns.find((c) => c.key === sortKey) : null;
+  const displayData: readonly T[] =
+    activeCol?.sortValue
+      ? [...data].sort((a, b) => {
+          const av = activeCol.sortValue!(a);
+          const bv = activeCol.sortValue!(b);
+          const cmp = av < bv ? -1 : av > bv ? 1 : 0;
+          return sortDir === "asc" ? cmp : -cmp;
+        })
+      : data;
+
   return (
     <div className="overflow-x-auto rounded-xl border border-slate-800">
       <table className="w-full text-sm">
@@ -78,7 +90,7 @@ export function DataTable<T>({
           </tr>
         </thead>
         <tbody>
-          {data.length === 0 ? (
+          {displayData.length === 0 ? (
             <tr>
               <td
                 colSpan={columns.length}
@@ -88,7 +100,7 @@ export function DataTable<T>({
               </td>
             </tr>
           ) : (
-            data.map((row) => (
+            displayData.map((row) => (
               <tr
                 key={keyExtractor(row)}
                 className="border-b border-slate-800/50 transition-colors hover:bg-slate-800/30"

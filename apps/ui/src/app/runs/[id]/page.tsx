@@ -9,11 +9,12 @@ import {
   fetchEquityCurve,
   fetchTrades,
   fetchOrders,
+  fetchFills,
   stopRun,
   formatCurrency,
   formatPct,
 } from "@/lib/api";
-import type { Run, Portfolio, EquityPoint, Trade, Order } from "@/lib/types";
+import type { Run, Portfolio, EquityPoint, Trade, Order, Fill } from "@/lib/types";
 import { Header } from "@/components/layout/header";
 import { RunStatusBadge } from "@/components/ui/status-badge";
 import { StatCard } from "@/components/ui/stat-card";
@@ -58,6 +59,8 @@ const TRADE_COLUMNS: Column<Trade>[] = [
   {
     key: "realisedPnl",
     header: "PnL",
+    sortable: true,
+    sortValue: (t) => parseFloat(t.realisedPnl),
     render: (t) => {
       const pnl = parseFloat(t.realisedPnl);
       return (
@@ -70,6 +73,8 @@ const TRADE_COLUMNS: Column<Trade>[] = [
   {
     key: "exitAt",
     header: "Closed",
+    sortable: true,
+    sortValue: (t) => new Date(t.exitAt).getTime(),
     render: (t) => (
       <span className="font-mono text-xs text-slate-500">
         {new Date(t.exitAt).toLocaleString()}
@@ -115,14 +120,76 @@ const ORDER_COLUMNS: Column<Order>[] = [
   {
     key: "status",
     header: "Status",
+    sortable: true,
+    sortValue: (o) => o.status,
     render: (o) => <RunStatusBadge status={o.status} />,
   },
   {
     key: "createdAt",
     header: "Created",
+    sortable: true,
+    sortValue: (o) => new Date(o.createdAt).getTime(),
     render: (o) => (
       <span className="font-mono text-xs text-slate-500">
         {new Date(o.createdAt).toLocaleString()}
+      </span>
+    ),
+  },
+];
+
+// ---------------------------------------------------------------------------
+// Fill columns
+// ---------------------------------------------------------------------------
+
+const FILL_COLUMNS: Column<Fill>[] = [
+  {
+    key: "symbol",
+    header: "Symbol",
+    render: (f) => <span className="font-mono text-xs text-slate-300">{f.symbol}</span>,
+  },
+  {
+    key: "side",
+    header: "Side",
+    render: (f) => (
+      <span className={f.side === "buy" ? "text-profit text-xs font-medium" : "text-loss text-xs font-medium"}>
+        {f.side.toUpperCase()}
+      </span>
+    ),
+  },
+  {
+    key: "quantity",
+    header: "Qty",
+    render: (f) => <span className="font-mono text-xs">{f.quantity}</span>,
+  },
+  {
+    key: "price",
+    header: "Price",
+    sortable: true,
+    sortValue: (f) => parseFloat(f.price),
+    render: (f) => <span className="font-mono text-xs">{formatCurrency(f.price)}</span>,
+  },
+  {
+    key: "fee",
+    header: "Fee",
+    render: (f) => (
+      <span className="font-mono text-xs text-slate-400">
+        {formatCurrency(f.fee)} {f.feeCurrency || ""}
+      </span>
+    ),
+  },
+  {
+    key: "isMaker",
+    header: "Maker",
+    render: (f) => <span className="text-xs text-slate-400">{f.isMaker ? "Yes" : "No"}</span>,
+  },
+  {
+    key: "executedAt",
+    header: "Executed",
+    sortable: true,
+    sortValue: (f) => new Date(f.executedAt).getTime(),
+    render: (f) => (
+      <span className="font-mono text-xs text-slate-500">
+        {new Date(f.executedAt).toLocaleString()}
       </span>
     ),
   },
@@ -141,17 +208,19 @@ export default function RunDetailPage() {
   const [equityPoints, setEquityPoints] = useState<readonly EquityPoint[]>([]);
   const [trades, setTrades] = useState<readonly Trade[]>([]);
   const [orders, setOrders] = useState<readonly Order[]>([]);
+  const [fills, setFills] = useState<readonly Fill[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [isStopping, setIsStopping] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const loadData = useCallback(async () => {
-    const [runRes, portRes, curveRes, tradesRes, ordersRes] = await Promise.all([
+    const [runRes, portRes, curveRes, tradesRes, ordersRes, fillsRes] = await Promise.all([
       fetchRun(id),
       fetchPortfolio(id),
       fetchEquityCurve(id, 500),
       fetchTrades(id, { limit: 100 }),
       fetchOrders(id, { limit: 100 }),
+      fetchFills(id, { limit: 100 }),
     ]);
 
     if (!runRes.ok) {
@@ -164,6 +233,7 @@ export default function RunDetailPage() {
     if (curveRes.ok) setEquityPoints(curveRes.data.points);
     if (tradesRes.ok) setTrades(tradesRes.data.items);
     if (ordersRes.ok) setOrders(ordersRes.data.items);
+    if (fillsRes.ok) setFills(fillsRes.data.items);
   }, [id]);
 
   useEffect(() => {
@@ -258,6 +328,7 @@ export default function RunDetailPage() {
           { id: "overview", label: "Overview" },
           { id: "trades", label: `Trades (${trades.length})` },
           { id: "orders", label: `Orders (${orders.length})` },
+          { id: "fills", label: `Fills (${fills.length})` },
         ]}
       >
         {(activeTab) => (
@@ -339,6 +410,32 @@ export default function RunDetailPage() {
                         subValue={`${run.backtestMetrics.barsInMarket} / ${run.backtestMetrics.totalBars} bars`}
                       />
                     </div>
+                    <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
+                      <StatCard
+                        label="CAGR"
+                        value={formatPct(run.backtestMetrics.cagr)}
+                        trend={run.backtestMetrics.cagr > 0 ? "up" : run.backtestMetrics.cagr < 0 ? "down" : "neutral"}
+                      />
+                      <StatCard
+                        label="Duration"
+                        value={`${run.backtestMetrics.durationDays} days`}
+                      />
+                      <StatCard
+                        label="Avg Trade PnL"
+                        value={`$${formatCurrency(run.backtestMetrics.averageTradePnl)}`}
+                        trend={parseFloat(run.backtestMetrics.averageTradePnl) >= 0 ? "up" : "down"}
+                      />
+                      <StatCard
+                        label="Largest Win"
+                        value={`$${formatCurrency(run.backtestMetrics.largestWin)}`}
+                        trend="up"
+                      />
+                      <StatCard
+                        label="Largest Loss"
+                        value={`$${formatCurrency(run.backtestMetrics.largestLoss)}`}
+                        trend="down"
+                      />
+                    </div>
                   </div>
                 )}
               </div>
@@ -359,6 +456,15 @@ export default function RunDetailPage() {
                 data={orders}
                 keyExtractor={(o) => o.id}
                 emptyMessage="No orders for this run."
+              />
+            )}
+
+            {activeTab === "fills" && (
+              <DataTable
+                columns={FILL_COLUMNS}
+                data={fills}
+                keyExtractor={(f) => f.id}
+                emptyMessage="No fills for this run."
               />
             )}
           </>
