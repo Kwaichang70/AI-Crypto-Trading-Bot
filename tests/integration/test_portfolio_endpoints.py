@@ -5,7 +5,7 @@ Integration tests for the portfolio endpoints.
 
 Endpoints under test
 --------------------
-GET /api/v1/runs/{run_id}/portfolio      -- Portfolio summary snapshot (8 DB calls)
+GET /api/v1/runs/{run_id}/portfolio      -- Portfolio summary snapshot (9 DB calls)
 GET /api/v1/runs/{run_id}/equity-curve   -- Paginated equity curve (3 DB calls)
 GET /api/v1/runs/{run_id}/trades         -- Paginated completed trades (3 DB calls)
 GET /api/v1/runs/{run_id}/positions      -- Open positions stub (1 DB call)
@@ -343,7 +343,7 @@ def _make_row_result(
 
 
 # ---------------------------------------------------------------------------
-# Shared side_effect builders for portfolio summary (8 execute() calls)
+# Shared side_effect builders for portfolio summary (9 execute() calls)
 # ---------------------------------------------------------------------------
 
 def _portfolio_side_effect_with_data(
@@ -357,9 +357,10 @@ def _portfolio_side_effect_with_data(
     peak_equity: Decimal = Decimal("11000.00"),
     max_drawdown: Decimal = Decimal("0.05"),
     equity_curve_length: int = 100,
+    daily_pnl: Decimal | None = None,
 ) -> list:
     """
-    Build the 8-element side_effect list for a portfolio summary request with
+    Build the 9-element side_effect list for a portfolio summary request with
     a fully populated run — snapshots exist and trades are present.
 
     Call order matches the handler's sequential await db.execute() calls:
@@ -371,6 +372,7 @@ def _portfolio_side_effect_with_data(
       [5] peak equity               -> scalar_one_or_none -> Decimal
       [6] max drawdown              -> scalar_one_or_none -> Decimal
       [7] equity curve count        -> scalar_one         -> int
+      [8] daily PnL SUM            -> scalar_one_or_none -> Decimal | None
     """
     return [
         _make_scalar_one_or_none_result(run_orm),
@@ -381,12 +383,13 @@ def _portfolio_side_effect_with_data(
         _make_scalar_one_or_none_result(peak_equity),
         _make_scalar_one_or_none_result(max_drawdown),
         _make_scalar_result(equity_curve_length),
+        _make_scalar_one_or_none_result(daily_pnl),
     ]
 
 
 def _portfolio_side_effect_empty_run(run_orm: SimpleNamespace) -> list:
     """
-    Build the 8-element side_effect list for a portfolio summary request with
+    Build the 9-element side_effect list for a portfolio summary request with
     no trades and no equity snapshots.
 
     When a run has just been created or has never processed a bar, all
@@ -407,6 +410,7 @@ def _portfolio_side_effect_empty_run(run_orm: SimpleNamespace) -> list:
         _make_scalar_one_or_none_result(None),  # no peak equity
         _make_scalar_one_or_none_result(None),  # no max drawdown
         _make_scalar_result(0),             # equity curve length
+        _make_scalar_one_or_none_result(None),  # daily PnL (no trades)
     ]
 
 
@@ -419,11 +423,11 @@ class TestGetPortfolio:
     """
     Tests for GET /api/v1/runs/{run_id}/portfolio.
 
-    This is the most complex endpoint: 8 sequential execute() calls are made
+    This is the most complex endpoint: 9 sequential execute() calls are made
     covering run lookup, trade aggregation, win/loss counting, snapshot
-    retrieval, peak equity, max drawdown, and equity curve length.
+    retrieval, peak equity, max drawdown, equity curve length, and daily PnL.
 
-    Each test configures mock_db_session.execute.side_effect as a list of 8
+    Each test configures mock_db_session.execute.side_effect as a list of 9
     pre-built MagicMock result objects so the handler's sequential awaits
     resolve predictably.
     """
@@ -446,8 +450,8 @@ class TestGetPortfolio:
         - peakEquity comes from func.max query
         - maxDrawdownPct comes from func.max(drawdown_pct) query
         - equityCurveLength comes from count query
-        - openPositions is always 0 for MVP
-        - dailyPnl is always "0" for MVP
+        - openPositions derived from latest snapshot unrealised_pnl
+        - dailyPnl computed from today's trades (0 when no daily_pnl mock)
         """
         run_orm = _make_run_orm(run_id=_RUN_UUID)
         snapshot_orm = _make_equity_snapshot_orm(
@@ -499,9 +503,9 @@ class TestGetPortfolio:
         # Equity curve
         assert body["equityCurveLength"] == 100
 
-        # MVP stubs
-        assert body["openPositions"] == 0
-        assert body["dailyPnl"] == "0"
+        # Derived fields
+        assert body["openPositions"] == 1  # unrealised_pnl="500.00" != 0
+        assert body["dailyPnl"] == "0"  # no daily_pnl passed → None → "0"
         # Win rate: 3 / 5 = 0.6
         assert body["winRate"] == pytest.approx(0.6, abs=1e-9)
         # Total return: (10500 - 10000) / 10000 = 0.05
@@ -611,6 +615,93 @@ class TestGetPortfolio:
         assert body["winningTrades"] == 3
         assert body["losingTrades"] == 2
         assert body["winRate"] == pytest.approx(0.6, abs=1e-9)
+
+    def test_daily_pnl_from_trades_exiting_today(
+        self, client_dev_with_db: TestClient, mock_db_session: AsyncMock
+    ) -> None:
+        """
+        When trades exited today exist, dailyPnl must reflect their summed
+        realised_pnl from the daily_pnl DB query (call index [8]).
+        """
+        run_orm = _make_run_orm(run_id=_RUN_UUID)
+        snapshot_orm = _make_equity_snapshot_orm(
+            run_id=_RUN_UUID,
+            unrealised_pnl="0.00",
+        )
+        mock_db_session.execute.side_effect = _portfolio_side_effect_with_data(
+            run_orm=run_orm,
+            snapshot_orm=snapshot_orm,
+            daily_pnl=Decimal("123.45"),
+        )
+
+        resp = client_dev_with_db.get(f"/api/v1/runs/{_RUN_UUID}/portfolio")
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["dailyPnl"] == "123.45"
+
+    def test_daily_pnl_zero_when_no_trades_today(
+        self, client_dev_with_db: TestClient, mock_db_session: AsyncMock
+    ) -> None:
+        """
+        When no trades exited today, the daily_pnl query returns None and
+        dailyPnl must be "0".
+        """
+        run_orm = _make_run_orm(run_id=_RUN_UUID)
+        snapshot_orm = _make_equity_snapshot_orm(run_id=_RUN_UUID)
+        mock_db_session.execute.side_effect = _portfolio_side_effect_with_data(
+            run_orm=run_orm,
+            snapshot_orm=snapshot_orm,
+            daily_pnl=None,
+        )
+
+        resp = client_dev_with_db.get(f"/api/v1/runs/{_RUN_UUID}/portfolio")
+
+        assert resp.status_code == 200
+        assert resp.json()["dailyPnl"] == "0"
+
+    def test_open_positions_from_unrealised_pnl(
+        self, client_dev_with_db: TestClient, mock_db_session: AsyncMock
+    ) -> None:
+        """
+        When latest snapshot has non-zero unrealised_pnl, openPositions
+        must be 1.
+        """
+        run_orm = _make_run_orm(run_id=_RUN_UUID)
+        snapshot_orm = _make_equity_snapshot_orm(
+            run_id=_RUN_UUID,
+            unrealised_pnl="250.00",
+        )
+        mock_db_session.execute.side_effect = _portfolio_side_effect_with_data(
+            run_orm=run_orm,
+            snapshot_orm=snapshot_orm,
+        )
+
+        resp = client_dev_with_db.get(f"/api/v1/runs/{_RUN_UUID}/portfolio")
+
+        assert resp.status_code == 200
+        assert resp.json()["openPositions"] == 1
+
+    def test_open_positions_zero_when_unrealised_pnl_is_zero(
+        self, client_dev_with_db: TestClient, mock_db_session: AsyncMock
+    ) -> None:
+        """
+        When latest snapshot has unrealised_pnl == 0, openPositions must be 0.
+        """
+        run_orm = _make_run_orm(run_id=_RUN_UUID)
+        snapshot_orm = _make_equity_snapshot_orm(
+            run_id=_RUN_UUID,
+            unrealised_pnl="0.00",
+        )
+        mock_db_session.execute.side_effect = _portfolio_side_effect_with_data(
+            run_orm=run_orm,
+            snapshot_orm=snapshot_orm,
+        )
+
+        resp = client_dev_with_db.get(f"/api/v1/runs/{_RUN_UUID}/portfolio")
+
+        assert resp.status_code == 200
+        assert resp.json()["openPositions"] == 0
 
 
 # ---------------------------------------------------------------------------

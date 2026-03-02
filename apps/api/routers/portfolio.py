@@ -30,6 +30,7 @@ Design notes
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Annotated
 
@@ -281,6 +282,26 @@ async def get_portfolio(
     )
     equity_curve_length: int = (await db.execute(eq_count_stmt)).scalar_one() or 0
 
+    # Compute daily PnL: sum of realised_pnl from trades exiting today (UTC)
+    # Use datetime.now(tz=UTC) to ensure UTC-day boundary regardless of server TZ
+    now_utc = datetime.now(tz=UTC)
+    today_start = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+    daily_pnl_stmt = (
+        select(func.sum(TradeORM.realised_pnl))
+        .where(TradeORM.run_id == run_id, TradeORM.exit_at >= today_start)
+    )
+    daily_pnl_raw = (await db.execute(daily_pnl_stmt)).scalar_one_or_none()
+    daily_pnl = Decimal(str(daily_pnl_raw)) if daily_pnl_raw is not None else Decimal("0")
+
+    # Open positions: derive from latest snapshot unrealised_pnl.
+    # MVP: unrealised_pnl is stored as 0 in paper run snapshots (see _persist_paper_results),
+    # so this returns 0 for completed paper runs. Sprint 12+ will add a positions table.
+    open_positions = (
+        1
+        if latest_snap is not None and latest_snap.unrealised_pnl != Decimal("0")
+        else 0
+    )
+
     win_rate = winning_trades / total_trades if total_trades > 0 else 0.0
 
     log.info(
@@ -299,14 +320,14 @@ async def get_portfolio(
         total_return_pct=total_return_pct,
         total_realised_pnl=str(total_realised_pnl),
         total_fees_paid=str(total_fees_paid),
-        daily_pnl="0",       # Daily PnL is maintained in-memory; DB snapshot pending Sprint 2
+        daily_pnl=str(daily_pnl),
         drawdown_pct=drawdown_pct,
         max_drawdown_pct=max_drawdown_pct,
         total_trades=total_trades,
         winning_trades=winning_trades,
         losing_trades=losing_trades,
         win_rate=win_rate,
-        open_positions=0,    # Derived from live engine state; DB reconstruction in Sprint 2
+        open_positions=open_positions,
         equity_curve_length=equity_curve_length,
     )
 
