@@ -41,12 +41,8 @@ import pytest
 
 from common.models import OHLCVBar
 from common.types import SignalDirection, TimeFrame
-from trading.strategies.model_strategy import (
-    ModelStrategy,
-    _safe_log,
-    _sma_float,
-    _wilder_rsi,
-)
+from data.ml_features import _safe_log, _sma_float, _wilder_rsi
+from trading.strategies.model_strategy import ModelStrategy
 
 
 # ---------------------------------------------------------------------------

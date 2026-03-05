@@ -5,6 +5,7 @@ Portfolio endpoints for the AI Crypto Trading Bot API.
 
 Endpoints
 ---------
+GET /api/v1/portfolio/summary             -- Aggregate cross-run portfolio summary
 GET /api/v1/runs/{run_id}/portfolio       -- Portfolio summary snapshot
 GET /api/v1/runs/{run_id}/equity-curve    -- Equity curve time series
 GET /api/v1/runs/{run_id}/trades          -- Completed round-trip trades
@@ -17,14 +18,13 @@ Design notes
   ``config`` JSONB on RunORM for initial capital).
 - For running paper/live runs, the in-memory PortfolioAccounting state
   is the source of truth for live metrics; the DB contains checkpointed
-  snapshots written on each bar close. Sprint 2 will wire this up.
+  snapshots written on each bar close.
 - For completed backtest runs, all data is fully in the DB.
 - Equity curve endpoint supports both a paginated view (for large backtests)
   and a full-download mode (limit=0) for the frontend charting component.
-- Positions are reconstructed from the latest EquitySnapshotORM that
-  contains position context, or from the TradeORM table (net position
-  from all trades). For MVP, positions come from a dedicated endpoint
-  that reads the latest snapshot data.
+- Positions are read from the dedicated ``position_snapshots`` table which
+  is populated when a run stops. Non-flat positions (quantity > 0) are
+  returned; flat/closed positions are excluded.
 """
 
 from __future__ import annotations
@@ -32,16 +32,17 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Annotated
+from typing import Annotated, Any
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from api.db.models import EquitySnapshotORM, RunORM, TradeORM
+from api.db.models import EquitySnapshotORM, PositionSnapshotORM, RunORM, TradeORM
 from api.db.session import get_db
 from api.schemas import (
+    AggregatePortfolioResponse,
     EquityCurveResponse,
     EquityPointResponse,
     ErrorResponse,
@@ -52,9 +53,11 @@ from api.schemas import (
     TradeResponse,
 )
 
-__all__ = ["router"]
+__all__ = ["router", "summary_router"]
 
 router = APIRouter(prefix="/runs", tags=["portfolio"])
+
+summary_router = APIRouter(prefix="/portfolio", tags=["portfolio"])
 
 logger = structlog.get_logger(__name__)
 
@@ -293,14 +296,17 @@ async def get_portfolio(
     daily_pnl_raw = (await db.execute(daily_pnl_stmt)).scalar_one_or_none()
     daily_pnl = Decimal(str(daily_pnl_raw)) if daily_pnl_raw is not None else Decimal("0")
 
-    # Open positions: derive from latest snapshot unrealised_pnl.
-    # MVP: unrealised_pnl is stored as 0 in paper run snapshots (see _persist_paper_results),
-    # so this returns 0 for completed paper runs. Sprint 12+ will add a positions table.
-    open_positions = (
-        1
-        if latest_snap is not None and latest_snap.unrealised_pnl != Decimal("0")
-        else 0
+    # Query real position count from position_snapshots table
+    pos_count_stmt = (
+        select(func.count())
+        .select_from(PositionSnapshotORM)
+        .where(
+            PositionSnapshotORM.run_id == run_id,
+            PositionSnapshotORM.quantity > 0,
+        )
     )
+    pos_count_result = await db.execute(pos_count_stmt)
+    open_positions = pos_count_result.scalar_one()
 
     win_rate = winning_trades / total_trades if total_trades > 0 else 0.0
 
@@ -532,8 +538,8 @@ async def list_trades(
     summary="Get current open positions for a run",
     description=(
         "Returns all non-flat open positions for the given run. "
-        "For MVP, positions are reconstructed from the latest equity snapshot "
-        "stored per symbol. Live engine position state is Sprint 2."
+        "Positions are read from the position_snapshots table populated "
+        "when a run stops. Only non-flat positions (quantity > 0) are returned."
     ),
 )
 async def get_positions(
@@ -541,7 +547,11 @@ async def get_positions(
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> PositionListResponse:
     """
-    Get current open positions for a trading run.
+    Return persisted position snapshots for a run.
+
+    Queries ``PositionSnapshotORM`` for the given run, filtering to rows
+    where ``quantity > 0`` (non-flat positions only). Returns an empty list
+    for runs where all positions have been closed or no snapshots exist yet.
 
     Parameters
     ----------
@@ -563,33 +573,157 @@ async def get_positions(
     log = logger.bind(endpoint="get_positions", run_id=str(run_id))
     log.info("positions.get_requested")
 
-    run = await _get_run_or_404(run_id, db)
+    await _get_run_or_404(run_id, db)
 
-    # For MVP, positions are not persisted with per-symbol breakdown in the
-    # equity_snapshots table (which stores aggregate portfolio state).
-    # Sprint 2 will add a dedicated positions table. For now:
-    # - If the run is stopped/completed: return empty (all positions closed)
-    # - If the run is running: return placeholder (live state in Sprint 2)
-    # This response correctly conveys the MVP limitation without misleading data.
-
-    initial_capital_str: str = run.config.get("initial_capital", "10000")
-
-    if run.status in ("stopped", "error"):
-        # Completed run — all positions should be closed
-        positions: list[PositionResponse] = []
-    else:
-        # Running run — live position state requires in-memory engine access
-        # (Sprint 2 will wire this). Return empty list for MVP.
-        positions = []
-
-    log.info(
-        "positions.returned",
-        run_status=run.status,
-        position_count=len(positions),
+    # Query persisted position snapshots (non-flat only)
+    stmt = (
+        select(PositionSnapshotORM)
+        .where(
+            PositionSnapshotORM.run_id == run_id,
+            PositionSnapshotORM.quantity > 0,
+        )
     )
+    result = await db.execute(stmt)
+    snapshots = list(result.scalars().all())
+
+    positions = [
+        PositionResponse(
+            symbol=s.symbol,
+            run_id=str(s.run_id),
+            quantity=str(s.quantity),
+            average_entry_price=str(s.average_entry_price),
+            current_price=str(s.current_price),
+            realised_pnl=str(s.realised_pnl),
+            unrealised_pnl=str(s.unrealised_pnl),
+            total_fees_paid=str(s.total_fees_paid),
+            notional_value=str(s.quantity * s.current_price),
+            opened_at=s.opened_at,
+            updated_at=s.snapshot_at,
+        )
+        for s in snapshots
+    ]
+
+    log.info("positions.returned", count=len(positions))
 
     return PositionListResponse(
         run_id=run_id,
         positions=positions,
         count=len(positions),
+    )
+
+
+# ---------------------------------------------------------------------------
+# GET /api/v1/portfolio/summary — cross-run aggregate summary
+# ---------------------------------------------------------------------------
+
+@summary_router.get(
+    "/summary",
+    response_model=AggregatePortfolioResponse,
+    summary="Get aggregate portfolio summary across all runs",
+    description=(
+        "Returns a cross-run aggregate view: run counts by status, total "
+        "trade win/loss statistics, cumulative realised PnL and fees, "
+        "best/worst backtest return percentages, and total capital deployed."
+    ),
+)
+async def get_aggregate_portfolio(
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> AggregatePortfolioResponse:
+    """Return a cross-run aggregate portfolio summary."""
+    log = logger.bind(endpoint="get_aggregate_portfolio")
+    log.info("aggregate_portfolio.get_requested")
+
+    # ------------------------------------------------------------------
+    # Query 1: Run status counts
+    # ------------------------------------------------------------------
+    status_stmt = (
+        select(RunORM.status, func.count(RunORM.id).label("cnt"))
+        .group_by(RunORM.status)
+    )
+    status_result = await db.execute(status_stmt)
+    status_counts: dict[str, int] = {
+        row.status: row.cnt for row in status_result.all()
+    }
+    total_runs = sum(status_counts.values())
+
+    # ------------------------------------------------------------------
+    # Query 2: Trade aggregate statistics (single round-trip)
+    # Uses CASE-based conditional counting for cross-DB compatibility.
+    # ------------------------------------------------------------------
+    trade_stmt = select(
+        func.count(TradeORM.id).label("total"),
+        func.count(
+            case((TradeORM.realised_pnl > Decimal("0"), TradeORM.id), else_=None)
+        ).label("wins"),
+        func.count(
+            case((TradeORM.realised_pnl < Decimal("0"), TradeORM.id), else_=None)
+        ).label("losses"),
+        func.coalesce(func.sum(TradeORM.realised_pnl), Decimal("0")).label("pnl"),
+        func.coalesce(func.sum(TradeORM.total_fees), Decimal("0")).label("fees"),
+    )
+    trade_result = await db.execute(trade_stmt)
+    trade_row = trade_result.one()
+
+    total_trades: int = trade_row.total or 0
+    winning_trades: int = trade_row.wins or 0
+    losing_trades: int = trade_row.losses or 0
+    total_realised_pnl = Decimal(str(trade_row.pnl or "0"))
+    total_fees_paid = Decimal(str(trade_row.fees or "0"))
+    win_rate = winning_trades / total_trades if total_trades > 0 else 0.0
+
+    # ------------------------------------------------------------------
+    # Query 3: Config blobs — initial_capital + backtest_metrics
+    # Python-level extraction from JSONB for safety and maintainability.
+    # ------------------------------------------------------------------
+    configs_stmt = select(RunORM.config)
+    configs_result = await db.execute(configs_stmt)
+    config_rows: list[dict[str, Any]] = [
+        row[0] for row in configs_result.all() if row[0]
+    ]
+
+    total_initial_capital = Decimal("0")
+    return_pcts: list[float] = []
+
+    for cfg in config_rows:
+        # Sum initial capital (stored as string e.g. "10000.00")
+        raw_capital = cfg.get("initial_capital")
+        if raw_capital is not None:
+            try:
+                total_initial_capital += Decimal(str(raw_capital))
+            except Exception:
+                pass
+
+        # Collect backtest return percentages (snake_case keys in JSONB)
+        raw_metrics = cfg.get("backtest_metrics")
+        if isinstance(raw_metrics, dict):
+            ret_pct = raw_metrics.get("total_return_pct")
+            if ret_pct is not None:
+                try:
+                    return_pcts.append(float(ret_pct))
+                except (TypeError, ValueError):
+                    pass
+
+    best_return: float | None = max(return_pcts) if return_pcts else None
+    worst_return: float | None = min(return_pcts) if return_pcts else None
+
+    log.info(
+        "aggregate_portfolio.fetched",
+        total_runs=total_runs,
+        total_trades=total_trades,
+    )
+
+    return AggregatePortfolioResponse(
+        total_runs=total_runs,
+        running_runs=status_counts.get("running", 0),
+        stopped_runs=status_counts.get("stopped", 0),
+        error_runs=status_counts.get("error", 0),
+        total_trades=total_trades,
+        winning_trades=winning_trades,
+        losing_trades=losing_trades,
+        win_rate=win_rate,
+        total_realised_pnl=str(total_realised_pnl),
+        total_fees_paid=str(total_fees_paid),
+        best_run_return_pct=best_return,
+        worst_run_return_pct=worst_return,
+        total_initial_capital=str(total_initial_capital),
     )

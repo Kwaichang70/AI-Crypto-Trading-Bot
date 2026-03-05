@@ -120,6 +120,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    volumes:
+      - ../models:/app/models
     environment:
       # -- Database --
       POSTGRES_HOST:     postgres

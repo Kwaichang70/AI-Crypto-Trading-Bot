@@ -49,3 +49,19 @@ __all__ = [
     "rolling_volatility",
     "compute_features",
 ]
+
+# ML features — guarded import (scikit-learn may not be installed)
+try:
+    from data.ml_features import (
+        FEATURE_NAMES,
+        build_feature_matrix,
+        build_feature_vector_from_bars,
+    )
+
+    __all__ += [
+        "FEATURE_NAMES",
+        "build_feature_matrix",
+        "build_feature_vector_from_bars",
+    ]
+except ImportError:
+    pass

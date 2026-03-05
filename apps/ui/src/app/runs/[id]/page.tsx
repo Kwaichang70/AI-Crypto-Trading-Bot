@@ -10,11 +10,12 @@ import {
   fetchTrades,
   fetchOrders,
   fetchFills,
+  fetchPositions,
   stopRun,
   formatCurrency,
   formatPct,
 } from "@/lib/api";
-import type { Run, Portfolio, EquityPoint, Trade, Order, Fill } from "@/lib/types";
+import type { Run, Portfolio, EquityPoint, Trade, Order, Fill, Position } from "@/lib/types";
 import { Header } from "@/components/layout/header";
 import { RunStatusBadge } from "@/components/ui/status-badge";
 import { StatCard } from "@/components/ui/stat-card";
@@ -196,6 +197,65 @@ const FILL_COLUMNS: Column<Fill>[] = [
 ];
 
 // ---------------------------------------------------------------------------
+// Position columns
+// ---------------------------------------------------------------------------
+
+const POSITION_COLUMNS: Column<Position>[] = [
+  {
+    key: "symbol",
+    header: "Symbol",
+    render: (p) => <span className="font-mono text-xs text-slate-300">{p.symbol}</span>,
+  },
+  {
+    key: "quantity",
+    header: "Quantity",
+    render: (p) => <span className="font-mono text-xs">{p.quantity}</span>,
+  },
+  {
+    key: "averageEntryPrice",
+    header: "Avg Entry",
+    render: (p) => <span className="font-mono text-xs">{formatCurrency(p.averageEntryPrice)}</span>,
+  },
+  {
+    key: "currentPrice",
+    header: "Current Price",
+    render: (p) => <span className="font-mono text-xs">{formatCurrency(p.currentPrice)}</span>,
+  },
+  {
+    key: "unrealisedPnl",
+    header: "Unrealised PnL",
+    sortable: true,
+    sortValue: (p) => parseFloat(p.unrealisedPnl),
+    render: (p) => {
+      const pnl = parseFloat(p.unrealisedPnl);
+      return (
+        <span className={`font-mono text-xs font-medium ${pnl >= 0 ? "text-profit" : "text-loss"}`}>
+          {pnl >= 0 ? "+" : ""}{formatCurrency(p.unrealisedPnl)}
+        </span>
+      );
+    },
+  },
+  {
+    key: "notionalValue",
+    header: "Notional Value",
+    sortable: true,
+    sortValue: (p) => parseFloat(p.notionalValue),
+    render: (p) => <span className="font-mono text-xs">{formatCurrency(p.notionalValue)}</span>,
+  },
+  {
+    key: "openedAt",
+    header: "Opened At",
+    sortable: true,
+    sortValue: (p) => new Date(p.openedAt).getTime(),
+    render: (p) => (
+      <span className="font-mono text-xs text-slate-500">
+        {new Date(p.openedAt).toLocaleString()}
+      </span>
+    ),
+  },
+];
+
+// ---------------------------------------------------------------------------
 // Page
 // ---------------------------------------------------------------------------
 
@@ -209,18 +269,20 @@ export default function RunDetailPage() {
   const [trades, setTrades] = useState<readonly Trade[]>([]);
   const [orders, setOrders] = useState<readonly Order[]>([]);
   const [fills, setFills] = useState<readonly Fill[]>([]);
+  const [positions, setPositions] = useState<readonly Position[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [isStopping, setIsStopping] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const loadData = useCallback(async () => {
-    const [runRes, portRes, curveRes, tradesRes, ordersRes, fillsRes] = await Promise.all([
+    const [runRes, portRes, curveRes, tradesRes, ordersRes, fillsRes, posRes] = await Promise.all([
       fetchRun(id),
       fetchPortfolio(id),
       fetchEquityCurve(id, 500),
       fetchTrades(id, { limit: 100 }),
       fetchOrders(id, { limit: 100 }),
       fetchFills(id, { limit: 100 }),
+      fetchPositions(id),
     ]);
 
     if (!runRes.ok) {
@@ -234,6 +296,7 @@ export default function RunDetailPage() {
     if (tradesRes.ok) setTrades(tradesRes.data.items);
     if (ordersRes.ok) setOrders(ordersRes.data.items);
     if (fillsRes.ok) setFills(fillsRes.data.items);
+    if (posRes.ok) setPositions(posRes.data.positions);
   }, [id]);
 
   useEffect(() => {
@@ -329,6 +392,7 @@ export default function RunDetailPage() {
           { id: "trades", label: `Trades (${trades.length})` },
           { id: "orders", label: `Orders (${orders.length})` },
           { id: "fills", label: `Fills (${fills.length})` },
+          { id: "positions", label: `Positions (${positions.length})` },
         ]}
       >
         {(activeTab) => (
@@ -465,6 +529,15 @@ export default function RunDetailPage() {
                 data={fills}
                 keyExtractor={(f) => f.id}
                 emptyMessage="No fills for this run."
+              />
+            )}
+
+            {activeTab === "positions" && (
+              <DataTable
+                columns={POSITION_COLUMNS}
+                data={positions}
+                keyExtractor={(p) => p.symbol}
+                emptyMessage="No open positions for this run."
               />
             )}
           </>

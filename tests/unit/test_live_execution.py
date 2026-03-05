@@ -1195,3 +1195,182 @@ class TestLifecycle:
         ex.load_markets.side_effect = Exception("exchange down")
         with pytest.raises(Exception, match="exchange down"):
             await engine.on_start()
+
+# ===========================================================================
+# Group 13: Get All Fills (LiveExecutionEngine.get_all_fills)
+# ===========================================================================
+
+
+class TestGetAllFills:
+    """
+    Verify LiveExecutionEngine.get_all_fills() merges all per-order fill
+    lists from the local cache and returns them sorted by executed_at ascending.
+
+    From engines/live.py:
+        def get_all_fills(self) -> list[Fill]:
+            all_fills: list[Fill] = []
+            for fills in self._fills.values():
+                all_fills.extend(fills)
+            return sorted(all_fills, key=lambda f: f.executed_at)
+
+    Fill objects are injected directly into engine._fills (bypassing the
+    async exchange path) so these tests are fully synchronous and
+    deterministic — no network interaction, no exchange mocking required.
+    """
+
+    def test_get_all_fills_empty(self) -> None:
+        """
+        A freshly constructed engine with no cached fills must return an empty list.
+
+        This is the baseline before any order fill events have been recorded.
+        The _fills dict is initialised as an empty dict in __init__, so the
+        sorted() call over an empty iterable must yield [].
+        """
+        engine, _, _ = _make_engine()
+
+        fills = engine.get_all_fills()
+
+        assert fills == [], (
+            f"Expected empty list from fresh LiveExecutionEngine, got {fills!r}"
+        )
+
+    def test_get_all_fills_merges_across_orders(self) -> None:
+        """
+        Fills from two distinct orders must be merged into a single list sorted
+        by executed_at ascending, regardless of the order in which they were
+        stored in _fills.
+
+        Setup:
+        - order_id_a has one fill at T3 (latest timestamp).
+        - order_id_b has two fills at T1 (earliest) and T2 (middle).
+
+        Expected result: [T1, T2, T3] — chronological order across both orders.
+
+        This test mirrors the pattern in TestGetAllFills in
+        test_order_fill_persistence.py but exercises the LiveExecutionEngine
+        implementation, which mirrors PaperExecutionEngine's get_all_fills().
+        """
+        engine, _, _ = _make_engine()
+
+        _T1 = datetime(2024, 3, 1, 0, 0, 0, tzinfo=UTC)
+        _T2 = datetime(2024, 3, 1, 1, 0, 0, tzinfo=UTC)
+        _T3 = datetime(2024, 3, 1, 2, 0, 0, tzinfo=UTC)
+
+        order_id_a = uuid4()
+        order_id_b = uuid4()
+
+        fill_a = Fill(
+            order_id=order_id_a,
+            symbol=_SYMBOL,
+            side=OrderSide.BUY,
+            quantity=Decimal("0.1"),
+            price=Decimal("50000"),
+            fee=Decimal("0.5"),
+            fee_currency="USDT",
+            is_maker=False,
+            executed_at=_T3,
+        )
+        fill_b1 = Fill(
+            order_id=order_id_b,
+            symbol=_SYMBOL,
+            side=OrderSide.SELL,
+            quantity=Decimal("0.05"),
+            price=Decimal("49000"),
+            fee=Decimal("0.25"),
+            fee_currency="USDT",
+            is_maker=False,
+            executed_at=_T1,
+        )
+        fill_b2 = Fill(
+            order_id=order_id_b,
+            symbol=_SYMBOL,
+            side=OrderSide.SELL,
+            quantity=Decimal("0.05"),
+            price=Decimal("49500"),
+            fee=Decimal("0.25"),
+            fee_currency="USDT",
+            is_maker=True,
+            executed_at=_T2,
+        )
+
+        # Inject directly into the fill cache, bypassing the async exchange path
+        engine._fills[order_id_a] = [fill_a]
+        engine._fills[order_id_b] = [fill_b1, fill_b2]
+
+        result = engine.get_all_fills()
+
+        assert len(result) == 3, (
+            f"Expected 3 fills merged from 2 orders, got {len(result)}"
+        )
+
+        # Must be sorted ascending by executed_at across both orders
+        assert result[0].executed_at == _T1, (
+            f"First fill should be at T1, got {result[0].executed_at}"
+        )
+        assert result[1].executed_at == _T2, (
+            f"Second fill should be at T2, got {result[1].executed_at}"
+        )
+        assert result[2].executed_at == _T3, (
+            f"Third fill should be at T3, got {result[2].executed_at}"
+        )
+
+        # Verify exact identity — no copying of Fill objects
+        assert result[0] is fill_b1
+        assert result[1] is fill_b2
+        assert result[2] is fill_a
+
+    def test_get_all_fills_single_order_sorted(self) -> None:
+        """
+        Fills from a single order must be returned in ascending executed_at order.
+
+        This exercises the sorting guarantee when only one order's fills are
+        present in the cache. Two fills are inserted in reverse chronological
+        order to confirm that get_all_fills() does not rely on insertion order.
+        """
+        engine, _, _ = _make_engine()
+
+        _T_EARLY = datetime(2024, 3, 1, 8, 0, 0, tzinfo=UTC)
+        _T_LATE = datetime(2024, 3, 1, 9, 0, 0, tzinfo=UTC)
+
+        order_id = uuid4()
+
+        fill_late = Fill(
+            order_id=order_id,
+            symbol=_SYMBOL,
+            side=OrderSide.BUY,
+            quantity=Decimal("0.05"),
+            price=Decimal("51000"),
+            fee=Decimal("0.25"),
+            fee_currency="USDT",
+            is_maker=False,
+            executed_at=_T_LATE,
+        )
+        fill_early = Fill(
+            order_id=order_id,
+            symbol=_SYMBOL,
+            side=OrderSide.BUY,
+            quantity=Decimal("0.05"),
+            price=Decimal("50900"),
+            fee=Decimal("0.25"),
+            fee_currency="USDT",
+            is_maker=False,
+            executed_at=_T_EARLY,
+        )
+
+        # Insert in reverse order to confirm sorting is applied
+        engine._fills[order_id] = [fill_late, fill_early]
+
+        result = engine.get_all_fills()
+
+        assert len(result) == 2, (
+            f"Expected 2 fills for single order, got {len(result)}"
+        )
+        assert result[0] is fill_early, (
+            "Earlier fill must appear first after sorting"
+        )
+        assert result[1] is fill_late, (
+            "Later fill must appear second after sorting"
+        )
+        assert result[0].executed_at < result[1].executed_at, (
+            "Fills must be sorted ascending by executed_at"
+        )

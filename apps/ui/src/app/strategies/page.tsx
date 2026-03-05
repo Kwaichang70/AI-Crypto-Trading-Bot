@@ -9,6 +9,7 @@ import type { Strategy } from "@/lib/types";
 import { Header } from "@/components/layout/header";
 
 export const metadata: Metadata = { title: "Strategies" };
+export const dynamic = "force-dynamic";
 
 // ---------------------------------------------------------------------------
 // Strategy tag pill

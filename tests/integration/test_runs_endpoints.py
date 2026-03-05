@@ -937,3 +937,281 @@ class TestPaperEngineTaskWiring:
         assert _RUN_TASKS[run_id_a] is not _RUN_TASKS[run_id_b], (
             "Both paper runs share the same Task object — expected independent tasks"
         )
+
+
+# ---------------------------------------------------------------------------
+# GET /api/v1/runs — server-side mode and status filtering tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.integration
+class TestListRunsFiltering:
+    """
+    Tests for the server-side mode and status filter parameters on
+    GET /api/v1/runs.
+
+    Background
+    ----------
+    The list_runs() handler accepts two optional query parameters for
+    server-side filtering:
+
+    - ``mode``   — one of "backtest", "paper", "live".  Any other value is
+                   rejected with HTTP 422 before any DB I/O occurs.
+    - ``status`` — one of "running", "stopped", "error".  The query param
+                   name is ``status`` (aliased from ``run_status`` in the
+                   handler signature).  Any other value is rejected with 422.
+
+    Both filters, when supplied, add WHERE clauses to both the COUNT query
+    and the page query.  Multiple filters are AND-combined.
+
+    Mock wiring (identical to TestListRuns):
+        mock_db_session.execute.side_effect = [
+            _make_scalar_result(count),          # COUNT(*) with filters (call 0)
+            _make_scalars_result([run_orm, ...]), # page SELECT with filters (call 1)
+        ]
+
+    Test strategy
+    -------------
+    Tests mock the DB session so execute() returns canned count + page data
+    appropriate to each filter scenario.  We verify the HTTP status code and
+    response body shape.  We do NOT inspect the SQLAlchemy statement internals
+    (that would couple tests to ORM implementation details).
+    """
+
+    def test_filter_by_mode_backtest(
+        self, client_dev_with_db: TestClient, mock_db_session: AsyncMock
+    ) -> None:
+        """
+        GET /api/v1/runs?mode=backtest must return HTTP 200 with only backtest runs.
+
+        The mock returns 2 backtest RunORM objects.  We assert:
+        - HTTP 200
+        - total == 2
+        - all items have runMode == "backtest"
+
+        This validates that the mode filter parameter is accepted and that
+        the response envelope reflects the filtered result set.
+        """
+        run_a = _make_run_orm(
+            run_id=uuid.UUID("a0000000-0000-0000-0000-000000000001"),
+            run_mode="backtest",
+            status="stopped",
+        )
+        run_b = _make_run_orm(
+            run_id=uuid.UUID("a0000000-0000-0000-0000-000000000002"),
+            run_mode="backtest",
+            status="stopped",
+        )
+
+        mock_db_session.execute.side_effect = [
+            _make_scalar_result(2),
+            _make_scalars_result([run_a, run_b]),
+        ]
+
+        resp = client_dev_with_db.get("/api/v1/runs?mode=backtest")
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["total"] == 2
+        assert len(body["items"]) == 2
+        assert all(item["runMode"] == "backtest" for item in body["items"])
+
+    def test_filter_by_mode_paper(
+        self, client_dev_with_db: TestClient, mock_db_session: AsyncMock
+    ) -> None:
+        """
+        GET /api/v1/runs?mode=paper must return HTTP 200 with only paper runs.
+
+        The mock returns 1 paper RunORM object.  We assert:
+        - HTTP 200
+        - total == 1
+        - items[0].runMode == "paper"
+        """
+        run = _make_run_orm(
+            run_id=uuid.UUID("b0000000-0000-0000-0000-000000000001"),
+            run_mode="paper",
+            status="running",
+        )
+
+        mock_db_session.execute.side_effect = [
+            _make_scalar_result(1),
+            _make_scalars_result([run]),
+        ]
+
+        resp = client_dev_with_db.get("/api/v1/runs?mode=paper")
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["total"] == 1
+        assert len(body["items"]) == 1
+        assert body["items"][0]["runMode"] == "paper"
+
+    def test_filter_by_status_running(
+        self, client_dev_with_db: TestClient, mock_db_session: AsyncMock
+    ) -> None:
+        """
+        GET /api/v1/runs?status=running must return HTTP 200 with only running runs.
+
+        The mock returns 1 running RunORM object.  We assert:
+        - HTTP 200
+        - total == 1
+        - items[0].status == "running"
+        """
+        run = _make_run_orm(
+            run_id=uuid.UUID("c0000000-0000-0000-0000-000000000001"),
+            run_mode="paper",
+            status="running",
+        )
+
+        mock_db_session.execute.side_effect = [
+            _make_scalar_result(1),
+            _make_scalars_result([run]),
+        ]
+
+        resp = client_dev_with_db.get("/api/v1/runs?status=running")
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["total"] == 1
+        assert len(body["items"]) == 1
+        assert body["items"][0]["status"] == "running"
+
+    def test_filter_by_status_stopped(
+        self, client_dev_with_db: TestClient, mock_db_session: AsyncMock
+    ) -> None:
+        """
+        GET /api/v1/runs?status=stopped must return HTTP 200 with only stopped runs.
+
+        We set up 2 stopped RunORM objects with different run modes to confirm
+        the status filter is mode-agnostic.  We assert:
+        - HTTP 200
+        - total == 2
+        - every returned item has status == "stopped"
+        """
+        run_a = _make_run_orm(
+            run_id=uuid.UUID("d0000000-0000-0000-0000-000000000001"),
+            run_mode="backtest",
+            status="stopped",
+            stopped_at=_FIXED_NOW,
+        )
+        run_b = _make_run_orm(
+            run_id=uuid.UUID("d0000000-0000-0000-0000-000000000002"),
+            run_mode="paper",
+            status="stopped",
+            stopped_at=_FIXED_NOW,
+        )
+
+        mock_db_session.execute.side_effect = [
+            _make_scalar_result(2),
+            _make_scalars_result([run_a, run_b]),
+        ]
+
+        resp = client_dev_with_db.get("/api/v1/runs?status=stopped")
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["total"] == 2
+        assert len(body["items"]) == 2
+        assert all(item["status"] == "stopped" for item in body["items"])
+
+    def test_combined_mode_and_status_filter(
+        self, client_dev_with_db: TestClient, mock_db_session: AsyncMock
+    ) -> None:
+        """
+        GET /api/v1/runs?mode=paper&status=running must apply both filters.
+
+        The handler combines mode and status into a compound WHERE clause
+        (AND-logic).  The mock returns 1 paper+running RunORM to simulate
+        the result of that compound query.  We assert:
+        - HTTP 200
+        - total == 1
+        - items[0].runMode == "paper"
+        - items[0].status == "running"
+        """
+        run = _make_run_orm(
+            run_id=uuid.UUID("e0000000-0000-0000-0000-000000000001"),
+            run_mode="paper",
+            status="running",
+        )
+
+        mock_db_session.execute.side_effect = [
+            _make_scalar_result(1),
+            _make_scalars_result([run]),
+        ]
+
+        resp = client_dev_with_db.get("/api/v1/runs?mode=paper&status=running")
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["total"] == 1
+        assert len(body["items"]) == 1
+        assert body["items"][0]["runMode"] == "paper"
+        assert body["items"][0]["status"] == "running"
+
+    def test_invalid_mode_returns_422(self, client_dev_with_db: TestClient) -> None:
+        """
+        GET /api/v1/runs?mode=invalid must return HTTP 422.
+
+        The handler validates mode against _VALID_MODES = {"backtest", "paper", "live"}
+        and raises HTTPException(422) for any other value before executing any
+        DB query.  No mock_db_session wiring is needed because the rejection
+        happens before db.execute() is ever called.
+        """
+        resp = client_dev_with_db.get("/api/v1/runs?mode=invalid")
+
+        assert resp.status_code == 422
+        body = resp.json()
+        assert "detail" in body
+
+    def test_invalid_status_returns_422(self, client_dev_with_db: TestClient) -> None:
+        """
+        GET /api/v1/runs?status=invalid must return HTTP 422.
+
+        The handler validates the status param against
+        _VALID_STATUSES = {"running", "stopped", "error"} and raises
+        HTTPException(422) for any unrecognised value before any DB I/O.
+        """
+        resp = client_dev_with_db.get("/api/v1/runs?status=invalid")
+
+        assert resp.status_code == 422
+        body = resp.json()
+        assert "detail" in body
+
+    def test_filter_with_pagination(
+        self, client_dev_with_db: TestClient, mock_db_session: AsyncMock
+    ) -> None:
+        """
+        GET /api/v1/runs?mode=backtest&offset=0&limit=1 must apply both the
+        mode filter and the pagination constraints independently.
+
+        The mock simulates a scenario where 3 backtest runs exist in total
+        but only 1 is returned on the first page (limit=1).  We assert:
+        - HTTP 200
+        - total == 3  (filtered count, not page size)
+        - len(items) == 1  (one record on this page)
+        - items[0].runMode == "backtest"
+        - offset == 0 and limit == 1 are echoed in the response envelope
+
+        This verifies that ``total`` reflects the filtered count (from the
+        COUNT query) rather than the number of items in the current page,
+        and that the mode filter and pagination params are both honoured.
+        """
+        run = _make_run_orm(
+            run_id=uuid.UUID("f0000000-0000-0000-0000-000000000001"),
+            run_mode="backtest",
+            status="stopped",
+        )
+
+        mock_db_session.execute.side_effect = [
+            _make_scalar_result(3),       # 3 backtest runs total (filtered count)
+            _make_scalars_result([run]),   # only 1 returned for this page
+        ]
+
+        resp = client_dev_with_db.get("/api/v1/runs?mode=backtest&offset=0&limit=1")
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["total"] == 3
+        assert body["offset"] == 0
+        assert body["limit"] == 1
+        assert len(body["items"]) == 1
+        assert body["items"][0]["runMode"] == "backtest"

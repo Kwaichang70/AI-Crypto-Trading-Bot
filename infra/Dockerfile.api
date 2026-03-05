@@ -19,8 +19,8 @@ ARG PYTHON_VERSION=3.11
 # -----------------------------------------------------------------------------
 # Stage 1: deps — install uv, resolve and install all Python dependencies
 # Using the full slim image here so uv can compile C extensions if needed.
-# All three workspace packages (common, trading, data) are installed alongside
-# the api package's third-party deps using `uv sync --frozen --no-dev`.
+# All workspace packages (common, trading, data) and their third-party runtime
+# deps are installed via `uv sync --frozen --no-dev --no-editable --package api`.
 # -----------------------------------------------------------------------------
 FROM python:${PYTHON_VERSION}-slim AS deps
 
@@ -74,11 +74,15 @@ COPY apps/api/ ./apps/api/
 # --no-editable:  install workspace packages as proper wheels into site-packages
 #                 (editable installs embed /build/ paths that break across stages)
 # --project:      workspace root is /build (contains pyproject.toml + uv.lock)
+# --package api:  target the 'api' workspace member so uv resolves the full
+#                 dependency tree: api + common + trading + data + all third-party
+#                 deps (fastapi, sqlalchemy, alembic, ccxt, etc.). Without this
+#                 flag, uv syncs only the root package (dependencies = []).
 #
 # NOTE: No error swallowing. If this RUN step fails, the Docker build fails.
 # This is intentional — a broken venv must never reach the runtime stage.
 # ---------------------------------------------------------------------------
-RUN uv sync --frozen --no-dev --no-editable --project /build
+RUN uv sync --frozen --no-dev --no-editable --project /build --package api
 
 # -----------------------------------------------------------------------------
 # Stage 2: runtime — minimal production image
@@ -138,10 +142,11 @@ HEALTHCHECK --interval=15s --timeout=5s --start-period=60s --retries=3 \
 ENTRYPOINT ["/app/entrypoint.sh"]
 
 # Graceful shutdown: uvicorn handles SIGTERM with --timeout-graceful-shutdown.
-CMD ["uvicorn", \
+# Use `python -m uvicorn` to avoid stale shebang paths from the build stage.
+CMD ["python", "-m", "uvicorn", \
      "api.main:app", \
      "--host", "0.0.0.0", \
      "--port", "8000", \
      "--workers", "1", \
-     "--log-config", "/dev/null", \
+     "--no-access-log", \
      "--timeout-graceful-shutdown", "25"]

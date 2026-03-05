@@ -668,6 +668,19 @@ class LiveExecutionEngine(BaseExecutionEngine):
             )
             return sorted(cached_fills, key=lambda f: f.executed_at)
 
+    def get_all_fills(self) -> list[Fill]:
+        """Return all fills across all orders, sorted by executed_at.
+
+        Note: returns only locally cached fills. Fills are populated when
+        ``get_fills(order_id)`` is called during execution or reconciliation.
+        If some orders' fills were never fetched from the exchange, they will
+        not be included.
+        """
+        all_fills: list[Fill] = []
+        for fills in self._fills.values():
+            all_fills.extend(fills)
+        return sorted(all_fills, key=lambda f: f.executed_at)
+
     # ------------------------------------------------------------------
     # Reconciliation
     # ------------------------------------------------------------------

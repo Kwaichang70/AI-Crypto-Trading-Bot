@@ -51,6 +51,7 @@ __all__ = [
     "TradeListResponse",
     # Portfolio
     "PortfolioResponse",
+    "AggregatePortfolioResponse",
     "EquityPointResponse",
     "EquityCurveResponse",
     "PositionResponse",
@@ -519,6 +520,36 @@ class PortfolioResponse(BaseModel):
     win_rate: float = Field(description="Fraction of winning trades")
     open_positions: int = Field(description="Number of open positions")
     equity_curve_length: int = Field(description="Equity curve data point count")
+
+
+class AggregatePortfolioResponse(BaseModel):
+    """Cross-run aggregate portfolio summary."""
+
+    model_config = _API_MODEL_CONFIG
+
+    total_runs: int = Field(description="Total number of runs")
+    running_runs: int = Field(description="Runs with status='running'")
+    stopped_runs: int = Field(description="Runs with status='stopped'")
+    error_runs: int = Field(description="Runs with status='error'")
+    total_trades: int = Field(description="Total completed trades across all runs")
+    winning_trades: int = Field(description="Trades with positive realised PnL")
+    losing_trades: int = Field(description="Trades with negative realised PnL")
+    win_rate: float = Field(description="Fraction of winning trades (0.0 if no trades)")
+    total_realised_pnl: str = Field(description="Sum of realised PnL across all trades")
+    total_fees_paid: str = Field(description="Sum of fees across all trades")
+    best_run_return_pct: float | None = Field(
+        description="Highest total_return_pct from backtest metrics (None if no backtests)"
+    )
+    worst_run_return_pct: float | None = Field(
+        description="Lowest total_return_pct from backtest metrics (None if no backtests)"
+    )
+    total_initial_capital: str = Field(
+        description="Sum of initial_capital across all runs"
+    )
+
+    @field_serializer("total_realised_pnl", "total_fees_paid", "total_initial_capital")
+    def serialise_decimal(self, v: Decimal | str) -> str:
+        return str(v)
 
 
 class EquityPointResponse(BaseModel):

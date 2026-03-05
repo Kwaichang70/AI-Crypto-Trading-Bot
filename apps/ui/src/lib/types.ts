@@ -209,6 +209,22 @@ export interface Portfolio {
   equityCurveLength: number;
 }
 
+export interface AggregatePortfolio {
+  totalRuns: number;
+  runningRuns: number;
+  stoppedRuns: number;
+  errorRuns: number;
+  totalTrades: number;
+  winningTrades: number;
+  losingTrades: number;
+  winRate: number;
+  totalRealisedPnl: string;
+  totalFeesPaid: string;
+  bestRunReturnPct: number | null;
+  worstRunReturnPct: number | null;
+  totalInitialCapital: string;
+}
+
 export interface EquityPoint {
   timestamp: string;
   equity: string;

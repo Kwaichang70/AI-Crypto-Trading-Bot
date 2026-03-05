@@ -694,6 +694,13 @@ class PaperExecutionEngine(BaseExecutionEngine):
         fills = self._fills.get(order_id, [])
         return sorted(fills, key=lambda f: f.executed_at)
 
+    def get_all_fills(self) -> list[Fill]:
+        """Return all fills across all orders, sorted by executed_at."""
+        all_fills: list[Fill] = []
+        for fills in self._fills.values():
+            all_fills.extend(fills)
+        return sorted(all_fills, key=lambda f: f.executed_at)
+
     # ------------------------------------------------------------------
     # Resting limit-order check (called on each new bar)
     # ------------------------------------------------------------------

@@ -5,9 +5,9 @@
 
 import type { Metadata } from "next";
 import Link from "next/link";
-import { fetchHealth, fetchRuns, fetchPortfolio, formatCurrency } from "@/lib/api";
+import { fetchHealth, fetchRuns, fetchAggregatePortfolio, formatCurrency, formatPct } from "@/lib/api";
 import type { HealthResponse } from "@/lib/api";
-import type { Run, Portfolio } from "@/lib/types";
+import type { Run, AggregatePortfolio } from "@/lib/types";
 import { StatCard } from "@/components/ui/stat-card";
 import { RunStatusBadge } from "@/components/ui/status-badge";
 import { Header } from "@/components/layout/header";
@@ -93,22 +93,15 @@ function RecentRunsTable({ runs }: { runs: readonly Run[] }) {
 // ---------------------------------------------------------------------------
 
 export default async function DashboardPage() {
-  const [healthResult, runsResult] = await Promise.all([
+  const [healthResult, runsResult, aggregateResult] = await Promise.all([
     fetchHealth(),
     fetchRuns({ limit: 25 }),
+    fetchAggregatePortfolio(),
   ]);
 
   const runs: readonly Run[] = runsResult.ok ? runsResult.data.items : [];
-  const totalRuns = runsResult.ok ? runsResult.data.total : 0;
-  const activeRuns = runs.filter((r) => r.status === "running").length;
-  const errorRuns = runs.filter((r) => r.status === "error").length;
-
-  // Fetch portfolio for the most relevant run: prefer a running run, fall back
-  // to the most recently created run in the page.
-  const latestRun = runs.find((r) => r.status === "running") ?? runs[0];
-  const portfolioResult = latestRun ? await fetchPortfolio(latestRun.id) : null;
-  const portfolio: Portfolio | null =
-    portfolioResult?.ok === true ? portfolioResult.data : null;
+  const aggregate: AggregatePortfolio | null =
+    aggregateResult.ok ? aggregateResult.data : null;
 
   return (
     <div className="space-y-6">
@@ -129,19 +122,19 @@ export default async function DashboardPage() {
       <section aria-label="Summary metrics" className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
         <StatCard
           label="Total Runs"
-          value={totalRuns}
+          value={aggregate?.totalRuns ?? 0}
           subValue="all time"
         />
         <StatCard
           label="Active Runs"
-          value={activeRuns}
-          trend={activeRuns > 0 ? "up" : "neutral"}
+          value={aggregate?.runningRuns ?? 0}
+          trend={(aggregate?.runningRuns ?? 0) > 0 ? "up" : "neutral"}
           subValue="currently running"
         />
         <StatCard
           label="Error Runs"
-          value={errorRuns}
-          trend={errorRuns > 0 ? "down" : "neutral"}
+          value={aggregate?.errorRuns ?? 0}
+          trend={(aggregate?.errorRuns ?? 0) > 0 ? "down" : "neutral"}
           subValue="needs attention"
         />
         <div className="card space-y-3">
@@ -162,49 +155,49 @@ export default async function DashboardPage() {
           )}
         </div>
         {(() => {
-          const equity = portfolio ? parseFloat(portfolio.currentEquity) : NaN;
-          const initial = portfolio ? parseFloat(portfolio.initialCash) : NaN;
-          const equityTrend: "up" | "down" | "neutral" =
-            !isNaN(equity) && !isNaN(initial)
-              ? equity > initial ? "up" : equity < initial ? "down" : "neutral"
-              : "neutral";
-          return (
-            <StatCard
-              label="Portfolio Equity"
-              value={
-                portfolio
-                  ? `$${formatCurrency(portfolio.currentEquity)}`
-                  : "—"
-              }
-              subValue={
-                latestRun
-                  ? `run ${latestRun.id.slice(0, 8)}…`
-                  : "no runs yet"
-              }
-              trend={equityTrend}
-            />
-          );
-        })()}
-        {(() => {
-          const pnl = portfolio ? parseFloat(portfolio.totalRealisedPnl) : NaN;
+          const pnl = aggregate ? parseFloat(aggregate.totalRealisedPnl) : NaN;
           const pnlTrend: "up" | "down" | "neutral" =
             !isNaN(pnl)
               ? pnl > 0 ? "up" : pnl < 0 ? "down" : "neutral"
               : "neutral";
           return (
             <StatCard
-              label="Realized PnL"
+              label="Total Realized PnL"
               value={
-                portfolio
-                  ? `$${formatCurrency(portfolio.totalRealisedPnl)}`
+                aggregate
+                  ? `$${formatCurrency(aggregate.totalRealisedPnl)}`
                   : "—"
               }
               subValue={
-                portfolio
-                  ? `${portfolio.totalTrades} trade${portfolio.totalTrades !== 1 ? "s" : ""}`
+                aggregate
+                  ? `${aggregate.totalTrades} trade${aggregate.totalTrades !== 1 ? "s" : ""}`
                   : "no data"
               }
               trend={pnlTrend}
+            />
+          );
+        })()}
+        {(() => {
+          return (
+            <StatCard
+              label="Win Rate"
+              value={
+                aggregate && aggregate.totalTrades > 0
+                  ? formatPct(aggregate.winRate)
+                  : "—"
+              }
+              subValue={
+                aggregate && aggregate.totalTrades > 0
+                  ? `${aggregate.winningTrades}W / ${aggregate.losingTrades}L`
+                  : "no trades"
+              }
+              trend={
+                aggregate && aggregate.winRate >= 0.5
+                  ? "up"
+                  : aggregate && aggregate.totalTrades > 0
+                    ? "down"
+                    : "neutral"
+              }
             />
           );
         })()}

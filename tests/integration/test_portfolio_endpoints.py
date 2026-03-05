@@ -358,9 +358,10 @@ def _portfolio_side_effect_with_data(
     max_drawdown: Decimal = Decimal("0.05"),
     equity_curve_length: int = 100,
     daily_pnl: Decimal | None = None,
+    open_positions: int = 1,
 ) -> list:
     """
-    Build the 9-element side_effect list for a portfolio summary request with
+    Build the 10-element side_effect list for a portfolio summary request with
     a fully populated run — snapshots exist and trades are present.
 
     Call order matches the handler's sequential await db.execute() calls:
@@ -373,6 +374,7 @@ def _portfolio_side_effect_with_data(
       [6] max drawdown              -> scalar_one_or_none -> Decimal
       [7] equity curve count        -> scalar_one         -> int
       [8] daily PnL SUM            -> scalar_one_or_none -> Decimal | None
+      [9] open positions count      -> scalar_one         -> int
     """
     return [
         _make_scalar_one_or_none_result(run_orm),
@@ -384,12 +386,13 @@ def _portfolio_side_effect_with_data(
         _make_scalar_one_or_none_result(max_drawdown),
         _make_scalar_result(equity_curve_length),
         _make_scalar_one_or_none_result(daily_pnl),
+        _make_scalar_result(open_positions),
     ]
 
 
 def _portfolio_side_effect_empty_run(run_orm: SimpleNamespace) -> list:
     """
-    Build the 9-element side_effect list for a portfolio summary request with
+    Build the 10-element side_effect list for a portfolio summary request with
     no trades and no equity snapshots.
 
     When a run has just been created or has never processed a bar, all
@@ -411,6 +414,7 @@ def _portfolio_side_effect_empty_run(run_orm: SimpleNamespace) -> list:
         _make_scalar_one_or_none_result(None),  # no max drawdown
         _make_scalar_result(0),             # equity curve length
         _make_scalar_one_or_none_result(None),  # daily PnL (no trades)
+        _make_scalar_result(0),             # open positions (none)
     ]
 
 
@@ -682,11 +686,11 @@ class TestGetPortfolio:
         assert resp.status_code == 200
         assert resp.json()["openPositions"] == 1
 
-    def test_open_positions_zero_when_unrealised_pnl_is_zero(
+    def test_open_positions_zero_when_no_position_snapshots(
         self, client_dev_with_db: TestClient, mock_db_session: AsyncMock
     ) -> None:
         """
-        When latest snapshot has unrealised_pnl == 0, openPositions must be 0.
+        When position_snapshots COUNT returns 0, openPositions must be 0.
         """
         run_orm = _make_run_orm(run_id=_RUN_UUID)
         snapshot_orm = _make_equity_snapshot_orm(
@@ -696,6 +700,7 @@ class TestGetPortfolio:
         mock_db_session.execute.side_effect = _portfolio_side_effect_with_data(
             run_orm=run_orm,
             snapshot_orm=snapshot_orm,
+            open_positions=0,
         )
 
         resp = client_dev_with_db.get(f"/api/v1/runs/{_RUN_UUID}/portfolio")
@@ -1010,9 +1015,9 @@ class TestGetPositions:
     """
     Tests for GET /api/v1/runs/{run_id}/positions.
 
-    For MVP, positions are not persisted with per-symbol breakdown.  The
-    handler always returns an empty positions list regardless of run status.
-    The only DB call is the _get_run_or_404() lookup.
+    The handler queries PositionSnapshotORM rows where quantity > 0 for
+    the given run.  Position snapshots are persisted when a run stops.
+    Two DB calls: _get_run_or_404() lookup, then position query.
 
     Responses use PositionListResponse:
       runId (UUID), positions (list), count (int)
@@ -1022,17 +1027,19 @@ class TestGetPositions:
         self, client_dev_with_db: TestClient, mock_db_session: AsyncMock
     ) -> None:
         """
-        A stopped run must return HTTP 200 with an empty positions list
-        and count=0.
+        A stopped run with no non-flat position snapshots must return HTTP 200
+        with an empty positions list and count=0.
 
-        For MVP, all positions on a stopped run are considered closed.  The
-        handler branch ``if run.status in ('stopped', 'error')`` returns an
-        empty list explicitly.
+        The handler queries position_snapshots WHERE quantity > 0; when no
+        matching rows exist, an empty list is returned.
         """
         run_orm = _make_run_orm(
             run_id=_RUN_UUID, status="stopped", stopped_at=_FIXED_NOW
         )
-        mock_db_session.execute.return_value = _make_scalar_one_or_none_result(run_orm)
+        mock_db_session.execute.side_effect = [
+            _make_scalar_one_or_none_result(run_orm),
+            _make_scalars_result([]),  # no position snapshots with qty > 0
+        ]
 
         resp = client_dev_with_db.get(f"/api/v1/runs/{_RUN_UUID}/positions")
 
@@ -1043,18 +1050,21 @@ class TestGetPositions:
         assert body["positions"] == []
         assert body["count"] == 0
 
-    def test_running_run_returns_200_with_empty_positions_mvp_stub(
+    def test_running_run_returns_200_with_empty_positions(
         self, client_dev_with_db: TestClient, mock_db_session: AsyncMock
     ) -> None:
         """
-        A currently running paper or live run must also return HTTP 200 with
-        empty positions and count=0.
+        A currently running run with no persisted position snapshots must
+        return HTTP 200 with empty positions and count=0.
 
-        Sprint 2 will wire live engine state into this endpoint.  For MVP,
-        the handler returns an empty list for both running and stopped runs.
+        Position snapshots are written on run stop; while a run is still
+        active, no snapshots exist yet in the DB.
         """
         run_orm = _make_run_orm(run_id=_RUN_UUID, status="running")
-        mock_db_session.execute.return_value = _make_scalar_one_or_none_result(run_orm)
+        mock_db_session.execute.side_effect = [
+            _make_scalar_one_or_none_result(run_orm),
+            _make_scalars_result([]),  # no position snapshots yet
+        ]
 
         resp = client_dev_with_db.get(f"/api/v1/runs/{_RUN_UUID}/positions")
 
@@ -1156,6 +1166,7 @@ class TestPaperEnginePersistencePipeline:
             max_drawdown=Decimal("0.01"),
             equity_curve_length=50,
             daily_pnl=Decimal("75.50"),
+            open_positions=0,
         )
 
         resp = client_dev_with_db.get(f"/api/v1/runs/{_RUN_UUID}/portfolio")
@@ -1472,3 +1483,279 @@ class TestPortfolioEndpointAuth:
         resp = client_prod.get(f"/api/v1/runs/{_RUN_UUID}/positions")
 
         assert resp.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# GET /api/v1/portfolio/summary — aggregate portfolio tests
+# ---------------------------------------------------------------------------
+
+# -- Additional helpers for the 3-query aggregate endpoint -----------------
+
+
+def _make_all_result(rows: list) -> MagicMock:
+    """
+    Return a MagicMock that mimics an execute() result supporting .all().
+
+    Used for the status-count query (Query 1) and the configs query (Query 3)
+    of get_aggregate_portfolio, both of which call ``result.all()`` to iterate
+    over rows.
+
+    Parameters
+    ----------
+    rows:
+        List of row objects (or tuples) to return from .all().
+    """
+    result = MagicMock()
+    result.all.return_value = rows
+    return result
+
+
+def _make_aggregate_trade_one(
+    total: int,
+    wins: int,
+    losses: int,
+    pnl: Decimal,
+    fees: Decimal,
+) -> MagicMock:
+    """
+    Return a MagicMock for the trade aggregate query (Query 2) that uses .one().
+
+    The get_aggregate_portfolio handler calls
+    ``(await db.execute(trade_stmt)).one()`` and accesses the attributes
+    ``total``, ``wins``, ``losses``, ``pnl``, ``fees`` on the returned row.
+
+    Parameters
+    ----------
+    total:
+        Total trade count.
+    wins:
+        Winning trade count (realised_pnl > 0).
+    losses:
+        Losing trade count (realised_pnl < 0).
+    pnl:
+        Aggregate SUM of realised_pnl.
+    fees:
+        Aggregate SUM of total_fees.
+    """
+    row = MagicMock()
+    row.total = total
+    row.wins = wins
+    row.losses = losses
+    row.pnl = pnl
+    row.fees = fees
+
+    result = MagicMock()
+    result.one.return_value = row
+    return result
+
+
+@pytest.mark.integration
+class TestAggregatePortfolio:
+    """
+    Tests for GET /api/v1/portfolio/summary.
+
+    The endpoint is served by summary_router (prefix="/portfolio") mounted
+    at /api/v1, so the full URL is /api/v1/portfolio/summary.
+
+    The handler issues exactly 3 sequential db.execute() calls:
+
+      [0] status counts  ->  result.all()  ->  list of rows with .status / .cnt
+      [1] trade stats    ->  result.one()  ->  Row with .total/.wins/.losses/.pnl/.fees
+      [2] config blobs   ->  result.all()  ->  list of (config_dict,) tuples
+
+    Each test sets mock_db_session.execute.side_effect as a 3-element list
+    built from _make_all_result() and _make_aggregate_trade_one().
+
+    Response key naming
+    -------------------
+    AggregatePortfolioResponse uses alias_generator=to_camel, so all
+    assertions use camelCase keys on resp.json() output.
+    """
+
+    def test_aggregate_empty_db(
+        self, client_dev_with_db: TestClient, mock_db_session: AsyncMock
+    ) -> None:
+        """
+        When the database contains no runs and no trades, the summary endpoint
+        must return HTTP 200 with all numeric totals as zero, winRate=0.0,
+        bestRunReturnPct=None, worstRunReturnPct=None, and
+        totalInitialCapital="0".
+
+        Query 1 returns an empty list (no status group rows).
+        Query 2 returns a trade row with all zeros.
+        Query 3 returns an empty list (no config rows).
+        """
+        mock_db_session.execute.side_effect = [
+            _make_all_result([]),                                     # no runs
+            _make_aggregate_trade_one(0, 0, 0, Decimal("0"), Decimal("0")),
+            _make_all_result([]),                                     # no configs
+        ]
+
+        resp = client_dev_with_db.get("/api/v1/portfolio/summary")
+
+        assert resp.status_code == 200
+        body = resp.json()
+
+        # Run counts — all zero
+        assert body["totalRuns"] == 0
+        assert body["runningRuns"] == 0
+        assert body["stoppedRuns"] == 0
+        assert body["errorRuns"] == 0
+
+        # Trade statistics — all zero
+        assert body["totalTrades"] == 0
+        assert body["winningTrades"] == 0
+        assert body["losingTrades"] == 0
+        assert body["winRate"] == pytest.approx(0.0, abs=1e-9)
+
+        # Financial totals
+        assert body["totalRealisedPnl"] == "0"
+        assert body["totalFeesPaid"] == "0"
+        assert body["totalInitialCapital"] == "0"
+
+        # No backtest metrics in empty DB
+        assert body["bestRunReturnPct"] is None
+        assert body["worstRunReturnPct"] is None
+
+    def test_aggregate_with_trades(
+        self, client_dev_with_db: TestClient, mock_db_session: AsyncMock
+    ) -> None:
+        """
+        With 2 runs and 5 trades (3 winners at +100 each, 2 losers at -40 each),
+        the summary must return correct totalTrades, winningTrades, losingTrades,
+        totalRealisedPnl, totalFeesPaid, and winRate.
+
+        Expected values:
+        - totalTrades = 5
+        - winningTrades = 3
+        - losingTrades = 2
+        - totalRealisedPnl = "220.00"  (3*100 - 2*40 = 220)
+        - totalFeesPaid = "15.00"      (5 trades at 3.00 each)
+        - winRate = 0.6                (3 / 5)
+        - totalRuns = 2                (1 stopped + 1 running)
+        - totalInitialCapital = "20000.00"  (2 runs at 10000 each)
+        """
+        status_rows = [
+            SimpleNamespace(status="stopped", cnt=1),
+            SimpleNamespace(status="running", cnt=1),
+        ]
+        config_rows = [
+            ({"initial_capital": "10000.00"},),
+            ({"initial_capital": "10000.00"},),
+        ]
+        mock_db_session.execute.side_effect = [
+            _make_all_result(status_rows),
+            _make_aggregate_trade_one(
+                total=5,
+                wins=3,
+                losses=2,
+                pnl=Decimal("220.00"),
+                fees=Decimal("15.00"),
+            ),
+            _make_all_result(config_rows),
+        ]
+
+        resp = client_dev_with_db.get("/api/v1/portfolio/summary")
+
+        assert resp.status_code == 200
+        body = resp.json()
+
+        # Run counts derived from status group-by rows
+        assert body["totalRuns"] == 2
+        assert body["stoppedRuns"] == 1
+        assert body["runningRuns"] == 1
+        assert body["errorRuns"] == 0
+
+        # Trade statistics
+        assert body["totalTrades"] == 5
+        assert body["winningTrades"] == 3
+        assert body["losingTrades"] == 2
+        assert body["winRate"] == pytest.approx(0.6, abs=1e-9)
+
+        # Financial totals
+        assert body["totalRealisedPnl"] == "220.00"
+        assert body["totalFeesPaid"] == "15.00"
+        assert body["totalInitialCapital"] == "20000.00"
+
+    def test_aggregate_run_counts(
+        self, client_dev_with_db: TestClient, mock_db_session: AsyncMock
+    ) -> None:
+        """
+        With 1 running run, 2 stopped runs, and 1 error run, the summary must
+        return runningRuns=1, stoppedRuns=2, errorRuns=1, and totalRuns=4.
+
+        The status count query returns 3 group-by rows (one per status value).
+        The total is computed as the sum of all cnt values in the handler, not
+        fetched from a separate COUNT(*) query.
+        """
+        status_rows = [
+            SimpleNamespace(status="running", cnt=1),
+            SimpleNamespace(status="stopped", cnt=2),
+            SimpleNamespace(status="error", cnt=1),
+        ]
+        mock_db_session.execute.side_effect = [
+            _make_all_result(status_rows),
+            _make_aggregate_trade_one(0, 0, 0, Decimal("0"), Decimal("0")),
+            _make_all_result([]),
+        ]
+
+        resp = client_dev_with_db.get("/api/v1/portfolio/summary")
+
+        assert resp.status_code == 200
+        body = resp.json()
+
+        assert body["totalRuns"] == 4
+        assert body["runningRuns"] == 1
+        assert body["stoppedRuns"] == 2
+        assert body["errorRuns"] == 1
+
+    def test_aggregate_with_backtest_metrics(
+        self, client_dev_with_db: TestClient, mock_db_session: AsyncMock
+    ) -> None:
+        """
+        When run configs contain backtest_metrics with total_return_pct, the
+        summary must populate bestRunReturnPct and worstRunReturnPct from the
+        maximum and minimum return values across those runs.
+
+        Three config rows:
+        - Run A: backtest_metrics.total_return_pct = 0.25  (best)
+        - Run B: backtest_metrics.total_return_pct = -0.10 (worst)
+        - Run C: no backtest_metrics key (paper/live run — excluded)
+
+        Expected:
+        - bestRunReturnPct = 0.25
+        - worstRunReturnPct = -0.10
+        """
+        status_rows = [
+            SimpleNamespace(status="stopped", cnt=3),
+        ]
+        config_rows = [
+            ({"initial_capital": "10000.00", "backtest_metrics": {"total_return_pct": 0.25}},),
+            ({"initial_capital": "10000.00", "backtest_metrics": {"total_return_pct": -0.10}},),
+            ({"initial_capital": "10000.00"},),   # paper run — no backtest_metrics
+        ]
+        mock_db_session.execute.side_effect = [
+            _make_all_result(status_rows),
+            _make_aggregate_trade_one(
+                total=10,
+                wins=6,
+                losses=4,
+                pnl=Decimal("500.00"),
+                fees=Decimal("30.00"),
+            ),
+            _make_all_result(config_rows),
+        ]
+
+        resp = client_dev_with_db.get("/api/v1/portfolio/summary")
+
+        assert resp.status_code == 200
+        body = resp.json()
+
+        # Backtest return percentages
+        assert body["bestRunReturnPct"] == pytest.approx(0.25, abs=1e-9)
+        assert body["worstRunReturnPct"] == pytest.approx(-0.10, abs=1e-9)
+
+        # Sanity-check other fields
+        assert body["totalRuns"] == 3
+        assert body["totalTrades"] == 10
+        assert body["totalInitialCapital"] == "30000.00"

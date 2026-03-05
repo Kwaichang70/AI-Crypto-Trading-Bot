@@ -348,7 +348,7 @@ def _register_routes(application: FastAPI) -> None:
     # ------------------------------------------------------------------
     # API v1 routers — protected by API key auth when enabled
     # ------------------------------------------------------------------
-    from api.routers import orders, portfolio, runs, strategies
+    from api.routers import ml, orders, portfolio, runs, strategies
 
     _V1 = "/api/v1"
 
@@ -368,11 +368,18 @@ def _register_routes(application: FastAPI) -> None:
         dependencies=[Depends(require_api_key)],
     )
 
-    # Portfolio: summary, equity curve, trades, positions
+    # Portfolio: per-run summary, equity curve, trades, positions
     application.include_router(
         portfolio.router,
         prefix=_V1,
         tags=["portfolio"],
+        dependencies=[Depends(require_api_key)],
+    )
+
+    # Portfolio: cross-run aggregate summary
+    application.include_router(
+        portfolio.summary_router,
+        prefix=_V1,
         dependencies=[Depends(require_api_key)],
     )
 
@@ -381,6 +388,14 @@ def _register_routes(application: FastAPI) -> None:
         strategies.router,
         prefix=_V1,
         tags=["strategies"],
+        dependencies=[Depends(require_api_key)],
+    )
+
+    # ML model training
+    application.include_router(
+        ml.router,
+        prefix=_V1,
+        tags=["ml"],
         dependencies=[Depends(require_api_key)],
     )
 

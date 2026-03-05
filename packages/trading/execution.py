@@ -331,6 +331,10 @@ class BaseExecutionEngine(abc.ABC):
         }
         return [o for o in self._orders.values() if o.status not in terminal]
 
+    def get_all_orders(self) -> list[Order]:
+        """Return all orders including terminal states."""
+        return list(self._orders.values())
+
     def __repr__(self) -> str:
         return (
             f"{self.__class__.__name__}("

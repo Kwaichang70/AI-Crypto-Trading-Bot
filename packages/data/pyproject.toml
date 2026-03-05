@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "data"
 version = "0.1.0"
@@ -11,7 +15,13 @@ dependencies = [
     "structlog>=24.4",
     "pydantic>=2.9",
     "common",
+    "scikit-learn>=1.5",
+    "joblib>=1.4",
 ]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["data*"]
 
 [tool.uv.sources]
 common  = { workspace = true }

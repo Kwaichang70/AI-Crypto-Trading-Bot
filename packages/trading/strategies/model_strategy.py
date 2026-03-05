@@ -54,7 +54,6 @@ position_size : float
 
 from __future__ import annotations
 
-import math
 from collections.abc import Sequence
 from decimal import Decimal
 from pathlib import Path
@@ -120,58 +119,6 @@ class _ModelStrategyParams(BaseModel):
     @classmethod
     def strip_path(cls, v: str) -> str:
         return v.strip()
-
-
-# ---------------------------------------------------------------------------
-# Feature extraction helpers
-# ---------------------------------------------------------------------------
-
-
-def _safe_log(value: Decimal) -> float:
-    """Return log of a Decimal, guarding against non-positive values."""
-    fval = float(value)
-    if fval <= 0.0:
-        return 0.0
-    return math.log(fval)
-
-
-def _sma_float(values: Sequence[float], period: int) -> float:
-    """Simple moving average over the last *period* float values."""
-    if len(values) < period:
-        return 0.0
-    window = values[-period:]
-    return sum(window) / period
-
-
-def _wilder_rsi(closes: Sequence[float], period: int = 14) -> float:
-    """
-    Compute Wilder RSI over a sequence of close prices.
-
-    Requires at least ``period + 1`` data points.  Returns 50.0 (neutral)
-    if insufficient data is available.
-    """
-    if len(closes) < period + 1:
-        return 50.0
-
-    deltas = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
-
-    # Seed averages with simple mean of first *period* deltas
-    gains = [max(0.0, d) for d in deltas[:period]]
-    losses = [max(0.0, -d) for d in deltas[:period]]
-    avg_gain = sum(gains) / period
-    avg_loss = sum(losses) / period
-
-    # Wilder smoothing for the remaining deltas
-    for delta in deltas[period:]:
-        gain = max(0.0, delta)
-        loss = max(0.0, -delta)
-        avg_gain = (avg_gain * (period - 1) + gain) / period
-        avg_loss = (avg_loss * (period - 1) + loss) / period
-
-    if avg_loss == 0.0:
-        return 100.0
-    rs = avg_gain / avg_loss
-    return 100.0 - (100.0 / (1.0 + rs))
 
 
 # ---------------------------------------------------------------------------
@@ -290,102 +237,15 @@ class ModelStrategy(BaseStrategy):
     # ------------------------------------------------------------------ #
 
     def _build_feature_vector(self, bars: Sequence[OHLCVBar]) -> list[float]:
+        """Build a 10-element feature vector from OHLCV bars.
+
+        Delegates to data.ml_features.build_feature_vector_from_bars for
+        single-source feature schema consistency between training and inference.
+        See that module for the canonical feature schema documentation.
         """
-        Build a 10-element feature vector from OHLCV bars.
+        from data.ml_features import build_feature_vector_from_bars
 
-        Feature schema
-        ~~~~~~~~~~~~~~
-        Index  Feature               Description
-        -----  --------------------  ------------------------------------
-        0      log_return_1          1-bar log return
-        1      log_return_5          5-bar cumulative log return
-        2      log_return_10         10-bar cumulative log return
-        3      volatility_10         10-bar rolling std of log returns
-        4      volatility_20         20-bar rolling std of log returns
-        5      rsi_14                14-bar Wilder RSI (normalised 0-1)
-        6      sma_ratio_10_50       SMA(10) / SMA(50) ratio
-        7      sma_ratio_20_100      SMA(20) / SMA(100) ratio
-        8      volume_ratio_10       current volume / SMA(volume, 10)
-        9      high_low_range        (high - low) / close of current bar
-
-        Parameters
-        ----------
-        bars : Sequence[OHLCVBar]
-            OHLCV bars ordered oldest-first.  At least ``feature_window``
-            bars must be provided.
-
-        Returns
-        -------
-        list[float]
-            Feature vector of length 10.
-        """
-        closes = [float(bar.close) for bar in bars]
-        volumes = [float(bar.volume) for bar in bars]
-        current_bar = bars[-1]
-
-        # Log returns
-        log_closes = [_safe_log(bar.close) for bar in bars]
-        log_return_1 = log_closes[-1] - log_closes[-2] if len(log_closes) >= 2 else 0.0
-        log_return_5 = log_closes[-1] - log_closes[-6] if len(log_closes) >= 6 else 0.0
-        log_return_10 = log_closes[-1] - log_closes[-11] if len(log_closes) >= 11 else 0.0
-
-        # Rolling volatility (std of log returns)
-        log_returns = [
-            log_closes[i] - log_closes[i - 1]
-            for i in range(1, len(log_closes))
-        ]
-
-        def _rolling_std(values: Sequence[float], window: int) -> float:
-            if len(values) < window:
-                return 0.0
-            subset = values[-window:]
-            mean = sum(subset) / window
-            variance = sum((x - mean) ** 2 for x in subset) / window
-            return math.sqrt(variance)
-
-        volatility_10 = _rolling_std(log_returns, 10)
-        volatility_20 = _rolling_std(log_returns, 20)
-
-        # RSI (normalised to 0-1 range)
-        rsi_14 = _wilder_rsi(closes, period=14) / 100.0
-
-        # SMA ratios
-        sma_10 = _sma_float(closes, 10)
-        sma_20 = _sma_float(closes, 20)
-        sma_50 = _sma_float(closes, 50)
-        sma_100 = _sma_float(closes, 100)
-
-        sma_ratio_10_50 = (sma_10 / sma_50) if sma_50 != 0.0 else 1.0
-        sma_ratio_20_100 = (sma_20 / sma_100) if sma_100 != 0.0 else 1.0
-
-        # Volume ratio
-        sma_vol_10 = _sma_float(volumes, 10)
-        volume_ratio_10 = (
-            float(current_bar.volume) / sma_vol_10
-            if sma_vol_10 > 0.0
-            else 1.0
-        )
-
-        # High-low range relative to close
-        close_f = float(current_bar.close)
-        high_low_range = (
-            (float(current_bar.high) - float(current_bar.low)) / close_f
-            if close_f > 0.0
-            else 0.0
-        )
-
-        return [
-            log_return_1,       # 0
-            log_return_5,       # 1
-            log_return_10,      # 2
-            volatility_10,      # 3
-            volatility_20,      # 4
-            rsi_14,             # 5
-            sma_ratio_10_50,    # 6
-            sma_ratio_20_100,   # 7
-            volume_ratio_10,    # 8
-            high_low_range,     # 9
-        ]
+        return build_feature_vector_from_bars(bars)
 
     # ------------------------------------------------------------------ #
     # Core signal generation

@@ -11,6 +11,7 @@
  */
 
 import type {
+  AggregatePortfolio,
   EquityCurveResponse,
   FillListResponse,
   OrderListResponse,
@@ -191,7 +192,7 @@ export function apiDelete<T>(
 
 /** GET /health — lightweight liveness probe used by the dashboard. */
 export async function fetchHealth(): Promise<ApiResult<HealthResponse>> {
-  return apiGet<HealthResponse>("/health");
+  return apiGet<HealthResponse>("/health", { cache: "no-store" });
 }
 
 // ---------------------------------------------------------------------------
@@ -202,10 +203,14 @@ export async function fetchHealth(): Promise<ApiResult<HealthResponse>> {
 export async function fetchRuns(params?: {
   offset?: number;
   limit?: number;
+  mode?: string;
+  status?: string;
 }): Promise<ApiResult<RunListResponse>> {
   const qs = new URLSearchParams();
   if (params?.offset !== undefined) qs.set("offset", String(params.offset));
   if (params?.limit !== undefined) qs.set("limit", String(params.limit));
+  if (params?.mode) qs.set("mode", params.mode);
+  if (params?.status) qs.set("status", params.status);
   const query = qs.toString() ? `?${qs.toString()}` : "";
   return apiGet<RunListResponse>(`/api/v1/runs${query}`, {
     cache: "no-store",
@@ -238,6 +243,13 @@ export async function fetchPortfolio(
   runId: string,
 ): Promise<ApiResult<Portfolio>> {
   return apiGet<Portfolio>(`/api/v1/runs/${runId}/portfolio`, {
+    cache: "no-store",
+  });
+}
+
+/** GET /api/v1/portfolio/summary — aggregate cross-run portfolio. */
+export async function fetchAggregatePortfolio(): Promise<ApiResult<AggregatePortfolio>> {
+  return apiGet<AggregatePortfolio>("/api/v1/portfolio/summary", {
     cache: "no-store",
   });
 }
@@ -312,7 +324,7 @@ export async function fetchPositions(
 
 /** GET /api/v1/strategies — list all available strategies. */
 export async function fetchStrategies(): Promise<ApiResult<StrategyListResponse>> {
-  return apiGet<StrategyListResponse>("/api/v1/strategies");
+  return apiGet<StrategyListResponse>("/api/v1/strategies", { cache: "no-store" });
 }
 
 /** GET /api/v1/strategies/{name}/schema — strategy parameter schema. */

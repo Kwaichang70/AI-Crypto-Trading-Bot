@@ -63,6 +63,7 @@ def _build_registry() -> dict[str, dict[str, Any]]:
     from trading.strategies import (
         BreakoutStrategy,
         MACrossoverStrategy,
+        ModelStrategy,
         RSIMeanReversionStrategy,
     )
 
@@ -72,6 +73,7 @@ def _build_registry() -> dict[str, dict[str, Any]]:
         ("ma_crossover", MACrossoverStrategy),
         ("rsi_mean_reversion", RSIMeanReversionStrategy),
         ("breakout", BreakoutStrategy),
+        ("model_strategy", ModelStrategy),
     ]
 
     for name, cls in entries:

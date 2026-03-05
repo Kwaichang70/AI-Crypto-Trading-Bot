@@ -5,8 +5,8 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { fetchRuns } from "@/lib/api";
-import type { Run, RunMode } from "@/lib/types";
+import { fetchRuns, formatPct } from "@/lib/api";
+import type { Run, RunMode, RunStatus } from "@/lib/types";
 import { DataTable, type Column } from "@/components/ui/data-table";
 import { RunStatusBadge } from "@/components/ui/status-badge";
 import { Header } from "@/components/layout/header";
@@ -16,6 +16,13 @@ const MODE_OPTIONS: { value: RunMode | "all"; label: string }[] = [
   { value: "backtest", label: "Backtest" },
   { value: "paper", label: "Paper" },
   { value: "live", label: "Live" },
+];
+
+const STATUS_OPTIONS: { value: RunStatus | "all"; label: string }[] = [
+  { value: "all", label: "All statuses" },
+  { value: "running", label: "Running" },
+  { value: "stopped", label: "Stopped" },
+  { value: "error", label: "Error" },
 ];
 
 const PAGE_SIZE_OPTIONS = [10, 25, 50, 100] as const;
@@ -53,6 +60,58 @@ const COLUMNS: Column<Run>[] = [
     render: (run) => <RunStatusBadge status={run.status} />,
   },
   {
+    key: "returnPct",
+    header: "Return %",
+    sortable: true,
+    sortValue: (run) => run.backtestMetrics?.totalReturnPct ?? 0,
+    render: (run) => {
+      const val = run.backtestMetrics?.totalReturnPct;
+      if (val === undefined || val === null) {
+        return <span className="text-slate-600 text-xs">—</span>;
+      }
+      const isPositive = val >= 0;
+      return (
+        <span
+          className={`font-mono text-xs font-medium ${isPositive ? "text-profit" : "text-loss"}`}
+        >
+          {isPositive ? "+" : ""}{formatPct(val)}
+        </span>
+      );
+    },
+  },
+  {
+    key: "trades",
+    header: "Trades",
+    sortable: true,
+    sortValue: (run) => run.backtestMetrics?.totalTrades ?? 0,
+    render: (run) => {
+      const val = run.backtestMetrics?.totalTrades;
+      if (val === undefined || val === null) {
+        return <span className="text-slate-600 text-xs">—</span>;
+      }
+      return <span className="font-mono text-xs text-slate-300">{val}</span>;
+    },
+  },
+  {
+    key: "sharpe",
+    header: "Sharpe",
+    sortable: true,
+    sortValue: (run) => run.backtestMetrics?.sharpeRatio ?? 0,
+    render: (run) => {
+      const val = run.backtestMetrics?.sharpeRatio;
+      if (val === undefined || val === null) {
+        return <span className="text-slate-600 text-xs">—</span>;
+      }
+      const colorClass =
+        val >= 1.0 ? "text-profit" : val < 0 ? "text-loss" : "text-slate-300";
+      return (
+        <span className={`font-mono text-xs font-medium ${colorClass}`}>
+          {val.toFixed(2)}
+        </span>
+      );
+    },
+  },
+  {
     key: "symbols",
     header: "Symbols",
     render: (run) => (
@@ -76,6 +135,7 @@ export default function RunsPage() {
   const [runs, setRuns] = useState<readonly Run[]>([]);
   const [total, setTotal] = useState(0);
   const [modeFilter, setModeFilter] = useState<RunMode | "all">("all");
+  const [statusFilter, setStatusFilter] = useState<RunStatus | "all">("all");
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -87,7 +147,12 @@ export default function RunsPage() {
     async function load() {
       setIsLoading(true);
       setError(null);
-      const result = await fetchRuns({ offset: page * pageSize, limit: pageSize });
+      const result = await fetchRuns({
+        offset: page * pageSize,
+        limit: pageSize,
+        ...(modeFilter !== "all" ? { mode: modeFilter } : {}),
+        ...(statusFilter !== "all" ? { status: statusFilter } : {}),
+      });
       if (result.ok) {
         setRuns(result.data.items);
         setTotal(result.data.total);
@@ -97,24 +162,22 @@ export default function RunsPage() {
       setIsLoading(false);
     }
     void load();
-  }, [page, pageSize]);
-
-  // Client-side mode filter applied to the current fetched page only.
-  const filtered =
-    modeFilter === "all"
-      ? runs
-      : runs.filter((r) => r.runMode === modeFilter);
+  }, [page, pageSize, modeFilter, statusFilter]);
 
   // Pagination derived values.
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
   const rangeStart = total === 0 ? 0 : page * pageSize + 1;
   const rangeEnd = Math.min((page + 1) * pageSize, total);
 
-  // When a mode filter is active, show the filtered row count for the range display.
-  const displayCount = modeFilter === "all" ? total : filtered.length;
+  const displayCount = total;
 
   function handleModeFilter(value: RunMode | "all") {
     setModeFilter(value);
+    setPage(0);
+  }
+
+  function handleStatusFilter(value: RunStatus | "all") {
+    setStatusFilter(value);
     setPage(0);
   }
 
@@ -150,6 +213,22 @@ export default function RunsPage() {
           </button>
         ))}
       </div>
+      <div className="flex flex-wrap gap-2">
+        {STATUS_OPTIONS.map((opt) => (
+          <button
+            key={opt.value}
+            onClick={() => handleStatusFilter(opt.value)}
+            className={[
+              "rounded-full px-3 py-1 text-xs font-medium transition-colors",
+              statusFilter === opt.value
+                ? "bg-emerald-600 text-white"
+                : "bg-slate-800 text-slate-400 hover:bg-slate-700 hover:text-slate-200",
+            ].join(" ")}
+          >
+            {opt.label}
+          </button>
+        ))}
+      </div>
 
       {error && (
         <div className="rounded-lg border border-red-800 bg-red-900/20 px-4 py-3 text-sm text-red-400">
@@ -159,7 +238,7 @@ export default function RunsPage() {
 
       <DataTable
         columns={COLUMNS}
-        data={filtered}
+        data={runs}
         keyExtractor={(r) => r.id}
         emptyMessage="No runs found. Create your first backtest."
         isLoading={isLoading}
@@ -194,9 +273,7 @@ export default function RunsPage() {
         <span className="text-slate-400 tabular-nums">
           {displayCount === 0
             ? "No results"
-            : modeFilter === "all"
-              ? `${rangeStart}–${rangeEnd} of ${total}`
-              : `${filtered.length} of ${total} (filtered)`}
+            : `${rangeStart}–${rangeEnd} of ${total}`}
         </span>
 
         {/* Right: prev / next buttons */}

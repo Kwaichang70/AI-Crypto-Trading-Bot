@@ -54,6 +54,7 @@ __all__ = [
     "TradeORM",
     "EquitySnapshotORM",
     "SignalORM",
+    "PositionSnapshotORM",
 ]
 
 # ---------------------------------------------------------------------------
@@ -191,6 +192,12 @@ class RunORM(Base):
     )
     signals: Mapped[list[SignalORM]] = relationship(
         "SignalORM",
+        back_populates="run",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+    position_snapshots: Mapped[list[PositionSnapshotORM]] = relationship(
+        "PositionSnapshotORM",
         back_populates="run",
         cascade="all, delete-orphan",
         passive_deletes=True,
@@ -771,3 +778,94 @@ class SignalORM(Base):
             f"<SignalORM id={self.id} run={self.run_id} "
             f"strategy={self.strategy_id} symbol={self.symbol} dir={self.direction}>"
         )
+
+
+# ---------------------------------------------------------------------------
+# 7. position_snapshots — Final position state at run termination
+# ---------------------------------------------------------------------------
+
+class PositionSnapshotORM(Base):
+    """
+    Final position state snapshot, persisted when a run stops.
+
+    One row per symbol per run. Stores the position state at run
+    termination (for backtests: last bar; for paper runs: when stopped).
+
+    Index strategy:
+    - (run_id) — all position snapshots for a run
+    - (run_id, symbol) UNIQUE — enforces one snapshot per symbol per run
+    """
+
+    __tablename__ = "position_snapshots"
+    __table_args__ = (
+        UniqueConstraint("run_id", "symbol", name="uq_position_snapshots_run_symbol"),
+        CheckConstraint("quantity >= 0", name="ck_position_snapshots_quantity_non_negative"),
+        CheckConstraint("average_entry_price >= 0", name="ck_position_snapshots_entry_price_non_negative"),
+        CheckConstraint("current_price >= 0", name="ck_position_snapshots_current_price_non_negative"),
+        Index("ix_position_snapshots_run_id", "run_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        comment="Position snapshot UUID",
+    )
+    run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("runs.id", ondelete="CASCADE"),
+        nullable=False,
+        comment="FK to the run this snapshot belongs to",
+    )
+    symbol: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        comment="Trading pair, e.g. BTC/USDT",
+    )
+    quantity: Mapped[Decimal] = mapped_column(
+        _MONEY,
+        nullable=False,
+        comment="Open position size in base asset at snapshot time",
+    )
+    average_entry_price: Mapped[Decimal] = mapped_column(
+        _MONEY,
+        nullable=False,
+        comment="Volume-weighted average entry price of the open position",
+    )
+    current_price: Mapped[Decimal] = mapped_column(
+        _MONEY,
+        nullable=False,
+        comment="Last known mark price used to compute unrealised PnL",
+    )
+    unrealised_pnl: Mapped[Decimal] = mapped_column(
+        _MONEY,
+        nullable=False,
+        comment="Unrealised profit/loss at snapshot time, in quote currency",
+    )
+    realised_pnl: Mapped[Decimal] = mapped_column(
+        _MONEY,
+        nullable=False,
+        comment="Cumulative realised profit/loss for this symbol within the run",
+    )
+    total_fees_paid: Mapped[Decimal] = mapped_column(
+        _MONEY,
+        nullable=False,
+        default=Decimal("0"),
+        comment="Total fees paid across all fills for this symbol within the run",
+    )
+    opened_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        comment="UTC timestamp when the position was first opened",
+    )
+    snapshot_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        comment="UTC timestamp when the snapshot was recorded (run stop time)",
+    )
+
+    # Relationships
+    run: Mapped[RunORM] = relationship("RunORM", back_populates="position_snapshots")
+
+    def __repr__(self) -> str:
+        return f"<PositionSnapshotORM run={self.run_id} symbol={self.symbol} qty={self.quantity}>"

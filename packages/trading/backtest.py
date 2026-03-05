@@ -193,6 +193,9 @@ class BacktestRunner:
             warmup_bars=self._warmup_bars,
         )
 
+        self._last_execution_engine: PaperExecutionEngine | None = None
+        self._last_portfolio: PortfolioAccounting | None = None
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -233,7 +236,7 @@ class BacktestRunner:
         run_id = f"bt-{uuid.uuid4().hex[:12]}"
 
         # 3. Build engine components
-        engine, portfolio, risk_manager = self._build_engine(run_id)
+        engine, portfolio, risk_manager, exec_engine = self._build_engine(run_id)
 
         self._log.info(
             "backtest.starting",
@@ -386,6 +389,8 @@ class BacktestRunner:
             total_fees=str(portfolio.total_fees_paid),
         )
 
+        self._last_execution_engine = exec_engine
+        self._last_portfolio = portfolio
         return result
 
     # ------------------------------------------------------------------
@@ -395,7 +400,7 @@ class BacktestRunner:
     def _build_engine(
         self,
         run_id: str,
-    ) -> tuple[StrategyEngine, PortfolioAccounting, DefaultRiskManager]:
+    ) -> tuple[StrategyEngine, PortfolioAccounting, DefaultRiskManager, PaperExecutionEngine]:
         """
         Wire up all trading core components for a backtest run.
 
@@ -406,8 +411,8 @@ class BacktestRunner:
 
         Returns
         -------
-        tuple[StrategyEngine, PortfolioAccounting, DefaultRiskManager]
-            The fully-wired engine, portfolio, and risk manager.
+        tuple[StrategyEngine, PortfolioAccounting, DefaultRiskManager, PaperExecutionEngine]
+            The fully-wired engine, portfolio, risk manager, and execution engine.
 
         Notes
         -----
@@ -449,7 +454,17 @@ class BacktestRunner:
             config={"warmup_bars": self._warmup_bars},
         )
 
-        return engine, portfolio, risk_manager
+        return engine, portfolio, risk_manager, execution_engine
+
+    @property
+    def last_execution_engine(self) -> PaperExecutionEngine | None:
+        """Return the execution engine from the most recent run, or None."""
+        return self._last_execution_engine
+
+    @property
+    def last_portfolio(self) -> PortfolioAccounting | None:
+        """Return the portfolio from the most recent run, or None."""
+        return self._last_portfolio
 
     # ------------------------------------------------------------------
     # Validation

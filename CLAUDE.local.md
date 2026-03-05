@@ -176,3 +176,89 @@
   - [x] P1: Code critic remediations (CR-003 mode+pagination coherence, CR-004 NaN guard, CR-006/007 parseFloat guards)
   - [x] P1: Home page portfolio equity + realized PnL summary cards (fetchPortfolio from latest run)
   - [x] P2: Update MEMORY.md + CLAUDE.local.md for Sprint 15
+
+### 16. AI Crypto Trading Bot — Critical Bugfix: SELL Order Concentration Cap
+- **Plan:** Discovered during live testing
+- **Status:** COMPLETE
+- **Orchestration Checklist:**
+  - [x] P0: Fix risk manager concentration cap blocking SELL orders — `order.side == OrderSide.BUY` guard (712586a)
+  - [x] P0: 4 new SELL-side unit tests (48 total risk manager tests)
+  - [x] P0: Verified: breakout 0→19 trades, ma_crossover 0→43 trades
+  - [x] P0: 987 tests pass, 0 mypy errors, 0 TSC errors
+  - [x] P1: RunConfig snake_case fix (904b3d1) — API returns snake_case config, UI expected camelCase
+
+### 17. AI Crypto Trading Bot — Sprint 16 (Order & Fill Persistence)
+- **Plan:** `.claude/plans/eventual-wandering-lecun.md`
+- **Status:** COMPLETE
+- **Orchestration Checklist:**
+  - [x] P0: Add get_all_orders() to BaseExecutionEngine + get_all_fills() to PaperExecutionEngine
+  - [x] P0: Extend _persist_paper_results() to write OrderORM + FillORM with FK-safe flush
+  - [x] P0: Wire execution_engine from _run_paper_engine finally block (CR-001 scope fix)
+  - [x] P0: Extend _persist_backtest_results() + BacktestRunner.last_execution_engine property
+  - [x] P1: Unit tests — 12 tests across 4 classes (test_order_fill_persistence.py)
+  - [x] P1: 999 tests pass, 0 mypy errors
+
+### 18. AI Crypto Trading Bot — Sprint 17 (Server-Side Filtering + Position Snapshots)
+- **Plan:** `.claude/plans/eventual-wandering-lecun.md`
+- **Status:** COMPLETE
+- **Orchestration Checklist:**
+  - [x] P0: Server-side mode/status filtering on GET /api/v1/runs (replaces broken client-side filter)
+  - [x] P0: PositionSnapshotORM model + RunORM relationship + db __init__ export
+  - [x] P0: Persist position snapshots on run stop (paper + backtest paths)
+  - [x] P0: Positions endpoint wired to real DB query (replaces empty stub)
+  - [x] P0: BacktestRunner.last_portfolio property
+  - [x] P1: Frontend — status filter pills, server-side mode filter, remove client-side filter
+  - [x] P1: Code critic remediations (CR-001 filter ordering, CR-002 module import, CR-004 open_positions COUNT)
+  - [x] P1: Integration tests — 8 filtering tests (TestListRunsFiltering)
+  - [x] P1: Unit tests — 6 position persistence tests (test_position_persistence.py)
+  - [x] P1: Fix portfolio integration tests for 10th DB call (position count)
+  - [x] P2: 1013 tests pass, 0 mypy errors, 0 TSC errors
+
+### 19. AI Crypto Trading Bot — Sprint 18 (Wire LiveExecutionEngine + Positions UI Tab)
+- **Plan:** `.claude/plans/eventual-wandering-lecun.md`
+- **Status:** COMPLETE
+- **Orchestration Checklist:**
+  - [x] P0: Add get_all_fills() to LiveExecutionEngine (mirrors PaperExecutionEngine pattern)
+  - [x] P0: Create _run_live_engine() coroutine (mirrors _run_paper_engine pattern)
+  - [x] P0: Wire live stub to asyncio.create_task + _RUN_TASKS registration
+  - [x] P0: Fix exchange_order_id persistence (order.exchange_order_id instead of None)
+  - [x] P1: Add Positions tab to run detail page (POSITION_COLUMNS, fetchPositions, DataTable)
+  - [x] P1: Update stop_run log key to engine-agnostic name
+  - [x] P1: Update module docstring for live engine wiring
+  - [x] P1: Code critic remediations (CR-004 enable_live_trading comment, CR-007 docstring warning)
+  - [x] P1: Unit tests — 10 tests (3 get_all_fills + 6 live wiring + 1 exchange_order_id)
+  - [x] P2: 1023 tests pass, 0 mypy errors, 0 TSC errors
+
+### 20. AI Crypto Trading Bot — Sprint 19 (Aggregate Portfolio Endpoint + Dashboard Polish)
+- **Plan:** `.claude/plans/eventual-wandering-lecun.md`
+- **Status:** COMPLETE
+- **Orchestration Checklist:**
+  - [x] P0: Add AggregatePortfolioResponse schema (13 fields, field_serializer for monetary strs)
+  - [x] P0: Add GET /api/v1/portfolio/summary endpoint (3 SQL queries + Python JSONB extraction)
+  - [x] P0: Register summary_router in main.py with API key dependency
+  - [x] P0: Rewire home page to fetchAggregatePortfolio — fixes Active/Error count bug for >25 runs
+  - [x] P0: Replace single-run portfolio cards with aggregate cards (Total Realized PnL, Win Rate)
+  - [x] P1: Add Return %, Trades, Sharpe sortable columns to runs page (zero backend changes)
+  - [x] P1: Add AggregatePortfolio TS interface + fetchAggregatePortfolio API function
+  - [x] P1: Fix stale "Sprint 2" docstrings in portfolio.py
+  - [x] P1: Code critic remediations (CR-002 CASE-based counting, CR-006 field_serializer)
+  - [x] P1: Integration tests — 4 tests (TestAggregatePortfolio)
+  - [x] P2: 1027 tests pass, 0 mypy errors, 0 TSC errors
+
+### 21. AI Crypto Trading Bot — Sprint 20 (ModelStrategy ML Training Pipeline)
+- **Plan:** `.claude/plans/eventual-wandering-lecun.md`
+- **Status:** COMPLETE
+- **Orchestration Checklist:**
+  - [x] P0: Add scikit-learn>=1.5 + joblib>=1.4 to packages/data/pyproject.toml
+  - [x] P0: Create packages/data/ml_features.py — shared 10-element feature builder (bars + DataFrame paths)
+  - [x] P0: Create packages/data/ml_training.py — ModelTrainer class (prepare_dataset, train, save/load)
+  - [x] P0: Refactor ModelStrategy._build_feature_vector → delegates to data.ml_features
+  - [x] P0: Register ModelStrategy in API strategy registry (strategies.py + runs.py)
+  - [x] P1: Create POST /api/v1/ml/train endpoint (apps/api/routers/ml.py) — uses ModelTrainer, not inline logic
+  - [x] P1: Create scripts/train_model.py CLI — sync ccxt fetch + ModelTrainer + metrics summary
+  - [x] P1: Add models/ volume mount to docker-compose.yml + models/.gitkeep
+  - [x] P1: Update packages/data/__init__.py with guarded ML feature exports
+  - [x] P1: Fix test_model_strategy.py imports (moved helpers to data.ml_features)
+  - [x] P1: Code critic review — CR-001 (DRY violation rewrite), CR-004 (__init__ exports), CR-005 (delegation)
+  - [x] P2: Unit tests — 17 ml_features tests + 21 ml_training tests (38 total)
+  - [x] P2: 1065 tests pass, 0 mypy errors

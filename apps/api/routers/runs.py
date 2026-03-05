@@ -14,8 +14,8 @@ MVP notes
 ---------
 - Backtest mode runs synchronously in the POST handler (fast enough for MVP).
   The BacktestRunner is wired up and results are persisted before returning.
-- Paper/Live run creation is stub-level: the run record is created with
-  status="running", but the engine is not wired up until Sprint 2.
+- Paper and Live modes run as background asyncio.Tasks via _run_paper_engine
+  and _run_live_engine coroutines respectively.
 - Strategy parameter validation occurs at request time via ``parameter_schema()``.
 - The ``config`` JSONB snapshot captures all run parameters at creation time
   so historical runs are fully self-contained even if strategy defaults change.
@@ -39,7 +39,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from api.db.models import EquitySnapshotORM, RunORM, TradeORM
+from api.db.models import EquitySnapshotORM, FillORM, OrderORM, PositionSnapshotORM, RunORM, TradeORM
 from api.db.session import get_db
 from api.schemas import (
     BacktestMetricsResponse,
@@ -85,6 +85,7 @@ def _get_strategy_registry() -> dict[str, Any]:
         from trading.strategies import (
             BreakoutStrategy,
             MACrossoverStrategy,
+            ModelStrategy,
             RSIMeanReversionStrategy,
         )
 
@@ -92,6 +93,7 @@ def _get_strategy_registry() -> dict[str, Any]:
             "ma_crossover": MACrossoverStrategy,
             "rsi_mean_reversion": RSIMeanReversionStrategy,
             "breakout": BreakoutStrategy,
+            "model_strategy": ModelStrategy,
         }
     return _STRATEGY_REGISTRY
 
@@ -160,21 +162,23 @@ async def _persist_paper_results(
     *,
     run_id_str: str,
     portfolio: Any,
+    execution_engine: Any | None = None,
     log: Any,
 ) -> None:
     """
-    Persist paper engine equity curve and completed trades to DB.
+    Persist paper engine equity curve, completed trades, orders, and fills to DB.
 
     Called from ``_run_paper_engine``'s ``finally`` block. Uses its own
-    isolated DB session. Skipped when both equity curve and trade history
-    are empty (engine stopped before generating any fills).
+    isolated DB session. Skipped when equity curve, trade history, and
+    order list are all empty (engine stopped before generating any data).
     """
     from api.db.session import get_session_factory
 
     equity_curve = portfolio.get_equity_curve()
     trade_history = portfolio.get_trade_history()
 
-    if not equity_curve and not trade_history:
+    has_orders = execution_engine is not None and bool(execution_engine.get_all_orders())
+    if not equity_curve and not trade_history and not has_orders:
         log.debug("runs.paper_persist_skipped", reason="no_data")
         return
 
@@ -239,6 +243,67 @@ async def _persist_paper_results(
             )
         )
 
+    # Build OrderORM and FillORM rows
+    order_orms: list[OrderORM] = []
+    fill_orms: list[FillORM] = []
+
+    if execution_engine is not None:
+        for order in execution_engine.get_all_orders():
+            order_orms.append(
+                OrderORM(
+                    id=order.order_id,
+                    client_order_id=order.client_order_id,
+                    run_id=run_id,
+                    symbol=order.symbol,
+                    side=order.side.value,
+                    order_type=order.order_type.value,
+                    quantity=order.quantity,
+                    price=order.price,
+                    status=order.status.value,
+                    filled_quantity=order.filled_quantity,
+                    average_fill_price=order.average_fill_price,
+                    exchange_order_id=order.exchange_order_id,
+                    created_at=order.created_at,
+                    updated_at=order.updated_at,
+                )
+            )
+
+        for fill in execution_engine.get_all_fills():
+            fill_orms.append(
+                FillORM(
+                    id=fill.fill_id,
+                    order_id=fill.order_id,
+                    symbol=fill.symbol,
+                    side=fill.side.value,
+                    quantity=fill.quantity,
+                    price=fill.price,
+                    fee=fill.fee,
+                    fee_currency=fill.fee_currency,
+                    is_maker=fill.is_maker,
+                    executed_at=fill.executed_at,
+                )
+            )
+
+    # Build PositionSnapshotORM rows from final position state
+    position_orms: list[PositionSnapshotORM] = []
+    now = datetime.now(tz=UTC)
+    if hasattr(portfolio, '_position_snapshots'):
+        for pos in portfolio._position_snapshots.values():
+            position_orms.append(
+                PositionSnapshotORM(
+                    run_id=run_id,
+                    symbol=pos.symbol,
+                    quantity=pos.quantity,
+                    average_entry_price=pos.average_entry_price,
+                    current_price=pos.current_price,
+                    unrealised_pnl=pos.unrealised_pnl,
+                    realised_pnl=pos.realised_pnl,
+                    total_fees_paid=pos.total_fees_paid,
+                    opened_at=pos.opened_at,
+                    snapshot_at=now,
+                )
+            )
+
     # Persist in isolated session
     try:
         factory = get_session_factory()
@@ -248,11 +313,21 @@ async def _persist_paper_results(
                     db.add_all(trade_orms)
                 if equity_orms:
                     db.add_all(equity_orms)
+                if order_orms:
+                    db.add_all(order_orms)
+                    await db.flush()
+                if fill_orms:
+                    db.add_all(fill_orms)
+                if position_orms:
+                    db.add_all(position_orms)
                 await db.commit()
                 log.info(
                     "runs.paper_results_persisted",
                     equity_snapshots=len(equity_orms),
                     trades=len(trade_orms),
+                    orders=len(order_orms),
+                    fills=len(fill_orms),
+                    positions=len(position_orms),
                 )
             except Exception:
                 await db.rollback()
@@ -314,6 +389,7 @@ async def _run_paper_engine(
     final_status = "stopped"
     engine: StrategyEngine | None = None
     portfolio: Any = None
+    execution: Any = None
 
     try:
         settings = get_settings()
@@ -416,8 +492,177 @@ async def _run_paper_engine(
             await _persist_paper_results(
                 run_id_str=run_id_str,
                 portfolio=portfolio,
+                execution_engine=execution,
                 log=log,
             )
+
+
+async def _run_live_engine(
+    *,
+    run_id_str: str,
+    strategy_cls: type,
+    strategy_name: str,
+    strategy_params: dict[str, Any],
+    symbols: list[str],
+    timeframe: TimeFrame,
+    initial_capital: str,
+) -> None:
+    """
+    Background coroutine that runs a live trading engine for a single run.
+
+    Creates all trading components with a real CCXT exchange connection,
+    starts the StrategyEngine, and runs the live loop until stopped or
+    errored. On exit, updates the run record in the database with the
+    final status and persists results.
+
+    This function uses its own database session (not the request session)
+    because the POST handler's session is closed before this coroutine runs.
+    """
+    import ccxt.async_support as ccxt_async
+
+    from api.config import get_settings
+    from api.db.models import RunORM
+    from api.db.session import get_session_factory
+    from common.types import RunMode
+    from data.services.ccxt_market_data import CCXTMarketDataService
+    from trading.engines.live import LiveExecutionEngine
+    from trading.portfolio import PortfolioAccounting
+    from trading.risk_manager import DefaultRiskManager
+    from trading.strategy_engine import StrategyEngine
+
+    log = logger.bind(run_id=run_id_str, mode="live")
+    log.info("runs.live_engine_starting")
+
+    final_status = "stopped"
+    engine: StrategyEngine | None = None
+    portfolio: Any = None
+    execution: Any = None
+    exchange: Any = None
+
+    try:
+        settings = get_settings()
+        capital = Decimal(initial_capital)
+
+        # Extract exchange credentials
+        api_key: str | None = None
+        api_secret: str | None = None
+        if settings.exchange_api_key is not None:
+            api_key = settings.exchange_api_key.get_secret_value()
+        if settings.exchange_api_secret is not None:
+            api_secret = settings.exchange_api_secret.get_secret_value()
+
+        # Build CCXT async exchange instance
+        exchange_cls = getattr(ccxt_async, settings.exchange_id, None)
+        if exchange_cls is None:
+            raise RuntimeError(f"Unsupported CCXT exchange: {settings.exchange_id!r}")
+        exchange = exchange_cls({
+            "apiKey": api_key,
+            "secret": api_secret,
+            "enableRateLimit": True,
+        })
+
+        # Instantiate components
+        market_data = CCXTMarketDataService(
+            exchange_id=settings.exchange_id,
+            api_key=api_key,
+            api_secret=api_secret,
+            cache_ttl_seconds=60,
+        )
+        risk_manager = DefaultRiskManager(run_id=run_id_str)
+        execution = LiveExecutionEngine(
+            run_id=run_id_str,
+            risk_manager=risk_manager,
+            exchange=exchange,
+            # Gate already enforced by LiveTradingGate in POST handler
+            enable_live_trading=True,
+        )
+        portfolio = PortfolioAccounting(
+            run_id=run_id_str,
+            initial_cash=capital,
+        )
+        strategy_instance = strategy_cls(
+            strategy_id=f"{strategy_name}-{run_id_str.replace('-', '')[:8]}",
+            params=strategy_params,
+        )
+
+        engine = StrategyEngine(
+            strategies=[strategy_instance],
+            execution_engine=execution,
+            risk_manager=risk_manager,
+            market_data=market_data,
+            portfolio=portfolio,
+            symbols=symbols,
+            timeframe=timeframe,
+            run_mode=RunMode.LIVE,
+        )
+
+        await engine.start(run_id_str)
+        log.info("runs.live_engine_running")
+        await engine.run_live_loop()
+
+    except asyncio.CancelledError:
+        log.info("runs.live_engine_cancelled")
+        if engine is not None:
+            try:
+                await engine.stop()
+            except Exception:
+                log.exception("runs.live_engine_stop_error")
+        raise  # Must re-raise CancelledError for asyncio bookkeeping
+
+    except Exception:
+        final_status = "error"
+        log.exception("runs.live_engine_error")
+        if engine is not None:
+            try:
+                await engine.stop()
+            except Exception:
+                log.exception("runs.live_engine_stop_error")
+
+    finally:
+        # Remove from task registry
+        _RUN_TASKS.pop(run_id_str, None)
+
+        # Update run status in DB using an isolated session
+        try:
+            factory = get_session_factory()
+            async with factory() as db:
+                try:
+                    result = await db.execute(
+                        select(RunORM).where(RunORM.id == uuid.UUID(run_id_str))
+                    )
+                    run = result.scalar_one_or_none()
+                    if run is not None and run.status == "running":
+                        now = datetime.now(tz=UTC)
+                        run.status = final_status
+                        run.stopped_at = now
+                        run.updated_at = now
+                        await db.commit()
+                        log.info(
+                            "runs.live_engine_status_updated",
+                            final_status=final_status,
+                        )
+                except Exception:
+                    await db.rollback()
+                    log.exception("runs.live_engine_db_update_failed")
+        except Exception:
+            log.exception("runs.live_engine_db_session_failed")
+
+        # Persist equity curve, trades, orders, fills, and positions
+        if portfolio is not None:
+            await _persist_paper_results(
+                run_id_str=run_id_str,
+                portfolio=portfolio,
+                execution_engine=execution,
+                log=log,
+            )
+
+        # Close exchange connection (belt-and-suspenders; LiveExecutionEngine.on_stop
+        # also closes it, but this covers cases where on_stop was never reached)
+        if exchange is not None:
+            try:
+                await exchange.close()
+            except Exception:
+                log.warning("runs.live_engine_exchange_close_failed")
 
 
 # ---------------------------------------------------------------------------
@@ -596,6 +841,8 @@ async def _persist_backtest_results(
     run_orm: RunORM,
     result: Any,
     log: Any,
+    execution_engine: Any | None = None,
+    portfolio: Any | None = None,
 ) -> None:
     """
     Write all backtest result records to the database.
@@ -665,6 +912,83 @@ async def _persist_backtest_results(
     if equity_orms:
         db.add_all(equity_orms)
         log.info("runs.backtest_equity_snapshots_inserted", count=len(equity_orms))
+
+    # --- Persist orders and fills ---
+    order_orms: list[OrderORM] = []
+    fill_orms: list[FillORM] = []
+
+    if execution_engine is not None:
+        for order in execution_engine.get_all_orders():
+            order_orms.append(
+                OrderORM(
+                    id=order.order_id,
+                    client_order_id=order.client_order_id,
+                    run_id=run_id,
+                    symbol=order.symbol,
+                    side=order.side.value,
+                    order_type=order.order_type.value,
+                    quantity=order.quantity,
+                    price=order.price,
+                    status=order.status.value,
+                    filled_quantity=order.filled_quantity,
+                    average_fill_price=order.average_fill_price,
+                    exchange_order_id=order.exchange_order_id,
+                    created_at=order.created_at,
+                    updated_at=order.updated_at,
+                )
+            )
+
+        for fill in execution_engine.get_all_fills():
+            fill_orms.append(
+                FillORM(
+                    id=fill.fill_id,
+                    order_id=fill.order_id,
+                    symbol=fill.symbol,
+                    side=fill.side.value,
+                    quantity=fill.quantity,
+                    price=fill.price,
+                    fee=fill.fee,
+                    fee_currency=fill.fee_currency,
+                    is_maker=fill.is_maker,
+                    executed_at=fill.executed_at,
+                )
+            )
+
+    if order_orms:
+        db.add_all(order_orms)
+        await db.flush()
+    if fill_orms:
+        db.add_all(fill_orms)
+    if order_orms or fill_orms:
+        log.info(
+            "runs.backtest_orders_fills_inserted",
+            orders=len(order_orms),
+            fills=len(fill_orms),
+        )
+
+    # --- Persist position snapshots ---
+    position_orms: list[PositionSnapshotORM] = []
+    if portfolio is not None and hasattr(portfolio, '_position_snapshots'):
+        now = datetime.now(tz=UTC)
+        for pos in portfolio._position_snapshots.values():
+            position_orms.append(
+                PositionSnapshotORM(
+                    run_id=run_id,
+                    symbol=pos.symbol,
+                    quantity=pos.quantity,
+                    average_entry_price=pos.average_entry_price,
+                    current_price=pos.current_price,
+                    unrealised_pnl=pos.unrealised_pnl,
+                    realised_pnl=pos.realised_pnl,
+                    total_fees_paid=pos.total_fees_paid,
+                    opened_at=pos.opened_at,
+                    snapshot_at=now,
+                )
+            )
+
+    if position_orms:
+        db.add_all(position_orms)
+        log.info("runs.backtest_positions_inserted", count=len(position_orms))
 
     # --- Merge metrics into run.config JSONB ---
     metrics_response = _build_backtest_metrics(result)
@@ -922,6 +1246,8 @@ async def create_run(
                 run_orm=run_orm,
                 result=result,
                 log=log,
+                execution_engine=runner.last_execution_engine,
+                portfolio=runner.last_portfolio,
             )
 
             # Step 5: Mark run as stopped
@@ -988,16 +1314,24 @@ async def create_run(
         log.info("runs.paper_engine_task_created", run_id=str(run_id))
 
     # ------------------------------------------------------------------
-    # LIVE MODE — stub: record created with status="running"
-    # The 3-layer LiveTradingGate is now fully enforced at the API level
-    # (SEC-003 remediation). Sprint 2 must wire the StrategyEngine launch.
+    # LIVE MODE — launch LiveExecutionEngine as a background asyncio.Task
+    # The 3-layer LiveTradingGate is enforced above before reaching here.
     # ------------------------------------------------------------------
     elif mode_value == "live":
-        log.info(
-            "runs.live_mode_stub",
-            run_id=str(run_id),
-            note="Live mode engine not yet wired — Sprint 2",
+        task = asyncio.create_task(
+            _run_live_engine(
+                run_id_str=str(run_id),
+                strategy_cls=strategy_cls,
+                strategy_name=strategy_name,
+                strategy_params=body.strategy_params,
+                symbols=body.symbols,
+                timeframe=timeframe,
+                initial_capital=body.initial_capital,
+            ),
+            name=f"live-engine-{run_id}",
         )
+        _RUN_TASKS[str(run_id)] = task
+        log.info("runs.live_engine_task_created", run_id=str(run_id))
 
     return _run_orm_to_detail_response(run_orm)
 
@@ -1005,6 +1339,10 @@ async def create_run(
 # ---------------------------------------------------------------------------
 # GET /api/v1/runs — list all runs
 # ---------------------------------------------------------------------------
+
+_VALID_MODES: frozenset[str] = frozenset({"backtest", "paper", "live"})
+_VALID_STATUSES: frozenset[str] = frozenset({"running", "stopped", "error"})
+
 
 @router.get(
     "",
@@ -1016,9 +1354,17 @@ async def list_runs(
     db: Annotated[AsyncSession, Depends(get_db)],
     offset: Annotated[int, Query(ge=0, description="Records to skip")] = 0,
     limit: Annotated[int, Query(ge=1, le=500, description="Max records to return")] = 50,
+    mode: Annotated[
+        str | None,
+        Query(description="Filter by run mode: backtest, paper, live"),
+    ] = None,
+    run_status: Annotated[
+        str | None,
+        Query(alias="status", description="Filter by status: running, stopped, error"),
+    ] = None,
 ) -> RunListResponse:
     """
-    List all trading runs with pagination.
+    List all trading runs with pagination and optional server-side filtering.
 
     Parameters
     ----------
@@ -1028,26 +1374,51 @@ async def list_runs(
         Number of records to skip.
     limit:
         Maximum records to return.
+    mode:
+        Optional filter by run mode.  Must be one of backtest, paper,
+        or live when supplied.
+    run_status:
+        Optional filter by run status (query param name: status).  Must be
+        one of running, stopped, or error when supplied.
 
     Returns
     -------
     RunListResponse
-        Paginated list of run records.
+        Paginated list of run records matching the supplied filters.
     """
-    log = logger.bind(endpoint="list_runs", offset=offset, limit=limit)
+    log = logger.bind(endpoint="list_runs", offset=offset, limit=limit, mode=mode, status=run_status)
     log.info("runs.list_requested")
+
+    # Validate optional filter values
+    if mode is not None and mode not in _VALID_MODES:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Invalid mode '{mode}'. Must be one of: {sorted(_VALID_MODES)}",
+        )
+    if run_status is not None and run_status not in _VALID_STATUSES:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Invalid status '{run_status}'. Must be one of: {sorted(_VALID_STATUSES)}",
+        )
+
+    # Build filter conditions
+    filters = []
+    if mode is not None:
+        filters.append(RunORM.run_mode == mode)
+    if run_status is not None:
+        filters.append(RunORM.status == run_status)
 
     # Count total matching rows
     count_stmt = select(func.count()).select_from(RunORM)
+    if filters:
+        count_stmt = count_stmt.where(*filters)
     total: int = (await db.execute(count_stmt)).scalar_one()
 
     # Fetch the page
-    page_stmt = (
-        select(RunORM)
-        .order_by(RunORM.created_at.desc())
-        .offset(offset)
-        .limit(limit)
-    )
+    page_stmt = select(RunORM)
+    if filters:
+        page_stmt = page_stmt.where(*filters)
+    page_stmt = page_stmt.order_by(RunORM.created_at.desc()).offset(offset).limit(limit)
     result = await db.execute(page_stmt)
     runs = list(result.scalars().all())
 
@@ -1198,7 +1569,7 @@ async def stop_run(
     task = _RUN_TASKS.pop(str(run_id), None)
     if task is not None and not task.done():
         task.cancel()
-        log.info("runs.paper_engine_task_cancelled", run_id=str(run_id))
+        log.info("runs.engine_task_cancelled", run_id=str(run_id))
 
     log.info("runs.stopped", run_id=str(run_id))
     return _run_orm_to_detail_response(run)
