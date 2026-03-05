@@ -262,3 +262,20 @@
   - [x] P1: Code critic review — CR-001 (DRY violation rewrite), CR-004 (__init__ exports), CR-005 (delegation)
   - [x] P2: Unit tests — 17 ml_features tests + 21 ml_training tests (38 total)
   - [x] P2: 1065 tests pass, 0 mypy errors
+
+### 22. AI Crypto Trading Bot — Sprint 21 (Coinbase Compatibility + User Guide)
+- **Plan:** `.claude/plans/eventual-wandering-lecun.md`
+- **Status:** COMPLETE (pending commit)
+- **Orchestration Checklist:**
+  - [x] P0: Replace fetch_order_trades() with capability-checked fallback in live engine
+  - [x] P0: Add _normalize_exchange_secret() PEM stripping helper in runs.py
+  - [x] P0: Add exchange_api_passphrase SecretStr field to config.py
+  - [x] P0: Conditional CCXT config (no None values) in live engine + paper engine wiring
+  - [x] P1: Reduce OHLCV _DEFAULT_PAGE_LIMIT 500→300 in ccxt_market_data.py
+  - [x] P1: Add api_passphrase parameter to CCXTMarketDataService.__init__()
+  - [x] P1: Wire EXCHANGE_API_PASSPHRASE in docker-compose.yml + .env.example
+  - [x] P1: Windows aiodns fix — ThreadedResolver patch in apps/api/main.py
+  - [x] P1: Code critic remediations (CR-001 double normalization, CR-002 conditional config, CR-003 fallback return)
+  - [x] P1: Gebruikershandleiding (Dutch user guide) — docs/gebruikershandleiding.md (618 lines, 11 sections)
+  - [x] P2: Unit tests — 4 new tests (fetch_order_trades fallback + passphrase wiring)
+  - [x] P2: 1069 tests pass, 0 mypy errors

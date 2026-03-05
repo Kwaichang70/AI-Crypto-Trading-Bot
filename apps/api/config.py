@@ -203,6 +203,10 @@ class Settings(BaseSettings):
         default=None,
         description="Exchange API secret — never logged",
     )
+    exchange_api_passphrase: SecretStr | None = Field(
+        default=None,
+        description="Exchange API passphrase (e.g. Coinbase legacy keys) — never logged",
+    )
 
     # ------------------------------------------------------------------
     # Live trading safety gates (all three must be satisfied)

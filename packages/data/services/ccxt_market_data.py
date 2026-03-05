@@ -61,8 +61,8 @@ logger = structlog.get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 #: Default maximum number of candles per exchange request.
-#: Most exchanges cap at 500; a conservative default prevents silent truncation.
-_DEFAULT_PAGE_LIMIT: int = 500
+#: Coinbase caps at 300; using a conservative default prevents silent truncation.
+_DEFAULT_PAGE_LIMIT: int = 300
 
 #: Maximum number of retry attempts on transient errors (429, NetworkError).
 _MAX_RETRIES: int = 3
@@ -116,11 +116,14 @@ class CCXTMarketDataService(BaseMarketDataService):
         Public OHLCV data does not require authentication on most exchanges.
     api_secret:
         Exchange API secret. Required only for authenticated endpoints.
+    api_passphrase:
+        Exchange API passphrase. Required by some exchanges (e.g. Coinbase
+        legacy keys). Leave ``None`` for exchanges that do not use one.
     cache_ttl_seconds:
         Lifetime of L1 in-process cache entries in seconds. Pass ``0`` to
         disable caching entirely.
     page_limit:
-        Maximum candles per exchange request. Defaults to ``500``.
+        Maximum candles per exchange request. Defaults to ``300``.
         Reduce for exchanges with smaller per-page caps.
     max_concurrency:
         Maximum simultaneous in-flight HTTP requests. Defaults to ``5``.
@@ -147,6 +150,7 @@ class CCXTMarketDataService(BaseMarketDataService):
         *,
         api_key: str | None = None,
         api_secret: str | None = None,
+        api_passphrase: str | None = None,
         cache_ttl_seconds: int = 60,
         page_limit: int = _DEFAULT_PAGE_LIMIT,
         max_concurrency: int = _DEFAULT_MAX_CONCURRENCY,
@@ -156,9 +160,11 @@ class CCXTMarketDataService(BaseMarketDataService):
         super().__init__(exchange_id=exchange_id, cache_ttl_seconds=cache_ttl_seconds)
 
         self._api_key = api_key
-        self._api_secret = api_secret
+        self._api_passphrase = api_passphrase
         self._page_limit = page_limit
         self._sandbox = sandbox
+
+        self._api_secret = api_secret
 
         # ---- L1 in-process cache ----
         # Key: (symbol, timeframe_str, since_ms_or_None, limit)
@@ -189,6 +195,8 @@ class CCXTMarketDataService(BaseMarketDataService):
             ccxt_config["apiKey"] = api_key
         if api_secret is not None:
             ccxt_config["secret"] = api_secret
+        if api_passphrase is not None:
+            ccxt_config["password"] = api_passphrase
         if extra_exchange_config:
             ccxt_config.update(extra_exchange_config)
 

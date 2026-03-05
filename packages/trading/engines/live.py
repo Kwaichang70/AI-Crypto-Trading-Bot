@@ -628,13 +628,22 @@ class LiveExecutionEngine(BaseExecutionEngine):
             return sorted(cached_fills, key=lambda f: f.executed_at)
 
         try:
-            # TODO: implement full exchange integration
-            # - Handle pagination for orders with many fills
-            # - Cache results to reduce API calls
-            ccxt_trades = await self._exchange.fetch_order_trades(
-                id=exchange_order_id,
-                symbol=order.symbol,
-            )
+            # Use exchange.has to pick the best fills-fetching method.
+            # Binance supports fetchOrderTrades; Coinbase does not.
+            if self._exchange.has.get("fetchOrderTrades"):
+                ccxt_trades = await self._exchange.fetch_order_trades(
+                    id=exchange_order_id,
+                    symbol=order.symbol,
+                )
+            else:
+                # Fallback: fetch all recent trades and filter by order ID.
+                all_trades = await self._exchange.fetch_my_trades(
+                    symbol=order.symbol,
+                )
+                ccxt_trades = [
+                    t for t in all_trades
+                    if t.get("order") == exchange_order_id
+                ]
 
             fills: list[Fill] = []
             for trade in ccxt_trades:

@@ -26,8 +26,24 @@ See ``api.auth`` for implementation details.
 
 from __future__ import annotations
 
+import platform
 import time
 from contextlib import asynccontextmanager
+
+# ---------------------------------------------------------------------------
+# Fix aiodns DNS failure on Windows.
+# aiodns (pulled in by CCXT) uses c-ares which cannot contact Windows DNS
+# servers.  Patching aiohttp's DefaultResolver to ThreadedResolver restores
+# working async DNS on Windows while keeping aiodns installed for Linux.
+# ---------------------------------------------------------------------------
+if platform.system() == "Windows":
+    try:
+        import aiohttp.resolver as _resolver
+        from aiohttp.resolver import ThreadedResolver
+
+        _resolver.DefaultResolver = ThreadedResolver
+    except ImportError:
+        pass
 from typing import Any, AsyncIterator, cast
 
 import structlog

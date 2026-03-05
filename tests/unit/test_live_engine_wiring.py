@@ -106,10 +106,14 @@ def _make_settings_mock() -> MagicMock:
     secret_secret = MagicMock()
     secret_secret.get_secret_value.return_value = "test-api-secret"
 
+    secret_passphrase = MagicMock()
+    secret_passphrase.get_secret_value.return_value = "test-passphrase"
+
     settings = MagicMock()
     settings.exchange_id = "binance"
     settings.exchange_api_key = secret_key
     settings.exchange_api_secret = secret_secret
+    settings.exchange_api_passphrase = secret_passphrase
     return settings
 
 
@@ -540,4 +544,60 @@ class TestRunLiveEngine:
         assert _RUN_ID not in _RUN_TASKS, (
             f"_RUN_TASKS must not contain run_id after coroutine exits, "
             f"but found: {_RUN_TASKS.get(_RUN_ID)!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_run_live_engine_passes_passphrase_to_exchange(self) -> None:
+        """
+        When settings.exchange_api_passphrase is configured, _run_live_engine()
+        must pass it as the "password" key in the CCXT exchange config dict.
+
+        This is the Coinbase compatibility requirement: Coinbase Advanced Trade
+        requires a passphrase which CCXT expects under the "password" config key.
+        Exchanges that do not need a passphrase (e.g. Binance) leave
+        settings.exchange_api_passphrase as None, so the key is omitted entirely.
+
+        Verification: inspect the positional argument passed to the exchange class
+        constructor via ccxt_module_mock.binance.call_args[0][0].
+        """
+        settings_mock = _make_settings_mock()
+        get_sf_mock, _ = _make_db_session_factory()
+        ccxt_module_mock, _ = _make_ccxt_module_mock()
+        se_cls_mock, _ = _make_strategy_engine_mock(raise_on_run_loop=None)
+        strategy_cls_mock = _make_strategy_cls_mock()
+
+        _RUN_TASKS.pop(_RUN_ID, None)
+
+        with (
+            patch(_PT_SETTINGS, return_value=settings_mock),
+            patch(_PT_SESSION_FACTORY, get_sf_mock),
+            patch(_PT_CCXT, ccxt_module_mock),
+            patch(_PT_MDS, MagicMock()),
+            patch(_PT_LIVE_ENGINE, MagicMock()),
+            patch(_PT_PORTFOLIO, MagicMock()),
+            patch(_PT_RISK_MGR, MagicMock()),
+            patch(_PT_STRAT_ENGINE, se_cls_mock),
+            patch(_PT_PERSIST, new_callable=AsyncMock),
+        ):
+            await _run_live_engine(
+                run_id_str=_RUN_ID,
+                strategy_cls=strategy_cls_mock,
+                strategy_name=_STRATEGY_NAME,
+                strategy_params={},
+                symbols=[_SYMBOL],
+                timeframe=TimeFrame.ONE_HOUR,
+                initial_capital=_INITIAL_CAPITAL,
+            )
+
+        # The CCXT exchange class is called with a positional config dict.
+        # Assert the passphrase is wired as 'password' in that dict.
+        ccxt_module_mock.binance.assert_called_once()
+        call_args = ccxt_module_mock.binance.call_args
+        # _run_live_engine calls exchange_cls(exchange_config) with positional arg
+        exchange_config = call_args[0][0]
+        assert "password" in exchange_config, (
+            f"Expected password key in CCXT exchange config, got: {exchange_config!r}"
+        )
+        assert exchange_config["password"] == "test-passphrase", (
+            f"Expected passphrase value test-passphrase, got: {exchange_config!r}"
         )

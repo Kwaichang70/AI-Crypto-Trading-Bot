@@ -119,6 +119,31 @@ def _run_orm_to_response(run: RunORM) -> RunResponse:
     return RunResponse.model_validate(run)
 
 
+# ---------------------------------------------------------------------------
+# Helper: normalize exchange secret for CCXT compatibility
+# ---------------------------------------------------------------------------
+
+def _normalize_exchange_secret(secret: str) -> str:
+    """Normalize exchange API secret for CCXT compatibility.
+
+    Coinbase Ed25519 CDP keys are often stored in PEM format
+    (-----BEGIN EC PRIVATE KEY-----\n...\n-----END EC PRIVATE KEY-----)
+    but CCXT expects raw base64 (88 chars) for EdDSA signing.
+    This strips PEM headers and converts escaped newlines.
+    """
+    # Convert literal backslash-n to real newlines
+    normalized = secret.replace("\\n", "\n")
+    # Strip PEM headers if present
+    lines = [
+        line.strip()
+        for line in normalized.splitlines()
+        if line.strip() and "-----" not in line
+    ]
+    if lines:
+        return "".join(lines)
+    return normalized
+
+
 def _run_orm_to_detail_response(run: RunORM) -> RunDetailResponse:
     """
     Convert a ``RunORM`` instance to a ``RunDetailResponse`` Pydantic model.
@@ -402,12 +427,18 @@ async def _run_paper_engine(
             api_key = settings.exchange_api_key.get_secret_value()
         if settings.exchange_api_secret is not None:
             api_secret = settings.exchange_api_secret.get_secret_value()
+        if api_secret is not None:
+            api_secret = _normalize_exchange_secret(api_secret)
+        api_passphrase: str | None = None
+        if settings.exchange_api_passphrase is not None:
+            api_passphrase = settings.exchange_api_passphrase.get_secret_value()
 
         # Instantiate components
         market_data = CCXTMarketDataService(
             exchange_id=settings.exchange_id,
             api_key=api_key,
             api_secret=api_secret,
+            api_passphrase=api_passphrase,
             cache_ttl_seconds=60,
         )
         risk_manager = DefaultRiskManager(run_id=run_id_str)
@@ -550,22 +581,33 @@ async def _run_live_engine(
             api_key = settings.exchange_api_key.get_secret_value()
         if settings.exchange_api_secret is not None:
             api_secret = settings.exchange_api_secret.get_secret_value()
+        if api_secret is not None:
+            api_secret = _normalize_exchange_secret(api_secret)
+        api_passphrase: str | None = None
+        if settings.exchange_api_passphrase is not None:
+            api_passphrase = settings.exchange_api_passphrase.get_secret_value()
 
         # Build CCXT async exchange instance
         exchange_cls = getattr(ccxt_async, settings.exchange_id, None)
         if exchange_cls is None:
             raise RuntimeError(f"Unsupported CCXT exchange: {settings.exchange_id!r}")
-        exchange = exchange_cls({
-            "apiKey": api_key,
-            "secret": api_secret,
+        exchange_config: dict[str, Any] = {
             "enableRateLimit": True,
-        })
+        }
+        if api_key is not None:
+            exchange_config["apiKey"] = api_key
+        if api_secret is not None:
+            exchange_config["secret"] = api_secret
+        if api_passphrase is not None:
+            exchange_config["password"] = api_passphrase
+        exchange = exchange_cls(exchange_config)
 
         # Instantiate components
         market_data = CCXTMarketDataService(
             exchange_id=settings.exchange_id,
             api_key=api_key,
             api_secret=api_secret,
+            api_passphrase=api_passphrase,
             cache_ttl_seconds=60,
         )
         risk_manager = DefaultRiskManager(run_id=run_id_str)
@@ -720,11 +762,17 @@ async def _fetch_bars_for_backtest(
         api_key = settings.exchange_api_key.get_secret_value()
     if settings.exchange_api_secret is not None:
         api_secret = settings.exchange_api_secret.get_secret_value()
+    if api_secret is not None:
+        api_secret = _normalize_exchange_secret(api_secret)
+    api_passphrase: str | None = None
+    if settings.exchange_api_passphrase is not None:
+        api_passphrase = settings.exchange_api_passphrase.get_secret_value()
 
     service = CCXTMarketDataService(
         exchange_id=settings.exchange_id,
         api_key=api_key,
         api_secret=api_secret,
+        api_passphrase=api_passphrase,
         cache_ttl_seconds=0,  # No caching for backtest data fetches
     )
 

@@ -89,6 +89,8 @@ def _make_mock_exchange(
     fetch_ticker_response: dict[str, Any] | None = None,
     fetch_balance_response: dict[str, Any] | None = None,
     markets: dict[str, Any] | None = None,
+    has_fetch_order_trades: bool = True,
+    fetch_my_trades_response: list[dict[str, Any]] | None = None,
 ) -> MagicMock:
     """
     Build a fully-configured AsyncMock exchange instance.
@@ -136,6 +138,15 @@ def _make_mock_exchange(
     )
     exchange.load_markets = AsyncMock(return_value=exchange.markets)
     exchange.close = AsyncMock(return_value=None)
+    # Exchange capability map -- controls which fills-fetching method is used.
+    # Set as a real dict so .get() returns a true bool, not a MagicMock.
+    exchange.has = {
+        "fetchOrderTrades": has_fetch_order_trades,
+        "fetchMyTrades": True,
+    }
+    exchange.fetch_my_trades = AsyncMock(
+        return_value=fetch_my_trades_response if fetch_my_trades_response is not None else []
+    )
 
     return exchange
 
@@ -965,6 +976,99 @@ class TestGetFills:
 
         assert fills == []
         ex.fetch_order_trades.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_fills_via_fetch_my_trades_fallback(self) -> None:
+        """
+        When exchange.has["fetchOrderTrades"] is falsy, get_fills() must
+        call fetch_my_trades(symbol) instead of fetch_order_trades().
+
+        This exercises the Coinbase-compatible fallback path introduced in
+        the get_fills() refactor. Binance supports fetchOrderTrades; exchanges
+        such as Coinbase Advanced Trade do not, so the fallback fetches all
+        recent trades and filters by order ID.
+        """
+        trade = _make_ccxt_trade(amount="0.1", price="50000", fee_cost="0.5")
+        # Attach the exchange_order_id that the engine will store after submit
+        trade["order"] = "exch-001"  # matches default create_order response id
+
+        engine, _, ex = _make_engine(
+            exchange_kwargs={
+                "has_fetch_order_trades": False,
+                "fetch_my_trades_response": [trade],
+            }
+        )
+        order = _make_market_order(quantity=Decimal("0.1"))
+        submitted = await engine.submit_order(order)
+
+        fills = await engine.get_fills(submitted.order_id)
+
+        assert len(fills) == 1, (
+            f"Expected 1 fill from fetch_my_trades fallback, got {len(fills)}"
+        )
+        assert fills[0].quantity == Decimal("0.1")
+        assert fills[0].price == Decimal("50000")
+        ex.fetch_order_trades.assert_not_called()
+        ex.fetch_my_trades.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_fetch_my_trades_filters_by_order_id(self) -> None:
+        """
+        When fetch_my_trades() returns multiple trades, get_fills() must
+        filter to only those whose "order" field matches the exchange_order_id.
+
+        Two trades are returned: one matching the submitted order's exchange ID
+        ("exch-001") and one belonging to a different order. Only the matching
+        trade should appear as a Fill object.
+        """
+        matching_trade = _make_ccxt_trade(amount="0.1", price="50000", fee_cost="0.5")
+        matching_trade["order"] = "exch-001"  # matches default create_order id
+
+        other_trade = _make_ccxt_trade(amount="0.2", price="49000", fee_cost="1.0")
+        other_trade["order"] = "exch-999"  # different order -- must be filtered out
+
+        engine, _, ex = _make_engine(
+            exchange_kwargs={
+                "has_fetch_order_trades": False,
+                "fetch_my_trades_response": [matching_trade, other_trade],
+            }
+        )
+        order = _make_market_order(quantity=Decimal("0.1"))
+        submitted = await engine.submit_order(order)
+
+        fills = await engine.get_fills(submitted.order_id)
+
+        assert len(fills) == 1, (
+            f"Expected only the matching trade to become a Fill, "
+            f"got {len(fills)}: {fills!r}"
+        )
+        assert fills[0].quantity == Decimal("0.1"), (
+            "Fill quantity must match the matching trade, not the filtered-out trade"
+        )
+
+    @pytest.mark.asyncio
+    async def test_fetch_my_trades_fallback_error_returns_cached(self) -> None:
+        """
+        When fetch_my_trades() raises a network error, get_fills() must fall
+        back to the locally cached fills (empty list for a freshly submitted order).
+
+        This mirrors test_fills_fallback_to_cache_on_exchange_error for the
+        fetchOrderTrades path, but exercises the Coinbase fallback branch.
+        """
+        engine, _, ex = _make_engine(
+            exchange_kwargs={"has_fetch_order_trades": False}
+        )
+        order = _make_market_order()
+        submitted = await engine.submit_order(order)
+
+        ex.fetch_my_trades.side_effect = ccxt_async.NetworkError("exchange unavailable")
+
+        fills = await engine.get_fills(submitted.order_id)
+
+        # No cached fills: fallback returns empty list
+        assert fills == [], (
+            f"Expected empty fallback list after fetch_my_trades error, got {fills!r}"
+        )
 
 
 # ===========================================================================
