@@ -138,6 +138,7 @@ services:
       ENVIRONMENT:       ${ENVIRONMENT:-development}
       # -- Trading safety gates --
       ENABLE_LIVE_TRADING:        ${ENABLE_LIVE_TRADING:-false}
+      EXCHANGE_ID:                ${EXCHANGE_ID:-binance}
       EXCHANGE_API_KEY:           ${EXCHANGE_API_KEY:-}
       EXCHANGE_API_SECRET:        ${EXCHANGE_API_SECRET:-}
       LIVE_TRADING_CONFIRM_TOKEN: ${LIVE_TRADING_CONFIRM_TOKEN:-}

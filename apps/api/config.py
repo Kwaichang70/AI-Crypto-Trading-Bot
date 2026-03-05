@@ -192,8 +192,8 @@ class Settings(BaseSettings):
     # Exchange / CCXT
     # ------------------------------------------------------------------
     exchange_id: str = Field(
-        default="kraken",
-        description="CCXT exchange ID (e.g. 'kraken', 'binance')",
+        default="binance",
+        description="CCXT exchange ID (e.g. 'binance', 'kraken')",
     )
     exchange_api_key: SecretStr | None = Field(
         default=None,

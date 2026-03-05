@@ -1275,6 +1275,29 @@ async def create_run(
             await db.flush()
             raise
 
+        except ValueError as exc:
+            # BacktestRunner._validate_bars raised a data-quality error
+            # (empty bars, insufficient warm-up, non-chronological data).
+            error_time = datetime.now(tz=UTC)
+            run_orm.status = "error"
+            run_orm.stopped_at = error_time
+            run_orm.updated_at = error_time
+            await db.flush()
+
+            log.warning(
+                "runs.backtest_data_quality_error",
+                run_id=str(run_id),
+                error=str(exc),
+            )
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"Backtest data quality check failed: {exc}. "
+                    "Verify your date range provides sufficient bars "
+                    "for the requested strategy."
+                ),
+            ) from exc
+
         except Exception as exc:
             # Unexpected backtest execution errors
             error_time = datetime.now(tz=UTC)
