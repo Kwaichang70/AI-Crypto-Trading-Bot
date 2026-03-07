@@ -11,7 +11,7 @@ import type { Strategy, JsonSchemaProperty, RunMode } from "@/lib/types";
 import { Header } from "@/components/layout/header";
 
 const TIMEFRAMES = ["1m", "5m", "15m", "1h", "4h", "1d"];
-const COMMON_SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "ADA/USDT"];
+const COMMON_SYMBOLS = ["BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "ADA/USD"];
 
 function ParamInput({
   name,
@@ -77,7 +77,7 @@ export default function NewRunPage() {
   const [strategies, setStrategies] = useState<readonly Strategy[]>([]);
   const [selectedStrategy, setSelectedStrategy] = useState<Strategy | null>(null);
   const [strategyParams, setStrategyParams] = useState<Record<string, unknown>>({});
-  const [symbols, setSymbols] = useState<string[]>(["BTC/USDT"]);
+  const [symbols, setSymbols] = useState<string[]>(["BTC/USD"]);
   const [customSymbol, setCustomSymbol] = useState("");
   const [timeframe, setTimeframe] = useState("1h");
   const [mode, setMode] = useState<RunMode>("backtest");
@@ -348,7 +348,7 @@ export default function NewRunPage() {
           <h2 className="text-sm font-semibold text-slate-200">Capital & Dates</h2>
           <div>
             <label className="block text-sm font-medium text-slate-300">
-              Initial Capital (USDT)
+              Initial Capital (USD)
             </label>
             <input
               type="number"
