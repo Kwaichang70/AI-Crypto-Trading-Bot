@@ -145,6 +145,11 @@ services:
       LIVE_TRADING_CONFIRM_TOKEN: ${LIVE_TRADING_CONFIRM_TOKEN:-}
       # -- Observability --
       PROMETHEUS_ENABLED: ${PROMETHEUS_ENABLED:-true}
+      # -- CORS --
+      ALLOWED_ORIGINS:     ${ALLOWED_ORIGINS:-http://localhost:3000}
+      # -- Authentication --
+      REQUIRE_API_AUTH:    ${REQUIRE_API_AUTH:-false}
+      API_KEY_HASH:        ${API_KEY_HASH:-}
     ports:
       - "${API_PORT:-8000}:8000"
     healthcheck:

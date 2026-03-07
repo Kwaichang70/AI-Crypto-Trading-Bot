@@ -24,19 +24,23 @@ MVP notes
 - LIVE mode requires passing the 3-layer safety gate:
   (1) ENABLE_LIVE_TRADING=true, (2) exchange API keys configured,
   (3) valid confirm_token matching LIVE_TRADING_CONFIRM_TOKEN.
+- Paper runs emit periodic incremental DB flushes every 30 seconds via
+  _flush_incremental / _incremental_flush_loop so equity, trades, orders,
+  fills, and positions are visible while the run is still active.
 """
 
 from __future__ import annotations
 
 import asyncio
 import uuid
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Annotated, Any
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.db.models import EquitySnapshotORM, FillORM, OrderORM, PositionSnapshotORM, RunORM, TradeORM
@@ -62,6 +66,18 @@ logger = structlog.get_logger(__name__)
 # Background task registry for paper/live trading engines
 # ---------------------------------------------------------------------------
 _RUN_TASKS: dict[str, asyncio.Task[None]] = {}
+
+
+@dataclass
+class _IncrementalFlushState:
+    """Watermark state for incremental DB persistence during paper runs."""
+
+    flushed_equity_count: int = 0
+    flushed_trade_count: int = 0
+    flushed_order_ids: set[uuid.UUID] = field(default_factory=set)
+    flushed_fill_ids: set[uuid.UUID] = field(default_factory=set)
+    peak_equity: Decimal = field(default_factory=lambda: Decimal("0"))
+
 
 # ---------------------------------------------------------------------------
 # Strategy registry — maps API names to strategy classes
@@ -180,6 +196,288 @@ def _run_orm_to_detail_response(run: RunORM) -> RunDetailResponse:
 
 
 # ---------------------------------------------------------------------------
+# Helper: incremental flush of paper engine data to DB during active run
+# ---------------------------------------------------------------------------
+
+async def _flush_incremental(
+    *,
+    run_id_str: str,
+    portfolio: Any,
+    execution_engine: Any | None,
+    state: _IncrementalFlushState,
+    log: Any,
+) -> None:
+    """
+    Perform one incremental flush cycle for an active paper run.
+
+    Reads in-memory state from portfolio and execution_engine, computes
+    deltas using watermarks stored in ``state``, and writes only new data
+    to the database.  Uses an isolated DB session.  Safe to call concurrently
+    with the engine loop — reads are non-destructive snapshots.
+
+    Parameters
+    ----------
+    run_id_str:
+        String representation of the run UUID.
+    portfolio:
+        ``PortfolioAccounting`` instance from the active paper engine.
+    execution_engine:
+        ``PaperExecutionEngine`` instance, or ``None`` if not yet created.
+    state:
+        Mutable watermark state tracking what has already been flushed.
+    log:
+        Bound structlog logger for contextual logging.
+    """
+    from api.db.session import get_session_factory
+
+    run_id = uuid.UUID(run_id_str)
+
+    # ------------------------------------------------------------------
+    # Compute deltas
+    # ------------------------------------------------------------------
+    equity_curve = portfolio.get_equity_curve()
+    new_equity_points = equity_curve[state.flushed_equity_count:]
+
+    trade_history = portfolio.get_trade_history()
+    new_trades = trade_history[state.flushed_trade_count:]
+
+    all_orders = execution_engine.get_all_orders() if execution_engine is not None else []
+    all_fills = execution_engine.get_all_fills() if execution_engine is not None else []
+    new_fills = [f for f in all_fills if f.fill_id not in state.flushed_fill_ids]
+
+    # Check position data availability
+    has_positions = hasattr(portfolio, "_position_snapshots")
+
+    new_orders = [o for o in all_orders if o.order_id not in state.flushed_order_ids]
+
+    # Skip entirely when there is nothing to persist
+    if (
+        not new_equity_points
+        and not new_trades
+        and not new_orders
+        and not new_fills
+        and not has_positions
+    ):
+        log.debug("runs.incremental_flush_skipped", reason="no_new_data")
+        return
+
+    # ------------------------------------------------------------------
+    # Build ORM rows
+    # ------------------------------------------------------------------
+
+    # Equity snapshots — use peak from state for consistent drawdown tracking
+    equity_orms: list[EquitySnapshotORM] = []
+    for i, (timestamp, equity) in enumerate(new_equity_points):
+        if equity > state.peak_equity:
+            state.peak_equity = equity
+        if state.peak_equity > Decimal("0"):
+            dd_pct = ((state.peak_equity - equity) / state.peak_equity).quantize(
+                Decimal("0.00000001")
+            )
+        else:
+            dd_pct = Decimal("0")
+        # Clamp to [0, 1] to satisfy DB CHECK constraint
+        dd_pct = max(Decimal("0"), min(dd_pct, Decimal("1")))
+
+        # Clamp equity to 0 to satisfy ck_equity_snapshots_equity_non_negative
+        if equity < Decimal("0"):
+            log.warning(
+                "runs.incremental_flush_negative_equity_clamped",
+                bar_index=state.flushed_equity_count + i,
+                raw_equity=str(equity),
+            )
+            equity = Decimal("0")
+
+        equity_orms.append(
+            EquitySnapshotORM(
+                run_id=run_id,
+                equity=equity,
+                cash=Decimal("0"),           # MVP: per-bar cash not tracked
+                unrealised_pnl=Decimal("0"), # MVP: per-bar unrealised not tracked
+                realised_pnl=Decimal("0"),   # MVP: per-bar realised not tracked
+                drawdown_pct=dd_pct,
+                bar_index=state.flushed_equity_count + i,
+                timestamp=timestamp,
+            )
+        )
+
+    # Trade rows
+    trade_orms: list[TradeORM] = []
+    for trade in new_trades:
+        trade_orms.append(
+            TradeORM(
+                id=trade.trade_id,
+                run_id=run_id,
+                symbol=trade.symbol,
+                side=(
+                    trade.side.value
+                    if hasattr(trade.side, "value")
+                    else str(trade.side)
+                ),
+                entry_price=trade.entry_price,
+                exit_price=trade.exit_price,
+                quantity=trade.quantity,
+                realised_pnl=trade.realised_pnl,
+                total_fees=trade.total_fees,
+                entry_at=trade.entry_at,
+                exit_at=trade.exit_at,
+                strategy_id=trade.strategy_id or "unknown",
+            )
+        )
+
+    # Order rows — use merge() so existing rows are updated when status changes
+    order_orms: list[OrderORM] = []
+    for order in all_orders:
+        order_orms.append(
+            OrderORM(
+                id=order.order_id,
+                client_order_id=order.client_order_id,
+                run_id=run_id,
+                symbol=order.symbol,
+                side=order.side.value,
+                order_type=order.order_type.value,
+                quantity=order.quantity,
+                price=order.price,
+                status=order.status.value,
+                filled_quantity=order.filled_quantity,
+                average_fill_price=order.average_fill_price,
+                exchange_order_id=order.exchange_order_id,
+                created_at=order.created_at,
+                updated_at=order.updated_at,
+            )
+        )
+
+    # Fill rows — insert only new fills (watermarked by fill_id)
+    fill_orms: list[FillORM] = []
+    new_fill_ids: list[uuid.UUID] = []
+    for fill in new_fills:
+        fill_orms.append(
+            FillORM(
+                id=fill.fill_id,
+                order_id=fill.order_id,
+                symbol=fill.symbol,
+                side=fill.side.value,
+                quantity=fill.quantity,
+                price=fill.price,
+                fee=fill.fee,
+                fee_currency=fill.fee_currency,
+                is_maker=fill.is_maker,
+                executed_at=fill.executed_at,
+            )
+        )
+        new_fill_ids.append(fill.fill_id)
+
+    # Position snapshot rows — delete existing then insert fresh
+    position_orms: list[PositionSnapshotORM] = []
+    now = datetime.now(tz=UTC)
+    if has_positions:
+        for pos in portfolio._position_snapshots.values():
+            # Skip flat positions (fully closed) to avoid DB clutter
+            if pos.quantity <= Decimal("0"):
+                continue
+            position_orms.append(
+                PositionSnapshotORM(
+                    run_id=run_id,
+                    symbol=pos.symbol,
+                    quantity=pos.quantity,
+                    average_entry_price=pos.average_entry_price,
+                    current_price=pos.current_price,
+                    unrealised_pnl=pos.unrealised_pnl,
+                    realised_pnl=pos.realised_pnl,
+                    total_fees_paid=pos.total_fees_paid,
+                    opened_at=pos.opened_at,
+                    snapshot_at=now,
+                )
+            )
+
+    # ------------------------------------------------------------------
+    # Persist in isolated session
+    # ------------------------------------------------------------------
+    try:
+        factory = get_session_factory()
+        async with factory() as db:
+            try:
+                # Orders first (FK parent of fills); use merge() so status
+                # updates on already-persisted orders are applied correctly
+                for order_orm in order_orms:
+                    await db.merge(order_orm)
+                if order_orms:
+                    await db.flush()
+
+                # New fills only (already-seen fills skipped above)
+                if fill_orms:
+                    db.add_all(fill_orms)
+
+                # Equity and trade rows are always new (watermarked by index / id)
+                if equity_orms:
+                    db.add_all(equity_orms)
+                if trade_orms:
+                    db.add_all(trade_orms)
+
+                # Positions: delete all existing snapshots for this run then
+                # insert the current state (idempotent refresh)
+                if has_positions:
+                    await db.execute(
+                        delete(PositionSnapshotORM).where(
+                            PositionSnapshotORM.run_id == run_id
+                        )
+                    )
+                    if position_orms:
+                        db.add_all(position_orms)
+
+                await db.commit()
+
+                log.info(
+                    "runs.incremental_flush_committed",
+                    new_equity=len(equity_orms),
+                    new_trades=len(trade_orms),
+                    orders_merged=len(order_orms),
+                    new_fills=len(fill_orms),
+                    positions=len(position_orms),
+                )
+
+                # Advance watermarks only after a successful commit
+                state.flushed_equity_count += len(equity_orms)
+                state.flushed_trade_count += len(trade_orms)
+                state.flushed_fill_ids.update(new_fill_ids)
+                state.flushed_order_ids.update(o.order_id for o in all_orders)
+
+            except Exception:
+                await db.rollback()
+                log.exception("runs.incremental_flush_db_error")
+    except Exception:
+        log.exception("runs.incremental_flush_session_failed")
+
+
+async def _incremental_flush_loop(
+    *,
+    run_id_str: str,
+    portfolio: Any,
+    execution_engine: Any | None,
+    state: _IncrementalFlushState,
+    flush_interval: float,
+    log: Any,
+) -> None:
+    """Periodic incremental flush loop — runs as parallel asyncio.Task."""
+    log.info("runs.incremental_flush_started", flush_interval=flush_interval)
+    try:
+        while True:
+            await asyncio.sleep(flush_interval)
+            try:
+                await _flush_incremental(
+                    run_id_str=run_id_str,
+                    portfolio=portfolio,
+                    execution_engine=execution_engine,
+                    state=state,
+                    log=log,
+                )
+            except Exception:
+                log.exception("runs.incremental_flush_error")
+    except asyncio.CancelledError:
+        log.info("runs.incremental_flush_stopped")
+
+
+# ---------------------------------------------------------------------------
 # Helper: persist paper engine results to DB
 # ---------------------------------------------------------------------------
 
@@ -193,7 +491,7 @@ async def _persist_paper_results(
     """
     Persist paper engine equity curve, completed trades, orders, and fills to DB.
 
-    Called from ``_run_paper_engine``'s ``finally`` block. Uses its own
+    Called from ``_run_live_engine``'s ``finally`` block. Uses its own
     isolated DB session. Skipped when equity curve, trade history, and
     order list are all empty (engine stopped before generating any data).
     """
@@ -381,6 +679,11 @@ async def _run_paper_engine(
     This function uses its own database session (not the request session)
     because the POST handler's session is closed before this coroutine runs.
 
+    An incremental flush task runs in parallel every 30 seconds to persist
+    equity snapshots, trades, orders, fills, and position data while the run
+    is still active.  A final flush is performed after the engine stops to
+    capture any remaining data not covered by the last periodic flush.
+
     Parameters
     ----------
     run_id_str:
@@ -415,6 +718,12 @@ async def _run_paper_engine(
     engine: StrategyEngine | None = None
     portfolio: Any = None
     execution: Any = None
+
+    # Incremental flush state — declared at function scope so except/finally
+    # blocks can access flush_task for cancellation regardless of where in
+    # the try block an error occurs.
+    flush_state = _IncrementalFlushState()
+    flush_task: asyncio.Task[None] | None = None
 
     try:
         settings = get_settings()
@@ -469,10 +778,32 @@ async def _run_paper_engine(
 
         await engine.start(run_id_str)
         log.info("runs.paper_engine_running")
+
+        # Start periodic incremental flush as a parallel background task
+        assert execution is not None, (
+            "flush task must be created after PaperExecutionEngine is initialized"
+        )
+        flush_task = asyncio.create_task(
+            _incremental_flush_loop(
+                run_id_str=run_id_str,
+                portfolio=portfolio,
+                execution_engine=execution,
+                state=flush_state,
+                flush_interval=30.0,
+                log=log,
+            )
+        )
+
         await engine.run_live_loop()
 
     except asyncio.CancelledError:
         log.info("runs.paper_engine_cancelled")
+        if flush_task is not None and not flush_task.done():
+            flush_task.cancel()
+            try:
+                await flush_task
+            except (asyncio.CancelledError, Exception):
+                pass
         if engine is not None:
             try:
                 await engine.stop()
@@ -483,6 +814,12 @@ async def _run_paper_engine(
     except Exception:
         final_status = "error"
         log.exception("runs.paper_engine_error")
+        if flush_task is not None and not flush_task.done():
+            flush_task.cancel()
+            try:
+                await flush_task
+            except (asyncio.CancelledError, Exception):
+                pass
         if engine is not None:
             try:
                 await engine.stop()
@@ -490,8 +827,28 @@ async def _run_paper_engine(
                 log.exception("runs.paper_engine_stop_error")
 
     finally:
+        # Belt-and-suspenders: cancel flush task if it somehow survived
+        if flush_task is not None and not flush_task.done():
+            flush_task.cancel()
+            try:
+                await flush_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
         # Remove from task registry
         _RUN_TASKS.pop(run_id_str, None)
+
+        # Final incremental flush captures any remaining data not covered by
+        # the last periodic flush cycle — must run BEFORE status update so
+        # clients see complete data when the run transitions to 'stopped'
+        if portfolio is not None:
+            await _flush_incremental(
+                run_id_str=run_id_str,
+                portfolio=portfolio,
+                execution_engine=execution,
+                state=flush_state,
+                log=log,
+            )
 
         # Update run status in DB using an isolated session
         try:
@@ -517,15 +874,6 @@ async def _run_paper_engine(
                     log.exception("runs.paper_engine_db_update_failed")
         except Exception:
             log.exception("runs.paper_engine_db_session_failed")
-
-        # Persist equity curve and trades collected during the run
-        if portfolio is not None:
-            await _persist_paper_results(
-                run_id_str=run_id_str,
-                portfolio=portfolio,
-                execution_engine=execution,
-                log=log,
-            )
 
 
 async def _run_live_engine(
@@ -1676,9 +2024,9 @@ def _validate_params_against_schema(
     errors: list[str] = []
 
     required_fields: list[str] = schema.get("required", [])
-    for field in required_fields:
-        if field not in params:
-            errors.append(f"Required parameter missing: '{field}'")
+    for field_name in required_fields:
+        if field_name not in params:
+            errors.append(f"Required parameter missing: '{field_name}'")
 
     properties: dict[str, Any] = schema.get("properties", {})
     for param_name, param_value in params.items():

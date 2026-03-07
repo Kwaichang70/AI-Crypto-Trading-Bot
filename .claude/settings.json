@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import sys; sys.path.insert\\(0, ''.''\\); import packages.common.types as t; print\\(t.OrderSide.BUY\\)\")",
+      "Bash(python -c \"import sys; sys.path.insert\\(0, ''packages''\\); from common.types import OrderSide; print\\(OrderSide.BUY\\)\")",
+      "Bash(python -c \":*)",
+      "Bash(pip install ccxt pydantic structlog)",
+      "Bash(pip install pydantic structlog pydantic-settings)",
+      "Bash(pip install pytest pytest-asyncio pytest-cov)",
+      "Bash(python -m pytest tests/ --collect-only --no-header -q --no-cov)",
+      "Bash(python -m pytest tests/ --no-cov -v)"
+    ]
+  }
+}
