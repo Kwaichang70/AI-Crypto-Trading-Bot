@@ -84,6 +84,7 @@ export default function NewRunPage() {
   const [initialCapital, setInitialCapital] = useState("10000");
   const [backtestStart, setBacktestStart] = useState("2024-01-01T00:00");
   const [backtestEnd, setBacktestEnd] = useState("2024-12-31T23:59");
+  const [confirmToken, setConfirmToken] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [isLoadingStrategies, setIsLoadingStrategies] = useState(true);
@@ -157,6 +158,7 @@ export default function NewRunPage() {
       initialCapital,
       backtestStart: mode === "backtest" ? new Date(backtestStart).toISOString() : null,
       backtestEnd: mode === "backtest" ? new Date(backtestEnd).toISOString() : null,
+      confirmToken: mode === "live" ? confirmToken : undefined,
     };
 
     const result = await createRun(body);
@@ -173,7 +175,7 @@ export default function NewRunPage() {
     <div className="space-y-6">
       <Header
         title="New Run"
-        subtitle="Configure and launch a new backtest or paper trading run."
+        subtitle="Configure and launch a new backtest, paper, or live trading run."
       />
 
       <form onSubmit={(e) => void handleSubmit(e)} className="space-y-6 lg:max-w-2xl">
@@ -181,7 +183,7 @@ export default function NewRunPage() {
         <div className="card space-y-3">
           <h2 className="text-sm font-semibold text-slate-200">Run Mode</h2>
           <div className="flex gap-3">
-            {(["backtest", "paper"] as const).map((m) => (
+            {(["backtest", "paper", "live"] as const).map((m) => (
               <label
                 key={m}
                 className={[
@@ -206,8 +208,27 @@ export default function NewRunPage() {
           <p className="text-xs text-slate-500">
             {mode === "backtest"
               ? "Backtest runs against historical data synchronously."
-              : "Paper trading simulates live execution without real funds."}
+              : mode === "paper"
+              ? "Paper trading simulates live execution without real funds."
+              : "Live trading executes real orders on your exchange account."}
           </p>
+          {mode === "live" && (
+            <div>
+              <label className="block text-sm font-medium text-slate-300">
+                Confirm Token
+              </label>
+              <input
+                type="password"
+                value={confirmToken}
+                onChange={(e) => setConfirmToken(e.target.value)}
+                placeholder="LIVE_TRADING_CONFIRM_TOKEN from .env"
+                className="mt-1 w-full rounded-lg border border-red-800 bg-slate-800 px-3 py-2 text-sm text-slate-200 focus:border-red-500 focus:outline-none focus:ring-1 focus:ring-red-500"
+              />
+              <p className="mt-1 text-xs text-red-400">
+                ⚠ This will place real orders. Ensure ENABLE_LIVE_TRADING=true and your API key are set in .env.
+              </p>
+            </div>
+          )}
         </div>
 
         {/* Strategy selection */}

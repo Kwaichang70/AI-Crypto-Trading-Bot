@@ -93,6 +93,7 @@ export interface RunCreateRequest {
   initialCapital: string;
   backtestStart?: string | null;
   backtestEnd?: string | null;
+  confirmToken?: string | undefined;
 }
 
 // ---------------------------------------------------------------------------
