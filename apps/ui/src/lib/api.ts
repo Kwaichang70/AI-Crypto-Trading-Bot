@@ -14,6 +14,8 @@ import type {
   AggregatePortfolio,
   EquityCurveResponse,
   FillListResponse,
+  ModelVersion,
+  ModelVersionListResponse,
   OrderListResponse,
   Portfolio,
   PositionListResponse,
@@ -127,7 +129,11 @@ async function apiFetch<T>(
       };
     }
 
-    if (response.status === 204) {
+    // Skip JSON parsing when the response carries no JSON body.
+    // Covers HTTP 204 (No Content) and any 2xx with a non-JSON content-type
+    // (e.g. HTTP 202 Accepted with an empty body from the retrain endpoint).
+    const ct = response.headers.get("content-type") ?? "";
+    if (response.status === 204 || !ct.includes("application/json")) {
       return { ok: true, data: undefined as unknown as T };
     }
 
@@ -332,6 +338,60 @@ export async function fetchStrategySchema(
   name: string,
 ): Promise<ApiResult<Strategy>> {
   return apiGet<Strategy>(`/api/v1/strategies/${name}/schema`);
+}
+
+// ---------------------------------------------------------------------------
+// ML Model Versions
+// ---------------------------------------------------------------------------
+
+/**
+ * GET /api/v1/ml/models — list trained model versions.
+ *
+ * @param symbol  Optional filter by trading pair (e.g. "BTC/USD").
+ * @param activeOnly  When true, return only the active version per symbol.
+ */
+export async function fetchModelVersions(
+  symbol?: string,
+  activeOnly?: boolean,
+): Promise<ApiResult<ModelVersionListResponse>> {
+  const qs = new URLSearchParams();
+  if (symbol) qs.set("symbol", symbol);
+  if (activeOnly !== undefined) qs.set("active_only", String(activeOnly));
+  const query = qs.toString() ? `?${qs.toString()}` : "";
+  return apiGet<ModelVersionListResponse>(`/api/v1/ml/models${query}`, {
+    cache: "no-store",
+  });
+}
+
+/**
+ * POST /api/v1/ml/retrain/{symbol} — trigger a model retrain for a symbol.
+ * The backend returns 202 Accepted with a JSON body; the function returns ApiResult<void>.
+ *
+ * @param symbol    Trading pair to retrain, e.g. "BTC/USD".
+ * @param timeframe OHLCV timeframe, e.g. "1h".
+ */
+export async function retrainModel(
+  symbol: string,
+  timeframe: string,
+): Promise<ApiResult<void>> {
+  const encodedSymbol = encodeURIComponent(symbol);
+  return apiPost<void>(
+    `/api/v1/ml/retrain/${encodedSymbol}?timeframe=${encodeURIComponent(timeframe)}`,
+  );
+}
+
+/**
+ * PUT /api/v1/ml/models/{id}/activate — mark a model version as active.
+ * Returns the updated ModelVersion record.
+ *
+ * @param id  UUID of the model version to activate.
+ */
+export async function activateModelVersion(
+  id: string,
+): Promise<ApiResult<ModelVersion>> {
+  return apiFetch<ModelVersion>(`/api/v1/ml/models/${id}/activate`, {
+    method: "PUT",
+  });
 }
 
 // ---------------------------------------------------------------------------

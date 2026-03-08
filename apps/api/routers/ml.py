@@ -1,18 +1,28 @@
 """
 apps/api/routers/ml.py
 -----------------------
-Machine learning model training endpoints.
+Machine learning model training and management endpoints.
 
-POST /api/v1/ml/train  -- Train a RandomForestClassifier for a symbol.
+Endpoints
+---------
+POST /api/v1/ml/train               -- Train using horizon-labeled OHLCV data (existing)
+GET  /api/v1/ml/models              -- List model versions with optional filters
+POST /api/v1/ml/retrain/{symbol}    -- Manual PnL-labeled retrain from trade history
+PUT  /api/v1/ml/models/{model_id}/activate -- Rollback/promote a specific model version
 """
 
 from __future__ import annotations
 
 import asyncio
+import uuid
 from typing import Any
 
 import structlog
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from api.db import get_db
+from api.schemas import ModelVersionListResponse, ModelVersionResponse
 
 __all__ = ["router"]
 
@@ -20,13 +30,31 @@ router = APIRouter(prefix="/ml", tags=["ml"])
 logger = structlog.get_logger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Module-level retraining service reference (set by main.py lifespan)
+# ---------------------------------------------------------------------------
+# This is set from main.py after the service is instantiated.
+# Using a module-level variable avoids threading the service through Depends().
+_retraining_service: Any = None
+
+
+def set_retraining_service(service: Any) -> None:
+    """Called by main.py lifespan to wire the RetrainingService instance."""
+    global _retraining_service
+    _retraining_service = service
+
+
+# ---------------------------------------------------------------------------
+# Existing endpoint: POST /train (horizon-labeled, OHLCV-only)
+# ---------------------------------------------------------------------------
+
 @router.post(
     "/train",
     summary="Train ML model for a symbol",
     description=(
         "Fetches historical OHLCV data and trains a RandomForestClassifier "
-        "for the specified symbol. The trained model is saved to the models/ "
-        "directory."
+        "for the specified symbol using horizon-based labels. The trained model "
+        "is saved to the models/ directory."
     ),
 )
 async def train_model(
@@ -137,3 +165,206 @@ def _train_model_sync(
         "test_samples": metrics["test_samples"],
         "metrics": metrics,
     }
+
+
+# ---------------------------------------------------------------------------
+# New endpoint: GET /models — list model versions
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/models",
+    response_model=ModelVersionListResponse,
+    summary="List ML model versions",
+    description=(
+        "Returns all trained model versions with optional filtering by symbol, "
+        "timeframe, and active status. Results are ordered by trained_at descending."
+    ),
+)
+async def list_model_versions(
+    symbol: str | None = Query(default=None, description="Filter by trading pair, e.g. BTC/USD"),
+    timeframe: str | None = Query(default=None, description="Filter by timeframe, e.g. 1h"),
+    active_only: bool = Query(default=False, description="Return only currently active models"),
+    limit: int = Query(default=50, ge=1, le=500, description="Max records to return"),
+    offset: int = Query(default=0, ge=0, description="Records to skip"),
+    db: AsyncSession = Depends(get_db),
+) -> ModelVersionListResponse:
+    """List ML model versions from the database."""
+    from sqlalchemy import func, select
+
+    from api.db.models import ModelVersionORM
+
+    log = logger.bind(endpoint="list_model_versions")
+
+    # Build base query
+    base_query = select(ModelVersionORM)
+    count_query = select(func.count()).select_from(ModelVersionORM)
+
+    filters = []
+    if symbol is not None:
+        filters.append(ModelVersionORM.symbol == symbol)
+    if timeframe is not None:
+        filters.append(ModelVersionORM.timeframe == timeframe)
+    if active_only:
+        filters.append(ModelVersionORM.is_active.is_(True))
+
+    if filters:
+        base_query = base_query.where(*filters)
+        count_query = count_query.where(*filters)
+
+    # Total count
+    total_result = await db.execute(count_query)
+    total = total_result.scalar_one()
+
+    # Paginated results, newest first
+    result = await db.execute(
+        base_query
+        .order_by(ModelVersionORM.trained_at.desc())
+        .offset(offset)
+        .limit(limit)
+    )
+    versions = list(result.scalars().all())
+
+    log.info("ml.list_model_versions", total=total, returned=len(versions))
+
+    return ModelVersionListResponse(
+        items=[ModelVersionResponse.model_validate(v) for v in versions],
+        total=total,
+    )
+
+
+# ---------------------------------------------------------------------------
+# New endpoint: POST /retrain/{symbol} — manual PnL-labeled retrain
+# ---------------------------------------------------------------------------
+
+@router.post(
+    "/retrain/{symbol:path}",
+    summary="Manually trigger PnL-labeled model retraining",
+    description=(
+        "Triggers an immediate retraining cycle for the specified symbol using "
+        "closed trade history (PnL-labeled). Requires ml_auto_retrain=True and "
+        "an active model version in the database. Returns immediately — training "
+        "runs in the background via the RetrainingService."
+    ),
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def manual_retrain(
+    symbol: str,
+    timeframe: str = Query(default="1h", description="Candle timeframe for OHLCV fetch"),
+) -> dict[str, str]:
+    """Trigger manual PnL-labeled retraining for a symbol."""
+    log = logger.bind(endpoint="manual_retrain", symbol=symbol, timeframe=timeframe)
+
+    if _retraining_service is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "RetrainingService is not running. "
+                "Set ML_AUTO_RETRAIN=true and restart the API to enable."
+            ),
+        )
+
+    log.info("ml.manual_retrain_requested")
+
+    # Fire-and-forget: not tracked for cancellation on shutdown (MVP scope).
+    # _do_retrain catches all exceptions internally; the DB row is only written
+    # after training succeeds, so mid-flight abandonment on shutdown is safe.
+    asyncio.create_task(
+        _retraining_service.manual_retrain(symbol=symbol, timeframe=timeframe),
+        name=f"manual_retrain_{symbol}_{timeframe}",
+    )
+
+    return {
+        "status": "accepted",
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "message": (
+            f"Retraining scheduled for {symbol}/{timeframe}. "
+            "Check logs for progress and GET /ml/models for the result."
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# New endpoint: PUT /models/{model_id}/activate — rollback/promote a version
+# ---------------------------------------------------------------------------
+
+@router.put(
+    "/models/{model_id}/activate",
+    response_model=ModelVersionResponse,
+    summary="Activate a specific model version",
+    description=(
+        "Deactivates the current active model for the target (symbol, timeframe) pair "
+        "and activates the specified version. Enables rollback to a previous model "
+        "or promotion of a higher-accuracy historical version."
+    ),
+)
+async def activate_model_version(
+    model_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+) -> ModelVersionResponse:
+    """Activate a specific model version by UUID, deactivating the current active one."""
+    from sqlalchemy import select, update
+
+    from api.db.models import ModelVersionORM
+    from api.services.retraining import RetrainingService
+
+    log = logger.bind(endpoint="activate_model_version", model_id=str(model_id))
+
+    # Fetch the target version
+    result = await db.execute(
+        select(ModelVersionORM).where(ModelVersionORM.id == model_id)
+    )
+    target: ModelVersionORM | None = result.scalar_one_or_none()
+
+    if target is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Model version {model_id} not found.",
+        )
+
+    if target.is_active:
+        # Already active — return immediately without DB writes
+        log.info("ml.model_already_active", model_id=str(model_id))
+        return ModelVersionResponse.model_validate(target)
+
+    symbol = target.symbol
+    timeframe = target.timeframe
+
+    # Deactivate all currently active models for this symbol+timeframe.
+    # Both UPDATEs commit atomically when get_db's session exits on handler return.
+    # Do NOT call db.begin() — get_db already manages the transaction lifecycle.
+    await db.execute(
+        update(ModelVersionORM)
+        .where(
+            ModelVersionORM.symbol == symbol,
+            ModelVersionORM.timeframe == timeframe,
+            ModelVersionORM.is_active.is_(True),
+        )
+        .values(is_active=False)
+    )
+    # Activate the target
+    await db.execute(
+        update(ModelVersionORM)
+        .where(ModelVersionORM.id == model_id)
+        .values(is_active=True)
+    )
+
+    await db.refresh(target)
+
+    # Update the sidecar JSON so ModelStrategy hot-swaps immediately
+    if _retraining_service is not None:
+        _retraining_service._write_active_sidecar(
+            symbol=symbol,
+            version_id=str(target.id),
+            model_path=target.model_path,
+            accuracy=float(target.accuracy),
+        )
+
+    log.info(
+        "ml.model_activated",
+        model_id=str(model_id),
+        symbol=symbol,
+        timeframe=timeframe,
+    )
+
+    return ModelVersionResponse.model_validate(target)

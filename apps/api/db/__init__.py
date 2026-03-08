@@ -24,7 +24,7 @@ dispose_engine
 
 All ORM model classes are also re-exported so callers can do:
 
-    from api.db import RunORM, OrderORM, PositionSnapshotORM
+    from api.db import RunORM, OrderORM, PositionSnapshotORM, ModelVersionORM
 """
 
 from __future__ import annotations
@@ -35,6 +35,7 @@ from api.db.models import (  # noqa: F401 — side-effect import registers model
     Base,
     EquitySnapshotORM,
     FillORM,
+    ModelVersionORM,
     OrderORM,
     PositionSnapshotORM,
     RunORM,
@@ -64,4 +65,5 @@ __all__ = [
     "EquitySnapshotORM",
     "SignalORM",
     "PositionSnapshotORM",
+    "ModelVersionORM",
 ]

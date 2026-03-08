@@ -297,3 +297,47 @@ export interface StrategyListResponse {
   strategies: readonly Strategy[];
   total: number;
 }
+
+// ---------------------------------------------------------------------------
+// ML Model Versions
+// ---------------------------------------------------------------------------
+
+/**
+ * A single trained model version persisted by the ML training pipeline.
+ * Mirrors ModelVersionResponse in apps/api/schemas.py.
+ *
+ * - accuracy is a decimal fraction (0.62 = 62 %).
+ * - trainedAt is an ISO-8601 datetime string.
+ */
+export interface ModelVersion {
+  /** UUID of the model version record. */
+  id: string;
+  /** Trading pair this model was trained on, e.g. "BTC/USD". */
+  symbol: string;
+  /** OHLCV timeframe used during training, e.g. "1h". */
+  timeframe: string;
+  /** ISO-8601 datetime when training completed. */
+  trainedAt: string;
+  /** Held-out accuracy as a decimal fraction (0.0 – 1.0). */
+  accuracy: number;
+  /** Number of completed trades used as training labels. */
+  nTradesUsed: number;
+  /** Number of OHLCV bars consumed during feature extraction. */
+  nBarsUsed: number;
+  /** Label generation method: "horizon" (fixed-lookahead) or "pnl" (trade PnL sign). */
+  labelMethod: string;
+  /** How training was initiated: "manual" (API/CLI) or "auto" (scheduled). */
+  trigger: string;
+  /** Filesystem path to the serialised model artefact. */
+  modelPath: string;
+  /** Whether this version is the active model used by ModelStrategy. */
+  isActive: boolean;
+  /** Arbitrary extra metadata stored by the trainer (precision, recall, etc.). */
+  extra: Record<string, unknown> | null;
+}
+
+/** Response envelope for GET /api/v1/ml/models. */
+export interface ModelVersionListResponse {
+  models: readonly ModelVersion[];
+  total: number;
+}

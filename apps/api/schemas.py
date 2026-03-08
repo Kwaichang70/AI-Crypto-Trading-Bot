@@ -56,6 +56,9 @@ __all__ = [
     "EquityCurveResponse",
     "PositionResponse",
     "PositionListResponse",
+    # ML Model Versions
+    "ModelVersionResponse",
+    "ModelVersionListResponse",
     # Strategies
     "StrategyInfoResponse",
     "StrategyListResponse",
@@ -749,3 +752,56 @@ class ErrorResponse(BaseModel):
 
     detail: str = Field(description="Human-readable error message")
     code: str = Field(description="Machine-readable error code")
+
+
+# ---------------------------------------------------------------------------
+# ML Model Version schemas
+# ---------------------------------------------------------------------------
+
+class ModelVersionResponse(BaseModel):
+    """
+    Response model for a single ML model version record.
+
+    Represents one training run's output: which model was trained,
+    when, on how many samples, and whether it is the currently active
+    model for its (symbol, timeframe) pair.
+    """
+
+    model_config = _API_MODEL_CONFIG
+
+    id: uuid.UUID = Field(description="Model version UUID")
+    symbol: str = Field(description="Trading pair this model was trained for")
+    timeframe: str = Field(description="Candle timeframe, e.g. 1h")
+    trained_at: datetime = Field(description="UTC timestamp when training completed")
+    accuracy: float = Field(description="Test-set accuracy in [0.0, 1.0]")
+    n_trades_used: int = Field(description="Closed trades used for training")
+    n_bars_used: int = Field(description="OHLCV bars fetched for training window")
+    label_method: str = Field(
+        description="Labeling scheme: trade_outcome or future_return"
+    )
+    model_path: str = Field(description="Filesystem path to .joblib model file")
+    is_active: bool = Field(description="True if currently active for this symbol/timeframe")
+    trigger: str = Field(description="Training trigger: manual or auto")
+    extra: dict[str, Any] | None = Field(
+        default=None,
+        description="Supplementary metadata: feature importances, class distribution",
+    )
+    created_at: datetime = Field(description="Row creation timestamp")
+
+
+class ModelVersionListResponse(BaseModel):
+    """
+    Paginated list of ML model versions.
+
+    Parameters
+    ----------
+    items:
+        The model version records on this page.
+    total:
+        Total number of matching records (before pagination).
+    """
+
+    model_config = _API_MODEL_CONFIG
+
+    items: list[ModelVersionResponse] = Field(description="Model version records")
+    total: int = Field(description="Total matching record count")

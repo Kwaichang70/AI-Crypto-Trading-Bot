@@ -12,6 +12,7 @@ Responsibilities
 - Register all API routers under /api/v1/ with API key authentication
 - Expose the /health endpoint (always available, no auth)
 - Expose the /api/v1/metrics endpoint (always available, no auth)
+- Start/stop RetrainingService when ml_auto_retrain=True (Sprint 23)
 
 The ``lifespan`` context manager is the recommended FastAPI pattern for
 startup/shutdown logic (replaces deprecated on_event handlers).
@@ -62,6 +63,11 @@ __all__ = ["app", "create_app"]
 
 logger = structlog.get_logger(__name__)
 
+# ---------------------------------------------------------------------------
+# Module-level RetrainingService instance (None when ml_auto_retrain=False)
+# ---------------------------------------------------------------------------
+_retraining_service: Any = None
+
 
 # ---------------------------------------------------------------------------
 # Application lifespan
@@ -77,17 +83,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     1. Configure structured logging with service-level context fields
     2. Log application boot parameters
     3. Initialise SQLAlchemy async engine and connection pool
-    4. (Future) Initialise Redis connection
-    5. (Future) Warm up CCXT exchange connection
+    4. Start RetrainingService if ml_auto_retrain=True (Sprint 23)
 
     Shutdown (after yield)
     ----------------------
-    1. (Future) Gracefully stop any running trading loops
-    2. (Future) Flush pending fills / position state to database
+    1. Cancel all active paper/live trading engine tasks
+    2. Stop RetrainingService if running
     3. Close database engine (dispose connection pool)
-    4. (Future) Close Redis connection
-    5. Log clean shutdown
+    4. Log clean shutdown
     """
+    global _retraining_service
+
     settings = get_settings()
 
     # 1. Configure structured logging with service-level context
@@ -107,6 +113,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         exchange=settings.exchange_id,
         live_trading_enabled=settings.enable_live_trading,
         api_auth_enabled=settings.require_api_auth,
+        ml_auto_retrain=settings.ml_auto_retrain,
     )
 
     # Store boot timestamp on app state so /health can report uptime.
@@ -115,7 +122,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # ------------------------------------------------------------------
     # 3. Initialise async database engine and connection pool
     # ------------------------------------------------------------------
-    from api.db.session import get_engine
+    from api.db.session import get_engine, get_session_factory
 
     engine = get_engine()
     app.state.db_engine = engine
@@ -124,6 +131,33 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         pool_size=settings.db_pool_size,
         max_overflow=settings.db_max_overflow,
     )
+
+    # ------------------------------------------------------------------
+    # 4. Start RetrainingService if ml_auto_retrain=True (Sprint 23)
+    # ------------------------------------------------------------------
+    if settings.ml_auto_retrain:
+        from api.routers.ml import set_retraining_service
+        from api.services.retraining import RetrainingService
+
+        session_factory = get_session_factory()
+        _retraining_service = RetrainingService(
+            db_session_factory=session_factory,
+            model_dir="models/",
+            check_interval_seconds=settings.ml_retrain_interval_minutes * 60,
+            min_trades_for_retrain=settings.ml_min_trades_for_retrain,
+            min_accuracy_threshold=settings.ml_min_accuracy_threshold,
+            max_model_versions=settings.ml_max_model_versions,
+            exchange_id=settings.exchange_id,
+        )
+        set_retraining_service(_retraining_service)
+        await _retraining_service.start()
+        log.info(
+            "retraining_service.wired",
+            interval_minutes=settings.ml_retrain_interval_minutes,
+            min_trades=settings.ml_min_trades_for_retrain,
+        )
+    else:
+        log.info("retraining_service.disabled", reason="ML_AUTO_RETRAIN=false")
 
     # ------------------------------------------------------------------
     # Future: Redis connection init goes here
@@ -153,12 +187,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 pending_count=len(pending),
             )
 
+    # Stop RetrainingService (Sprint 23)
+    if _retraining_service is not None:
+        await _retraining_service.stop()
+        _retraining_service = None
+
     # Close all pooled database connections gracefully
     from api.db.session import dispose_engine
 
     await dispose_engine()
-
-    # Future: await app.state.redis.aclose()
 
     log.info("api.stopped")
 
@@ -175,25 +212,6 @@ _PROBE_PATHS: frozenset[str] = frozenset({"/health", "/metrics", "/api/v1/metric
 async def _request_timing_middleware(request: Request, call_next: Any) -> Response:
     """
     Add X-Process-Time header and emit a structured HTTP request log entry.
-
-    Measures wall-clock time from request receipt to response completion.
-    Emits a structured ``http.request`` log entry after each response,
-    including the HTTP method, path, status code, and duration in milliseconds.
-
-    Health-check and metrics probe paths are logged at DEBUG level to
-    prevent high-frequency polling from flooding production log streams.
-
-    Parameters
-    ----------
-    request:
-        Incoming HTTP request.
-    call_next:
-        Next ASGI middleware / handler callable.
-
-    Returns
-    -------
-    Response
-        The response with the X-Process-Time header added.
     """
     start = time.monotonic()
     response = await call_next(request)
@@ -218,18 +236,7 @@ async def _request_timing_middleware(request: Request, call_next: Any) -> Respon
 # ---------------------------------------------------------------------------
 
 def create_app() -> FastAPI:
-    """
-    Application factory.
-
-    Separating app creation from module-level instantiation makes the
-    application testable — test fixtures call ``create_app()`` and get
-    an isolated instance without side effects.
-
-    Returns
-    -------
-    FastAPI:
-        Fully configured application ready for ``uvicorn``.
-    """
+    """Application factory."""
     settings = get_settings()
 
     application = FastAPI(
@@ -245,12 +252,6 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
-    # ------------------------------------------------------------------
-    # Middleware — order matters: added last runs outermost (first to execute)
-    # ------------------------------------------------------------------
-
-    # 1. CORS — must be outermost to handle preflight OPTIONS requests before
-    #    auth/timing middleware process them.
     application.add_middleware(
         CORSMiddleware,
         allow_origins=settings.allowed_origins,
@@ -260,47 +261,17 @@ def create_app() -> FastAPI:
         expose_headers=["X-Process-Time"],
     )
 
-    # 2. Request timing + logging — wraps every request/response cycle
     application.middleware("http")(_request_timing_middleware)
-
-    # 3. Rate limiting — per-IP tiered limits (SEC-S2-001)
-    #    Registered after timing middleware, so it runs outermost (Starlette
-    #    reverse order). Rate-limited 429s are rejected cheaply without
-    #    timing overhead; the rate_limit.exceeded log event provides
-    #    security observability instead.
     setup_rate_limiting(application)
-
-    # ------------------------------------------------------------------
-    # Routes
-    # ------------------------------------------------------------------
     _register_routes(application)
-
-    # ------------------------------------------------------------------
-    # Prometheus scrape endpoint — controlled by PROMETHEUS_ENABLED
-    # ------------------------------------------------------------------
     setup_prometheus(application)
 
     return application
 
 
 def _register_routes(application: FastAPI) -> None:
-    """
-    Mount all API routers onto the application.
+    """Mount all API routers onto the application."""
 
-    All versioned endpoints live under the ``/api/v1`` prefix.
-    The /health endpoint is mounted directly (no versioning — it is used
-    by Docker health checks and load balancers that should not need version
-    awareness).
-
-    Authentication
-    ^^^^^^^^^^^^^^
-    - ``/health`` and ``/api/v1/metrics`` are **always public** (no auth).
-    - All other ``/api/v1/*`` routers use the ``require_api_key`` dependency
-      which enforces API key validation when ``require_api_auth=True``.
-    """
-    # ------------------------------------------------------------------
-    # Observability — no version prefix, no auth
-    # ------------------------------------------------------------------
     @application.get(
         "/health",
         tags=["observability"],
@@ -308,16 +279,6 @@ def _register_routes(application: FastAPI) -> None:
         response_class=JSONResponse,
     )
     async def health() -> dict[str, Any]:
-        """
-        Return service health status.
-
-        Used by Docker health checks, load balancers, and monitoring.
-        Responds 200 OK when the service is ready to accept requests.
-        Always public — no authentication required.
-
-        Future: include database connectivity check, Redis ping, and
-        exchange reachability in the response body.
-        """
         from datetime import UTC, datetime as dt
 
         uptime_seconds = round(time.monotonic() - application.state.started_at, 2)
@@ -328,9 +289,6 @@ def _register_routes(application: FastAPI) -> None:
             "timestamp": dt.now(tz=UTC).isoformat(),
         }
 
-    # ------------------------------------------------------------------
-    # In-memory metrics snapshot — always public (for monitoring/Prometheus)
-    # ------------------------------------------------------------------
     @application.get(
         "/api/v1/metrics",
         tags=["observability"],
@@ -338,22 +296,6 @@ def _register_routes(application: FastAPI) -> None:
         response_class=JSONResponse,
     )
     async def get_metrics() -> dict[str, Any]:
-        """
-        Return a point-in-time snapshot of all in-memory trading metrics.
-
-        Includes:
-
-        - **counters** — bars processed, signals generated, orders submitted,
-          fills executed (with optional per-strategy / per-side label breakdowns).
-        - **gauges** — portfolio equity, drawdown percentage, active positions.
-        - **histograms** — bar processing duration summary statistics.
-
-        All values reflect the state since last process restart.
-        Always public — no authentication required (monitoring endpoint).
-
-        Sprint 2 plan: complement or replace with a Prometheus ``/metrics``
-        scrape endpoint for Grafana integration.
-        """
         from datetime import UTC, datetime as dt
 
         return {
@@ -361,14 +303,10 @@ def _register_routes(application: FastAPI) -> None:
             "timestamp": dt.now(tz=UTC).isoformat(),
         }
 
-    # ------------------------------------------------------------------
-    # API v1 routers — protected by API key auth when enabled
-    # ------------------------------------------------------------------
     from api.routers import ml, orders, portfolio, runs, strategies
 
     _V1 = "/api/v1"
 
-    # Run management
     application.include_router(
         runs.router,
         prefix=_V1,
@@ -376,7 +314,6 @@ def _register_routes(application: FastAPI) -> None:
         dependencies=[Depends(require_api_key)],
     )
 
-    # Order and fill queries
     application.include_router(
         orders.router,
         prefix=_V1,
@@ -384,7 +321,6 @@ def _register_routes(application: FastAPI) -> None:
         dependencies=[Depends(require_api_key)],
     )
 
-    # Portfolio: per-run summary, equity curve, trades, positions
     application.include_router(
         portfolio.router,
         prefix=_V1,
@@ -392,14 +328,12 @@ def _register_routes(application: FastAPI) -> None:
         dependencies=[Depends(require_api_key)],
     )
 
-    # Portfolio: cross-run aggregate summary
     application.include_router(
         portfolio.summary_router,
         prefix=_V1,
         dependencies=[Depends(require_api_key)],
     )
 
-    # Strategy discovery
     application.include_router(
         strategies.router,
         prefix=_V1,
@@ -407,7 +341,6 @@ def _register_routes(application: FastAPI) -> None:
         dependencies=[Depends(require_api_key)],
     )
 
-    # ML model training
     application.include_router(
         ml.router,
         prefix=_V1,

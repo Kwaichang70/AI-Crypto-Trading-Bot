@@ -51,6 +51,7 @@ export default function RootLayout({
               <a href="/runs" className="text-xs text-slate-400 hover:text-slate-200">Runs</a>
               <a href="/runs/new" className="text-xs text-slate-400 hover:text-slate-200">New Run</a>
               <a href="/strategies" className="text-xs text-slate-400 hover:text-slate-200">Strategies</a>
+              <a href="/models" className="text-xs text-slate-400 hover:text-slate-200">Models</a>
             </nav>
           </div>
         </header>

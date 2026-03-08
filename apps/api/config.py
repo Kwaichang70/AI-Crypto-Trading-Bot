@@ -238,6 +238,59 @@ class Settings(BaseSettings):
     )
 
     # ------------------------------------------------------------------
+    # ML Auto-Retraining (Sprint 23)
+    # ------------------------------------------------------------------
+    ml_auto_retrain: bool = Field(
+        default=False,
+        description=(
+            "Master switch for automatic model retraining. "
+            "false = RetrainingService does not start (safe default). "
+            "true = RetrainingService polls trade counts and retrains when threshold met. "
+            "Follows the same safety-first convention as enable_live_trading."
+        ),
+    )
+    ml_min_trades_for_retrain: int = Field(
+        default=50,
+        ge=10,
+        le=10000,
+        description=(
+            "Minimum number of new closed trades since last training required "
+            "to trigger automatic retraining. 50 provides ~15-20 samples per class "
+            "with a typical 40/30/30 label distribution."
+        ),
+    )
+    ml_min_accuracy_threshold: float = Field(
+        default=0.38,
+        gt=0.0,
+        le=1.0,
+        description=(
+            "Minimum test-set accuracy for a retrained model to be activated. "
+            "0.38 is 5% above the 0.33 random baseline for a 3-class classifier. "
+            "Models below this threshold are saved but not activated."
+        ),
+    )
+    ml_max_model_versions: int = Field(
+        default=5,
+        ge=1,
+        le=50,
+        description=(
+            "Maximum number of model versions kept on disk and in the DB "
+            "per (symbol, timeframe) pair. Older versions are pruned after "
+            "each successful retraining. The active model is never pruned."
+        ),
+    )
+    ml_retrain_interval_minutes: int = Field(
+        default=60,
+        ge=5,
+        le=1440,
+        description=(
+            "How often (in minutes) RetrainingService polls the database for "
+            "new trade counts. The service sleeps for this interval before each "
+            "check. Default 60 minutes (once per hour)."
+        ),
+    )
+
+    # ------------------------------------------------------------------
     # Validators
     # ------------------------------------------------------------------
     @field_validator("database_url")

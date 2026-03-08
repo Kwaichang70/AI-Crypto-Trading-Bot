@@ -1,12 +1,21 @@
 """
 packages/trading/strategies/model_strategy.py
 -----------------------------------------------
-ML Model-Based Trading Strategy (Sprint 2 placeholder).
+ML Model-Based Trading Strategy (Sprint 2 placeholder, Sprint 23 hot-swap).
 
 This strategy demonstrates the integration pattern for scikit-learn (or
 compatible) models within the pluggable strategy framework.  It loads a
 serialised model from disk, builds a feature vector from recent OHLCV bars,
 and converts the model's prediction into a trading Signal with confidence.
+
+Sprint 23 — Hot-swap mechanism
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ModelStrategy reads the `models/{safe_symbol}_active.json` sidecar file on
+every on_bar() call. When the sidecar's version_id differs from the currently
+loaded model's version_id, the model is reloaded from the path in the sidecar.
+This enables RetrainingService to swap in retrained models without restarting
+the strategy. If the sidecar does not exist, the strategy continues with the
+originally loaded model (backward compatible).
 
 Feature schema (built by ``_build_feature_vector``)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -50,10 +59,14 @@ prediction_threshold : float
     Below this threshold, the strategy returns HOLD.  Default 0.60.
 position_size : float
     Target notional position in quote currency.  Default 1000.0.
+model_dir : str
+    Directory where the active sidecar JSON is written by RetrainingService.
+    Default "models/". Used to construct the sidecar path for hot-swap.
 """
 
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 from decimal import Decimal
 from pathlib import Path
@@ -114,6 +127,13 @@ class _ModelStrategyParams(BaseModel):
         le=1_000_000.0,
         description="Target notional position in quote currency",
     )
+    model_dir: str = Field(
+        default="models/",
+        description=(
+            "Directory for the active-version sidecar JSON. "
+            "Must match RetrainingService.model_dir for hot-swap to work."
+        ),
+    )
 
     @field_validator("model_path")
     @classmethod
@@ -128,11 +148,18 @@ class _ModelStrategyParams(BaseModel):
 
 class ModelStrategy(BaseStrategy):
     """
-    ML model-based trading strategy (placeholder for Sprint 2).
+    ML model-based trading strategy with hot-swap model reloading (Sprint 23).
 
     Designed to load a trained scikit-learn model and use its predictions
     for signal generation.  The model receives a feature vector built from
     recent OHLCV bars and outputs a BUY/SELL/HOLD prediction with confidence.
+
+    Hot-swap
+    --------
+    On each on_bar() call, the strategy checks the
+    `models/{safe_symbol}_active.json` sidecar file written by RetrainingService.
+    If the sidecar's version_id differs from the currently loaded version, the
+    model is reloaded transparently without interrupting the strategy lifecycle.
 
     Parameters
     ----------
@@ -144,20 +171,32 @@ class ModelStrategy(BaseStrategy):
         Minimum confidence to emit signal.
     position_size : float
         Target position in quote currency.
+    model_dir : str
+        Directory where sidecar JSON is located.
     """
 
     metadata: ClassVar[StrategyMetadata] = StrategyMetadata(
         name="ML Model Strategy",
-        version="0.1.0",
-        description="ML model-based trading strategy (placeholder for Sprint 2)",
+        version="0.2.0",
+        description=(
+            "ML model-based trading strategy with automatic hot-swap reloading "
+            "when RetrainingService publishes a new model version."
+        ),
         author="trading-engine-architect",
-        tags=["ml", "model", "scikit-learn", "placeholder"],
+        tags=["ml", "model", "scikit-learn", "adaptive"],
     )
 
     def __init__(self, strategy_id: str, params: dict[str, Any] | None = None) -> None:
         super().__init__(strategy_id=strategy_id, params=params)
         self._model: Any = None
         self._model_loaded: bool = False
+        # Sprint 23: hot-swap tracking
+        self._active_version_id: str | None = None
+        self._sidecar_path: Path | None = None
+        # Default path; overwritten in on_start() with the configured model_dir param.
+        # Initialized here so _check_model_version() never raises AttributeError
+        # if called before on_start() (e.g., in unit tests or atypical lifecycle).
+        self._model_dir_path: Path = Path("models/")
 
     # ------------------------------------------------------------------ #
     # Parameter validation
@@ -184,12 +223,18 @@ class ModelStrategy(BaseStrategy):
 
     def on_start(self, run_id: str) -> None:
         """
-        Load the ML model from disk.
+        Load the ML model from disk and compute the sidecar path.
 
         If the model file is not found or model_path is empty, logs a
         warning and continues in placeholder mode (always returns HOLD).
         """
         super().on_start(run_id)
+
+        # Sprint 23: compute sidecar path from model_dir + symbol
+        # symbol is not known at on_start time (it is per-bar); we set the
+        # sidecar_path lazily on first on_bar() call when we have bars[-1].symbol.
+        # Store model_dir for deferred sidecar path construction.
+        self._model_dir_path = Path(self._params.get("model_dir", "models/"))
 
         model_path_str: str = self._params.get("model_path", "")
         if not model_path_str:
@@ -233,6 +278,61 @@ class ModelStrategy(BaseStrategy):
             )
 
     # ------------------------------------------------------------------ #
+    # Sprint 23: hot-swap check
+    # ------------------------------------------------------------------ #
+
+    def _check_model_version(self, symbol: str) -> None:
+        """Check sidecar JSON for a new model version and hot-swap if changed.
+
+        Reads the `models/{safe_symbol}_active.json` sidecar file written by
+        RetrainingService. If the sidecar's version_id differs from the
+        currently loaded version_id, the model is reloaded from the path in
+        the sidecar. File reads are <1ms and do not require DB access.
+
+        Parameters
+        ----------
+        symbol : str
+            Trading pair for this bar (used to locate the sidecar file).
+        """
+        # Lazily construct the sidecar path on first call
+        if self._sidecar_path is None:
+            safe_symbol = symbol.replace("/", "_").replace(" ", "_").lower()
+            self._sidecar_path = self._model_dir_path / f"{safe_symbol}_active.json"
+
+        if not self._sidecar_path.exists():
+            return
+
+        try:
+            data: dict[str, Any] = json.loads(
+                self._sidecar_path.read_text(encoding="utf-8")
+            )
+            sidecar_version_id: str | None = data.get("version_id")
+            if sidecar_version_id is None or sidecar_version_id == self._active_version_id:
+                return
+
+            # Version changed — reload model
+            new_model_path: str = data["model_path"]
+            import joblib
+
+            new_model = joblib.load(new_model_path)
+            self._model = new_model
+            self._model_loaded = True
+            self._active_version_id = sidecar_version_id
+
+            self._log.info(
+                "model_strategy.hot_swap",
+                version_id=sidecar_version_id,
+                model_path=new_model_path,
+                model_type=type(new_model).__name__,
+            )
+        except Exception as exc:
+            self._log.warning(
+                "model_strategy.hot_swap_failed",
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
+
+    # ------------------------------------------------------------------ #
     # Feature extraction
     # ------------------------------------------------------------------ #
 
@@ -255,6 +355,9 @@ class ModelStrategy(BaseStrategy):
         """
         Process OHLCV bars through the ML model to generate signals.
 
+        Sprint 23: calls _check_model_version() at the top to hot-swap
+        the model if RetrainingService has published a new version.
+
         If no model is loaded, returns an empty list (equivalent to HOLD).
         Otherwise, builds a feature vector, runs prediction, and emits a
         Signal if the predicted-class probability exceeds the configured
@@ -273,6 +376,10 @@ class ModelStrategy(BaseStrategy):
         feature_window: int = self._params["feature_window"]
         prediction_threshold: float = self._params["prediction_threshold"]
         position_size: float = self._params["position_size"]
+
+        # Sprint 23: hot-swap check (before warmup — no bars needed for file read)
+        if bars:
+            self._check_model_version(symbol=bars[-1].symbol)
 
         # Warm-up check
         if len(bars) < feature_window:
@@ -308,7 +415,6 @@ class ModelStrategy(BaseStrategy):
                 probas = self._model.predict_proba(X)[0]  # shape (3,)
                 confidence = float(probas[prediction])
             else:
-                # Model does not support predict_proba — use fixed confidence
                 confidence = 0.5
                 self._log.debug(
                     "model_strategy.no_predict_proba",
@@ -356,6 +462,7 @@ class ModelStrategy(BaseStrategy):
                 "prediction_label": prediction,
                 "prediction_confidence": round(confidence, 6),
                 "prediction_threshold": prediction_threshold,
+                "active_version_id": self._active_version_id,
                 "features": {
                     "log_return_1": round(feature_vector[0], 6),
                     "log_return_5": round(feature_vector[1], 6),
@@ -378,6 +485,7 @@ class ModelStrategy(BaseStrategy):
             confidence=signal.confidence,
             prediction_label=prediction,
             symbol=current_bar.symbol,
+            active_version_id=self._active_version_id,
         )
 
         return [signal]
@@ -388,7 +496,10 @@ class ModelStrategy(BaseStrategy):
             self._log.info(
                 "model_strategy.model_released",
                 model_type=type(self._model).__name__ if self._model else "None",
+                active_version_id=self._active_version_id,
             )
         self._model = None
         self._model_loaded = False
+        self._active_version_id = None
+        self._sidecar_path = None
         super().on_stop()

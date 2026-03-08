@@ -55,6 +55,7 @@ __all__ = [
     "EquitySnapshotORM",
     "SignalORM",
     "PositionSnapshotORM",
+    "ModelVersionORM",
 ]
 
 # ---------------------------------------------------------------------------
@@ -869,3 +870,131 @@ class PositionSnapshotORM(Base):
 
     def __repr__(self) -> str:
         return f"<PositionSnapshotORM run={self.run_id} symbol={self.symbol} qty={self.quantity}>"
+
+
+# ---------------------------------------------------------------------------
+# 8. model_versions — ML model version registry
+# ---------------------------------------------------------------------------
+
+class ModelVersionORM(Base):
+    """
+    Registry of trained ML model versions.
+
+    Each row represents one trained RandomForestClassifier, tagged with the
+    symbol/timeframe pair, training provenance, and accuracy metrics. At most
+    one row per (symbol, timeframe) pair has is_active=True — the invariant
+    is enforced at the application layer in RetrainingService.
+
+    The model_path column holds the filesystem path to the .joblib file.
+    RetrainingService prunes old versions when the count exceeds ml_max_model_versions.
+
+    Index strategy:
+    - (symbol, timeframe) — primary lookup for active model per symbol/timeframe
+    - (trained_at) — prune query ORDER BY trained_at DESC
+    - partial on (symbol, timeframe) WHERE is_active=true — fast active model lookup
+      (created via op.execute() in the Alembic migration; SQLAlchemy ORM does not
+      support partial index WHERE clauses on Index() objects).
+    """
+
+    __tablename__ = "model_versions"
+    __table_args__ = (
+        CheckConstraint(
+            "accuracy >= 0 AND accuracy <= 1",
+            name="ck_model_versions_accuracy_range",
+        ),
+        CheckConstraint(
+            "n_trades_used >= 0",
+            name="ck_model_versions_n_trades_non_negative",
+        ),
+        CheckConstraint(
+            "n_bars_used >= 0",
+            name="ck_model_versions_n_bars_non_negative",
+        ),
+        CheckConstraint(
+            "label_method IN ('trade_outcome', 'future_return')",
+            name="ck_model_versions_label_method",
+        ),
+        CheckConstraint(
+            "trigger IN ('manual', 'auto')",
+            name="ck_model_versions_trigger",
+        ),
+        Index("ix_model_versions_symbol_timeframe", "symbol", "timeframe"),
+        Index("ix_model_versions_trained_at", "trained_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        comment="Model version UUID (app-generated v4)",
+    )
+    symbol: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        comment="Trading pair this model was trained for, e.g. BTC/USD",
+    )
+    timeframe: Mapped[str] = mapped_column(
+        String(8),
+        nullable=False,
+        comment="Candle timeframe this model was trained on, e.g. 1h",
+    )
+    trained_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        comment="UTC wall-clock when training completed",
+    )
+    accuracy: Mapped[float] = mapped_column(
+        Numeric(precision=6, scale=4),
+        nullable=False,
+        comment="Test-set accuracy in [0, 1]",
+    )
+    n_trades_used: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        comment="Count of closed trades used for training",
+    )
+    n_bars_used: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        comment="Count of OHLCV bars fetched for the training window",
+    )
+    label_method: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        comment="Labeling scheme: trade_outcome (PnL-based) or future_return (horizon-based)",
+    )
+    model_path: Mapped[str] = mapped_column(
+        String(512),
+        nullable=False,
+        comment="Filesystem path to the .joblib model file",
+    )
+    is_active: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default="false",
+        comment="True if this is the currently active model for its (symbol, timeframe) pair",
+    )
+    trigger: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        default="manual",
+        comment="What triggered training: manual (API call) or auto (RetrainingService)",
+    )
+    extra: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB,
+        nullable=True,
+        comment="Supplementary metadata: feature importances, class distribution, etc.",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        comment="Row creation time — immutable after INSERT",
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<ModelVersionORM id={self.id} symbol={self.symbol} "
+            f"tf={self.timeframe} acc={self.accuracy} active={self.is_active}>"
+        )
