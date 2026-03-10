@@ -338,6 +338,6 @@ export interface ModelVersion {
 
 /** Response envelope for GET /api/v1/ml/models. */
 export interface ModelVersionListResponse {
-  models: readonly ModelVersion[];
+  items: readonly ModelVersion[];
   total: number;
 }

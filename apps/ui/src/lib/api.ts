@@ -84,7 +84,7 @@ export interface HealthResponse {
 /**
  * Generic fetch wrapper with:
  * - Automatic JSON serialisation / deserialisation
- * - 10-second timeout via AbortController
+ * - Configurable timeout via AbortController (default 10 s; callers may override)
  * - Structured error normalisation into ApiResult
  *
  * @template T - The expected shape of a successful JSON response body.
@@ -92,9 +92,10 @@ export interface HealthResponse {
 async function apiFetch<T>(
   path: string,
   init?: RequestInit,
+  timeoutMs: number = 10_000,
 ): Promise<ApiResult<T>> {
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 10_000);
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
   const url = `${BASE_URL}${path}`;
 
@@ -147,7 +148,7 @@ async function apiFetch<T>(
         ok: false,
         error: {
           status: 0,
-          message: "Request timed out. Check the API server is running.",
+          message: "Request timed out. The operation may still be running on the server.",
         },
       };
     }
@@ -228,11 +229,14 @@ export async function fetchRun(id: string): Promise<ApiResult<Run>> {
   return apiGet<Run>(`/api/v1/runs/${id}`, { cache: "no-store" });
 }
 
-/** POST /api/v1/runs — create / start a new run. */
+/** POST /api/v1/runs — create / start a new run (120 s timeout for backtests). */
 export async function createRun(
   body: RunCreateRequest,
 ): Promise<ApiResult<Run>> {
-  return apiPost<Run>("/api/v1/runs", body);
+  return apiFetch<Run>("/api/v1/runs", {
+    method: "POST",
+    body: JSON.stringify(body),
+  }, 120_000);
 }
 
 /** DELETE /api/v1/runs/{id} — stop a running run. */

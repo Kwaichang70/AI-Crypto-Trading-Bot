@@ -150,6 +150,12 @@ services:
       # -- Authentication --
       REQUIRE_API_AUTH:    ${REQUIRE_API_AUTH:-false}
       API_KEY_HASH:        ${API_KEY_HASH:-}
+      # -- ML Auto-Retraining --
+      ML_AUTO_RETRAIN:              ${ML_AUTO_RETRAIN:-false}
+      ML_MIN_TRADES_FOR_RETRAIN:    ${ML_MIN_TRADES_FOR_RETRAIN:-50}
+      ML_MIN_ACCURACY_THRESHOLD:    ${ML_MIN_ACCURACY_THRESHOLD:-0.38}
+      ML_MAX_MODEL_VERSIONS:        ${ML_MAX_MODEL_VERSIONS:-5}
+      ML_RETRAIN_INTERVAL_MINUTES:  ${ML_RETRAIN_INTERVAL_MINUTES:-60}
     ports:
       - "${API_PORT:-8000}:8000"
     healthcheck:
