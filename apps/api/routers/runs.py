@@ -56,7 +56,7 @@ from api.schemas import (
 )
 from common.types import TimeFrame
 
-__all__ = ["router"]
+__all__ = ["router", "recover_orphaned_runs"]
 
 router = APIRouter(prefix="/runs", tags=["runs"])
 
@@ -2071,3 +2071,218 @@ def _validate_params_against_schema(
                 )
 
     return errors
+
+# ---------------------------------------------------------------------------
+# Startup helper: recover orphaned paper/live runs (Sprint 24)
+# ---------------------------------------------------------------------------
+
+
+async def _mark_orphan_error(
+    factory: Any,
+    run_id: uuid.UUID,
+    log: Any,
+) -> None:
+    """Mark an orphaned run as error so it does not stay running forever."""
+    try:
+        async with factory() as session:
+            result = await session.execute(
+                select(RunORM).where(RunORM.id == run_id)
+            )
+            stale = result.scalar_one_or_none()
+            if stale is not None and stale.status == "running":
+                now = datetime.now(tz=UTC)
+                stale.status = "error"
+                stale.stopped_at = now
+                stale.updated_at = now
+                await session.commit()
+    except Exception:
+        log.exception("recovery.mark_error_failed", run_id=str(run_id))
+
+
+async def recover_orphaned_runs() -> int:
+    """Recover orphaned paper/live runs on API startup.
+
+    When the API container restarts, any paper or live run that was in
+    ``status='running'`` is an orphan -- its asyncio.Task has been killed and
+    will never update the DB again.  This function:
+
+    1. Queries the DB for all runs with status='running' and run_mode in
+       ('paper', 'live').
+    2. For each orphan:
+       a. Marks the original as status='error', stopped_at=now().
+       b. Creates a new RunORM with a fresh UUID, copying config verbatim,
+          and setting ``recovered_from_run_id`` to the orphan's ID.
+       c. Starts the appropriate background coroutine (_run_paper_engine or
+          _run_live_engine) and registers the new task in _RUN_TASKS.
+    3. For live-mode orphans, re-checks that layers 1 and 2 of the safety
+       gate are satisfied (env flag + API keys). Layer 3 (confirm_token) is
+       a runtime-only gate and is skipped here -- the operator already proved
+       intent when the original run was created.  If layers 1/2 fail the
+       live orphan is skipped (marked error only; no new run is created).
+
+    Each orphan is processed in its own try/except so a single bad run does
+    not prevent the others from being recovered.  The entire function is
+    wrapped in a top-level try/except so a DB error at startup does not crash
+    the API process.
+
+    Returns
+    -------
+    int
+        Number of runs successfully recovered (new tasks started).
+    """
+    from api.config import get_settings
+    from api.db.models import RunORM
+    from api.db.session import get_session_factory
+
+    log = logger.bind(component="recovery")
+    recovered_count = 0
+
+    try:
+        factory = get_session_factory()
+
+        # --- Step 1: find orphaned runs ---
+        # Exclude runs that were themselves recovered (non-null recovered_from_run_id)
+        # to prevent ever-deepening recovery chains on repeated restarts (CR-001).
+        async with factory() as session:
+            result = await session.execute(
+                select(RunORM).where(
+                    RunORM.status == "running",
+                    RunORM.run_mode.in_(["paper", "live"]),
+                    RunORM.recovered_from_run_id.is_(None),
+                )
+            )
+            orphans = list(result.scalars().all())
+
+        if not orphans:
+            log.debug("recovery.no_orphans_found")
+            return 0
+
+        log.info("recovery.orphans_found", count=len(orphans))
+
+        settings = get_settings()
+
+        for orphan in orphans:
+            orphan_id = str(orphan.id)
+            orphan_mode = orphan.run_mode
+            orphan_config = dict(orphan.config or {})
+            log.info(
+                "recovery.found_orphan",
+                run_id=orphan_id,
+                mode=orphan_mode,
+                strategy=orphan_config.get("strategy_name"),
+            )
+
+            try:
+                # --- Extract config fields ---
+                strategy_name: str | None = orphan_config.get("strategy_name")
+                symbols: list[str] = orphan_config.get("symbols") or []
+                timeframe_str: str = orphan_config.get("timeframe", "1h")
+                initial_capital: str = orphan_config.get("initial_capital", "10000")
+                strategy_params: dict[str, Any] = orphan_config.get("strategy_params") or {}
+
+                # Validate strategy is still registered
+                if not strategy_name:
+                    log.warning("recovery.orphan_skipped", run_id=orphan_id, reason="missing_strategy_name")
+                    await _mark_orphan_error(factory, orphan.id, log)
+                    continue
+
+                registry = _get_strategy_registry()
+                strategy_cls = registry.get(strategy_name)
+                if strategy_cls is None:
+                    log.warning("recovery.orphan_skipped", run_id=orphan_id, reason="unknown_strategy", strategy_name=strategy_name)
+                    await _mark_orphan_error(factory, orphan.id, log)
+                    continue
+
+                if not symbols:
+                    log.warning("recovery.orphan_skipped", run_id=orphan_id, reason="empty_symbols")
+                    await _mark_orphan_error(factory, orphan.id, log)
+                    continue
+
+                # Validate timeframe before DB write (CR-005)
+                try:
+                    timeframe = TimeFrame(timeframe_str)
+                except ValueError:
+                    log.warning("recovery.orphan_skipped", run_id=orphan_id, reason="invalid_timeframe", timeframe=timeframe_str)
+                    await _mark_orphan_error(factory, orphan.id, log)
+                    continue
+
+                # --- Live-mode safety gate re-check (layers 1 + 2 only) ---
+                if orphan_mode == "live":
+                    env_ok = settings.enable_live_trading
+                    keys_ok = (
+                        settings.exchange_api_key is not None
+                        and settings.exchange_api_secret is not None
+                        and settings.exchange_api_key.get_secret_value().strip() != ""
+                        and settings.exchange_api_secret.get_secret_value().strip() != ""
+                    )
+                    if not env_ok or not keys_ok:
+                        log.warning("recovery.live_orphan_skipped_gate", run_id=orphan_id, env_ok=env_ok, keys_ok=keys_ok)
+                        await _mark_orphan_error(factory, orphan.id, log)
+                        continue
+
+                # --- Atomically mark original as error and create recovery run ---
+                new_run_id = uuid.uuid4()
+                new_run_id_str = str(new_run_id)
+
+                async with factory() as session:
+                    result2 = await session.execute(
+                        select(RunORM).where(RunORM.id == orphan.id)
+                    )
+                    stale = result2.scalar_one_or_none()
+                    if stale is None or stale.status != "running":
+                        log.debug("recovery.orphan_already_handled", run_id=orphan_id)
+                        continue
+
+                    now = datetime.now(tz=UTC)
+                    stale.status = "error"
+                    stale.stopped_at = now
+                    stale.updated_at = now
+
+                    new_run = RunORM(
+                        id=new_run_id,
+                        run_mode=orphan_mode,
+                        status="running",
+                        config=orphan_config,
+                        started_at=now,
+                        recovered_from_run_id=orphan.id,
+                    )
+                    session.add(new_run)
+                    await session.commit()
+
+                log.info("recovery.db_records_written", original_run_id=orphan_id, new_run_id=new_run_id_str)
+
+                # --- Start background engine task ---
+                coro = _run_paper_engine if orphan_mode == "paper" else _run_live_engine
+                task = asyncio.create_task(
+                    coro(
+                        run_id_str=new_run_id_str,
+                        strategy_cls=strategy_cls,
+                        strategy_name=strategy_name,
+                        strategy_params=strategy_params,
+                        symbols=symbols,
+                        timeframe=timeframe,
+                        initial_capital=initial_capital,
+                    ),
+                    name=f"recovery-{orphan_mode}-{new_run_id_str[:8]}",
+                )
+                _RUN_TASKS[new_run_id_str] = task
+
+                log.info(
+                    "recovery.run_recovered",
+                    original_run_id=orphan_id,
+                    new_run_id=new_run_id_str,
+                    mode=orphan_mode,
+                )
+                recovered_count += 1
+
+            except Exception:
+                log.exception(
+                    "recovery.run_failed",
+                    run_id=orphan_id,
+                )
+                # Continue to next orphan -- one bad run must not block others
+
+    except Exception:
+        log.exception("recovery.fatal_error")
+
+    return recovered_count

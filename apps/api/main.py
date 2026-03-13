@@ -13,6 +13,7 @@ Responsibilities
 - Expose the /health endpoint (always available, no auth)
 - Expose the /api/v1/metrics endpoint (always available, no auth)
 - Start/stop RetrainingService when ml_auto_retrain=True (Sprint 23)
+- Recover orphaned paper/live runs left running after a crash/restart (Sprint 24)
 
 The ``lifespan`` context manager is the recommended FastAPI pattern for
 startup/shutdown logic (replaces deprecated on_event handlers).
@@ -84,6 +85,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     2. Log application boot parameters
     3. Initialise SQLAlchemy async engine and connection pool
     4. Start RetrainingService if ml_auto_retrain=True (Sprint 23)
+    5. Recover orphaned paper/live runs (Sprint 24)
 
     Shutdown (after yield)
     ----------------------
@@ -131,6 +133,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         pool_size=settings.db_pool_size,
         max_overflow=settings.db_max_overflow,
     )
+
+    # ------------------------------------------------------------------
+    # 3b. Recover orphaned paper/live runs (Sprint 24)
+    # ------------------------------------------------------------------
+    try:
+        from api.routers.runs import recover_orphaned_runs
+
+        recovered_count = await recover_orphaned_runs()
+        if recovered_count > 0:
+            log.info("recovery.completed", recovered_count=recovered_count)
+        else:
+            log.info("recovery.none_found")
+    except Exception:
+        log.exception("recovery.startup_error")
 
     # ------------------------------------------------------------------
     # 4. Start RetrainingService if ml_auto_retrain=True (Sprint 23)

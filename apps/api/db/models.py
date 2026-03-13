@@ -94,6 +94,12 @@ class RunORM(Base):
     Status transitions:
         RUNNING -> STOPPED (normal shutdown)
         RUNNING -> ERROR   (unhandled exception or circuit breaker)
+
+    Recovery chain (Sprint 24):
+        When the API restarts, orphaned RUNNING paper/live runs are marked
+        as ERROR and a new run is created from the same config.  The new
+        run's ``recovered_from_run_id`` points back to the original orphan,
+        forming a recoverable audit trail.
     """
 
     __tablename__ = "runs"
@@ -154,6 +160,17 @@ class RunORM(Base):
         nullable=True,
         comment="UTC timestamp when the run was stopped or errored. NULL = still running",
     )
+
+    # Recovery self-reference (Sprint 24) — set on the NEW run that replaced
+    # an orphaned run after an API restart.  NULL for all non-recovered runs.
+    recovered_from_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("runs.id"),
+        nullable=True,
+        default=None,
+        comment="If this run was auto-recovered, the ID of the original orphaned run",
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
