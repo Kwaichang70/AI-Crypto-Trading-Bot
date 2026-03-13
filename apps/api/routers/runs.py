@@ -1389,7 +1389,13 @@ async def _persist_backtest_results(
     # --- Merge metrics into run.config JSONB ---
     metrics_response = _build_backtest_metrics(result)
     updated_config = dict(run_orm.config or {})
-    updated_config["backtest_metrics"] = metrics_response.model_dump(mode="json")
+    metrics_dict = metrics_response.model_dump(mode="json")
+    # PostgreSQL JSONB rejects Infinity/NaN — replace with None
+    import math
+    for k, v in metrics_dict.items():
+        if isinstance(v, float) and (math.isinf(v) or math.isnan(v)):
+            metrics_dict[k] = None
+    updated_config["backtest_metrics"] = metrics_dict
     run_orm.config = updated_config
     # Explicitly flag the JSONB column as modified so SQLAlchemy tracks the
     # in-place dict mutation through its change-detection mechanism.
