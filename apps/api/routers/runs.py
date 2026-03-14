@@ -1562,9 +1562,9 @@ async def create_run(
     # Extract trailing_stop_pct from strategy params (passed to engine config)
     _trailing_stop_pct: float | None = None
     if "trailing_stop_pct" in body.strategy_params:
-        _trailing_stop_pct = body.strategy_params.get("trailing_stop_pct")
-        if _trailing_stop_pct is not None:
-            _trailing_stop_pct = float(_trailing_stop_pct)
+        raw_tsp = body.strategy_params.get("trailing_stop_pct")
+        if raw_tsp is not None and raw_tsp != "":
+            _trailing_stop_pct = float(raw_tsp)
 
     # Additional validation for backtest mode
     is_backtest = body.mode == "backtest"
