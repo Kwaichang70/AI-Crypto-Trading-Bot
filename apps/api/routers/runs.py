@@ -668,6 +668,7 @@ async def _run_paper_engine(
     symbols: list[str],
     timeframe: TimeFrame,
     initial_capital: str,
+    trailing_stop_pct: float | None = None,
 ) -> None:
     """
     Background coroutine that runs a paper trading engine for a single run.
@@ -765,6 +766,11 @@ async def _run_paper_engine(
             params=strategy_params,
         )
 
+        # Build engine config — include trailing stop if configured
+        engine_config: dict[str, object] = {}
+        if trailing_stop_pct is not None:
+            engine_config["trailing_stop_pct"] = trailing_stop_pct
+
         engine = StrategyEngine(
             strategies=[strategy_instance],
             execution_engine=execution,
@@ -774,6 +780,7 @@ async def _run_paper_engine(
             symbols=symbols,
             timeframe=timeframe,
             run_mode=RunMode.PAPER,
+            config=engine_config if engine_config else None,
         )
 
         await engine.start(run_id_str)
@@ -885,6 +892,7 @@ async def _run_live_engine(
     symbols: list[str],
     timeframe: TimeFrame,
     initial_capital: str,
+    trailing_stop_pct: float | None = None,
 ) -> None:
     """
     Background coroutine that runs a live trading engine for a single run.
@@ -979,6 +987,11 @@ async def _run_live_engine(
             params=strategy_params,
         )
 
+        # Build engine config — include trailing stop if configured
+        live_engine_config: dict[str, object] = {}
+        if trailing_stop_pct is not None:
+            live_engine_config["trailing_stop_pct"] = trailing_stop_pct
+
         engine = StrategyEngine(
             strategies=[strategy_instance],
             execution_engine=execution,
@@ -988,6 +1001,7 @@ async def _run_live_engine(
             symbols=symbols,
             timeframe=timeframe,
             run_mode=RunMode.LIVE,
+            config=live_engine_config if live_engine_config else None,
         )
 
         await engine.start(run_id_str)
@@ -1545,6 +1559,13 @@ async def create_run(
             detail=f"Invalid strategy parameters: {'; '.join(param_errors)}",
         )
 
+    # Extract trailing_stop_pct from strategy params (passed to engine config)
+    _trailing_stop_pct: float | None = None
+    if "trailing_stop_pct" in body.strategy_params:
+        _trailing_stop_pct = body.strategy_params.get("trailing_stop_pct")
+        if _trailing_stop_pct is not None:
+            _trailing_stop_pct = float(_trailing_stop_pct)
+
     # Additional validation for backtest mode
     is_backtest = body.mode == "backtest"
     if is_backtest:
@@ -1676,6 +1697,7 @@ async def create_run(
                 symbols=body.symbols,
                 timeframe=timeframe,
                 initial_capital=Decimal(body.initial_capital),
+                trailing_stop_pct=_trailing_stop_pct,
             )
 
             log.info("runs.backtest_execution_starting", run_id=str(run_id))
@@ -1772,6 +1794,7 @@ async def create_run(
                 symbols=body.symbols,
                 timeframe=timeframe,
                 initial_capital=body.initial_capital,
+                trailing_stop_pct=_trailing_stop_pct,
             ),
             name=f"paper-engine-{run_id}",
         )
@@ -1792,6 +1815,7 @@ async def create_run(
                 symbols=body.symbols,
                 timeframe=timeframe,
                 initial_capital=body.initial_capital,
+                trailing_stop_pct=_trailing_stop_pct,
             ),
             name=f"live-engine-{run_id}",
         )
@@ -2298,6 +2322,12 @@ async def recover_orphaned_runs() -> int:
                 log.info("recovery.db_records_written", original_run_id=orphan_id, new_run_id=new_run_id_str)
 
                 # --- Start background engine task ---
+                # Extract trailing_stop_pct from saved strategy params (Sprint 27)
+                recovery_trailing_pct: float | None = None
+                raw_tsp = strategy_params.get("trailing_stop_pct")
+                if raw_tsp is not None:
+                    recovery_trailing_pct = float(raw_tsp)
+
                 coro = _run_paper_engine if orphan_mode == "paper" else _run_live_engine
                 task = asyncio.create_task(
                     coro(
@@ -2308,6 +2338,7 @@ async def recover_orphaned_runs() -> int:
                         symbols=symbols,
                         timeframe=timeframe,
                         initial_capital=initial_capital,
+                        trailing_stop_pct=recovery_trailing_pct,
                     ),
                     name=f"recovery-{orphan_mode}-{new_run_id_str[:8]}",
                 )

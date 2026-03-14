@@ -134,6 +134,12 @@ class _ModelStrategyParams(BaseModel):
             "Must match RetrainingService.model_dir for hot-swap to work."
         ),
     )
+    trailing_stop_pct: float | None = Field(
+        default=None,
+        ge=0.005,
+        le=0.50,
+        description="Trailing stop-loss percentage (e.g. 0.03 = 3%). None to disable.",
+    )
 
     @field_validator("model_path")
     @classmethod

@@ -92,6 +92,10 @@ class _BreakoutParams(BaseModel):
     atr_multiplier: float = Field(
         default=1.5, gt=0.0, le=10.0, description="ATR confidence scaling factor"
     )
+    trailing_stop_pct: float | None = Field(
+        default=None, ge=0.005, le=0.50,
+        description="Trailing stop-loss percentage (e.g. 0.03 = 3%). None to disable."
+    )
 
 
 # ---------------------------------------------------------------------------

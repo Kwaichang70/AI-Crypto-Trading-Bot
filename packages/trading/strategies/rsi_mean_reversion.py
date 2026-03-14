@@ -81,6 +81,10 @@ class _RSIParams(BaseModel):
     position_size: float = Field(
         default=1000.0, gt=0.0, le=1_000_000.0, description="Quote-currency notional"
     )
+    trailing_stop_pct: float | None = Field(
+        default=None, ge=0.005, le=0.50,
+        description="Trailing stop-loss percentage (e.g. 0.03 = 3%). None to disable."
+    )
 
     @model_validator(mode="after")
     def oversold_lt_overbought(self) -> _RSIParams:

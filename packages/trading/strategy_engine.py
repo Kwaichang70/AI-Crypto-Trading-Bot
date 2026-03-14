@@ -48,6 +48,7 @@ from trading.models import Fill, Position, Signal, TradeResult
 from trading.portfolio import PortfolioAccounting
 from trading.risk import BaseRiskManager
 from trading.strategy import BaseStrategy
+from trading.trailing_stop import TrailingStopManager
 
 __all__ = ["StrategyEngine", "EngineState"]
 
@@ -187,6 +188,22 @@ class StrategyEngine:
             s: [] for s in self._symbols
         }
 
+        # Trailing stop manager (optional, configured via "trailing_stop_pct")
+        trailing_stop_pct = self._config.get("trailing_stop_pct")
+        self._trailing_stop: TrailingStopManager | None = None
+        if trailing_stop_pct is not None:
+            try:
+                self._trailing_stop = TrailingStopManager(
+                    trailing_stop_pct=float(trailing_stop_pct),
+                    strategy_id="trailing_stop",
+                )
+            except (ValueError, TypeError) as exc:
+                structlog.get_logger(__name__).warning(
+                    "engine.trailing_stop_disabled",
+                    reason=str(exc),
+                    trailing_stop_pct=trailing_stop_pct,
+                )
+
         self._log = structlog.get_logger(__name__).bind(
             component="strategy_engine",
             run_mode=run_mode.value,
@@ -321,6 +338,10 @@ class StrategyEngine:
                     "engine.strategy_stop_failed",
                     strategy_id=strategy.strategy_id,
                 )
+
+        # Reset trailing stop tracking state
+        if self._trailing_stop is not None:
+            self._trailing_stop.reset()
 
         # Cancel open orders
         open_orders = self._execution_engine.get_open_orders()
@@ -650,6 +671,37 @@ class StrategyEngine:
                     direction=signal.direction.value,
                 )
                 continue
+
+        # 5b. Check trailing stops for open positions
+        if self._trailing_stop is not None:
+            for symbol, bar in current_bars.items():
+                try:
+                    position = self._portfolio.get_position(symbol)
+                    stop_signal = self._trailing_stop.check(
+                        symbol=symbol,
+                        current_price=bar.close,
+                        position=position,
+                    )
+                    if stop_signal is not None:
+                        orders = await self._execution_engine.process_signal(stop_signal)
+                        bar_orders += len(orders)
+                        for order in orders:
+                            fills = await self._execution_engine.get_fills(order.order_id)
+                            bar_fills += len(fills)
+                            for fill in fills:
+                                pre_fill_pos = self._portfolio.get_position(fill.symbol)
+                                self._portfolio.update_position(fill, bar.close)
+                                self._record_trade_if_closed(
+                                    fill=fill,
+                                    pre_fill_position=pre_fill_pos,
+                                    strategy_id=stop_signal.strategy_id,
+                                )
+                                self._route_fill_to_risk_manager(fill, bar.close)
+                except Exception:
+                    self._log.exception(
+                        "engine.trailing_stop_error",
+                        symbol=symbol,
+                    )
 
         self._total_orders += bar_orders
         self._total_fills += bar_fills

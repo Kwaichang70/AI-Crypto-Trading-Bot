@@ -137,6 +137,7 @@ class BacktestRunner:
         maker_fee_bps: int = 10,
         taker_fee_bps: int = 15,
         seed: int | None = None,
+        trailing_stop_pct: float | None = None,
     ) -> None:
         if not strategies:
             raise ValueError("At least one strategy is required")
@@ -155,6 +156,7 @@ class BacktestRunner:
         self._maker_fee_bps = maker_fee_bps
         self._taker_fee_bps = taker_fee_bps
         self._seed = seed
+        self._trailing_stop_pct = trailing_stop_pct
 
         # Build risk parameters with explicit fee overrides
         if risk_params is not None:
@@ -398,6 +400,13 @@ class BacktestRunner:
     # Engine wiring
     # ------------------------------------------------------------------
 
+    def _build_engine_config(self) -> dict[str, object]:
+        """Build the StrategyEngine config dict, including optional trailing stop."""
+        config: dict[str, object] = {"warmup_bars": self._warmup_bars}
+        if self._trailing_stop_pct is not None:
+            config["trailing_stop_pct"] = self._trailing_stop_pct
+        return config
+
     def _build_engine(
         self,
         run_id: str,
@@ -452,7 +461,7 @@ class BacktestRunner:
             symbols=self._symbols,
             timeframe=self._timeframe,
             run_mode=RunMode.BACKTEST,
-            config={"warmup_bars": self._warmup_bars},
+            config=self._build_engine_config(),
         )
 
         return engine, portfolio, risk_manager, execution_engine
