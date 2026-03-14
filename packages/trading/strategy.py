@@ -25,7 +25,7 @@ from typing import Any, ClassVar
 
 import structlog
 
-from common.models import OHLCVBar
+from common.models import MultiTimeframeContext, OHLCVBar
 from trading.models import Signal
 
 __all__ = ["BaseStrategy", "StrategyMetadata"]
@@ -125,6 +125,21 @@ class BaseStrategy(abc.ABC):
         """
         return 0
 
+    @property
+    def htf_timeframes(self) -> list[str]:
+        """
+        Higher timeframes this strategy wants to consume.
+
+        Override to declare which higher timeframes the strategy needs.
+        The engine will fetch and provide these via mtf_context.
+
+        Returns
+        -------
+        list[str]
+            Timeframe strings (e.g. ["4h", "1d"]). Default empty.
+        """
+        return []
+
     # ------------------------------------------------------------------
     # Lifecycle hooks
     # ------------------------------------------------------------------
@@ -145,7 +160,12 @@ class BaseStrategy(abc.ABC):
         self._log.info("strategy.started", run_id=run_id)
 
     @abc.abstractmethod
-    def on_bar(self, bars: Sequence[OHLCVBar]) -> list[Signal]:
+    def on_bar(
+        self,
+        bars: Sequence[OHLCVBar],
+        *,
+        mtf_context: MultiTimeframeContext | None = None,
+    ) -> list[Signal]:
         """
         Process a batch of OHLCV bars and return zero or more signals.
 
@@ -160,6 +180,10 @@ class BaseStrategy(abc.ABC):
             Sequence of OHLCVBar objects, oldest first, most recent last.
             The strategy must NOT look ahead (i.e. must not access bars
             beyond the last element).
+        mtf_context:
+            Optional higher-timeframe bar context. Contains bars from
+            timeframes above the primary, filtered to prevent look-ahead
+            bias. None if no higher timeframes are configured.
 
         Returns
         -------

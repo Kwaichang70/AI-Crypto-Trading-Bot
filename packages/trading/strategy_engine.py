@@ -40,7 +40,7 @@ from typing import Any
 
 import structlog
 
-from common.models import OHLCVBar
+from common.models import MultiTimeframeContext, OHLCVBar
 from common.types import OrderSide, RunMode, TimeFrame
 from data.market_data import BaseMarketDataService, MarketDataError
 from trading.execution import BaseExecutionEngine
@@ -204,6 +204,9 @@ class StrategyEngine:
                     trailing_stop_pct=trailing_stop_pct,
                 )
 
+        # Higher-timeframe bar data (optional, for multi-TF strategies)
+        self._htf_bars: dict[str, dict[str, list[OHLCVBar]]] | None = None
+
         self._log = structlog.get_logger(__name__).bind(
             component="strategy_engine",
             run_mode=run_mode.value,
@@ -296,6 +299,21 @@ class StrategyEngine:
                     raise
 
             self._state = EngineState.RUNNING
+
+            # CR-002: Warn if strategies declare htf_timeframes in paper/live mode
+            # (HTF data is only auto-provided in backtest mode via run_backtest)
+            if self._run_mode in (RunMode.PAPER, RunMode.LIVE):
+                for strategy in self._strategies:
+                    if strategy.htf_timeframes:
+                        self._log.warning(
+                            "engine.htf_not_available_in_live_mode",
+                            strategy_id=strategy.strategy_id,
+                            htf_timeframes=strategy.htf_timeframes,
+                            msg="Strategy declares htf_timeframes but HTF data "
+                                "is not auto-fetched in paper/live mode. "
+                                "mtf_context will be None.",
+                        )
+
             self._log.info(
                 "engine.started",
                 strategies=[s.strategy_id for s in self._strategies],
@@ -343,6 +361,9 @@ class StrategyEngine:
         if self._trailing_stop is not None:
             self._trailing_stop.reset()
 
+        # Clear HTF bar data
+        self._htf_bars = None
+
         # Cancel open orders
         open_orders = self._execution_engine.get_open_orders()
         for order in open_orders:
@@ -389,6 +410,7 @@ class StrategyEngine:
     async def run_backtest(
         self,
         bars_by_symbol: dict[str, list[OHLCVBar]],
+        htf_bars: dict[str, dict[str, list[OHLCVBar]]] | None = None,
     ) -> dict[str, Any]:
         """
         Walk through historical bars deterministically.
@@ -402,6 +424,9 @@ class StrategyEngine:
         bars_by_symbol :
             Pre-fetched OHLCV bars keyed by symbol. Each list must be
             sorted by timestamp ascending.
+        htf_bars :
+            Optional higher-timeframe bar data keyed by timeframe string,
+            then by symbol. Passed to strategies via MultiTimeframeContext.
 
         Returns
         -------
@@ -436,6 +461,9 @@ class StrategyEngine:
 
         # Determine the number of bars to process (shortest series)
         num_bars = min(len(bars_by_symbol[s]) for s in self._symbols)
+
+        # Store HTF bars for multi-timeframe context building
+        self._htf_bars = htf_bars
 
         self._log.info(
             "engine.backtest_starting",
@@ -605,10 +633,13 @@ class StrategyEngine:
         bar_orders: int = 0
         bar_fills: int = 0
 
+        # Build multi-timeframe context (look-ahead bias filtered)
+        mtf_context = self._build_mtf_context(bar_timestamp)
+
         for strategy in self._strategies:
             try:
                 signals = self._call_strategy_on_bar(
-                    strategy, history_by_symbol
+                    strategy, history_by_symbol, mtf_context=mtf_context
                 )
                 bar_signals.extend(signals)
             except Exception:
@@ -729,6 +760,7 @@ class StrategyEngine:
         self,
         strategy: BaseStrategy,
         history_by_symbol: dict[str, list[OHLCVBar]],
+        mtf_context: MultiTimeframeContext | None = None,
     ) -> list[Signal]:
         """
         Call a strategy's ``on_bar`` for each symbol and collect signals.
@@ -739,6 +771,9 @@ class StrategyEngine:
             The strategy to invoke.
         history_by_symbol :
             Bar history for each symbol.
+        mtf_context :
+            Optional higher-timeframe context for strategies that declared
+            htf_timeframes. None if no HTF data is available.
 
         Returns
         -------
@@ -752,12 +787,51 @@ class StrategyEngine:
             if not bars:
                 continue
 
-            signals = strategy.on_bar(bars)
+            signals = strategy.on_bar(bars, mtf_context=mtf_context)
 
             if signals:
                 all_signals.extend(signals)
 
         return all_signals
+
+    def _build_mtf_context(
+        self,
+        current_timestamp: datetime,
+    ) -> MultiTimeframeContext | None:
+        """
+        Build a MultiTimeframeContext filtered to prevent look-ahead bias.
+
+        Only includes HTF bars whose full period has completed before
+        the current primary bar timestamp.
+        """
+        if self._htf_bars is None:
+            return None
+
+        filtered: dict[str, dict[str, list[OHLCVBar]]] = {}
+        for tf_str, bars_by_sym in self._htf_bars.items():
+            try:
+                tf_key = TimeFrame(tf_str)
+            except ValueError:
+                self._log.warning(
+                    "engine.unknown_htf_timeframe",
+                    timeframe=tf_str,
+                    msg="Unrecognised HTF timeframe — excluding all bars as safety default.",
+                )
+                # Exclude all bars for unknown timeframes (safe default)
+                filtered[tf_str] = {sym: [] for sym in bars_by_sym}
+                continue
+            tf_duration = _TIMEFRAME_SECONDS.get(tf_key, 0)
+            filtered_sym: dict[str, list[OHLCVBar]] = {}
+            for symbol, bars in bars_by_sym.items():
+                # Only include bars whose full period ended before current_timestamp
+                # A bar opened at T with duration D is complete at T + D
+                filtered_sym[symbol] = [
+                    b for b in bars
+                    if b.timestamp.timestamp() + tf_duration <= current_timestamp.timestamp()
+                ]
+            filtered[tf_str] = filtered_sym
+
+        return MultiTimeframeContext(htf_bars=filtered)
 
     # ------------------------------------------------------------------
     # Fill routing

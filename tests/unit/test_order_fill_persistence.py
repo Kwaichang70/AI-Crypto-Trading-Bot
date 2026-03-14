@@ -54,7 +54,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from api.routers.runs import _persist_paper_results
-from common.models import OHLCVBar
+from common.models import MultiTimeframeContext, OHLCVBar
 from common.types import OrderSide, OrderStatus, OrderType, TimeFrame
 from trading.backtest import BacktestRunner
 from trading.engines.paper import PaperExecutionEngine
@@ -320,7 +320,7 @@ class _AlwaysHoldStrategy(BaseStrategy):
         description="Stub strategy for order/fill persistence tests",
     )
 
-    def on_bar(self, bars: Sequence[OHLCVBar]) -> list[Signal]:
+    def on_bar(self, bars: Sequence[OHLCVBar], *, mtf_context: MultiTimeframeContext | None = None) -> list[Signal]:
         return []
 
     @classmethod

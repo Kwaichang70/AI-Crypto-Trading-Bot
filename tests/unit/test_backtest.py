@@ -42,7 +42,7 @@ from typing import Any
 
 import pytest
 
-from common.models import OHLCVBar
+from common.models import MultiTimeframeContext, OHLCVBar
 from common.types import TimeFrame
 from trading.backtest import BacktestRunner
 from trading.metrics import BacktestResult
@@ -77,7 +77,7 @@ class _AlwaysHoldStrategy(BaseStrategy):
         description="Test strategy that always holds",
     )
 
-    def on_bar(self, bars: Sequence[OHLCVBar]) -> list[Signal]:
+    def on_bar(self, bars: Sequence[OHLCVBar], *, mtf_context: MultiTimeframeContext | None = None) -> list[Signal]:
         return []
 
     @classmethod

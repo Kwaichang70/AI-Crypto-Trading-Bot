@@ -7,6 +7,7 @@ These are pure data transfer objects with no business logic dependencies.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -16,6 +17,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from common.types import TimeFrame
 
 __all__ = [
+    "MultiTimeframeContext",
     "OHLCVBar",
 ]
 
@@ -56,3 +58,23 @@ class OHLCVBar(BaseModel):
         if not (self.low <= self.close <= self.high):
             raise ValueError("close must be within [low, high]")
         return self
+
+
+@dataclass(frozen=True)
+class MultiTimeframeContext:
+    """
+    Read-only higher-timeframe bar context passed to strategies.
+
+    Strategies use this to access bars from higher timeframes (e.g., 4h, 1d)
+    while executing on a lower primary timeframe (e.g., 1h). This is purely
+    informational — no orders are placed on higher timeframes.
+    """
+
+    htf_bars: dict[str, dict[str, list[OHLCVBar]]] = field(default_factory=dict)
+    """
+    Higher-timeframe bars keyed by timeframe string, then by symbol.
+    E.g. {"4h": {"BTC/USD": [bar1, bar2, ...]}, "1d": {"BTC/USD": [bar1, ...]}}
+
+    Bars are filtered to prevent look-ahead bias: only bars whose entire
+    period has completed before the current primary bar are included.
+    """

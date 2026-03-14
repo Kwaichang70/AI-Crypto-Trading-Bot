@@ -63,7 +63,7 @@ from typing import Any, ClassVar
 import structlog
 from pydantic import BaseModel, Field
 
-from common.models import OHLCVBar
+from common.models import MultiTimeframeContext, OHLCVBar
 from common.types import SignalDirection
 from trading.models import Signal
 from trading.strategy import BaseStrategy, StrategyMetadata
@@ -280,7 +280,7 @@ class BreakoutStrategy(BaseStrategy):
     # Core signal generation
     # ------------------------------------------------------------------ #
 
-    def on_bar(self, bars: Sequence[OHLCVBar]) -> list[Signal]:
+    def on_bar(self, bars: Sequence[OHLCVBar], *, mtf_context: MultiTimeframeContext | None = None) -> list[Signal]:
         """
         Process a batch of OHLCV bars and detect channel breakouts.
 

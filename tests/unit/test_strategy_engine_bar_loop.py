@@ -367,7 +367,7 @@ class TestProcessBar:
         history = [bar]
         await engine._process_bar({"BTC/USDT": bar}, {"BTC/USDT": history})
 
-        mocks["strategy"].on_bar.assert_called_once_with(history)
+        mocks["strategy"].on_bar.assert_called_once_with(history, mtf_context=None)
 
     async def test_signal_routed_to_execution_process_signal(self) -> None:
         """
@@ -572,7 +572,7 @@ class TestCallStrategyOnBar:
 
         await engine._process_bar({"BTC/USDT": bar2}, {"BTC/USDT": history})
 
-        mocks["strategy"].on_bar.assert_called_once_with(history)
+        mocks["strategy"].on_bar.assert_called_once_with(history, mtf_context=None)
 
     async def test_symbol_with_empty_history_is_skipped(self) -> None:
         """
@@ -596,7 +596,7 @@ class TestCallStrategyOnBar:
         await engine._process_bar(current_bars, history)
 
         assert mocks["strategy"].on_bar.call_count == 1
-        mocks["strategy"].on_bar.assert_called_with([bar_btc])
+        mocks["strategy"].on_bar.assert_called_with([bar_btc], mtf_context=None)
 
     async def test_signals_collected_from_multiple_symbols(self) -> None:
         """

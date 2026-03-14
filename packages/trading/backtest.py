@@ -206,6 +206,7 @@ class BacktestRunner:
     async def run(
         self,
         bars_by_symbol: dict[str, list[OHLCVBar]],
+        htf_bars: dict[str, dict[str, list[OHLCVBar]]] | None = None,
     ) -> BacktestResult:
         """
         Execute a backtest over the provided historical bars.
@@ -215,6 +216,10 @@ class BacktestRunner:
         bars_by_symbol : dict[str, list[OHLCVBar]]
             Pre-fetched OHLCV bars keyed by symbol.  Each list must be
             sorted by timestamp ascending and use the same timeframe.
+        htf_bars : dict[str, dict[str, list[OHLCVBar]]] | None
+            Optional higher-timeframe bars keyed by timeframe string,
+            then by symbol. Passed through to the strategy engine for
+            multi-timeframe strategies. Default None.
 
         Returns
         -------
@@ -264,7 +269,7 @@ class BacktestRunner:
 
         try:
             # 6. Run backtest through the strategy engine
-            await engine.run_backtest(bars_by_symbol)
+            await engine.run_backtest(bars_by_symbol, htf_bars=htf_bars)
         finally:
             # 7. Stop engine (always, even on error)
             await engine.stop()

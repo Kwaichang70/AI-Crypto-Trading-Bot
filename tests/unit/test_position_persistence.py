@@ -64,7 +64,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from api.routers.runs import _persist_paper_results
-from common.models import OHLCVBar
+from common.models import MultiTimeframeContext, OHLCVBar
 from common.types import TimeFrame
 from trading.backtest import BacktestRunner
 from trading.models import Position
@@ -275,7 +275,7 @@ class _AlwaysHoldStrategy(BaseStrategy):
         description="Stub strategy for position persistence tests",
     )
 
-    def on_bar(self, bars: Sequence[OHLCVBar]) -> list[Signal]:
+    def on_bar(self, bars: Sequence[OHLCVBar], *, mtf_context: MultiTimeframeContext | None = None) -> list[Signal]:
         return []
 
     @classmethod
