@@ -1560,11 +1560,14 @@ async def create_run(
         )
 
     # Extract trailing_stop_pct from strategy params (passed to engine config)
+    # Clean empty strings from form submission before strategy Pydantic validation
     _trailing_stop_pct: float | None = None
     if "trailing_stop_pct" in body.strategy_params:
         raw_tsp = body.strategy_params.get("trailing_stop_pct")
         if raw_tsp is not None and raw_tsp != "":
             _trailing_stop_pct = float(raw_tsp)
+        else:
+            del body.strategy_params["trailing_stop_pct"]
 
     # Additional validation for backtest mode
     is_backtest = body.mode == "backtest"
