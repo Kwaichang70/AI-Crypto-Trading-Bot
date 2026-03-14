@@ -55,8 +55,8 @@ _RUN_ID = "paper-test-run-001"
 _INITIAL_CASH = Decimal("10000")
 _LAST_PRICE = Decimal("50000")
 _SLIPPAGE_BPS = 5
-_TAKER_FEE_PCT = 0.001   # 0.1%
-_MAKER_FEE_PCT = 0.0005  # 0.05%
+_TAKER_FEE_PCT = 0.006   # 0.60% (Coinbase Advanced Trade lowest tier)
+_MAKER_FEE_PCT = 0.004   # 0.40%
 
 # Precision constant matching paper.py internal constant
 _PRICE_PRECISION = Decimal("0.00000001")
@@ -77,7 +77,7 @@ def _make_risk_manager_mock(
     Build a fully-configured MagicMock for BaseRiskManager.
 
     Configures:
-    - params.taker_fee_pct / maker_fee_pct matching RiskParameters defaults
+    - params.taker_fee_pct / maker_fee_pct matching RiskParameters defaults (0.60%/0.40%)
     - pre_trade_check() returning an approved RiskCheckResult by default
     - calculate_position_size() returning `position_size`
     """

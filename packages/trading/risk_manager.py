@@ -74,6 +74,7 @@ class DefaultRiskManager(BaseRiskManager):
             3. max_positions
             4. daily_loss
             5. drawdown
+            5b. portfolio_exposure
             6. order_size (notional cap + concentration cap)
 
         All violations are collected before a verdict is issued.  If any
@@ -105,6 +106,11 @@ class DefaultRiskManager(BaseRiskManager):
 
         # 5. Drawdown
         v = self._check_drawdown(current_equity, peak_equity)
+        if v is not None:
+            violations.append(v)
+
+        # 5b. Portfolio exposure
+        v = self._check_portfolio_exposure(order, current_equity, open_positions)
         if v is not None:
             violations.append(v)
 

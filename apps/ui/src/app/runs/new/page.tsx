@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import {
   fetchStrategies,
   fetchStrategySchema,
@@ -73,15 +73,24 @@ function ParamInput({
 
 export default function NewRunPage() {
   const router = useRouter();
+  const searchParams = useSearchParams();
+
+  // Read pre-fill params supplied by the Duplicate Run button.
+  const preStrategy = searchParams.get("strategy") ?? "";
+  const preSymbols = searchParams.get("symbols") ?? "";
+  const preTimeframe = searchParams.get("timeframe") ?? "";
+  const preCapital = searchParams.get("initial_capital") ?? "";
 
   const [strategies, setStrategies] = useState<readonly Strategy[]>([]);
   const [selectedStrategy, setSelectedStrategy] = useState<Strategy | null>(null);
   const [strategyParams, setStrategyParams] = useState<Record<string, unknown>>({});
-  const [symbols, setSymbols] = useState<string[]>(["BTC/USD"]);
+  const [symbols, setSymbols] = useState<string[]>(
+    preSymbols ? preSymbols.split(",").map((s) => s.trim()).filter(Boolean) : ["BTC/USD"],
+  );
   const [customSymbol, setCustomSymbol] = useState("");
-  const [timeframe, setTimeframe] = useState("1h");
+  const [timeframe, setTimeframe] = useState(preTimeframe || "1h");
   const [mode, setMode] = useState<RunMode>("backtest");
-  const [initialCapital, setInitialCapital] = useState("10000");
+  const [initialCapital, setInitialCapital] = useState(preCapital || "10000");
   const [backtestStart, setBacktestStart] = useState("2024-01-01T00:00");
   const [backtestEnd, setBacktestEnd] = useState("2024-12-31T23:59");
   const [confirmToken, setConfirmToken] = useState("");
@@ -94,14 +103,34 @@ export default function NewRunPage() {
       const result = await fetchStrategies();
       if (result.ok && result.data.strategies.length > 0) {
         setStrategies(result.data.strategies);
-        // Auto-select first strategy
-        const first = result.data.strategies[0];
-        setSelectedStrategy(first);
-        initDefaults(first);
+
+        // If duplicating a run, try to match the pre-filled strategy name;
+        // otherwise fall back to the first strategy in the list.
+        const matchedByName = preStrategy
+          ? result.data.strategies.find((s) => s.name === preStrategy) ?? null
+          : null;
+        const targetStrategy = matchedByName ?? result.data.strategies[0];
+
+        if (matchedByName) {
+          // Fetch full schema (includes parameterSchema) for the matched strategy.
+          const schemaResult = await fetchStrategySchema(matchedByName.name);
+          if (schemaResult.ok) {
+            setSelectedStrategy(schemaResult.data);
+            initDefaults(schemaResult.data);
+          } else {
+            setSelectedStrategy(targetStrategy);
+            initDefaults(targetStrategy);
+          }
+        } else {
+          setSelectedStrategy(targetStrategy);
+          initDefaults(targetStrategy);
+        }
       }
       setIsLoadingStrategies(false);
     }
     void load();
+    // preStrategy intentionally read once on mount — stale-closure is acceptable here.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   function initDefaults(strategy: Strategy) {
@@ -178,6 +207,12 @@ export default function NewRunPage() {
         subtitle="Configure and launch a new backtest, paper, or live trading run."
       />
 
+      {preStrategy && (
+        <div className="rounded-lg border border-indigo-800 bg-indigo-900/20 px-4 py-2 text-xs text-indigo-400">
+          Pre-filled from a previous run. Adjust settings as needed and click Start Run.
+        </div>
+      )}
+
       <form onSubmit={(e) => void handleSubmit(e)} className="space-y-6 lg:max-w-2xl">
         {/* Mode selector */}
         <div className="card space-y-3">
@@ -225,7 +260,7 @@ export default function NewRunPage() {
                 className="mt-1 w-full rounded-lg border border-red-800 bg-slate-800 px-3 py-2 text-sm text-slate-200 focus:border-red-500 focus:outline-none focus:ring-1 focus:ring-red-500"
               />
               <p className="mt-1 text-xs text-red-400">
-                ⚠ This will place real orders. Ensure ENABLE_LIVE_TRADING=true and your API key are set in .env.
+                This will place real orders. Ensure ENABLE_LIVE_TRADING=true and your API key are set in .env.
               </p>
             </div>
           )}

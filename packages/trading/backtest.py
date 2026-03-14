@@ -170,6 +170,7 @@ class BacktestRunner:
                 slippage_bps=slippage_bps,
                 cooldown_after_loss_streak=risk_params.cooldown_after_loss_streak,
                 loss_streak_count=risk_params.loss_streak_count,
+                max_portfolio_exposure_pct=risk_params.max_portfolio_exposure_pct,
             )
         else:
             self._risk_params = RiskParameters(

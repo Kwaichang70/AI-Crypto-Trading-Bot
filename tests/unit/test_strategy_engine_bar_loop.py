@@ -75,6 +75,7 @@ def _make_engine(
     """
     strategy = MagicMock()
     strategy.strategy_id = "test_strategy"
+    strategy.min_bars_required = 20
     strategy.on_start = MagicMock(return_value=None)
     strategy.on_stop = MagicMock(return_value=None)
 

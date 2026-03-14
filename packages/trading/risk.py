@@ -25,6 +25,7 @@ from typing import Any
 
 import structlog
 
+from common.types import OrderSide
 from trading.models import Order, Position, RiskCheckResult
 
 __all__ = [
@@ -48,6 +49,7 @@ class RiskParameters:
     # Position limits
     max_open_positions: int = 3
     max_position_size_pct: float = 0.10   # max 10% of equity per position
+    max_portfolio_exposure_pct: float = 0.30  # max 30% of equity in open positions
 
     # Trade-level risk
     per_trade_risk_pct: float = 0.01      # risk 1% of equity per trade
@@ -57,9 +59,9 @@ class RiskParameters:
     max_daily_loss_pct: float = 0.05      # halt if daily loss >= 5% of start equity
     max_drawdown_pct: float = 0.15        # halt if drawdown >= 15% of peak equity
 
-    # Fee / slippage model
-    taker_fee_pct: float = 0.001          # 0.1% taker fee
-    maker_fee_pct: float = 0.0005         # 0.05% maker fee
+    # Fee / slippage model (Coinbase Advanced Trade lowest tier)
+    taker_fee_pct: float = 0.006          # 0.60% taker fee
+    maker_fee_pct: float = 0.004          # 0.40% maker fee
     slippage_bps: int = 5                 # 5 basis points slippage
 
     # Cooldown
@@ -78,6 +80,11 @@ class RiskParameters:
         if self.max_open_positions < 1:
             raise ValueError(
                 f"max_open_positions must be >= 1, got {self.max_open_positions}"
+            )
+        if not (0 < self.max_portfolio_exposure_pct <= 1.0):
+            raise ValueError(
+                f"max_portfolio_exposure_pct {self.max_portfolio_exposure_pct} "
+                f"out of safe range (0, 1.0]"
             )
 
 
@@ -369,6 +376,32 @@ class BaseRiskManager(abc.ABC):
                 message=(
                     f"Drawdown {drawdown:.1%} exceeds limit "
                     f"{self._params.max_drawdown_pct:.1%}"
+                ),
+                blocking=True,
+            )
+        return None
+
+    def _check_portfolio_exposure(
+        self,
+        order: Order,
+        current_equity: Decimal,
+        open_positions: list[Position],
+    ) -> RiskViolation | None:
+        """Block BUY orders if total portfolio exposure exceeds cap."""
+        if order.side != OrderSide.BUY or current_equity <= Decimal(0):
+            return None
+        total_exposure = sum(
+            (p.notional_value for p in open_positions if not p.is_flat),
+            Decimal(0),
+        )
+        cap = Decimal(str(self._params.max_portfolio_exposure_pct)) * current_equity
+        if total_exposure >= cap:
+            return RiskViolation(
+                rule="max_portfolio_exposure",
+                message=(
+                    f"Total portfolio exposure {total_exposure:.2f} "
+                    f"already at or above cap {cap:.2f} "
+                    f"({self._params.max_portfolio_exposure_pct:.0%} of equity)"
                 ),
                 blocking=True,
             )

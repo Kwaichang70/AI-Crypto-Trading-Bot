@@ -58,6 +58,7 @@ def _make_params(**overrides) -> RiskParameters:
     defaults = {
         "max_open_positions": 3,
         "max_position_size_pct": 0.10,
+        "max_portfolio_exposure_pct": 1.0,  # disabled in unit tests unless explicitly overridden
         "per_trade_risk_pct": 0.01,
         "max_order_size_quote": Decimal("10000"),
         "max_daily_loss_pct": 0.05,

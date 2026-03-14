@@ -154,7 +154,15 @@ class StrategyEngine:
         self._config: dict[str, Any] = config or {}
 
         # Derived configuration
-        self._warmup_bars: int = int(self._config.get("warmup_bars", 50))
+        config_warmup = self._config.get("warmup_bars")
+        if config_warmup is not None:
+            self._warmup_bars = int(config_warmup)
+        else:
+            max_min_bars = max(
+                (s.min_bars_required for s in self._strategies),
+                default=0,
+            )
+            self._warmup_bars = max(max_min_bars * 2, 50)
         self._max_bars_history: int = int(
             self._config.get("max_bars_history", 500)
         )

@@ -84,6 +84,9 @@ class LiveExecutionEngine(BaseExecutionEngine):
         # Position tracking: symbol -> Position
         self._positions: dict[str, Position] = {}
 
+        # Peak equity tracker for drawdown calculation
+        self._peak_equity: Decimal = Decimal("0")
+
         # Map internal order_id -> exchange order ID for reconciliation
         self._exchange_order_map: dict[UUID, str] = {}
 
@@ -831,18 +834,19 @@ class LiveExecutionEngine(BaseExecutionEngine):
 
     async def _fetch_peak_equity(self) -> Decimal:
         """
-        Fetch peak equity. In production this should be tracked by
-        PortfolioAccounting. For now, return current equity as
-        a conservative estimate.
+        Return the highest equity observed during this run.
+
+        Updates the internal peak tracker on each call.
 
         Returns
         -------
         Decimal:
-            Peak equity estimate.
+            Peak equity (highest equity seen since engine start).
         """
-        # TODO: implement full exchange integration
-        # - Wire into PortfolioAccounting for accurate peak tracking
-        return await self._fetch_equity()
+        current = await self._fetch_equity()
+        if current > self._peak_equity:
+            self._peak_equity = current
+        return self._peak_equity
 
     def _calculate_daily_pnl(self) -> Decimal:
         """
@@ -908,6 +912,8 @@ class LiveExecutionEngine(BaseExecutionEngine):
             # - Load exchange markets for symbol validation
             # - Sync existing positions
             await self._exchange.load_markets()
+            # Seed peak equity so the first drawdown check has a baseline.
+            self._peak_equity = await self._fetch_equity()
             self._log.info(
                 "live.engine_started",
                 exchange=self._exchange.id,

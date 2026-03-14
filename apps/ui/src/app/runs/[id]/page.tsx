@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useCallback } from "react";
 import Link from "next/link";
-import { useParams } from "next/navigation";
+import { useParams, useRouter } from "next/navigation";
 import {
   fetchRun,
   fetchPortfolio,
@@ -261,6 +261,7 @@ const POSITION_COLUMNS: Column<Position>[] = [
 
 export default function RunDetailPage() {
   const params = useParams();
+  const router = useRouter();
   const id = params.id as string;
 
   const [run, setRun] = useState<Run | null>(null);
@@ -304,12 +305,32 @@ export default function RunDetailPage() {
     void loadData().finally(() => setIsLoading(false));
   }, [loadData]);
 
-  // Poll every 5 seconds for running runs
+  // Poll every 5 seconds for active runs, pausing when the browser tab is hidden.
   useEffect(() => {
-    if (!run || run.status !== "running") return;
-    const interval = setInterval(() => void loadData(), 5000);
-    return () => clearInterval(interval);
-  }, [run, loadData]);
+    // Only poll while the run is in an active state.
+    if (run?.status !== "running") return;
+
+    const startPolling = () => setInterval(() => void loadData(), 5000);
+
+    let intervalId = startPolling();
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "hidden") {
+        clearInterval(intervalId);
+      } else {
+        // Tab became visible — fetch immediately then restart the interval.
+        void loadData();
+        intervalId = startPolling();
+      }
+    };
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+
+    return () => {
+      clearInterval(intervalId);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, [run?.status, loadData]);
 
   async function handleStop() {
     if (!run) return;
@@ -321,6 +342,18 @@ export default function RunDetailPage() {
       setError(result.error.message);
     }
     setIsStopping(false);
+  }
+
+  function handleDuplicate() {
+    if (!run?.config) return;
+    const { strategy_name, symbols: configSymbols, timeframe, initial_capital } = run.config;
+    const params = new URLSearchParams({
+      strategy: strategy_name ?? "",
+      symbols: Array.isArray(configSymbols) ? configSymbols.join(",") : "",
+      timeframe: timeframe ?? "",
+      initial_capital: initial_capital ?? "",
+    });
+    router.push(`/runs/new?${params.toString()}`);
   }
 
   if (isLoading) {
@@ -352,6 +385,9 @@ export default function RunDetailPage() {
   const strategyName = run.config?.strategy_name ?? "Unknown strategy";
   const symbols = run.config?.symbols?.join(", ") ?? "—";
 
+  const isDone =
+    run.status === "stopped" || run.status === "error";
+
   return (
     <div className="space-y-6">
       {/* Back link */}
@@ -364,15 +400,25 @@ export default function RunDetailPage() {
         title={`Run ${run.id.slice(0, 8)}…`}
         subtitle={`${run.runMode} · ${strategyName} · ${symbols}`}
         actions={
-          run.status === "running" ? (
-            <button
-              onClick={() => void handleStop()}
-              disabled={isStopping}
-              className="rounded-lg border border-red-700 bg-red-900/20 px-4 py-2 text-sm font-medium text-red-400 transition-colors hover:bg-red-900/40 disabled:opacity-50"
-            >
-              {isStopping ? "Stopping…" : "Stop Run"}
-            </button>
-          ) : null
+          <div className="flex items-center gap-2">
+            {run.status === "running" && (
+              <button
+                onClick={() => void handleStop()}
+                disabled={isStopping}
+                className="rounded-lg border border-red-700 bg-red-900/20 px-4 py-2 text-sm font-medium text-red-400 transition-colors hover:bg-red-900/40 disabled:opacity-50"
+              >
+                {isStopping ? "Stopping…" : "Stop Run"}
+              </button>
+            )}
+            {isDone && (
+              <button
+                onClick={handleDuplicate}
+                className="rounded-lg border border-slate-700 bg-slate-800/60 px-4 py-2 text-sm font-medium text-slate-300 transition-colors hover:border-indigo-500 hover:bg-indigo-600/10 hover:text-indigo-300"
+              >
+                Duplicate Run
+              </button>
+            )}
+          </div>
         }
       />
 

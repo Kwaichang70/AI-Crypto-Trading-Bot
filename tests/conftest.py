@@ -266,10 +266,10 @@ def sample_market_order() -> Order:
 
 @pytest.fixture
 def sample_buy_fill() -> Fill:
-    """A BUY fill for 0.01 BTC at 50_000 USDT with 0.1% taker fee."""
+    """A BUY fill for 0.01 BTC at 50_000 USDT with 0.6% taker fee."""
     qty = Decimal("0.01")
     price = Decimal("50000")
-    fee = qty * price * Decimal("0.001")
+    fee = qty * price * Decimal("0.006")
     return Fill(
         order_id=uuid4(),
         symbol=_SYMBOL,
@@ -285,10 +285,10 @@ def sample_buy_fill() -> Fill:
 
 @pytest.fixture
 def sample_sell_fill() -> Fill:
-    """A SELL fill for 0.01 BTC at 51_000 USDT with 0.1% taker fee."""
+    """A SELL fill for 0.01 BTC at 51_000 USDT with 0.6% taker fee."""
     qty = Decimal("0.01")
     price = Decimal("51000")
-    fee = qty * price * Decimal("0.001")
+    fee = qty * price * Decimal("0.006")
     return Fill(
         order_id=uuid4(),
         symbol=_SYMBOL,
