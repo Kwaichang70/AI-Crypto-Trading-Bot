@@ -918,6 +918,10 @@ async def _run_live_engine(
     execution: Any = None
     exchange: Any = None
 
+    # Incremental flush state — mirrors paper engine pattern (Sprint 25)
+    flush_state = _IncrementalFlushState()
+    flush_task: asyncio.Task[None] | None = None
+
     try:
         settings = get_settings()
         capital = Decimal(initial_capital)
@@ -988,10 +992,29 @@ async def _run_live_engine(
 
         await engine.start(run_id_str)
         log.info("runs.live_engine_running")
+
+        # Start periodic incremental flush (Sprint 25 — mirrors paper engine)
+        flush_task = asyncio.create_task(
+            _incremental_flush_loop(
+                run_id_str=run_id_str,
+                portfolio=portfolio,
+                execution_engine=execution,
+                state=flush_state,
+                flush_interval=30.0,
+                log=log,
+            )
+        )
+
         await engine.run_live_loop()
 
     except asyncio.CancelledError:
         log.info("runs.live_engine_cancelled")
+        if flush_task is not None and not flush_task.done():
+            flush_task.cancel()
+            try:
+                await flush_task
+            except (asyncio.CancelledError, Exception):
+                pass
         if engine is not None:
             try:
                 await engine.stop()
@@ -1002,6 +1025,12 @@ async def _run_live_engine(
     except Exception:
         final_status = "error"
         log.exception("runs.live_engine_error")
+        if flush_task is not None and not flush_task.done():
+            flush_task.cancel()
+            try:
+                await flush_task
+            except (asyncio.CancelledError, Exception):
+                pass
         if engine is not None:
             try:
                 await engine.stop()
@@ -1009,8 +1038,28 @@ async def _run_live_engine(
                 log.exception("runs.live_engine_stop_error")
 
     finally:
+        # Belt-and-suspenders: cancel flush task if it somehow survived
+        if flush_task is not None and not flush_task.done():
+            flush_task.cancel()
+            try:
+                await flush_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
         # Remove from task registry
         _RUN_TASKS.pop(run_id_str, None)
+
+        # Final incremental flush captures any remaining data not covered by
+        # the last periodic flush cycle — must run BEFORE status update so
+        # clients see complete data when the run transitions to 'stopped'
+        if portfolio is not None:
+            await _flush_incremental(
+                run_id_str=run_id_str,
+                portfolio=portfolio,
+                execution_engine=execution,
+                state=flush_state,
+                log=log,
+            )
 
         # Update run status in DB using an isolated session
         try:
@@ -1036,15 +1085,6 @@ async def _run_live_engine(
                     log.exception("runs.live_engine_db_update_failed")
         except Exception:
             log.exception("runs.live_engine_db_session_failed")
-
-        # Persist equity curve, trades, orders, fills, and positions
-        if portfolio is not None:
-            await _persist_paper_results(
-                run_id_str=run_id_str,
-                portfolio=portfolio,
-                execution_engine=execution,
-                log=log,
-            )
 
         # Close exchange connection (belt-and-suspenders; LiveExecutionEngine.on_stop
         # also closes it, but this covers cases where on_stop was never reached)

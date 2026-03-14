@@ -28,13 +28,15 @@ Design notes
       trading.portfolio.PortfolioAccounting
       trading.risk_manager.DefaultRiskManager
       trading.strategy_engine.StrategyEngine
-      api.routers.runs._persist_paper_results   (intra-module reference)
+      api.routers.runs._flush_incremental        (intra-module reference)
+      api.routers.runs._incremental_flush_loop   (intra-module reference)
 
 - The coroutine always executes the ``finally`` block, which:
-  1. Removes the run_id from _RUN_TASKS.
-  2. Updates the run status in the DB.
-  3. Calls _persist_paper_results when portfolio is not None.
-  4. Calls exchange.close().
+  1. Cancels the periodic flush task (if running).
+  2. Removes the run_id from _RUN_TASKS.
+  3. Calls _flush_incremental (final flush) when portfolio is not None.
+  4. Updates the run status in the DB.
+  5. Calls exchange.close().
 
 - StrategyEngine.run_live_loop() is the natural "park" point for the coroutine.
   Tests configure it to either return normally (normal stop) or raise an
@@ -84,7 +86,8 @@ _PT_LIVE_ENGINE = "trading.engines.live.LiveExecutionEngine"
 _PT_PORTFOLIO = "trading.portfolio.PortfolioAccounting"
 _PT_RISK_MGR = "trading.risk_manager.DefaultRiskManager"
 _PT_STRAT_ENGINE = "trading.strategy_engine.StrategyEngine"
-_PT_PERSIST = "api.routers.runs._persist_paper_results"
+_PT_FLUSH = "api.routers.runs._flush_incremental"
+_PT_FLUSH_LOOP = "api.routers.runs._incremental_flush_loop"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -147,7 +150,6 @@ def _make_db_session_factory(run_status: str = "running") -> tuple[MagicMock, Ma
     db_mock.execute = AsyncMock(return_value=mock_execute_result)
     db_mock.commit = AsyncMock()
     db_mock.rollback = AsyncMock()
-    db_mock.add_all = MagicMock()
 
     # Async context manager: async with factory() as db
     async_ctx = MagicMock()
@@ -287,7 +289,8 @@ class TestRunLiveEngine:
             patch(_PT_PORTFOLIO, portfolio_cls),
             patch(_PT_RISK_MGR, risk_mgr_cls),
             patch(_PT_STRAT_ENGINE, se_cls_mock),
-            patch(_PT_PERSIST, new_callable=AsyncMock),
+            patch(_PT_FLUSH, new_callable=AsyncMock),
+            patch(_PT_FLUSH_LOOP, new_callable=AsyncMock),
         ):
             await _run_live_engine(
                 run_id_str=_RUN_ID,
@@ -332,7 +335,8 @@ class TestRunLiveEngine:
             patch(_PT_PORTFOLIO, MagicMock()),
             patch(_PT_RISK_MGR, MagicMock()),
             patch(_PT_STRAT_ENGINE, se_cls_mock),
-            patch(_PT_PERSIST, new_callable=AsyncMock),
+            patch(_PT_FLUSH, new_callable=AsyncMock),
+            patch(_PT_FLUSH_LOOP, new_callable=AsyncMock),
         ):
             await _run_live_engine(
                 run_id_str=_RUN_ID,
@@ -352,21 +356,22 @@ class TestRunLiveEngine:
         )
 
     @pytest.mark.asyncio
-    async def test_run_live_engine_persists_on_normal_stop(self) -> None:
+    async def test_run_live_engine_flushes_on_normal_stop(self) -> None:
         """
-        When run_live_loop() completes normally, _persist_paper_results must
-        be called exactly once in the finally block.
+        When run_live_loop() completes normally, _flush_incremental must
+        be called at least once in the finally block (the final flush).
 
-        This verifies the persistence contract for the clean-stop path (e.g.
-        the DELETE /runs/{id} endpoint cancels the task via CancelledError,
-        but here we test the normal completion path for coverage).
+        This verifies the persistence contract for the clean-stop path.
+        Sprint 25 replaced the one-time _persist_paper_results with
+        incremental flushing — the final _flush_incremental in the finally
+        block captures any remaining data.
         """
         settings_mock = _make_settings_mock()
         get_sf_mock, _ = _make_db_session_factory()
         ccxt_module_mock, _ = _make_ccxt_module_mock()
         se_cls_mock, _ = _make_strategy_engine_mock(raise_on_run_loop=None)
         strategy_cls_mock = _make_strategy_cls_mock()
-        persist_mock = AsyncMock()
+        flush_mock = AsyncMock()
 
         _RUN_TASKS.pop(_RUN_ID, None)
 
@@ -379,7 +384,8 @@ class TestRunLiveEngine:
             patch(_PT_PORTFOLIO, MagicMock()),
             patch(_PT_RISK_MGR, MagicMock()),
             patch(_PT_STRAT_ENGINE, se_cls_mock),
-            patch(_PT_PERSIST, persist_mock),
+            patch(_PT_FLUSH, flush_mock),
+            patch(_PT_FLUSH_LOOP, new_callable=AsyncMock),
         ):
             await _run_live_engine(
                 run_id_str=_RUN_ID,
@@ -391,11 +397,14 @@ class TestRunLiveEngine:
                 initial_capital=_INITIAL_CAPITAL,
             )
 
-        persist_mock.assert_called_once()
-        call_kwargs = persist_mock.call_args.kwargs
+        flush_mock.assert_called_once()
+        call_kwargs = flush_mock.call_args.kwargs
         assert call_kwargs.get("run_id_str") == _RUN_ID, (
-            f"_persist_paper_results called with wrong run_id_str: "
+            f"_flush_incremental called with wrong run_id_str: "
             f"{call_kwargs.get('run_id_str')!r}"
+        )
+        assert "state" in call_kwargs, (
+            "_flush_incremental must receive 'state' kwarg (flush_state)"
         )
 
     @pytest.mark.asyncio
@@ -434,7 +443,8 @@ class TestRunLiveEngine:
             patch(_PT_PORTFOLIO, MagicMock()),
             patch(_PT_RISK_MGR, MagicMock()),
             patch(_PT_STRAT_ENGINE, se_cls_mock),
-            patch(_PT_PERSIST, new_callable=AsyncMock),
+            patch(_PT_FLUSH, new_callable=AsyncMock),
+            patch(_PT_FLUSH_LOOP, new_callable=AsyncMock),
         ):
             await _run_live_engine(
                 run_id_str=_RUN_ID,
@@ -480,7 +490,8 @@ class TestRunLiveEngine:
             patch(_PT_PORTFOLIO, MagicMock()),
             patch(_PT_RISK_MGR, MagicMock()),
             patch(_PT_STRAT_ENGINE, se_cls_mock),
-            patch(_PT_PERSIST, new_callable=AsyncMock),
+            patch(_PT_FLUSH, new_callable=AsyncMock),
+            patch(_PT_FLUSH_LOOP, new_callable=AsyncMock),
         ):
             await _run_live_engine(
                 run_id_str=_RUN_ID,
@@ -529,7 +540,8 @@ class TestRunLiveEngine:
             patch(_PT_PORTFOLIO, MagicMock()),
             patch(_PT_RISK_MGR, MagicMock()),
             patch(_PT_STRAT_ENGINE, se_cls_mock),
-            patch(_PT_PERSIST, new_callable=AsyncMock),
+            patch(_PT_FLUSH, new_callable=AsyncMock),
+            patch(_PT_FLUSH_LOOP, new_callable=AsyncMock),
         ):
             await _run_live_engine(
                 run_id_str=_RUN_ID,
@@ -577,7 +589,8 @@ class TestRunLiveEngine:
             patch(_PT_PORTFOLIO, MagicMock()),
             patch(_PT_RISK_MGR, MagicMock()),
             patch(_PT_STRAT_ENGINE, se_cls_mock),
-            patch(_PT_PERSIST, new_callable=AsyncMock),
+            patch(_PT_FLUSH, new_callable=AsyncMock),
+            patch(_PT_FLUSH_LOOP, new_callable=AsyncMock),
         ):
             await _run_live_engine(
                 run_id_str=_RUN_ID,
