@@ -19,6 +19,9 @@ from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 
 from common.types import TimeFrame
+# TODO(sprint-30): extract to api.services.market_data / api.services.strategy_registry
+from api.routers.runs import _fetch_bars_for_backtest, _get_strategy_registry
+from trading.optimizer import SUPPORTED_METRICS, ParameterOptimizer
 
 __all__ = ["router"]
 
@@ -144,10 +147,6 @@ async def run_optimization(body: OptimizeRequest) -> OptimizeResponse:
         symbols=body.symbols,
     )
     log.info("optimize.requested")
-
-    # TODO(sprint-30): extract to api.services.market_data / api.services.strategy_registry
-    from api.routers.runs import _fetch_bars_for_backtest, _get_strategy_registry
-    from trading.optimizer import SUPPORTED_METRICS, ParameterOptimizer
 
     # Validate strategy name
     registry = _get_strategy_registry()

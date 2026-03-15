@@ -279,3 +279,21 @@
   - [x] P1: Gebruikershandleiding (Dutch user guide) — docs/gebruikershandleiding.md (618 lines, 11 sections)
   - [x] P2: Unit tests — 4 new tests (fetch_order_trades fallback + passphrase wiring)
   - [x] P2: 1069 tests pass, 0 mypy errors
+
+### 23. AI Crypto Trading Bot — Sprint 22–28 (Incremental Flush → Multi-Timeframe)
+- **Plan:** `.claude/plans/eventual-wandering-lecun.md`
+- **Status:** COMPLETE — see MEMORY.md for full sprint details
+- **Sprints:** 22 (live equity flush), 23 (adaptive ML retraining), 24 (orphan run recovery), 25 (live engine flush), 26 (security hardening), 27 (trailing stop-loss), 28 (multi-timeframe analysis)
+
+### 24. AI Crypto Trading Bot — Sprint 29 (Parameter Grid Search Optimizer)
+- **Plan:** `.claude/plans/eventual-wandering-lecun.md`
+- **Status:** COMPLETE
+- **Orchestration Checklist:**
+  - [x] P0: ParameterOptimizer class — grid search, SUPPORTED_METRICS, ascending/descending ranking (9f3a59c)
+  - [x] P0: POST /api/v1/optimize endpoint — fetch-once, run-many pattern, max_combinations ≤ 1000 (9f3a59c)
+  - [x] P0: Register optimize router in main.py with API key auth (9f3a59c)
+  - [x] P0: Export optimizer public API from packages/trading/__init__.py (9f3a59c)
+  - [x] P0: Architecture critic review — APPROVED_WITH_CONDITIONS (AR-001 TODO, AR-004/AR-005 cap) (9f3a59c)
+  - [x] P1: Unit tests — 22 tests across 5 classes (test_parameter_optimizer.py) (9f3a59c)
+  - [x] P1: Fix trailing_stop_pct empty string crash from UI form (9ffbe96)
+  - [x] P2: 1045 tests pass, 0 mypy errors

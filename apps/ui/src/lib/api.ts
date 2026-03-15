@@ -16,6 +16,8 @@ import type {
   FillListResponse,
   ModelVersion,
   ModelVersionListResponse,
+  OptimizeRequest,
+  OptimizeResponse,
   OrderListResponse,
   Portfolio,
   PositionListResponse,
@@ -417,6 +419,29 @@ function httpStatusMessage(status: number): string {
     504: "Gateway timeout — the API took too long to respond.",
   };
   return messages[status] ?? `HTTP ${status} — an error occurred.`;
+}
+
+// ---------------------------------------------------------------------------
+// Optimization
+// ---------------------------------------------------------------------------
+
+/**
+ * POST /api/v1/optimize — run a parameter grid search.
+ *
+ * Uses a 300 s timeout because a large grid (e.g. 500 combinations) can take
+ * several minutes of sequential backtest execution on the server.
+ */
+export async function runOptimization(
+  body: OptimizeRequest,
+): Promise<ApiResult<OptimizeResponse>> {
+  return apiFetch<OptimizeResponse>(
+    "/api/v1/optimize",
+    {
+      method: "POST",
+      body: JSON.stringify(body),
+    },
+    300_000,
+  );
 }
 
 // ---------------------------------------------------------------------------

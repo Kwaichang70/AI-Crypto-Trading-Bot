@@ -341,3 +341,44 @@ export interface ModelVersionListResponse {
   items: readonly ModelVersion[];
   total: number;
 }
+
+// ---------------------------------------------------------------------------
+// Parameter Optimization
+// ---------------------------------------------------------------------------
+
+export interface OptimizeRequest {
+  strategyName: string;
+  paramGrid: Record<string, unknown[]>;
+  symbols: string[];
+  timeframe: string;
+  backtestStart: string;
+  backtestEnd: string;
+  initialCapital?: string;
+  rankBy?: string;
+  topN?: number;
+  maxCombinations?: number;
+}
+
+export interface OptimizeEntry {
+  rank: number;
+  /** Parameter values for this combination (snake_case keys). */
+  params: Record<string, unknown>;
+  /**
+   * Metric values keyed by snake_case name, e.g. "sharpe_ratio".
+   * Note: these keys are NOT camelCased — the backend passes them through
+   * as raw dict values, bypassing Pydantic's alias_generator.
+   */
+  metrics: Record<string, number>;
+}
+
+export interface OptimizeResponse {
+  strategyName: string;
+  symbols: readonly string[];
+  timeframe: string;
+  rankBy: string;
+  totalCombinations: number;
+  completedCombinations: number;
+  failedCombinations: number;
+  elapsedSeconds: number;
+  entries: readonly OptimizeEntry[];
+}
