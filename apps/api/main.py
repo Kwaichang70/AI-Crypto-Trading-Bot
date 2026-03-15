@@ -319,7 +319,7 @@ def _register_routes(application: FastAPI) -> None:
             "timestamp": dt.now(tz=UTC).isoformat(),
         }
 
-    from api.routers import ml, orders, portfolio, runs, strategies
+    from api.routers import ml, optimize, orders, portfolio, runs, strategies
 
     _V1 = "/api/v1"
 
@@ -361,6 +361,13 @@ def _register_routes(application: FastAPI) -> None:
         ml.router,
         prefix=_V1,
         tags=["ml"],
+        dependencies=[Depends(require_api_key)],
+    )
+
+    application.include_router(
+        optimize.router,
+        prefix=_V1,
+        tags=["optimize"],
         dependencies=[Depends(require_api_key)],
     )
 

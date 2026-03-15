@@ -7,6 +7,7 @@ and orchestration.
 
 from trading.backtest import BacktestRunner
 from trading.execution import BaseExecutionEngine
+from trading.optimizer import OptimizationEntry, OptimizationResult, ParameterOptimizer
 from trading.metrics import (
     BacktestResult,
     EquityCurvePoint,
@@ -39,6 +40,10 @@ __all__ = [
     # Orchestrator
     "StrategyEngine",
     "EngineState",
+    # Optimization
+    "ParameterOptimizer",
+    "OptimizationResult",
+    "OptimizationEntry",
     # Backtesting
     "BacktestRunner",
     "BacktestResult",
