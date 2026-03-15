@@ -64,7 +64,9 @@ function OptimizationHistory() {
     setIsLoading(true);
     fetchOptimizationRuns({ limit: 10 }).then((r) => {
       if (r.ok) {
-        setRuns(r.data.items);
+        // API returns plain array or { items } envelope — handle both
+        const data = r.data as any;
+        setRuns(Array.isArray(data) ? data : (data.items ?? []));
       } else {
         setError(r.error.message);
       }
@@ -328,7 +330,7 @@ export default function OptimizePage() {
     const endIso = toUtcIso(backtestEnd);
 
     const result = await createRun({
-      strategyName: phase.data.strategyName, // CR-003: always use result strategy name
+      strategyName: selectedStrategy?.name ?? phase.data.strategyName,
       strategyParams: entry.params,
       symbols: [...phase.data.symbols],
       timeframe: phase.data.timeframe,

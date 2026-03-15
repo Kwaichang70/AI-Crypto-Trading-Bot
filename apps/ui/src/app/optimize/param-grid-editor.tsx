@@ -26,7 +26,10 @@ export function ParamGridEditor({
   function addRow() {
     const used = new Set(rows.map((r) => r.paramName));
     const next = paramNames.find((n) => !used.has(n)) ?? paramNames[0] ?? "";
-    onChange([...rows, { id: crypto.randomUUID(), paramName: next, valuesRaw: "" }]);
+    const id = typeof crypto !== "undefined" && crypto.randomUUID
+      ? crypto.randomUUID()
+      : `row-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+    onChange([...rows, { id, paramName: next, valuesRaw: "" }]);
   }
 
   function removeRow(idx: number) {
