@@ -26,6 +26,7 @@ All ORM model classes are also re-exported so callers can do:
 
     from api.db import RunORM, OrderORM, PositionSnapshotORM, ModelVersionORM
     from api.db import OptimizationRunORM, OptimizationEntryORM
+    from api.db import SkippedTradeORM
 """
 
 from __future__ import annotations
@@ -43,6 +44,7 @@ from api.db.models import (  # noqa: F401 — side-effect import registers model
     PositionSnapshotORM,
     RunORM,
     SignalORM,
+    SkippedTradeORM,
     TradeORM,
 )
 from api.db.session import (
@@ -65,6 +67,7 @@ __all__ = [
     "OrderORM",
     "FillORM",
     "TradeORM",
+    "SkippedTradeORM",
     "EquitySnapshotORM",
     "SignalORM",
     "PositionSnapshotORM",

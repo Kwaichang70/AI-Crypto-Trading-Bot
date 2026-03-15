@@ -4,7 +4,7 @@ apps/api/db/models.py
 SQLAlchemy 2.0 ORM models for the AI Crypto Trading Bot persistence layer.
 
 Design principles:
-- All monetary values use Numeric(20, 8) — never Float — to avoid IEEE-754 rounding
+- All monetary values use Numeric(20, 8)  -- never Float  -- to avoid IEEE-754 rounding
   errors that are catastrophic in financial accounting.
 - Enum columns use String storage, not PostgreSQL native ENUM types. This avoids
   the painful ALTER TYPE migrations required when adding enum members (e.g., new
@@ -13,13 +13,13 @@ Design principles:
   and signal context without sacrificing PostgreSQL's indexing capabilities.
 - All timestamps are stored WITH TIME ZONE. UTC is enforced at the application
   layer via Pydantic validators; the database stores the offset for correctness.
-- Composite and partial indexes are placed deliberately — every query pattern that
+- Composite and partial indexes are placed deliberately  -- every query pattern that
   appears in the execution hot-path has a covering index.
 
 Relationship to Pydantic models (packages/trading/models.py):
 - These ORM models mirror the Pydantic domain models but are NOT the same objects.
 - Conversion helpers belong in the service layer, not here.
-- Do not import from trading.models here — that would create a circular dependency.
+- Do not import from trading.models here  -- that would create a circular dependency.
 """
 
 from __future__ import annotations
@@ -52,6 +52,7 @@ __all__ = [
     "OrderORM",
     "FillORM",
     "TradeORM",
+    "SkippedTradeORM",
     "EquitySnapshotORM",
     "SignalORM",
     "PositionSnapshotORM",
@@ -76,13 +77,13 @@ class Base(DeclarativeBase):
 
 
 # ---------------------------------------------------------------------------
-# Monetary precision constant — never use Float for money
+# Monetary precision constant  -- never use Float for money
 # ---------------------------------------------------------------------------
 _MONEY = Numeric(precision=20, scale=8)
 
 
 # ---------------------------------------------------------------------------
-# 1. runs — Trading session records
+# 1. runs  -- Trading session records
 # ---------------------------------------------------------------------------
 
 class RunORM(Base):
@@ -120,7 +121,7 @@ class RunORM(Base):
         ),
     )
 
-    # Primary key — UUID v4 generated at the application layer so callers
+    # Primary key  -- UUID v4 generated at the application layer so callers
     # know the run_id before the INSERT completes (important for async flows).
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
@@ -129,7 +130,7 @@ class RunORM(Base):
         comment="Unique run identifier (UUID v4)",
     )
 
-    # Enum stored as String — see module docstring for rationale.
+    # Enum stored as String  -- see module docstring for rationale.
     run_mode: Mapped[str] = mapped_column(
         String(16),
         nullable=False,
@@ -142,7 +143,7 @@ class RunORM(Base):
         comment="Current run state: running | stopped | error",
     )
 
-    # Strategy configuration snapshot — stored at run creation time.
+    # Strategy configuration snapshot  -- stored at run creation time.
     # Includes: strategy_id, symbols, timeframe, risk params, etc.
     config: Mapped[dict[str, Any]] = mapped_column(
         JSONB,
@@ -163,7 +164,7 @@ class RunORM(Base):
         comment="UTC timestamp when the run was stopped or errored. NULL = still running",
     )
 
-    # Recovery self-reference (Sprint 24) — set on the NEW run that replaced
+    # Recovery self-reference (Sprint 24)  -- set on the NEW run that replaced
     # an orphaned run after an API restart.  NULL for all non-recovered runs.
     recovered_from_run_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
@@ -185,11 +186,11 @@ class RunORM(Base):
         server_default=func.now(),
         # NOTE: updated_at is maintained by the trigger_set_updated_at()
         # PostgreSQL trigger (defined in migration 001). Do not add onupdate=
-        # here — it conflicts with the trigger and causes double-write overhead.
-        comment="Row last-update time — maintained by DB trigger",
+        # here  -- it conflicts with the trigger and causes double-write overhead.
+        comment="Row last-update time  -- maintained by DB trigger",
     )
 
-    # Relationships — lazy="select" is the 2.0-safe default.
+    # Relationships  -- lazy="select" is the 2.0-safe default.
     # Use selectin_load() in query code for N+1 prevention.
     orders: Mapped[list[OrderORM]] = relationship(
         "OrderORM",
@@ -199,6 +200,12 @@ class RunORM(Base):
     )
     trades: Mapped[list[TradeORM]] = relationship(
         "TradeORM",
+        back_populates="run",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+    skipped_trades: Mapped[list[SkippedTradeORM]] = relationship(
+        "SkippedTradeORM",
         back_populates="run",
         cascade="all, delete-orphan",
         passive_deletes=True,
@@ -228,7 +235,7 @@ class RunORM(Base):
 
 
 # ---------------------------------------------------------------------------
-# 2. orders — Order state machine records
+# 2. orders  -- Order state machine records
 # ---------------------------------------------------------------------------
 
 class OrderORM(Base):
@@ -240,11 +247,11 @@ class OrderORM(Base):
     PARTIAL -> FILLED (or CANCELED / REJECTED / EXPIRED).
 
     Index strategy:
-    - (run_id) — fetch all orders for a run
-    - (client_order_id) UNIQUE — idempotency enforcement at the DB layer
-    - (exchange_order_id) — reconciliation lookups from exchange callbacks
-    - (run_id, symbol) — symbol-level P&L queries within a run
-    - (status) PARTIAL — monitoring open/partial orders (hot path for the execution engine)
+    - (run_id)  -- fetch all orders for a run
+    - (client_order_id) UNIQUE  -- idempotency enforcement at the DB layer
+    - (exchange_order_id)  -- reconciliation lookups from exchange callbacks
+    - (run_id, symbol)  -- symbol-level P&L queries within a run
+    - (status) PARTIAL  -- monitoring open/partial orders (hot path for the execution engine)
     """
 
     __tablename__ = "orders"
@@ -277,7 +284,7 @@ class OrderORM(Base):
         Index("ix_orders_run_id", "run_id"),
         Index("ix_orders_exchange_order_id", "exchange_order_id"),
         Index("ix_orders_run_id_symbol", "run_id", "symbol"),
-        # Partial index — only index non-terminal orders to keep the index small.
+        # Partial index  -- only index non-terminal orders to keep the index small.
         # The execution engine polls this frequently; terminal orders are rarely queried.
         Index(
             "ix_orders_status_active",
@@ -361,7 +368,7 @@ class OrderORM(Base):
         nullable=False,
         server_default=func.now(),
         # NOTE: Maintained by trigger_set_updated_at() DB trigger (migration 001).
-        comment="Row last-update time — maintained by DB trigger",
+        comment="Row last-update time  -- maintained by DB trigger",
     )
 
     # Relationships
@@ -381,7 +388,7 @@ class OrderORM(Base):
 
 
 # ---------------------------------------------------------------------------
-# 3. fills — Execution fill events
+# 3. fills  -- Execution fill events
 # ---------------------------------------------------------------------------
 
 class FillORM(Base):
@@ -392,9 +399,9 @@ class FillORM(Base):
     ``is_maker`` flag differentiates maker/taker fee tiers.
 
     Index strategy:
-    - (order_id) — retrieve all fills for an order (join from orders)
-    - (order_id, symbol) composite — P&L aggregation queries
-    - (executed_at) — time-range queries for reporting
+    - (order_id)  -- retrieve all fills for an order (join from orders)
+    - (order_id, symbol) composite  -- P&L aggregation queries
+    - (executed_at)  -- time-range queries for reporting
     """
 
     __tablename__ = "fills"
@@ -485,7 +492,7 @@ class FillORM(Base):
 
 
 # ---------------------------------------------------------------------------
-# 4. trades — Completed round-trip trade records
+# 4. trades  -- Completed round-trip trade records
 # ---------------------------------------------------------------------------
 
 class TradeORM(Base):
@@ -495,11 +502,17 @@ class TradeORM(Base):
     Written to the database when a position is fully closed by the portfolio
     accounting service. Maps to the ``TradeResult`` Pydantic domain model.
 
+    Sprint 32 additions:
+    - mae_pct, mfe_pct: Maximum Adverse/Favorable Excursion as fraction of entry
+    - exit_reason: Classified exit trigger (trailing_stop, signal_exit, etc.)
+    - regime_at_entry: Market regime label at position open
+    - signal_context: JSONB snapshot of indicator values at entry
+
     Index strategy:
-    - (run_id) — all trades for a run
-    - (run_id, symbol) — per-symbol P&L within a run
-    - (strategy_id) — aggregate performance by strategy
-    - (entry_at, exit_at) — time-range queries for backtest reporting
+    - (run_id)  -- all trades for a run
+    - (run_id, symbol)  -- per-symbol P&L within a run
+    - (strategy_id)  -- aggregate performance by strategy
+    - (entry_at, exit_at)  -- time-range queries for backtest reporting
     """
 
     __tablename__ = "trades"
@@ -523,6 +536,11 @@ class TradeORM(Base):
         CheckConstraint(
             "exit_at >= entry_at",
             name="ck_trades_exit_after_entry",
+        ),
+        CheckConstraint(
+            "exit_reason IS NULL OR exit_reason IN "
+            "('take_profit', 'stop_loss', 'trailing_stop', 'signal_exit', 'regime_change', 'manual')",
+            name="ck_trades_exit_reason",
         ),
         Index("ix_trades_run_id", "run_id"),
         Index("ix_trades_run_id_symbol", "run_id", "symbol"),
@@ -593,6 +611,33 @@ class TradeORM(Base):
         comment="Identifier of the strategy that generated the opening signal",
     )
 
+    # Sprint 32: Adaptive learning fields
+    mae_pct: Mapped[Decimal | None] = mapped_column(
+        Numeric(10, 6),
+        nullable=True,
+        comment="Maximum Adverse Excursion as fraction of entry price (Sprint 32)",
+    )
+    mfe_pct: Mapped[Decimal | None] = mapped_column(
+        Numeric(10, 6),
+        nullable=True,
+        comment="Maximum Favorable Excursion as fraction of entry price (Sprint 32)",
+    )
+    exit_reason: Mapped[str | None] = mapped_column(
+        String(32),
+        nullable=True,
+        comment="Exit trigger: take_profit|stop_loss|trailing_stop|signal_exit|regime_change|manual",
+    )
+    regime_at_entry: Mapped[str | None] = mapped_column(
+        String(16),
+        nullable=True,
+        comment="Market regime at position open: RISK_ON|NEUTRAL|RISK_OFF",
+    )
+    signal_context: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB,
+        nullable=True,
+        comment="Indicator snapshot at entry time for adaptive learning",
+    )
+
     # Relationships
     run: Mapped[RunORM] = relationship("RunORM", back_populates="trades")
 
@@ -604,7 +649,96 @@ class TradeORM(Base):
 
 
 # ---------------------------------------------------------------------------
-# 5. equity_snapshots — Equity curve data points
+# 4b. skipped_trades  -- Trades evaluated but not taken (Sprint 32)
+# ---------------------------------------------------------------------------
+
+class SkippedTradeORM(Base):
+    """
+    Records trades that were evaluated but not taken.
+
+    Persisted for adaptive learning analysis. Allows comparison between
+    hypothetical outcomes of risk-blocked trades and actual outcomes of
+    trades that were taken.
+
+    Index strategy:
+    - (run_id)  -- all skipped trades for a run
+    - (run_id, symbol)  -- per-symbol skip analysis
+    - (skipped_at)  -- time-range queries
+    """
+
+    __tablename__ = "skipped_trades"
+    __table_args__ = (
+        Index("ix_skipped_trades_run_id", "run_id"),
+        Index("ix_skipped_trades_run_id_symbol", "run_id", "symbol"),
+        Index("ix_skipped_trades_skipped_at", "skipped_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        comment="Skipped trade UUID (maps to SkippedTrade.skip_id in domain model)",
+    )
+    run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("runs.id", ondelete="CASCADE"),
+        nullable=False,
+        comment="FK to the run that produced this skip event",
+    )
+    symbol: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        comment="Trading pair that was evaluated, e.g. BTC/USDT",
+    )
+    skip_reason: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        comment="Human-readable reason the trade was not taken (e.g. risk rule name)",
+    )
+    regime_at_skip: Mapped[str | None] = mapped_column(
+        String(16),
+        nullable=True,
+        comment="Market regime label at skip time",
+    )
+    signal_context: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB,
+        nullable=True,
+        comment="Indicator snapshot at skip time for adaptive learning",
+    )
+    hypothetical_entry_price: Mapped[Decimal | None] = mapped_column(
+        Numeric(20, 8),
+        nullable=True,
+        comment="Price at which the trade would have been entered",
+    )
+    hypothetical_outcome_pct: Mapped[Decimal | None] = mapped_column(
+        Numeric(10, 6),
+        nullable=True,
+        comment="Hypothetical return pct if the trade had been taken (filled post-hoc)",
+    )
+    hypothetical_outcome_filled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="UTC timestamp when the hypothetical outcome was computed",
+    )
+    skipped_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        comment="UTC timestamp when the skip event occurred",
+    )
+
+    # Relationships
+    run: Mapped[RunORM] = relationship("RunORM", back_populates="skipped_trades")
+
+    def __repr__(self) -> str:
+        return (
+            f"<SkippedTradeORM id={self.id} symbol={self.symbol} "
+            f"reason={self.skip_reason}>"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 5. equity_snapshots  -- Equity curve data points
 # ---------------------------------------------------------------------------
 
 class EquitySnapshotORM(Base):
@@ -615,12 +749,12 @@ class EquitySnapshotORM(Base):
     equity curve used by the backtesting metrics engine (Sharpe, Sortino,
     max drawdown calculations).
 
-    Uses a BigInteger serial PK rather than UUID for insert performance —
+    Uses a BigInteger serial PK rather than UUID for insert performance  --
     these rows are written at very high frequency during backtests.
 
     Index strategy:
-    - (run_id, bar_index) UNIQUE — prevents duplicate snapshots per bar
-    - (run_id, timestamp) — time-range queries for equity curve plotting
+    - (run_id, bar_index) UNIQUE  -- prevents duplicate snapshots per bar
+    - (run_id, timestamp)  -- time-range queries for equity curve plotting
     """
 
     __tablename__ = "equity_snapshots"
@@ -638,7 +772,7 @@ class EquitySnapshotORM(Base):
         Index("ix_equity_snapshots_run_id_timestamp", "run_id", "timestamp"),
     )
 
-    # Serial integer PK — Alembic will map this to BIGSERIAL in the DDL
+    # Serial integer PK  -- Alembic will map this to BIGSERIAL in the DDL
     id: Mapped[int] = mapped_column(
         BigInteger,
         primary_key=True,
@@ -698,7 +832,7 @@ class EquitySnapshotORM(Base):
 
 
 # ---------------------------------------------------------------------------
-# 6. signals — Strategy signal log
+# 6. signals  -- Strategy signal log
 # ---------------------------------------------------------------------------
 
 class SignalORM(Base):
@@ -713,10 +847,10 @@ class SignalORM(Base):
     (indicator values, model outputs, etc.) without requiring schema changes.
 
     Index strategy:
-    - (run_id) — all signals for a run
-    - (run_id, symbol) — per-symbol signal history
-    - (strategy_id) — cross-run strategy analysis
-    - (generated_at) — time-range queries
+    - (run_id)  -- all signals for a run
+    - (run_id, symbol)  -- per-symbol signal history
+    - (strategy_id)  -- cross-run strategy analysis
+    - (generated_at)  -- time-range queries
     """
 
     __tablename__ = "signals"
@@ -801,7 +935,7 @@ class SignalORM(Base):
 
 
 # ---------------------------------------------------------------------------
-# 7. position_snapshots — Final position state at run termination
+# 7. position_snapshots  -- Final position state at run termination
 # ---------------------------------------------------------------------------
 
 class PositionSnapshotORM(Base):
@@ -812,8 +946,8 @@ class PositionSnapshotORM(Base):
     termination (for backtests: last bar; for paper runs: when stopped).
 
     Index strategy:
-    - (run_id) — all position snapshots for a run
-    - (run_id, symbol) UNIQUE — enforces one snapshot per symbol per run
+    - (run_id)  -- all position snapshots for a run
+    - (run_id, symbol) UNIQUE  -- enforces one snapshot per symbol per run
     """
 
     __tablename__ = "position_snapshots"
@@ -892,7 +1026,7 @@ class PositionSnapshotORM(Base):
 
 
 # ---------------------------------------------------------------------------
-# 8. model_versions — ML model version registry
+# 8. model_versions  -- ML model version registry
 # ---------------------------------------------------------------------------
 
 class ModelVersionORM(Base):
@@ -901,16 +1035,16 @@ class ModelVersionORM(Base):
 
     Each row represents one trained RandomForestClassifier, tagged with the
     symbol/timeframe pair, training provenance, and accuracy metrics. At most
-    one row per (symbol, timeframe) pair has is_active=True — the invariant
+    one row per (symbol, timeframe) pair has is_active=True  -- the invariant
     is enforced at the application layer in RetrainingService.
 
     The model_path column holds the filesystem path to the .joblib file.
     RetrainingService prunes old versions when the count exceeds ml_max_model_versions.
 
     Index strategy:
-    - (symbol, timeframe) — primary lookup for active model per symbol/timeframe
-    - (trained_at) — prune query ORDER BY trained_at DESC
-    - partial on (symbol, timeframe) WHERE is_active=true — fast active model lookup
+    - (symbol, timeframe)  -- primary lookup for active model per symbol/timeframe
+    - (trained_at)  -- prune query ORDER BY trained_at DESC
+    - partial on (symbol, timeframe) WHERE is_active=true  -- fast active model lookup
       (created via op.execute() in the Alembic migration; SQLAlchemy ORM does not
       support partial index WHERE clauses on Index() objects).
     """
@@ -1009,7 +1143,7 @@ class ModelVersionORM(Base):
         DateTime(timezone=True),
         nullable=False,
         server_default=func.now(),
-        comment="Row creation time — immutable after INSERT",
+        comment="Row creation time  -- immutable after INSERT",
     )
 
     def __repr__(self) -> str:
@@ -1020,7 +1154,7 @@ class ModelVersionORM(Base):
 
 
 # ---------------------------------------------------------------------------
-# 9. optimization_runs — Parameter grid search session records
+# 9. optimization_runs  -- Parameter grid search session records
 # ---------------------------------------------------------------------------
 
 class OptimizationRunORM(Base):
@@ -1032,7 +1166,7 @@ class OptimizationRunORM(Base):
     ``OptimizationEntryORM`` rows.
 
     Index strategy:
-    - (created_at DESC) — list endpoint ORDER BY, newest-first pagination
+    - (created_at DESC)  -- list endpoint ORDER BY, newest-first pagination
     """
 
     __tablename__ = "optimization_runs"
@@ -1048,12 +1182,12 @@ class OptimizationRunORM(Base):
         nullable=False,
         comment="Strategy identifier used for this search, e.g. ma_crossover",
     )
-    # JSONB list of symbol strings — uses list[Any] per project JSONB convention
+    # JSONB list of symbol strings  -- uses list[Any] per project JSONB convention
     # (SQLAlchemy returns list[Any] at runtime; Pydantic layer enforces list[str]).
     symbols: Mapped[list[Any]] = mapped_column(
         JSONB,
         nullable=False,
-        comment="CCXT-format trading pairs searched, e.g. [\"BTC/USD\"]",
+        comment='CCXT-format trading pairs searched, e.g. ["BTC/USD"]',
     )
     timeframe: Mapped[str] = mapped_column(
         String(8),
@@ -1092,7 +1226,7 @@ class OptimizationRunORM(Base):
         comment="UTC timestamp when the optimization run was persisted",
     )
 
-    # Relationship — ordered by rank ascending so entry[0] is the best result
+    # Relationship  -- ordered by rank ascending so entry[0] is the best result
     entries: Mapped[list[OptimizationEntryORM]] = relationship(
         "OptimizationEntryORM",
         back_populates="optimization_run",
@@ -1108,7 +1242,7 @@ class OptimizationRunORM(Base):
 
 
 # ---------------------------------------------------------------------------
-# 10. optimization_entries — Individual ranked parameter combination results
+# 10. optimization_entries  -- Individual ranked parameter combination results
 # ---------------------------------------------------------------------------
 
 class OptimizationEntryORM(Base):
@@ -1119,8 +1253,8 @@ class OptimizationEntryORM(Base):
     rank (1 = best) for a single backtest combination.
 
     Index strategy:
-    - (optimization_run_id) — retrieve all entries for a run
-    - (optimization_run_id, rank) UNIQUE — enforces one entry per rank per run
+    - (optimization_run_id)  -- retrieve all entries for a run
+    - (optimization_run_id, rank) UNIQUE  -- enforces one entry per rank per run
       and supports fast ORDER BY rank queries on the entries page.
     """
 
@@ -1150,19 +1284,19 @@ class OptimizationEntryORM(Base):
         nullable=False,
         comment="Rank of this parameter combination (1 = best by rank_by metric)",
     )
-    # JSONB parameter dict — uses dict[str, Any] per project JSONB convention.
+    # JSONB parameter dict  -- uses dict[str, Any] per project JSONB convention.
     # The Pydantic response layer (OptimizeEntryResponse) enforces the actual types.
     params: Mapped[dict[str, Any]] = mapped_column(
         JSONB,
         nullable=False,
-        comment="Parameter combination for this entry, e.g. {\"fast_period\": 10}",
+        comment='Parameter combination for this entry, e.g. {"fast_period": 10}',
     )
-    # JSONB metrics dict — uses dict[str, Any] per project JSONB convention.
+    # JSONB metrics dict  -- uses dict[str, Any] per project JSONB convention.
     # Metrics are floats at runtime; the Pydantic layer enforces dict[str, float].
     metrics: Mapped[dict[str, Any]] = mapped_column(
         JSONB,
         nullable=False,
-        comment="Computed backtest metrics for this combination, e.g. {\"sharpe_ratio\": 1.2}",
+        comment='Computed backtest metrics for this combination, e.g. {"sharpe_ratio": 1.2}',
     )
 
     # Relationship

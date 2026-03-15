@@ -187,6 +187,59 @@ class RSIMeanReversionStrategy(BaseStrategy):
     )
 
     # ------------------------------------------------------------------ #
+    # Fear & Greed Index confidence modifier (Sprint 32)
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _fgi_confidence_boost(fgi: int, direction: SignalDirection) -> float:
+        """
+        Return a confidence delta based on the Fear & Greed Index.
+
+        The RSI mean-reversion strategy benefits from contrarian conditions:
+        - BUY in extreme fear = markets oversold, stronger bounce expected
+        - SELL in extreme greed = markets overbought, stronger pullback expected
+
+        Parameters
+        ----------
+        fgi : int
+            Fear & Greed Index value in [0, 100].
+        direction : SignalDirection
+            The signal direction (BUY or SELL).
+
+        Returns
+        -------
+        float
+            Confidence delta in [-0.10, +0.10].
+        """
+        if direction == SignalDirection.BUY:
+            # Extreme fear: strong contrarian BUY opportunity
+            if fgi <= 24:
+                return 0.10
+            elif fgi <= 44:
+                return 0.05
+            elif fgi <= 55:
+                return 0.0
+            elif fgi <= 75:
+                return -0.05  # Greed: less conviction for mean-reversion BUY
+            else:
+                return -0.10  # Extreme greed: least conviction for BUY
+
+        elif direction == SignalDirection.SELL:
+            # Extreme greed: strong contrarian SELL opportunity
+            if fgi >= 76:
+                return 0.10
+            elif fgi >= 56:
+                return 0.05
+            elif fgi >= 45:
+                return 0.0
+            elif fgi >= 25:
+                return -0.05  # Fear: less conviction for mean-reversion SELL
+            else:
+                return -0.10  # Extreme fear: least conviction for SELL
+
+        return 0.0
+
+    # ------------------------------------------------------------------ #
     # Parameter validation
     # ------------------------------------------------------------------ #
 
@@ -317,6 +370,13 @@ class RSIMeanReversionStrategy(BaseStrategy):
 
         current_bar = bars[-1]
 
+        # Sprint 32: apply Fear & Greed Index confidence boost
+        fgi_value: int | None = None
+        if mtf_context is not None and mtf_context.fear_greed_index is not None:
+            fgi_value = mtf_context.fear_greed_index
+            fgi_boost = RSIMeanReversionStrategy._fgi_confidence_boost(fgi_value, direction)
+            confidence = min(1.0, max(0.0, confidence + fgi_boost))
+
         signal = Signal(
             strategy_id=self._strategy_id,
             symbol=current_bar.symbol,
@@ -330,6 +390,7 @@ class RSIMeanReversionStrategy(BaseStrategy):
                 "oversold": oversold,
                 "overbought": overbought,
                 "close": str(current_bar.close),
+                "fear_greed_index": fgi_value,
             },
         )
 

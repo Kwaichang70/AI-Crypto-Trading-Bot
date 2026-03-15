@@ -24,6 +24,7 @@ __all__ = [
     "Fill",
     "Position",
     "TradeResult",
+    "SkippedTrade",
     "OHLCVBar",  # re-exported from common.models
     "RiskCheckResult",
 ]
@@ -203,6 +204,28 @@ class TradeResult(BaseModel):
     exit_at: datetime
     strategy_id: str = Field(description="Strategy that generated the opening signal")
 
+    # Sprint 32: Adaptive learning fields
+    mae_pct: float | None = Field(
+        default=None,
+        description="Maximum Adverse Excursion as pct of entry price",
+    )
+    mfe_pct: float | None = Field(
+        default=None,
+        description="Maximum Favorable Excursion as pct of entry price",
+    )
+    exit_reason: str | None = Field(
+        default=None,
+        description="Exit trigger: take_profit|stop_loss|trailing_stop|signal_exit|regime_change|manual",
+    )
+    regime_at_entry: str | None = Field(
+        default=None,
+        description="Market regime at open: RISK_ON|NEUTRAL|RISK_OFF",
+    )
+    signal_context: dict[str, Any] | None = Field(
+        default=None,
+        description="Indicator snapshot at entry",
+    )
+
     @property
     def return_pct(self) -> float:
         """Percentage return relative to entry cost."""
@@ -210,6 +233,22 @@ class TradeResult(BaseModel):
         if cost == 0:
             return 0.0
         return float(self.realised_pnl) / cost
+
+
+class SkippedTrade(BaseModel):
+    """Trade that was evaluated but not taken, logged for adaptive learning."""
+
+    model_config = {"frozen": True}
+
+    skip_id: UUID = Field(default_factory=uuid4)
+    run_id: str
+    symbol: str
+    skip_reason: str
+    regime_at_skip: str | None = Field(default=None)
+    signal_context: dict[str, Any] | None = Field(default=None)
+    hypothetical_entry_price: Decimal | None = Field(default=None)
+    hypothetical_outcome_pct: float | None = Field(default=None)
+    skipped_at: datetime = Field(default_factory=lambda: datetime.now(tz=UTC))
 
 
 class RiskCheckResult(BaseModel):

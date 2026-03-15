@@ -17,6 +17,7 @@ dependencies = [
     "common",
     "scikit-learn>=1.5",
     "joblib>=1.4",
+    "aiohttp>=3.9",
 ]
 
 [tool.setuptools.packages.find]

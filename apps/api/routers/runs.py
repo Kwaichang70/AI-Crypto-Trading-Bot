@@ -43,7 +43,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from api.db.models import EquitySnapshotORM, FillORM, OrderORM, PositionSnapshotORM, RunORM, TradeORM
+from api.db.models import EquitySnapshotORM, FillORM, OrderORM, PositionSnapshotORM, RunORM, SkippedTradeORM, TradeORM
 from api.db.session import get_db
 from api.schemas import (
     BacktestMetricsResponse,
@@ -80,7 +80,7 @@ class _IncrementalFlushState:
 
 
 # ---------------------------------------------------------------------------
-# Strategy registry — maps API names to strategy classes
+# Strategy registry  -- maps API names to strategy classes
 # Imported lazily inside the handler to avoid circular import issues.
 # ---------------------------------------------------------------------------
 
@@ -185,7 +185,7 @@ def _run_orm_to_detail_response(run: RunORM) -> RunDetailResponse:
             base = base.model_copy(
                 update={"backtest_metrics": BacktestMetricsResponse.model_validate(raw_metrics)}
             )
-        except Exception:  # noqa: BLE001 — best-effort; never fail a GET on bad stored data
+        except Exception:  # noqa: BLE001  -- best-effort; never fail a GET on bad stored data
             logger.warning(
                 "runs.backtest_metrics_parse_error",
                 run_id=str(run.id),
@@ -213,7 +213,7 @@ async def _flush_incremental(
     Reads in-memory state from portfolio and execution_engine, computes
     deltas using watermarks stored in ``state``, and writes only new data
     to the database.  Uses an isolated DB session.  Safe to call concurrently
-    with the engine loop — reads are non-destructive snapshots.
+    with the engine loop  -- reads are non-destructive snapshots.
 
     Parameters
     ----------
@@ -265,7 +265,7 @@ async def _flush_incremental(
     # Build ORM rows
     # ------------------------------------------------------------------
 
-    # Equity snapshots — use peak from state for consistent drawdown tracking
+    # Equity snapshots  -- use peak from state for consistent drawdown tracking
     equity_orms: list[EquitySnapshotORM] = []
     for i, (timestamp, equity) in enumerate(new_equity_points):
         if equity > state.peak_equity:
@@ -322,10 +322,16 @@ async def _flush_incremental(
                 entry_at=trade.entry_at,
                 exit_at=trade.exit_at,
                 strategy_id=trade.strategy_id or "unknown",
+                # Sprint 32: adaptive learning fields (getattr for backward compat)
+                mae_pct=getattr(trade, "mae_pct", None),
+                mfe_pct=getattr(trade, "mfe_pct", None),
+                exit_reason=getattr(trade, "exit_reason", None),
+                regime_at_entry=getattr(trade, "regime_at_entry", None),
+                signal_context=getattr(trade, "signal_context", None),
             )
         )
 
-    # Order rows — use merge() so existing rows are updated when status changes
+    # Order rows  -- use merge() so existing rows are updated when status changes
     order_orms: list[OrderORM] = []
     for order in all_orders:
         order_orms.append(
@@ -347,7 +353,7 @@ async def _flush_incremental(
             )
         )
 
-    # Fill rows — insert only new fills (watermarked by fill_id)
+    # Fill rows  -- insert only new fills (watermarked by fill_id)
     fill_orms: list[FillORM] = []
     new_fill_ids: list[uuid.UUID] = []
     for fill in new_fills:
@@ -367,7 +373,7 @@ async def _flush_incremental(
         )
         new_fill_ids.append(fill.fill_id)
 
-    # Position snapshot rows — delete existing then insert fresh
+    # Position snapshot rows  -- delete existing then insert fresh
     position_orms: list[PositionSnapshotORM] = []
     now = datetime.now(tz=UTC)
     if has_positions:
@@ -458,7 +464,7 @@ async def _incremental_flush_loop(
     flush_interval: float,
     log: Any,
 ) -> None:
-    """Periodic incremental flush loop — runs as parallel asyncio.Task."""
+    """Periodic incremental flush loop  -- runs as parallel asyncio.Task."""
     log.info("runs.incremental_flush_started", flush_interval=flush_interval)
     try:
         while True:
@@ -563,6 +569,12 @@ async def _persist_paper_results(
                 entry_at=trade.entry_at,
                 exit_at=trade.exit_at,
                 strategy_id=trade.strategy_id or "unknown",
+                # Sprint 32: adaptive learning fields (getattr for backward compat)
+                mae_pct=getattr(trade, "mae_pct", None),
+                mfe_pct=getattr(trade, "mfe_pct", None),
+                exit_reason=getattr(trade, "exit_reason", None),
+                regime_at_entry=getattr(trade, "regime_at_entry", None),
+                signal_context=getattr(trade, "signal_context", None),
             )
         )
 
@@ -720,7 +732,7 @@ async def _run_paper_engine(
     portfolio: Any = None
     execution: Any = None
 
-    # Incremental flush state — declared at function scope so except/finally
+    # Incremental flush state  -- declared at function scope so except/finally
     # blocks can access flush_task for cancellation regardless of where in
     # the try block an error occurs.
     flush_state = _IncrementalFlushState()
@@ -766,7 +778,7 @@ async def _run_paper_engine(
             params=strategy_params,
         )
 
-        # Build engine config — include trailing stop if configured
+        # Build engine config  -- include trailing stop if configured
         engine_config: dict[str, object] = {}
         if trailing_stop_pct is not None:
             engine_config["trailing_stop_pct"] = trailing_stop_pct
@@ -846,7 +858,7 @@ async def _run_paper_engine(
         _RUN_TASKS.pop(run_id_str, None)
 
         # Final incremental flush captures any remaining data not covered by
-        # the last periodic flush cycle — must run BEFORE status update so
+        # the last periodic flush cycle  -- must run BEFORE status update so
         # clients see complete data when the run transitions to 'stopped'
         if portfolio is not None:
             await _flush_incremental(
@@ -926,7 +938,7 @@ async def _run_live_engine(
     execution: Any = None
     exchange: Any = None
 
-    # Incremental flush state — mirrors paper engine pattern (Sprint 25)
+    # Incremental flush state  -- mirrors paper engine pattern (Sprint 25)
     flush_state = _IncrementalFlushState()
     flush_task: asyncio.Task[None] | None = None
 
@@ -987,7 +999,7 @@ async def _run_live_engine(
             params=strategy_params,
         )
 
-        # Build engine config — include trailing stop if configured
+        # Build engine config  -- include trailing stop if configured
         live_engine_config: dict[str, object] = {}
         if trailing_stop_pct is not None:
             live_engine_config["trailing_stop_pct"] = trailing_stop_pct
@@ -1007,7 +1019,7 @@ async def _run_live_engine(
         await engine.start(run_id_str)
         log.info("runs.live_engine_running")
 
-        # Start periodic incremental flush (Sprint 25 — mirrors paper engine)
+        # Start periodic incremental flush (Sprint 25  -- mirrors paper engine)
         flush_task = asyncio.create_task(
             _incremental_flush_loop(
                 run_id_str=run_id_str,
@@ -1064,7 +1076,7 @@ async def _run_live_engine(
         _RUN_TASKS.pop(run_id_str, None)
 
         # Final incremental flush captures any remaining data not covered by
-        # the last periodic flush cycle — must run BEFORE status update so
+        # the last periodic flush cycle  -- must run BEFORE status update so
         # clients see complete data when the run transitions to 'stopped'
         if portfolio is not None:
             await _flush_incremental(
@@ -1333,6 +1345,12 @@ async def _persist_backtest_results(
             entry_at=trade.entry_at,
             exit_at=trade.exit_at,
             strategy_id=trade.strategy_id,
+            # Sprint 32: adaptive learning fields (getattr for backward compat)
+            mae_pct=getattr(trade, "mae_pct", None),
+            mfe_pct=getattr(trade, "mfe_pct", None),
+            exit_reason=getattr(trade, "exit_reason", None),
+            regime_at_entry=getattr(trade, "regime_at_entry", None),
+            signal_context=getattr(trade, "signal_context", None),
         )
         trade_orms.append(trade_orm)
 
@@ -1444,7 +1462,7 @@ async def _persist_backtest_results(
     metrics_response = _build_backtest_metrics(result)
     updated_config = dict(run_orm.config or {})
     metrics_dict = metrics_response.model_dump(mode="json")
-    # PostgreSQL JSONB rejects Infinity/NaN — replace with None
+    # PostgreSQL JSONB rejects Infinity/NaN  -- replace with None
     import math
     for k, v in metrics_dict.items():
         if isinstance(v, float) and (math.isinf(v) or math.isnan(v)):
@@ -1465,7 +1483,7 @@ async def _persist_backtest_results(
 
 
 # ---------------------------------------------------------------------------
-# POST /api/v1/runs — start a new trading run
+# POST /api/v1/runs  -- start a new trading run
 # ---------------------------------------------------------------------------
 
 @router.post(
@@ -1591,9 +1609,9 @@ async def create_run(
     # ------------------------------------------------------------------
     # All three layers must pass before a LIVE mode run is permitted:
     #
-    #   Layer 1 — Environment: ENABLE_LIVE_TRADING must be True.
-    #   Layer 2 — API Keys: EXCHANGE_API_KEY and EXCHANGE_API_SECRET must be non-empty.
-    #   Layer 3 — Confirmation Token: A runtime token provided in the request body
+    #   Layer 1  -- Environment: ENABLE_LIVE_TRADING must be True.
+    #   Layer 2  -- API Keys: EXCHANGE_API_KEY and EXCHANGE_API_SECRET must be non-empty.
+    #   Layer 3  -- Confirmation Token: A runtime token provided in the request body
     #             must match LIVE_TRADING_CONFIRM_TOKEN (hmac.compare_digest).
     #
     # If any layer fails, the endpoint returns HTTP 403 with a structured
@@ -1676,7 +1694,7 @@ async def create_run(
     )
 
     # ------------------------------------------------------------------
-    # BACKTEST MODE — execute synchronously, persist results, finish run
+    # BACKTEST MODE  -- execute synchronously, persist results, finish run
     # ------------------------------------------------------------------
     if is_backtest:
         try:
@@ -1737,7 +1755,7 @@ async def create_run(
             )
 
         except HTTPException:
-            # Data fetch errors (400, 502) — mark run as error and re-raise
+            # Data fetch errors (400, 502)  -- mark run as error and re-raise
             error_time = datetime.now(tz=UTC)
             run_orm.status = "error"
             run_orm.stopped_at = error_time
@@ -1788,7 +1806,7 @@ async def create_run(
             ) from exc
 
     # ------------------------------------------------------------------
-    # PAPER MODE — launch StrategyEngine as a background asyncio.Task
+    # PAPER MODE  -- launch StrategyEngine as a background asyncio.Task
     # ------------------------------------------------------------------
     elif mode_value == "paper":
         task = asyncio.create_task(
@@ -1808,7 +1826,7 @@ async def create_run(
         log.info("runs.paper_engine_task_created", run_id=str(run_id))
 
     # ------------------------------------------------------------------
-    # LIVE MODE — launch LiveExecutionEngine as a background asyncio.Task
+    # LIVE MODE  -- launch LiveExecutionEngine as a background asyncio.Task
     # The 3-layer LiveTradingGate is enforced above before reaching here.
     # ------------------------------------------------------------------
     elif mode_value == "live":
@@ -1832,7 +1850,7 @@ async def create_run(
 
 
 # ---------------------------------------------------------------------------
-# GET /api/v1/runs — list all runs
+# GET /api/v1/runs  -- list all runs
 # ---------------------------------------------------------------------------
 
 _VALID_MODES: frozenset[str] = frozenset({"backtest", "paper", "live"})
@@ -1928,7 +1946,7 @@ async def list_runs(
 
 
 # ---------------------------------------------------------------------------
-# GET /api/v1/runs/{run_id} — get a single run
+# GET /api/v1/runs/{run_id}  -- get a single run
 # ---------------------------------------------------------------------------
 
 @router.get(
@@ -1986,7 +2004,7 @@ async def get_run(
 
 
 # ---------------------------------------------------------------------------
-# DELETE /api/v1/runs/{run_id} — stop a running run
+# DELETE /api/v1/runs/{run_id}  -- stop a running run
 # ---------------------------------------------------------------------------
 
 @router.delete(

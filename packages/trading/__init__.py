@@ -23,15 +23,21 @@ from trading.metrics import (
     compute_sortino,
     compute_trade_statistics,
 )
-from trading.models import Fill, Order, Position, Signal, TradeResult, RiskCheckResult
+from trading.models import Fill, Order, Position, Signal, SkippedTrade, TradeResult, RiskCheckResult
 from trading.portfolio import PortfolioAccounting
 from trading.risk import BaseRiskManager, RiskParameters
 from trading.safety import (
     CircuitBreaker,
     CircuitBreakerConfig,
+    CircuitBreakerResponse,
     GateCheckResult,
     LiveTradingGate,
     LiveTradingGateError,
+)
+from trading.trade_journal import (
+    ExitReasonDetector,
+    TradeExcursionTracker,
+    TradeSkipLogger,
 )
 from trading.strategy import BaseStrategy, StrategyMetadata
 from trading.strategy_engine import EngineState, StrategyEngine
@@ -74,6 +80,11 @@ __all__ = [
     "GateCheckResult",
     "CircuitBreaker",
     "CircuitBreakerConfig",
+    "CircuitBreakerResponse",
+    # Trade Journal (Sprint 32)
+    "TradeExcursionTracker",
+    "ExitReasonDetector",
+    "TradeSkipLogger",
     # Portfolio
     "PortfolioAccounting",
     # Models
@@ -82,5 +93,6 @@ __all__ = [
     "Fill",
     "Position",
     "TradeResult",
+    "SkippedTrade",
     "RiskCheckResult",
 ]

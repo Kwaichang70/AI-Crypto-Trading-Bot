@@ -50,7 +50,7 @@ __all__ = [
     "compute_features",
 ]
 
-# ML features — guarded import (scikit-learn may not be installed)
+# ML features  -- guarded import (scikit-learn may not be installed)
 try:
     from data.ml_features import (
         FEATURE_NAMES,
@@ -62,6 +62,24 @@ try:
         "FEATURE_NAMES",
         "build_feature_matrix",
         "build_feature_vector_from_bars",
+    ]
+except ImportError:
+    pass
+
+# Sentiment / Fear & Greed Index - guarded import (aiohttp may not be installed)
+try:
+    from data.sentiment import (
+        FearGreedClient,
+        FearGreedSnapshot,
+        get_global_client,
+        set_global_client,
+    )
+
+    __all__ += [
+        "FearGreedClient",
+        "FearGreedSnapshot",
+        "get_global_client",
+        "set_global_client",
     ]
 except ImportError:
     pass

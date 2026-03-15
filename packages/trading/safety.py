@@ -5,15 +5,20 @@ Safety gates and circuit breaker for live trading protection.
 
 This module implements two independent safety mechanisms:
 
-1. **LiveTradingGate** — Three-layer activation gate that must be fully
+1. **LiveTradingGate**  -- Three-layer activation gate that must be fully
    satisfied before any live order is submitted.  Checked by the
    ``LiveExecutionEngine`` and by the API run-creation endpoint.
 
-2. **CircuitBreaker** — Emergency stop mechanism that halts all trading
+2. **CircuitBreaker**  -- Emergency stop mechanism that halts all trading
    when configurable risk thresholds are breached.  Once tripped, the
    breaker stays open until manually reset by an operator.
 
-Both classes are stateless with respect to persistence — they evaluate
+   Sprint 32 adds a graduated response system via ``check_graduated()``:
+   - REDUCE: drawdown below max but above reduce threshold  -> scale down position sizes
+   - DAILY_LIMIT: daily loss limit reached  -> no new entries until next day
+   - HALT: max thresholds breached  -> full trading halt (same as check())
+
+Both classes are stateless with respect to persistence  -- they evaluate
 conditions from injected state at call time.  The CircuitBreaker holds
 in-memory trip state that survives across bar ticks within a single process
 but must be persisted externally for crash recovery.
@@ -28,12 +33,13 @@ Design principles
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
+from enum import StrEnum
 from typing import Any
 
 import hmac
 import structlog
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from pydantic import SecretStr
 
 __all__ = [
@@ -43,6 +49,7 @@ __all__ = [
     "GateLayer",
     "CircuitBreaker",
     "CircuitBreakerConfig",
+    "CircuitBreakerResponse",
     "CircuitBreakerState",
 ]
 
@@ -103,11 +110,11 @@ class LiveTradingGate:
 
     All three layers must be satisfied before any live order is submitted:
 
-    1. **Environment** — ``enable_live_trading`` must be explicitly True
+    1. **Environment**  -- ``enable_live_trading`` must be explicitly True
        in the application settings (``Settings.enable_live_trading``).
-    2. **API Keys** — Valid exchange API key and secret must be configured
+    2. **API Keys**  -- Valid exchange API key and secret must be configured
        (non-empty ``Settings.exchange_api_key`` and ``exchange_api_secret``).
-    3. **Confirmation** — A runtime confirmation token must be provided
+    3. **Confirmation**  -- A runtime confirmation token must be provided
        and must match the stored ``live_trading_confirm_token``.
 
     This gate is checked by the ``LiveExecutionEngine`` on startup and
@@ -268,7 +275,7 @@ class LiveTradingGate:
                        "Pass the confirm_token when creating a LIVE run.",
             )
 
-        # Token provided but none configured — require exact match impossible
+        # Token provided but none configured  -- require exact match impossible
         if not stored and confirm_token:
             return GateLayer(
                 name="confirmation",
@@ -277,7 +284,7 @@ class LiveTradingGate:
                        "Set LIVE_TRADING_CONFIRM_TOKEN to enable token verification.",
             )
 
-        # Both present — constant-time comparison to prevent timing attacks.
+        # Both present  -- constant-time comparison to prevent timing attacks.
         # Guards above guarantee both are non-None; assert to enforce the
         # invariant and fail loudly rather than silently matching empty strings.
         assert stored is not None, "stored token must be non-None at this point"
@@ -387,6 +394,34 @@ class LiveTradingGateError(RuntimeError):
 
 
 # ---------------------------------------------------------------------------
+# Graduated circuit breaker response enum (Sprint 32)
+# ---------------------------------------------------------------------------
+
+
+class CircuitBreakerResponse(StrEnum):
+    """
+    Graduated response level from the circuit breaker.
+
+    OK
+        Normal operation  -- no restrictions.
+    REDUCE
+        Drawdown between reduce_drawdown_pct and max_drawdown_pct  -- scale
+        down BUY position sizes by reduce_position_multiplier.
+    DAILY_LIMIT
+        Daily loss limit reached  -- no new BUY entries until next trading day.
+        Trailing stops and SELL signals continue to fire.
+    HALT
+        Hard halt  -- max drawdown or consecutive losses breached.
+        All new signals are blocked (equivalent to check() returning True).
+    """
+
+    OK = "ok"
+    REDUCE = "reduce"
+    DAILY_LIMIT = "daily_limit"
+    HALT = "halt"
+
+
+# ---------------------------------------------------------------------------
 # Circuit breaker configuration
 # ---------------------------------------------------------------------------
 
@@ -396,6 +431,16 @@ class CircuitBreakerConfig(BaseModel):
     Configuration for the circuit breaker thresholds.
 
     All percentage values are expressed as fractions (0.05 = 5%).
+
+    Sprint 32 additions
+    -------------------
+    reduce_drawdown_pct:
+        Drawdown level at which position sizes are reduced (soft warning).
+        Must be less than max_drawdown_pct.
+    reduce_position_multiplier:
+        Fraction of normal position size to use when in REDUCE state.
+    daily_loss_resume_next_day:
+        If True, the DAILY_LIMIT state automatically clears at midnight UTC.
     """
 
     model_config = {"frozen": True}
@@ -418,6 +463,32 @@ class CircuitBreakerConfig(BaseModel):
         le=50,
         description="Number of consecutive losing trades before tripping",
     )
+    reduce_drawdown_pct: float = Field(
+        default=0.10,
+        gt=0.0,
+        le=0.50,
+        description="Drawdown threshold for graduated REDUCE response (must be < max_drawdown_pct)",
+    )
+    reduce_position_multiplier: float = Field(
+        default=0.5,
+        gt=0.0,
+        le=1.0,
+        description="Position size multiplier applied when in REDUCE state (0.5 = 50% of normal)",
+    )
+    daily_loss_resume_next_day: bool = Field(
+        default=True,
+        description="If True, DAILY_LIMIT state clears automatically at midnight UTC",
+    )
+
+    @model_validator(mode="after")
+    def validate_drawdown_ordering(self) -> CircuitBreakerConfig:
+        """Ensure reduce_drawdown_pct < max_drawdown_pct."""
+        if self.reduce_drawdown_pct >= self.max_drawdown_pct:
+            raise ValueError(
+                f"reduce_drawdown_pct ({self.reduce_drawdown_pct}) must be "
+                f"less than max_drawdown_pct ({self.max_drawdown_pct})"
+            )
+        return self
 
 
 # ---------------------------------------------------------------------------
@@ -443,6 +514,10 @@ class CircuitBreakerState(BaseModel):
         default=0,
         description="Total number of times the breaker has tripped in this session",
     )
+    graduated_response: str = Field(
+        default=CircuitBreakerResponse.OK,
+        description="Current graduated response level (Sprint 32)",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -458,8 +533,17 @@ class CircuitBreaker:
     before every order submission.  When any threshold is breached, the
     breaker trips and remains open until an operator explicitly resets it.
 
-    Triggers
-    --------
+    Sprint 32 adds a graduated response system via ``check_graduated()``:
+    - REDUCE: soft warning with position size scaling
+    - DAILY_LIMIT: no new entries until next trading day
+    - HALT: full trading halt
+
+    IMPORTANT: ``check()`` is unchanged. ``check_graduated()`` is a
+    separate method that does NOT trip the hard breaker. Callers must
+    handle both methods independently.
+
+    Triggers (hard halt)
+    --------------------
     - Max daily loss exceeded
     - Max drawdown from peak exceeded
     - Rapid consecutive losses (configurable threshold)
@@ -482,10 +566,16 @@ class CircuitBreaker:
 
         breaker = CircuitBreaker(config=CircuitBreakerConfig(), run_id="run-123")
 
-        # Check before every order
+        # Hard check before every order
         if breaker.check(equity=9500, daily_pnl=-600, drawdown=0.12, consecutive_losses=3):
-            # Trading halted — do not submit orders
+            # Trading halted  -- do not submit orders
             ...
+
+        # Graduated check for soft warnings
+        response = breaker.check_graduated(equity=9500, daily_pnl=-300, drawdown=0.08)
+        if response == CircuitBreakerResponse.REDUCE:
+            multiplier = breaker.get_position_size_multiplier()
+            # scale down position sizes
 
         # Manual trip
         breaker.trip("Operator initiated emergency stop")
@@ -505,6 +595,8 @@ class CircuitBreaker:
         self._trip_reason: str | None = None
         self._tripped_at: datetime | None = None
         self._trip_count: int = 0
+        self._current_response: CircuitBreakerResponse = CircuitBreakerResponse.OK
+        self._daily_limit_date: date | None = None
         self._log = structlog.get_logger(__name__).bind(
             component="circuit_breaker",
             run_id=run_id,
@@ -525,6 +617,11 @@ class CircuitBreaker:
         return self._config
 
     @property
+    def current_response(self) -> CircuitBreakerResponse:
+        """Current graduated response level."""
+        return self._current_response
+
+    @property
     def state(self) -> CircuitBreakerState:
         """Return a snapshot of the current breaker state."""
         return CircuitBreakerState(
@@ -532,10 +629,11 @@ class CircuitBreaker:
             trip_reason=self._trip_reason,
             tripped_at=self._tripped_at,
             trip_count=self._trip_count,
+            graduated_response=self._current_response,
         )
 
     # ------------------------------------------------------------------ #
-    # Core check
+    # Core check (unchanged from pre-Sprint 32)
     # ------------------------------------------------------------------ #
 
     def check(
@@ -551,6 +649,9 @@ class CircuitBreaker:
 
         This method is idempotent: if the breaker is already tripped, it
         returns True immediately without re-evaluating conditions.
+
+        IMPORTANT: This method is unchanged from pre-Sprint 32. The graduated
+        response system is available via ``check_graduated()``.
 
         Parameters
         ----------
@@ -600,6 +701,126 @@ class CircuitBreaker:
         return False
 
     # ------------------------------------------------------------------ #
+    # Graduated response (Sprint 32)
+    # ------------------------------------------------------------------ #
+
+    def check_graduated(
+        self,
+        equity: float,
+        daily_pnl: float,
+        drawdown: float,
+    ) -> CircuitBreakerResponse:
+        """
+        Evaluate graduated risk conditions without tripping the hard breaker.
+
+        This method evaluates soft thresholds and returns an action-level
+        response without permanently tripping the breaker. The hard ``check()``
+        method remains unchanged and handles the full-halt case.
+
+        Daily limit reset:
+            If ``daily_loss_resume_next_day=True`` (default), the DAILY_LIMIT
+            state is automatically cleared when the UTC date changes.
+
+        Parameters
+        ----------
+        equity : float
+            Current portfolio equity in quote currency.
+        daily_pnl : float
+            Net PnL since the start of the current trading day.
+        drawdown : float
+            Current drawdown as a fraction (0.10 = 10% below peak).
+
+        Returns
+        -------
+        CircuitBreakerResponse
+            The current graduated response level.
+        """
+        # Check if daily limit should be reset (new trading day)
+        if self._config.daily_loss_resume_next_day:
+            self.check_daily_limit_reset()
+
+        # If hard-tripped, always return HALT
+        if self._tripped:
+            self._current_response = CircuitBreakerResponse.HALT
+            return self._current_response
+
+        # Check DAILY_LIMIT  -- already in daily limit state
+        if self._current_response == CircuitBreakerResponse.DAILY_LIMIT:
+            return self._current_response
+
+        # Check if daily loss limit is newly reached
+        if equity > 0.0:
+            daily_loss_pct = abs(min(0.0, daily_pnl)) / equity
+            if daily_loss_pct >= self._config.max_daily_loss_pct:
+                self._current_response = CircuitBreakerResponse.DAILY_LIMIT
+                self._daily_limit_date = datetime.now(tz=UTC).date()
+                self._log.warning(
+                    "circuit_breaker.daily_limit_reached",
+                    daily_loss_pct=f"{daily_loss_pct:.2%}",
+                    limit=f"{self._config.max_daily_loss_pct:.2%}",
+                )
+                return self._current_response
+
+        # Check REDUCE threshold (drawdown between soft and hard thresholds)
+        if (
+            drawdown >= self._config.reduce_drawdown_pct
+            and drawdown < self._config.max_drawdown_pct
+        ):
+            if self._current_response != CircuitBreakerResponse.REDUCE:
+                self._log.warning(
+                    "circuit_breaker.reduce_response_activated",
+                    drawdown=f"{drawdown:.2%}",
+                    reduce_threshold=f"{self._config.reduce_drawdown_pct:.2%}",
+                    multiplier=self._config.reduce_position_multiplier,
+                )
+            self._current_response = CircuitBreakerResponse.REDUCE
+            return self._current_response
+
+        # All clear
+        self._current_response = CircuitBreakerResponse.OK
+        return self._current_response
+
+    def get_position_size_multiplier(self) -> float:
+        """
+        Return the position size multiplier for the current response level.
+
+        Returns
+        -------
+        float
+            1.0 for OK, reduce_position_multiplier for REDUCE, 0.0 for HALT/DAILY_LIMIT.
+        """
+        if self._current_response == CircuitBreakerResponse.OK:
+            return 1.0
+        elif self._current_response == CircuitBreakerResponse.REDUCE:
+            return self._config.reduce_position_multiplier
+        else:
+            return 0.0
+
+    def check_daily_limit_reset(self) -> bool:
+        """
+        Check if the DAILY_LIMIT state should be cleared (new UTC day).
+
+        Returns
+        -------
+        bool
+            True if the daily limit was reset.
+        """
+        if (
+            self._current_response == CircuitBreakerResponse.DAILY_LIMIT
+            and self._daily_limit_date is not None
+        ):
+            today = datetime.now(tz=UTC).date()
+            if today > self._daily_limit_date:
+                self._current_response = CircuitBreakerResponse.OK
+                self._daily_limit_date = None
+                self._log.info(
+                    "circuit_breaker.daily_limit_reset",
+                    new_date=str(today),
+                )
+                return True
+        return False
+
+    # ------------------------------------------------------------------ #
     # Manual controls
     # ------------------------------------------------------------------ #
 
@@ -621,8 +842,8 @@ class CircuitBreaker:
         """
         Reset the circuit breaker after manual review.
 
-        Clears the tripped state and allows trading to resume.
-        The trip count is preserved for audit purposes.
+        Clears the tripped state, graduated response, and daily limit state.
+        Allows trading to resume. The trip count is preserved for audit purposes.
         """
         if not self._tripped:
             self._log.debug("circuit_breaker.reset_while_not_tripped")
@@ -638,6 +859,8 @@ class CircuitBreaker:
         self._tripped = False
         self._trip_reason = None
         self._tripped_at = None
+        self._current_response = CircuitBreakerResponse.OK
+        self._daily_limit_date = None
 
     # ------------------------------------------------------------------ #
     # Internal helpers
@@ -662,6 +885,7 @@ class CircuitBreaker:
         self._trip_reason = reason
         self._tripped_at = datetime.now(tz=UTC)
         self._trip_count += 1
+        self._current_response = CircuitBreakerResponse.HALT
 
         self._log.critical(
             "circuit_breaker.tripped",
@@ -679,5 +903,6 @@ class CircuitBreaker:
             f"CircuitBreaker("
             f"tripped={self._tripped}, "
             f"reason={self._trip_reason!r}, "
-            f"trip_count={self._trip_count})"
+            f"trip_count={self._trip_count}, "
+            f"response={self._current_response})"
         )

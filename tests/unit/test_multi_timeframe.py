@@ -291,7 +291,14 @@ class TestBuildMtfContext:
         # Default state: _htf_bars is None (not set via run_backtest)
         assert engine._htf_bars is None  # type: ignore[attr-defined]
 
-        result = engine._build_mtf_context(datetime(2024, 1, 1, 4, tzinfo=UTC))
+        # Ensure no FGI global client leaks from other tests (Sprint 32)
+        import data.sentiment as _sent_mod
+        _prev = _sent_mod._global_client
+        _sent_mod._global_client = None
+        try:
+            result = engine._build_mtf_context(datetime(2024, 1, 1, 4, tzinfo=UTC))
+        finally:
+            _sent_mod._global_client = _prev
 
         assert result is None
 
@@ -577,7 +584,14 @@ class TestRunBacktestWithHtfBars:
 
         bars = self._make_minimal_bars()
         # No htf_bars argument -- default None
-        await engine.run_backtest({"BTC/USD": bars})
+        # Ensure no FGI global client leaks from other tests (Sprint 32)
+        import data.sentiment as _sent_mod
+        _prev = _sent_mod._global_client
+        _sent_mod._global_client = None
+        try:
+            await engine.run_backtest({"BTC/USD": bars})
+        finally:
+            _sent_mod._global_client = _prev
 
         assert mocks["strategy"].on_bar.call_count >= 1
         for single_call in mocks["strategy"].on_bar.call_args_list:

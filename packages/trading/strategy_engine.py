@@ -47,7 +47,9 @@ from trading.execution import BaseExecutionEngine
 from trading.models import Fill, Position, Signal, TradeResult
 from trading.portfolio import PortfolioAccounting
 from trading.risk import BaseRiskManager
+from trading.safety import CircuitBreaker, CircuitBreakerResponse
 from trading.strategy import BaseStrategy
+from trading.trade_journal import ExitReasonDetector, TradeExcursionTracker, TradeSkipLogger
 from trading.trailing_stop import TrailingStopManager
 
 __all__ = ["StrategyEngine", "EngineState"]
@@ -138,6 +140,7 @@ class StrategyEngine:
         timeframe: TimeFrame,
         run_mode: RunMode,
         config: dict[str, Any] | None = None,
+        circuit_breaker: CircuitBreaker | None = None,
     ) -> None:
         if not strategies:
             raise ValueError("At least one strategy is required")
@@ -145,6 +148,7 @@ class StrategyEngine:
             raise ValueError("At least one symbol is required")
 
         self._strategies = list(strategies)
+        self._circuit_breaker = circuit_breaker
         self._execution_engine = execution_engine
         self._risk_manager = risk_manager
         self._market_data = market_data
@@ -182,6 +186,11 @@ class StrategyEngine:
         self._total_orders: int = 0
         self._total_fills: int = 0
         self._stop_event: asyncio.Event = asyncio.Event()
+
+        # Adaptive learning - excursion and skip tracking (Sprint 32)
+        self._excursion_tracker = TradeExcursionTracker()
+        self._skip_logger = TradeSkipLogger()
+        self._last_mtf_context: MultiTimeframeContext | None = None
 
         # Rolling bar windows for paper/live mode: symbol -> list[OHLCVBar]
         self._bar_windows: dict[str, list[OHLCVBar]] = {
@@ -276,6 +285,7 @@ class StrategyEngine:
         self._run_id = run_id
         self._stop_event.clear()  # Reset for this run (supports restart)
         self._log = self._log.bind(run_id=run_id)
+        self._skip_logger.set_run_id(run_id)
 
         self._log.info("engine.starting")
 
@@ -360,6 +370,18 @@ class StrategyEngine:
         # Reset trailing stop tracking state
         if self._trailing_stop is not None:
             self._trailing_stop.reset()
+
+        # Sprint 32: clear adaptive learning trackers
+        self._excursion_tracker.clear()
+        skip_summary = self._skip_logger.get_skip_summary()
+        if skip_summary:
+            self._log.info(
+                "engine.skip_summary",
+                total_skips=self._skip_logger.skip_count,
+                by_reason=skip_summary,
+            )
+        self._skip_logger.clear()
+        self._last_mtf_context = None
 
         # Clear HTF bar data
         self._htf_bars = None
@@ -611,6 +633,12 @@ class StrategyEngine:
         prices = {s: bar.close for s, bar in current_bars.items()}
         self._portfolio.update_market_prices(prices)
 
+        # C1. Update excursion tracker on every bar (Sprint 32)
+        for sym, b in current_bars.items():
+            self._excursion_tracker.on_bar(
+                symbol=sym, high=b.high, low=b.low, close=b.close
+            )
+
         # 2. Tick risk manager cooldown
         self._risk_manager.tick_cooldown()
 
@@ -619,6 +647,14 @@ class StrategyEngine:
         # so strategies can still be monitored and signals recorded. The paper
         # execution engine's pre_trade_check will block actual order placement.
         if self._run_mode == RunMode.LIVE and self._risk_manager.kill_switch_active:
+            # C6: Log skipped trades on kill switch (Sprint 32)
+            if self._skip_logger is not None:
+                for sym, sym_bar in current_bars.items():
+                    self._skip_logger.log_skip(
+                        symbol=sym,
+                        skip_reason="kill_switch",
+                        hypothetical_entry_price=sym_bar.close,
+                    )
             self._log.warning(
                 "engine.bar_skipped_kill_switch",
                 bar_timestamp=str(bar_timestamp),
@@ -628,6 +664,21 @@ class StrategyEngine:
         # Count only bars that reach strategy processing
         self._bar_count += 1
 
+        # C2. Check graduated circuit breaker (Sprint 32).
+        # DAILY_LIMIT: no new entries but trailing stops must still fire - do NOT return.
+        # HALT: block all new signals (but fall through to trailing stop section 5b).
+        _cb_response = CircuitBreakerResponse.OK
+        if self._circuit_breaker is not None:
+            equity_summary = self._portfolio.get_summary()
+            _cb_equity = float(equity_summary.get("current_equity", 0.0))
+            _cb_daily_pnl = float(equity_summary.get("realised_pnl", 0.0))
+            _cb_drawdown = float(equity_summary.get("max_drawdown", 0.0))
+            _cb_response = self._circuit_breaker.check_graduated(
+                equity=_cb_equity,
+                daily_pnl=_cb_daily_pnl,
+                drawdown=_cb_drawdown,
+            )
+
         # 4. For each strategy: call on_bar and process resulting signals
         bar_signals: list[Signal] = []
         bar_orders: int = 0
@@ -635,6 +686,14 @@ class StrategyEngine:
 
         # Build multi-timeframe context (look-ahead bias filtered)
         mtf_context = self._build_mtf_context(bar_timestamp)
+        # C3: Store for use in trade recording / skip logging (Sprint 32)
+        self._last_mtf_context = mtf_context
+
+        # C2 (cont.): If HALT or DAILY_LIMIT, suppress new entry signals
+        # but preserve flow so trailing stops (section 5b) can still fire.
+        _suppress_new_signals = (
+            _cb_response in (CircuitBreakerResponse.HALT, CircuitBreakerResponse.DAILY_LIMIT)
+        )
 
         for strategy in self._strategies:
             try:
@@ -650,11 +709,47 @@ class StrategyEngine:
                 )
                 continue
 
+        # C2 (cont.): filter/reduce signals based on graduated CB response
+        if _suppress_new_signals:
+            if _cb_response == CircuitBreakerResponse.DAILY_LIMIT:
+                self._log.warning(
+                    "engine.daily_limit_signals_suppressed",
+                    bar_timestamp=str(bar_timestamp),
+                    skip_count=len(bar_signals),
+                )
+            # Log suppressed BUY signals as skipped trades
+            from common.types import SignalDirection as _SD
+            for _sig in bar_signals:
+                if _sig.direction == _SD.BUY:
+                    self._skip_logger.log_skip(
+                        symbol=_sig.symbol,
+                        skip_reason=f"circuit_breaker_{_cb_response}",
+                        hypothetical_entry_price=current_bars.get(_sig.symbol, next(iter(current_bars.values()))).close,
+                        signal_context=dict(_sig.metadata),
+                    )
+            bar_signals = []
+
         self._total_signals += len(bar_signals)
 
         # 5. Process each signal through the execution engine
         for signal in bar_signals:
             try:
+                # C3: Apply REDUCE position multiplier to BUY signals only (Sprint 32)
+                _size_multiplier = 1.0
+                if (
+                    self._circuit_breaker is not None
+                    and _cb_response == CircuitBreakerResponse.REDUCE
+                ):
+                    from common.types import SignalDirection as _SD2
+                    if signal.direction == _SD2.BUY:
+                        _size_multiplier = self._circuit_breaker.get_position_size_multiplier()
+                        if _size_multiplier < 1.0:
+                            signal = signal.model_copy(
+                                update={
+                                    "target_position": signal.target_position * type(signal.target_position)(str(_size_multiplier))
+                                }
+                            )
+
                 orders = await self._execution_engine.process_signal(signal)
                 bar_orders += len(orders)
 
@@ -682,11 +777,27 @@ class StrategyEngine:
 
                         self._portfolio.update_position(fill, current_price)
 
+                        # C4: Start excursion tracking when a new BUY fill opens a position (Sprint 32)
+                        if fill.side.value == "buy" or str(fill.side) in ("buy", "BUY"):
+                            post_fill_pos = self._portfolio.get_position(fill.symbol)
+                            if post_fill_pos is not None and not post_fill_pos.is_flat:
+                                fgi_val: int | None = None
+                                if self._last_mtf_context is not None:
+                                    fgi_val = self._last_mtf_context.fear_greed_index
+                                self._excursion_tracker.on_position_open(
+                                    symbol=fill.symbol,
+                                    entry_price=fill.price,
+                                    side="long",
+                                    regime_at_entry=self._fgi_to_regime(fgi_val),
+                                    signal_context=dict(signal.metadata) if signal.metadata else None,
+                                )
+
                         # Record trade if this fill closed/reduced a position
                         self._record_trade_if_closed(
                             fill=fill,
                             pre_fill_position=pre_fill_pos,
                             strategy_id=signal.strategy_id,
+                            signal_metadata=dict(signal.metadata) if signal.metadata else None,
                         )
 
                         # Determine if this fill closed a position (for risk
@@ -701,6 +812,16 @@ class StrategyEngine:
                     symbol=signal.symbol,
                     direction=signal.direction.value,
                 )
+                # C5: Log skipped trade on execution error (Sprint 32)
+                from common.types import SignalDirection as _SD3
+                if signal.direction == _SD3.BUY:
+                    bar_ref = current_bars.get(signal.symbol)
+                    self._skip_logger.log_skip(
+                        symbol=signal.symbol,
+                        skip_reason="execution_error",
+                        hypothetical_entry_price=bar_ref.close if bar_ref else None,
+                        signal_context=dict(signal.metadata) if signal.metadata else None,
+                    )
                 continue
 
         # 5b. Check trailing stops for open positions
@@ -726,6 +847,7 @@ class StrategyEngine:
                                     fill=fill,
                                     pre_fill_position=pre_fill_pos,
                                     strategy_id=stop_signal.strategy_id,
+                                    signal_metadata=dict(stop_signal.metadata) if stop_signal.metadata else None,
                                 )
                                 self._route_fill_to_risk_manager(fill, bar.close)
                 except Exception:
@@ -804,7 +926,20 @@ class StrategyEngine:
         Only includes HTF bars whose full period has completed before
         the current primary bar timestamp.
         """
+        # Sprint 32: read cached FGI value (best-effort, never crashes)
+        fgi_value: int | None = None
+        try:
+            from data.sentiment import get_global_client as _get_fgi_client
+            _fgi_client = _get_fgi_client()
+            if _fgi_client is not None:
+                fgi_value = _fgi_client.cached_value  # CR-002: public property
+        except Exception:
+            pass  # FGI is best-effort; never crash bar processing
+
+        # CR-003: Return context with FGI even when no HTF bars exist
         if self._htf_bars is None:
+            if fgi_value is not None:
+                return MultiTimeframeContext(fear_greed_index=fgi_value)
             return None
 
         filtered: dict[str, dict[str, list[OHLCVBar]]] = {}
@@ -815,7 +950,7 @@ class StrategyEngine:
                 self._log.warning(
                     "engine.unknown_htf_timeframe",
                     timeframe=tf_str,
-                    msg="Unrecognised HTF timeframe — excluding all bars as safety default.",
+                    msg="Unrecognised HTF timeframe  -- excluding all bars as safety default.",
                 )
                 # Exclude all bars for unknown timeframes (safe default)
                 filtered[tf_str] = {sym: [] for sym in bars_by_sym}
@@ -831,7 +966,27 @@ class StrategyEngine:
                 ]
             filtered[tf_str] = filtered_sym
 
-        return MultiTimeframeContext(htf_bars=filtered)
+        return MultiTimeframeContext(htf_bars=filtered, fear_greed_index=fgi_value)
+
+    # ------------------------------------------------------------------
+    # Regime classification (Sprint 32 CR-001)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _fgi_to_regime(fgi: int | None) -> str | None:
+        """Classify a Fear & Greed Index value into a regime label."""
+        if fgi is None:
+            return None
+        if fgi <= 24:
+            return "EXTREME_FEAR"
+        elif fgi <= 44:
+            return "FEAR"
+        elif fgi <= 55:
+            return "NEUTRAL"
+        elif fgi <= 75:
+            return "GREED"
+        else:
+            return "EXTREME_GREED"
 
     # ------------------------------------------------------------------
     # Fill routing
@@ -882,6 +1037,7 @@ class StrategyEngine:
         fill: Fill,
         pre_fill_position: Position | None,
         strategy_id: str,
+        signal_metadata: dict[str, Any] | None = None,
     ) -> None:
         """
         Detect round-trip completion and record a TradeResult.
@@ -889,6 +1045,9 @@ class StrategyEngine:
         Called after update_position() has applied the fill. Compares the
         pre-fill position state with the post-fill state to determine
         whether a position was fully or partially closed.
+
+        Sprint 32: Enriches TradeResult with MAE/MFE excursion data,
+        exit reason classification, regime at entry, and signal context.
 
         Parameters
         ----------
@@ -899,6 +1058,8 @@ class StrategyEngine:
             None if no position existed for this symbol.
         strategy_id :
             The strategy that generated the signal leading to this fill.
+        signal_metadata :
+            Optional metadata dict from the closing signal (Sprint 32).
         """
         # Only SELL fills can close long positions (spot-only MVP)
         if fill.side != OrderSide.SELL:
@@ -925,6 +1086,21 @@ class StrategyEngine:
 
         now = datetime.now(tz=UTC)
 
+        # Sprint 32: retrieve excursion data and exit reason
+        excursion_data = self._excursion_tracker.on_position_close(fill.symbol)
+        mae_pct: float | None = None
+        mfe_pct: float | None = None
+        regime_at_entry: str | None = None
+        entry_signal_context: dict[str, Any] | None = None
+
+        if excursion_data is not None:
+            mae_pct, mfe_pct, regime_at_entry, entry_signal_context = excursion_data
+
+        exit_reason = ExitReasonDetector.detect(
+            strategy_id=strategy_id,
+            signal_metadata=signal_metadata,
+        )
+
         try:
             trade = TradeResult(
                 run_id=self._run_id,
@@ -940,6 +1116,11 @@ class StrategyEngine:
                 entry_at=pre_fill_position.opened_at,
                 exit_at=now,
                 strategy_id=strategy_id,
+                mae_pct=mae_pct,
+                mfe_pct=mfe_pct,
+                exit_reason=exit_reason,
+                regime_at_entry=regime_at_entry,
+                signal_context=entry_signal_context,
             )
             self._portfolio.record_trade(trade)
             self._log.info(
@@ -948,6 +1129,9 @@ class StrategyEngine:
                 symbol=trade.symbol,
                 pnl=str(trade.realised_pnl),
                 quantity=str(trade.quantity),
+                exit_reason=exit_reason,
+                mae_pct=mae_pct,
+                mfe_pct=mfe_pct,
             )
         except Exception:
             self._log.exception(
@@ -995,12 +1179,13 @@ class StrategyEngine:
                             self._portfolio.update_position(
                                 fill, bar.close
                             )
-                            # TODO: track Order→strategy_id mapping for
+                            # TODO: track Order ->strategy_id mapping for
                             # correct multi-strategy attribution on resting fills.
                             self._record_trade_if_closed(
                                 fill=fill,
                                 pre_fill_position=pre_fill_pos,
                                 strategy_id=self._strategies[0].strategy_id,
+                                signal_metadata=None,  # Resting order: no signal metadata
                             )
                             self._route_fill_to_risk_manager(
                                 fill, bar.close

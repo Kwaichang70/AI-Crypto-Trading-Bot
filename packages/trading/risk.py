@@ -144,6 +144,11 @@ class BaseRiskManager(abc.ABC):
     def kill_switch_active(self) -> bool:
         return self._kill_switch_active
 
+    @property
+    def consecutive_losses(self) -> int:
+        """Current count of consecutive losing trades."""
+        return self._consecutive_losses
+
     # ------------------------------------------------------------------
     # Kill switch
     # ------------------------------------------------------------------

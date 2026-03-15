@@ -69,6 +69,11 @@ logger = structlog.get_logger(__name__)
 # ---------------------------------------------------------------------------
 _retraining_service: Any = None
 
+# ---------------------------------------------------------------------------
+# Module-level FearGreedClient instance (Sprint 32)
+# ---------------------------------------------------------------------------
+_fgi_client: Any = None
+
 
 # ---------------------------------------------------------------------------
 # Application lifespan
@@ -176,6 +181,28 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log.info("retraining_service.disabled", reason="ML_AUTO_RETRAIN=false")
 
     # ------------------------------------------------------------------
+    # 5. Start Fear & Greed Index client (Sprint 32)
+    # ------------------------------------------------------------------
+    try:
+        from data.sentiment import FearGreedClient, set_global_client as _set_fgi
+
+        _fgi_client_instance = FearGreedClient()
+        _set_fgi(_fgi_client_instance)
+        # Warm up the cache on startup (best-effort; never block startup)
+        try:
+            await _fgi_client_instance.get_latest()
+            log.info("fgi_client.warmed_up")
+        except Exception:
+            log.warning("fgi_client.warmup_failed", exc_info=True)
+
+        globals()["_fgi_client"] = _fgi_client_instance
+        log.info("fgi_client.started")
+    except ImportError:
+        log.info("fgi_client.skipped", reason="aiohttp not installed")
+    except Exception:
+        log.warning("fgi_client.startup_error", exc_info=True)
+
+    # ------------------------------------------------------------------
     # Future: Redis connection init goes here
     # ------------------------------------------------------------------
 
@@ -207,6 +234,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     if _retraining_service is not None:
         await _retraining_service.stop()
         _retraining_service = None
+
+    # Close FearGreedClient session (Sprint 32)
+    if _fgi_client is not None:
+        try:
+            await _fgi_client.close()
+        except Exception:
+            pass
 
     # Close all pooled database connections gracefully
     from api.db.session import dispose_engine
@@ -259,7 +293,7 @@ def create_app() -> FastAPI:
         title=settings.app_name,
         version=settings.app_version,
         description=(
-            "AI Crypto Trading Bot API — "
+            "AI Crypto Trading Bot API  -- "
             "backtesting, paper trading, and live trading via CCXT"
         ),
         docs_url="/docs" if settings.debug else None,
@@ -373,6 +407,6 @@ def _register_routes(application: FastAPI) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Module-level app instance — used by uvicorn and test client
+# Module-level app instance  -- used by uvicorn and test client
 # ---------------------------------------------------------------------------
 app = create_app()

@@ -71,6 +71,7 @@ class MultiTimeframeContext:
     """
 
     htf_bars: dict[str, dict[str, list[OHLCVBar]]] = field(default_factory=dict)
+    fear_greed_index: int | None = field(default=None)
     """
     Higher-timeframe bars keyed by timeframe string, then by symbol.
     E.g. {"4h": {"BTC/USD": [bar1, bar2, ...]}, "1d": {"BTC/USD": [bar1, ...]}}
