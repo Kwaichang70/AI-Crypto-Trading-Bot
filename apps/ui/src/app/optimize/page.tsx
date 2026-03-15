@@ -1,24 +1,27 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import {
   fetchStrategies,
   fetchStrategySchema,
   runOptimization,
   createRun,
+  fetchOptimizationRuns,
 } from "@/lib/api";
 import type {
   Strategy,
   JsonSchemaProperty,
   OptimizeResponse,
   OptimizeEntry,
+  OptimizationRunSummary,
 } from "@/lib/types";
 import { Header } from "@/components/layout/header";
 import { DataTable } from "@/components/ui/data-table";
-import type { Column } from "@/components/ui/data-table";
 import { ParamGridEditor } from "./param-grid-editor";
 import type { ParamGridRow } from "./param-grid-editor";
+import { buildResultColumns } from "./result-columns";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -49,123 +52,109 @@ type PagePhase =
   | { kind: "error"; message: string };
 
 // ---------------------------------------------------------------------------
-// Results table column factory
+// Optimization history component
 // ---------------------------------------------------------------------------
 
-function buildResultColumns(
-  rankBy: string,
-  launchingRank: number | null,
-  onLaunch: (entry: OptimizeEntry) => void,
-): Column<OptimizeEntry>[] {
-  return [
-    {
-      key: "rank",
-      header: "#",
-      render: (e) => (
-        <span
-          className={
-            e.rank === 1
-              ? "font-bold text-yellow-400"
-              : "text-slate-400"
-          }
-        >
-          {e.rank}
-        </span>
-      ),
-    },
-    {
-      key: "params",
-      header: "Parameters",
-      render: (e) => (
-        <div className="flex flex-wrap gap-1">
-          {Object.entries(e.params).map(([k, v]) => (
-            <span
-              key={k}
-              className="rounded bg-slate-700 px-1.5 py-0.5 font-mono text-xs text-slate-300"
-            >
-              {k}={String(v)}
-            </span>
+function OptimizationHistory() {
+  const [runs, setRuns] = useState<readonly OptimizationRunSummary[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setIsLoading(true);
+    fetchOptimizationRuns({ limit: 10 }).then((r) => {
+      if (r.ok) {
+        setRuns(r.data.items);
+      } else {
+        setError(r.error.message);
+      }
+      setIsLoading(false);
+    });
+  }, []);
+
+  if (isLoading) {
+    return (
+      <div className="card p-4">
+        <h2 className="mb-3 text-sm font-semibold text-slate-300">Recent Optimization Runs</h2>
+        <div className="space-y-2">
+          {[...Array(3)].map((_, i) => (
+            <div key={i} className="h-10 animate-pulse rounded bg-slate-800" />
           ))}
         </div>
-      ),
-    },
-    {
-      key: "sharpe_ratio",
-      header: rankBy === "sharpe_ratio" ? "Sharpe ★" : "Sharpe",
-      sortable: true,
-      sortValue: (e) => e.metrics["sharpe_ratio"] ?? -Infinity,
-      render: (e) => (
-        <span className={rankBy === "sharpe_ratio" ? "font-semibold text-indigo-300" : ""}>
-          {(e.metrics["sharpe_ratio"] ?? 0).toFixed(3)}
-        </span>
-      ),
-    },
-    {
-      key: "total_return_pct",
-      header: rankBy === "total_return_pct" ? "Return % ★" : "Return %",
-      sortable: true,
-      sortValue: (e) => e.metrics["total_return_pct"] ?? -Infinity,
-      render: (e) => {
-        const v = e.metrics["total_return_pct"] ?? 0;
-        return (
-          <span
-            className={
-              rankBy === "total_return_pct"
-                ? "font-semibold text-indigo-300"
-                : v >= 0
-                  ? "text-emerald-400"
-                  : "text-red-400"
-            }
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="card p-4">
+        <h2 className="mb-3 text-sm font-semibold text-slate-300">Recent Optimization Runs</h2>
+        <p className="text-sm text-slate-500">{error}</p>
+      </div>
+    );
+  }
+
+  if (runs.length === 0) {
+    return (
+      <div className="card p-4">
+        <h2 className="mb-3 text-sm font-semibold text-slate-300">Recent Optimization Runs</h2>
+        <p className="text-sm text-slate-500">No saved optimization runs yet. Run your first grid search above.</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="card overflow-hidden">
+      <div className="border-b border-slate-800 px-4 py-3">
+        <h2 className="text-sm font-semibold text-slate-300">Recent Optimization Runs</h2>
+      </div>
+      <div className="divide-y divide-slate-800">
+        {runs.map((run) => (
+          <div
+            key={run.id}
+            className="flex items-center justify-between px-4 py-3 hover:bg-slate-800/40"
           >
-            {v >= 0 ? "+" : ""}
-            {(v * 100).toFixed(2)}%
-          </span>
-        );
-      },
-    },
-    {
-      key: "max_drawdown_pct",
-      header: rankBy === "max_drawdown_pct" ? "Max DD ★" : "Max DD",
-      sortable: true,
-      sortValue: (e) => e.metrics["max_drawdown_pct"] ?? Infinity,
-      render: (e) => (
-        <span className={rankBy === "max_drawdown_pct" ? "font-semibold text-indigo-300" : "text-red-400"}>
-          {((e.metrics["max_drawdown_pct"] ?? 0) * 100).toFixed(2)}%
-        </span>
-      ),
-    },
-    {
-      key: "win_rate",
-      header: rankBy === "win_rate" ? "Win Rate ★" : "Win Rate",
-      sortable: true,
-      sortValue: (e) => e.metrics["win_rate"] ?? -Infinity,
-      render: (e) => (
-        <span className={rankBy === "win_rate" ? "font-semibold text-indigo-300" : ""}>
-          {((e.metrics["win_rate"] ?? 0) * 100).toFixed(1)}%
-        </span>
-      ),
-    },
-    {
-      key: "total_trades",
-      header: "Trades",
-      sortable: true,
-      sortValue: (e) => e.metrics["total_trades"] ?? 0,
-      render: (e) => String(Math.round(e.metrics["total_trades"] ?? 0)),
-    },
-    {
-      key: "actions",
-      header: "",
-      render: (e) => (
-        <button
-          onClick={() => onLaunch(e)}
-          disabled={launchingRank === e.rank}
-          className="rounded-lg bg-indigo-600 px-3 py-1 text-xs font-medium text-white hover:bg-indigo-500 disabled:opacity-50"
-        >
-          {launchingRank === e.rank ? "Starting…" : "Launch Run"}
-        </button>
-      ),
-    },
-  ];
+            <div className="min-w-0 flex-1 space-y-0.5">
+              <div className="flex items-center gap-2">
+                <span className="text-sm font-medium text-slate-200">
+                  {run.strategyName}
+                </span>
+                <span className="rounded bg-slate-700 px-1.5 py-0.5 font-mono text-xs text-slate-400">
+                  {run.timeframe}
+                </span>
+                <span className="text-xs text-slate-500">
+                  ranked by <span className="text-slate-400">{run.rankBy}</span>
+                </span>
+              </div>
+              <div className="flex items-center gap-3 text-xs text-slate-500">
+                <span>{run.symbols.join(", ")}</span>
+                <span>·</span>
+                <span>
+                  {run.completedCombinations}/{run.totalCombinations} combinations
+                </span>
+                {run.failedCombinations > 0 && (
+                  <>
+                    <span>·</span>
+                    <span className="text-amber-500">{run.failedCombinations} failed</span>
+                  </>
+                )}
+                <span>·</span>
+                <span>{run.elapsedSeconds}s</span>
+                <span>·</span>
+                <span>{new Date(run.createdAt).toLocaleDateString()}</span>
+              </div>
+            </div>
+            <Link
+              href={`/optimize/${run.id}`}
+              className="ml-4 shrink-0 rounded-lg border border-slate-700 px-3 py-1.5 text-xs font-medium text-slate-400 transition-colors hover:border-indigo-500 hover:text-indigo-400"
+            >
+              View
+            </Link>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -638,6 +627,19 @@ export default function OptimizePage() {
               <span className="text-slate-400">
                 Elapsed: <span className="text-slate-200">{phase.data.elapsedSeconds}s</span>
               </span>
+              {/* Link to saved detail page — only shown when the backend has persisted the run */}
+              {phase.data.optimizationRunId && (
+                <>
+                  <span className="text-slate-600">·</span>
+                  <span className="text-slate-500">Saved</span>
+                  <Link
+                    href={`/optimize/${phase.data.optimizationRunId}`}
+                    className="text-indigo-400 hover:underline"
+                  >
+                    View
+                  </Link>
+                </>
+              )}
             </div>
           </div>
 
@@ -664,6 +666,9 @@ export default function OptimizePage() {
           )}
         </div>
       )}
+
+      {/* Optimization history — always visible, fetches saved runs on mount */}
+      <OptimizationHistory />
     </div>
   );
 }

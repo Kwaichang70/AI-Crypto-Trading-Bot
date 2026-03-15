@@ -16,6 +16,7 @@ import type {
   FillListResponse,
   ModelVersion,
   ModelVersionListResponse,
+  OptimizationRunListResponse,
   OptimizeRequest,
   OptimizeResponse,
   OrderListResponse,
@@ -442,6 +443,37 @@ export async function runOptimization(
     },
     300_000,
   );
+}
+
+/**
+ * GET /api/v1/optimize — paginated list of saved optimization run summaries.
+ * Does NOT include the entries array — use fetchOptimizationRun(id) for full detail.
+ */
+export async function fetchOptimizationRuns(params?: {
+  offset?: number;
+  limit?: number;
+}): Promise<ApiResult<OptimizationRunListResponse>> {
+  const qs = new URLSearchParams();
+  if (params?.offset !== undefined) qs.set("offset", String(params.offset));
+  if (params?.limit !== undefined) qs.set("limit", String(params.limit));
+  const query = qs.toString() ? `?${qs.toString()}` : "";
+  return apiGet<OptimizationRunListResponse>(`/api/v1/optimize${query}`, {
+    cache: "no-store",
+  });
+}
+
+/**
+ * GET /api/v1/optimize/{id} — full detail of a saved optimization run, including all entries.
+ *
+ * Uses a 30 s timeout — the entries JSONB column can be large on cold DB connections.
+ */
+export async function fetchOptimizationRun(
+  id: string,
+): Promise<ApiResult<OptimizeResponse>> {
+  // 30 s: entries JSONB column can be large on cold DB connections.
+  return apiFetch<OptimizeResponse>(`/api/v1/optimize/${id}`, {
+    cache: "no-store",
+  }, 30_000);
 }
 
 // ---------------------------------------------------------------------------

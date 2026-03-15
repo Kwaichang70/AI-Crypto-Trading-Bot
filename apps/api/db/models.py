@@ -56,6 +56,8 @@ __all__ = [
     "SignalORM",
     "PositionSnapshotORM",
     "ModelVersionORM",
+    "OptimizationRunORM",
+    "OptimizationEntryORM",
 ]
 
 # ---------------------------------------------------------------------------
@@ -1014,4 +1016,163 @@ class ModelVersionORM(Base):
         return (
             f"<ModelVersionORM id={self.id} symbol={self.symbol} "
             f"tf={self.timeframe} acc={self.accuracy} active={self.is_active}>"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 9. optimization_runs — Parameter grid search session records
+# ---------------------------------------------------------------------------
+
+class OptimizationRunORM(Base):
+    """
+    Represents one completed parameter grid search (optimization) run.
+
+    Written atomically when POST /api/v1/optimize completes successfully.
+    Stores the top-N ranked parameter combinations in the related
+    ``OptimizationEntryORM`` rows.
+
+    Index strategy:
+    - (created_at DESC) — list endpoint ORDER BY, newest-first pagination
+    """
+
+    __tablename__ = "optimization_runs"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        comment="Optimization run UUID (app-generated v4)",
+    )
+    strategy_name: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        comment="Strategy identifier used for this search, e.g. ma_crossover",
+    )
+    # JSONB list of symbol strings — uses list[Any] per project JSONB convention
+    # (SQLAlchemy returns list[Any] at runtime; Pydantic layer enforces list[str]).
+    symbols: Mapped[list[Any]] = mapped_column(
+        JSONB,
+        nullable=False,
+        comment="CCXT-format trading pairs searched, e.g. [\"BTC/USD\"]",
+    )
+    timeframe: Mapped[str] = mapped_column(
+        String(8),
+        nullable=False,
+        comment="Candle timeframe used for the search, e.g. 1h",
+    )
+    rank_by: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        comment="Metric used to rank results, e.g. sharpe_ratio",
+    )
+    total_combinations: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        comment="Total number of parameter combinations in the grid",
+    )
+    completed_combinations: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        comment="Number of combinations that completed without error",
+    )
+    failed_combinations: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        comment="Number of combinations that raised an exception",
+    )
+    elapsed_seconds: Mapped[float] = mapped_column(
+        Numeric(10, 3),
+        nullable=False,
+        comment="Wall-clock time for the full grid search in seconds",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        comment="UTC timestamp when the optimization run was persisted",
+    )
+
+    # Relationship — ordered by rank ascending so entry[0] is the best result
+    entries: Mapped[list[OptimizationEntryORM]] = relationship(
+        "OptimizationEntryORM",
+        back_populates="optimization_run",
+        cascade="all, delete-orphan",
+        order_by="OptimizationEntryORM.rank",
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<OptimizationRunORM id={self.id} strategy={self.strategy_name} "
+            f"combinations={self.total_combinations}>"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 10. optimization_entries — Individual ranked parameter combination results
+# ---------------------------------------------------------------------------
+
+class OptimizationEntryORM(Base):
+    """
+    One ranked parameter combination result within an optimization run.
+
+    Each row stores the parameter dict, the computed metrics dict, and the
+    rank (1 = best) for a single backtest combination.
+
+    Index strategy:
+    - (optimization_run_id) — retrieve all entries for a run
+    - (optimization_run_id, rank) UNIQUE — enforces one entry per rank per run
+      and supports fast ORDER BY rank queries on the entries page.
+    """
+
+    __tablename__ = "optimization_entries"
+    __table_args__ = (
+        UniqueConstraint(
+            "optimization_run_id",
+            "rank",
+            name="uq_optimization_entries_run_rank",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        comment="Entry UUID (app-generated v4)",
+    )
+    optimization_run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("optimization_runs.id", ondelete="CASCADE"),
+        nullable=False,
+        comment="FK to the parent optimization run",
+    )
+    rank: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        comment="Rank of this parameter combination (1 = best by rank_by metric)",
+    )
+    # JSONB parameter dict — uses dict[str, Any] per project JSONB convention.
+    # The Pydantic response layer (OptimizeEntryResponse) enforces the actual types.
+    params: Mapped[dict[str, Any]] = mapped_column(
+        JSONB,
+        nullable=False,
+        comment="Parameter combination for this entry, e.g. {\"fast_period\": 10}",
+    )
+    # JSONB metrics dict — uses dict[str, Any] per project JSONB convention.
+    # Metrics are floats at runtime; the Pydantic layer enforces dict[str, float].
+    metrics: Mapped[dict[str, Any]] = mapped_column(
+        JSONB,
+        nullable=False,
+        comment="Computed backtest metrics for this combination, e.g. {\"sharpe_ratio\": 1.2}",
+    )
+
+    # Relationship
+    optimization_run: Mapped[OptimizationRunORM] = relationship(
+        "OptimizationRunORM",
+        back_populates="entries",
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<OptimizationEntryORM run={self.optimization_run_id} "
+            f"rank={self.rank} params={self.params}>"
         )

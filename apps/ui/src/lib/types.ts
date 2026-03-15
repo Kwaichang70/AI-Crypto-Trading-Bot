@@ -381,4 +381,53 @@ export interface OptimizeResponse {
   failedCombinations: number;
   elapsedSeconds: number;
   entries: readonly OptimizeEntry[];
+  /**
+   * UUID of the persisted OptimizationRun record.
+   * Optional until backend always returns this field (Sprint 31 backend persistence).
+   * TODO(sprint-32): promote to required once GET /api/v1/optimize/{id} is deployed.
+   * set after backend persistence is wired (Sprint 31)
+   */
+  optimizationRunId?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Optimization Run History
+// ---------------------------------------------------------------------------
+
+/**
+ * A saved optimization run summary returned by GET /api/v1/optimize.
+ * Mirrors OptimizationRunSummaryResponse in apps/api/schemas.py.
+ *
+ * The `entries` field is NOT included in the list response — only the full
+ * detail response (GET /api/v1/optimize/{id}) carries the entries array.
+ */
+export interface OptimizationRunSummary {
+  /** UUID of the saved optimization run. */
+  id: string;
+  /** Strategy name used in this optimization, e.g. "ma_crossover". */
+  strategyName: string;
+  /** OHLCV timeframe used, e.g. "1h". */
+  timeframe: string;
+  /** Trading symbols included in the backtest, e.g. ["BTC/USD"]. */
+  symbols: readonly string[];
+  /** Metric used to rank parameter combinations, e.g. "sharpe_ratio". */
+  rankBy: string;
+  /** Total number of parameter combinations attempted. */
+  totalCombinations: number;
+  /** Number of combinations that completed successfully. */
+  completedCombinations: number;
+  /** Number of combinations that failed (exception during backtest). */
+  failedCombinations: number;
+  /** Wall-clock seconds elapsed for the full grid search. */
+  elapsedSeconds: number;
+  /** ISO-8601 datetime when this optimization run was persisted. */
+  createdAt: string;
+}
+
+/** Response envelope for GET /api/v1/optimize (paginated list). */
+export interface OptimizationRunListResponse {
+  items: readonly OptimizationRunSummary[];
+  total: number;
+  offset: number;
+  limit: number;
 }

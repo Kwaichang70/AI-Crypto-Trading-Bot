@@ -1545,6 +1545,19 @@ async def create_run(
 
     strategy_cls = registry[strategy_name]
 
+    # Extract trailing_stop_pct from strategy params BEFORE schema validation.
+    # The UI may submit trailing_stop_pct as an empty string when the field is
+    # left blank.  If it reaches the Pydantic schema validator while still a
+    # string, validation raises HTTP 400 because the strategy schemas expect a
+    # float.  Stripping it here ensures the validator sees a clean params dict.
+    _trailing_stop_pct: float | None = None
+    if "trailing_stop_pct" in body.strategy_params:
+        raw_tsp = body.strategy_params.get("trailing_stop_pct")
+        if raw_tsp is not None and raw_tsp != "":
+            _trailing_stop_pct = float(raw_tsp)
+        else:
+            del body.strategy_params["trailing_stop_pct"]
+
     # Validate strategy parameters against the declared parameter_schema
     schema = strategy_cls.parameter_schema()
     param_errors = _validate_params_against_schema(body.strategy_params, schema)
@@ -1558,16 +1571,6 @@ async def create_run(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Invalid strategy parameters: {'; '.join(param_errors)}",
         )
-
-    # Extract trailing_stop_pct from strategy params (passed to engine config)
-    # Clean empty strings from form submission before strategy Pydantic validation
-    _trailing_stop_pct: float | None = None
-    if "trailing_stop_pct" in body.strategy_params:
-        raw_tsp = body.strategy_params.get("trailing_stop_pct")
-        if raw_tsp is not None and raw_tsp != "":
-            _trailing_stop_pct = float(raw_tsp)
-        else:
-            del body.strategy_params["trailing_stop_pct"]
 
     # Additional validation for backtest mode
     is_backtest = body.mode == "backtest"
