@@ -1,15 +1,109 @@
 "use client";
 
+import {
+  Area,
+  AreaChart,
+  CartesianGrid,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
 import type { EquityPoint } from "@/lib/types";
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
 
 interface EquityCurveChartProps {
   points: readonly EquityPoint[];
   height?: number;
+  showDrawdown?: boolean;
 }
+
+interface ChartDatum {
+  timestamp: number;
+  equity: number;
+  drawdown: number;
+}
+
+// ---------------------------------------------------------------------------
+// Formatters
+// ---------------------------------------------------------------------------
+
+function formatDate(ts: number): string {
+  return new Date(ts).toLocaleDateString("en-US", {
+    month: "short",
+    day: "numeric",
+  });
+}
+
+function formatCurrency(v: number): string {
+  if (v >= 1_000_000) return `$${(v / 1_000_000).toFixed(1)}M`;
+  if (v >= 1_000) return `$${(v / 1_000).toFixed(1)}k`;
+  return `$${v.toFixed(0)}`;
+}
+
+// ---------------------------------------------------------------------------
+// Custom tooltip
+// ---------------------------------------------------------------------------
+
+interface TooltipPayloadEntry {
+  name: string;
+  value: number;
+  dataKey: string;
+}
+
+interface CustomTooltipProps {
+  active?: boolean;
+  payload?: TooltipPayloadEntry[];
+  label?: number;
+}
+
+function CustomTooltip({ active, payload, label }: CustomTooltipProps) {
+  if (!active || !payload || payload.length === 0 || label === undefined) {
+    return null;
+  }
+
+  const equityEntry = payload.find((p) => p.dataKey === "equity");
+  const drawdownEntry = payload.find((p) => p.dataKey === "drawdown");
+
+  return (
+    <div
+      style={{
+        backgroundColor: "#0f172a",
+        border: "1px solid #334155",
+        borderRadius: "8px",
+        padding: "8px 12px",
+        fontSize: "12px",
+        lineHeight: "1.6",
+      }}
+    >
+      <p style={{ color: "#94a3b8", marginBottom: "4px" }}>
+        {new Date(label).toLocaleString()}
+      </p>
+      {equityEntry && (
+        <p style={{ color: "#6366f1", margin: 0 }}>
+          Equity: <strong>${equityEntry.value.toFixed(2)}</strong>
+        </p>
+      )}
+      {drawdownEntry && (
+        <p style={{ color: "#ef4444", margin: 0 }}>
+          Drawdown: <strong>{drawdownEntry.value.toFixed(2)}%</strong>
+        </p>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Main component
+// ---------------------------------------------------------------------------
 
 export function EquityCurveChart({
   points,
-  height = 240,
+  height = 280,
+  showDrawdown = true,
 }: EquityCurveChartProps) {
   if (points.length === 0) {
     return (
@@ -22,149 +116,114 @@ export function EquityCurveChart({
     );
   }
 
-  const W = 800;
-  const H = height;
-  const PAD = { top: 12, right: 12, bottom: 28, left: 64 };
-  const plotW = W - PAD.left - PAD.right;
-  const plotH = H - PAD.top - PAD.bottom;
-
-  const equityValues = points.map((p) => parseFloat(p.equity));
-  const minEq = Math.min(...equityValues);
-  const maxEq = Math.max(...equityValues);
-  const range = maxEq - minEq || 1;
-
-  const xScale = (i: number) => PAD.left + (i / (points.length - 1)) * plotW;
-  const yScale = (v: number) =>
-    PAD.top + plotH - ((v - minEq) / range) * plotH;
-
-  // Build equity polyline
-  const equityPoints = points
-    .map((p, i) => `${xScale(i).toFixed(1)},${yScale(parseFloat(p.equity)).toFixed(1)}`)
-    .join(" ");
-
-  // Build drawdown fill (inverted, red) — scale drawdown % onto the plot
-  const maxDd = Math.max(...points.map((p) => p.drawdownPct), 0.001);
-  const ddYScale = (pct: number) => PAD.top + (pct / maxDd) * (plotH * 0.3);
-  const ddPoints = [
-    `${xScale(0).toFixed(1)},${PAD.top}`,
-    ...points.map(
-      (p, i) =>
-        `${xScale(i).toFixed(1)},${ddYScale(p.drawdownPct).toFixed(1)}`,
-    ),
-    `${xScale(points.length - 1).toFixed(1)},${PAD.top}`,
-  ].join(" ");
-
-  // Area fill polygon for equity
-  const areaPoints = [
-    `${xScale(0).toFixed(1)},${(PAD.top + plotH).toFixed(1)}`,
-    equityPoints,
-    `${xScale(points.length - 1).toFixed(1)},${(PAD.top + plotH).toFixed(1)}`,
-  ].join(" ");
-
-  // Axis labels
-  const firstDate = new Date(points[0].timestamp).toLocaleDateString("en-US", {
-    month: "short",
-    day: "numeric",
-  });
-  const lastDate = new Date(
-    points[points.length - 1].timestamp,
-  ).toLocaleDateString("en-US", { month: "short", day: "numeric" });
-
-  const formatK = (v: number) =>
-    v >= 1000 ? `${(v / 1000).toFixed(1)}k` : v.toFixed(0);
-
-  const midEq = (minEq + maxEq) / 2;
+  const data: ChartDatum[] = points.map((p) => ({
+    timestamp: new Date(p.timestamp).getTime(),
+    equity: parseFloat(p.equity),
+    // Convert fraction (0.12) to percentage (12) for right-axis display
+    drawdown: p.drawdownPct * 100,
+  }));
 
   return (
-    <div className="w-full overflow-hidden rounded-lg border border-slate-800 bg-slate-900/40 p-2">
-      <svg
-        viewBox={`0 0 ${W} ${H}`}
-        className="w-full"
-        style={{ height }}
-        aria-label="Equity curve chart"
-        role="img"
-      >
-        {/* Grid lines */}
-        {[0, 0.25, 0.5, 0.75, 1].map((frac) => {
-          const y = PAD.top + plotH * frac;
-          return (
-            <line
-              key={frac}
-              x1={PAD.left}
-              y1={y}
-              x2={PAD.left + plotW}
-              y2={y}
-              stroke="#1e293b"
-              strokeWidth={1}
+    <div className="w-full rounded-lg border border-slate-800 bg-slate-900/40 p-3">
+      <ResponsiveContainer width="100%" height={height}>
+        <AreaChart
+          data={data}
+          margin={{ top: 8, right: showDrawdown ? 48 : 8, bottom: 0, left: 8 }}
+        >
+          <defs>
+            <linearGradient id="equityGradient" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="5%" stopColor="#6366f1" stopOpacity={0.3} />
+              <stop offset="95%" stopColor="#6366f1" stopOpacity={0.0} />
+            </linearGradient>
+            <linearGradient id="drawdownGradient" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="5%" stopColor="#ef4444" stopOpacity={0.25} />
+              <stop offset="95%" stopColor="#ef4444" stopOpacity={0.0} />
+            </linearGradient>
+          </defs>
+
+          <CartesianGrid
+            strokeDasharray="3 3"
+            stroke="#1e293b"
+            vertical={false}
+          />
+
+          <XAxis
+            dataKey="timestamp"
+            tickFormatter={formatDate}
+            stroke="#475569"
+            fontSize={11}
+            tickLine={false}
+            axisLine={false}
+            minTickGap={60}
+          />
+
+          {/* Left axis — equity in dollars */}
+          <YAxis
+            yAxisId="left"
+            tickFormatter={formatCurrency}
+            stroke="#475569"
+            fontSize={11}
+            tickLine={false}
+            axisLine={false}
+            width={58}
+          />
+
+          {/* Right axis — drawdown percentage (only rendered when showDrawdown is true) */}
+          {showDrawdown && (
+            <YAxis
+              yAxisId="right"
+              orientation="right"
+              tickFormatter={(v: number) => `${v.toFixed(1)}%`}
+              stroke="#475569"
+              fontSize={11}
+              tickLine={false}
+              axisLine={false}
+              width={42}
             />
-          );
-        })}
+          )}
 
-        {/* Y-axis labels */}
-        <text x={PAD.left - 6} y={PAD.top + 4} textAnchor="end" fontSize={10} fill="#64748b">
-          {formatK(maxEq)}
-        </text>
-        <text x={PAD.left - 6} y={PAD.top + plotH / 2 + 4} textAnchor="end" fontSize={10} fill="#64748b">
-          {formatK(midEq)}
-        </text>
-        <text x={PAD.left - 6} y={PAD.top + plotH + 4} textAnchor="end" fontSize={10} fill="#64748b">
-          {formatK(minEq)}
-        </text>
+          <Tooltip content={<CustomTooltip />} />
 
-        {/* Drawdown shaded area */}
-        {points.length > 1 && (
-          <polygon
-            points={ddPoints}
-            fill="rgba(239,68,68,0.15)"
-          />
-        )}
-
-        {/* Equity area fill */}
-        {points.length > 1 && (
-          <polygon points={areaPoints} fill="rgba(99,102,241,0.08)" />
-        )}
-
-        {/* Equity line */}
-        {points.length > 1 && (
-          <polyline
-            points={equityPoints}
-            fill="none"
+          {/* Equity area */}
+          <Area
+            yAxisId="left"
+            type="monotone"
+            dataKey="equity"
             stroke="#6366f1"
-            strokeWidth={1.5}
-            strokeLinejoin="round"
+            strokeWidth={2}
+            fill="url(#equityGradient)"
+            dot={false}
+            activeDot={{ r: 4, fill: "#6366f1", stroke: "#0f172a", strokeWidth: 2 }}
           />
-        )}
 
-        {/* X-axis date labels */}
-        <text
-          x={PAD.left}
-          y={H - 6}
-          fontSize={10}
-          fill="#64748b"
-        >
-          {firstDate}
-        </text>
-        <text
-          x={PAD.left + plotW}
-          y={H - 6}
-          textAnchor="end"
-          fontSize={10}
-          fill="#64748b"
-        >
-          {lastDate}
-        </text>
-      </svg>
+          {/* Drawdown area — overlaid on right axis */}
+          {showDrawdown && (
+            <Area
+              yAxisId="right"
+              type="monotone"
+              dataKey="drawdown"
+              stroke="#ef4444"
+              strokeWidth={1}
+              fill="url(#drawdownGradient)"
+              dot={false}
+              activeDot={{ r: 3, fill: "#ef4444", stroke: "#0f172a", strokeWidth: 2 }}
+            />
+          )}
+        </AreaChart>
+      </ResponsiveContainer>
 
       {/* Legend */}
-      <div className="mt-1 flex items-center gap-4 px-2 text-xs text-slate-500">
+      <div className="mt-1 flex items-center gap-4 px-1 text-xs text-slate-500">
         <span className="flex items-center gap-1">
           <span className="inline-block h-2 w-6 rounded bg-indigo-500/60" />
           Equity
         </span>
-        <span className="flex items-center gap-1">
-          <span className="inline-block h-2 w-6 rounded bg-red-500/40" />
-          Drawdown
-        </span>
+        {showDrawdown && (
+          <span className="flex items-center gap-1">
+            <span className="inline-block h-2 w-6 rounded bg-red-500/40" />
+            Drawdown
+          </span>
+        )}
       </div>
     </div>
   );

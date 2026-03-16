@@ -1,6 +1,7 @@
 /**
  * Dashboard Home — Server Component.
  * Fetches health + recent runs + portfolio at request time.
+ * EquityOverview is a client component island that lazy-fetches sparkline data.
  */
 
 import type { Metadata } from "next";
@@ -11,6 +12,7 @@ import type { Run, AggregatePortfolio } from "@/lib/types";
 import { StatCard } from "@/components/ui/stat-card";
 import { RunStatusBadge } from "@/components/ui/status-badge";
 import { Header } from "@/components/layout/header";
+import { EquityOverview } from "@/components/dashboard/equity-overview";
 
 export const metadata: Metadata = { title: "Dashboard" };
 export const dynamic = "force-dynamic";
@@ -201,6 +203,12 @@ export default async function DashboardPage() {
             />
           );
         })()}
+      </section>
+
+      {/* Equity sparkline — client island, lazy-fetches from most recent stopped run */}
+      <section aria-label="Equity overview" className="card p-4">
+        <h2 className="text-sm font-semibold text-slate-200">Equity Trend</h2>
+        <EquityOverview />
       </section>
 
       {/* Recent runs */}
