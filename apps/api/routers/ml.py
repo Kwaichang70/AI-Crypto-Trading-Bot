@@ -65,6 +65,7 @@ async def train_model(
     n_estimators: int = Query(default=100, ge=10, le=500, description="Number of trees"),
     horizon: int = Query(default=5, ge=1, le=50, description="Prediction horizon in bars"),
     threshold: float = Query(default=0.01, ge=0.001, le=0.1, description="Return threshold"),
+    db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     """Train a RandomForestClassifier and save it to disk."""
     log = logger.bind(
@@ -102,7 +103,38 @@ async def train_model(
             detail=f"Training failed: {exc}",
         ) from exc
 
-    log.info("ml.train_completed", model_path=result.get("model_path"))
+    # Persist model version to database
+    from datetime import UTC, datetime as _dt
+    from api.db.models import ModelVersionORM
+
+    model_version = ModelVersionORM(
+        symbol=symbol,
+        timeframe=timeframe,
+        trained_at=_dt.now(tz=UTC),
+        accuracy=result.get("metrics", {}).get("accuracy", 0.0),
+        n_trades_used=0,  # horizon-based training uses bars, not trades
+        n_bars_used=result.get("bars_fetched", 0),
+        label_method="future_return",
+        model_path=result.get("model_path", ""),
+        is_active=True,
+        trigger="manual",
+        extra=result.get("metrics"),
+    )
+    # Deactivate previous active model for this symbol+timeframe
+    from sqlalchemy import update
+    await db.execute(
+        update(ModelVersionORM)
+        .where(
+            ModelVersionORM.symbol == symbol,
+            ModelVersionORM.timeframe == timeframe,
+            ModelVersionORM.is_active.is_(True),
+        )
+        .values(is_active=False)
+    )
+    db.add(model_version)
+    await db.commit()
+
+    log.info("ml.train_completed", model_path=result.get("model_path"), model_id=str(model_version.id))
     return result
 
 

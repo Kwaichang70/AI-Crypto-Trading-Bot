@@ -296,9 +296,9 @@ def create_app() -> FastAPI:
             "AI Crypto Trading Bot API  -- "
             "backtesting, paper trading, and live trading via CCXT"
         ),
-        docs_url="/docs" if settings.debug else None,
-        redoc_url="/redoc" if settings.debug else None,
-        openapi_url="/openapi.json" if settings.debug else None,
+        docs_url="/docs",
+        redoc_url="/redoc",
+        openapi_url="/openapi.json",
         lifespan=lifespan,
     )
 
