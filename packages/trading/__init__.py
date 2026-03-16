@@ -24,6 +24,18 @@ from trading.metrics import (
     compute_trade_statistics,
 )
 from trading.models import Fill, Order, Position, Signal, SkippedTrade, TradeResult, RiskCheckResult
+from trading.performance_analyzer import (
+    IndicatorAnalysis,
+    IndicatorStats,
+    PairAnalysis,
+    PairStats,
+    ParameterAnalysis,
+    PerformanceAnalyzer,
+    PerformanceReport,
+    RSIBucketStats,
+    RegimeAnalysis,
+    RegimeStats,
+)
 from trading.portfolio import PortfolioAccounting
 from trading.risk import BaseRiskManager, RiskParameters
 from trading.safety import (
@@ -85,6 +97,17 @@ __all__ = [
     "TradeExcursionTracker",
     "ExitReasonDetector",
     "TradeSkipLogger",
+    # Performance Analyzer (Sprint 33)
+    "PerformanceAnalyzer",
+    "PerformanceReport",
+    "RegimeAnalysis",
+    "RegimeStats",
+    "IndicatorAnalysis",
+    "IndicatorStats",
+    "ParameterAnalysis",
+    "RSIBucketStats",
+    "PairAnalysis",
+    "PairStats",
     # Portfolio
     "PortfolioAccounting",
     # Models
