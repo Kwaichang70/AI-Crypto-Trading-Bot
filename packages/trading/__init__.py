@@ -5,6 +5,14 @@ Trading engine core: strategies, execution, risk, portfolio, backtesting,
 and orchestration.
 """
 
+from trading.adaptive_optimizer import (
+    AdaptiveOptimizer,
+    OptimizerState,
+    ParameterAdjustment,
+    ParameterChange,
+    RollbackDecision,
+    SAFEGUARDS,
+)
 from trading.backtest import BacktestRunner
 from trading.execution import BaseExecutionEngine
 from trading.optimizer import OptimizationEntry, OptimizationResult, ParameterOptimizer
@@ -58,6 +66,13 @@ __all__ = [
     # Orchestrator
     "StrategyEngine",
     "EngineState",
+    # Adaptive Optimizer (Sprint 34)
+    "AdaptiveOptimizer",
+    "ParameterAdjustment",
+    "ParameterChange",
+    "RollbackDecision",
+    "OptimizerState",
+    "SAFEGUARDS",
     # Optimization
     "ParameterOptimizer",
     "OptimizationResult",

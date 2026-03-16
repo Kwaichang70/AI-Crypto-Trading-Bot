@@ -203,7 +203,7 @@ class BaseStrategy(abc.ABC):
         self._log.info("strategy.stopped", run_id=self._run_id)
 
     # ------------------------------------------------------------------
-    # Parameter validation
+    # Parameter validation and hot-swap
     # ------------------------------------------------------------------
 
     def _validate_params(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -224,6 +224,36 @@ class BaseStrategy(abc.ABC):
             Validated (and possibly coerced) parameter dictionary.
         """
         return params
+
+    def update_params(self, params: dict[str, Any]) -> None:
+        """
+        Hot-swap strategy parameters during a live or paper run.
+
+        Called by the AdaptiveOptimizer integration layer after an
+        actionable ``ParameterAdjustment`` has been applied.  The new
+        params are routed through ``_validate_params`` so all Pydantic
+        validation runs on the incoming values before they become active.
+
+        Subclasses that use a Pydantic-backed ``_validate_params`` will
+        automatically benefit from full schema enforcement.  Subclasses
+        with additional derived state (e.g. pre-computed indicator windows)
+        should override this method to re-derive that state after calling
+        ``super().update_params(params)``.
+
+        Parameters
+        ----------
+        params:
+            New parameter dictionary.  Keys not present in the current
+            ``_params`` dict are added; existing keys are updated.
+            Values are validated before being stored.
+        """
+        merged = {**self._params, **params}
+        validated = self._validate_params(merged)
+        self._params = validated
+        self._log.info(
+            "strategy.params_updated",
+            updated_keys=list(params.keys()),
+        )
 
     @classmethod
     def parameter_schema(cls) -> dict[str, Any]:
