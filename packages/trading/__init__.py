@@ -5,6 +5,7 @@ Trading engine core: strategies, execution, risk, portfolio, backtesting,
 and orchestration.
 """
 
+from trading.adaptive_learning import AdaptiveLearningTask
 from trading.adaptive_optimizer import (
     AdaptiveOptimizer,
     OptimizerState,
@@ -74,6 +75,8 @@ __all__ = [
     # Orchestrator
     "StrategyEngine",
     "EngineState",
+    # Adaptive Learning (Sprint 36)
+    "AdaptiveLearningTask",
     # Adaptive Optimizer (Sprint 34)
     "AdaptiveOptimizer",
     "ParameterAdjustment",
