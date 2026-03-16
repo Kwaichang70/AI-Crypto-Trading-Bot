@@ -113,7 +113,7 @@ function OptimizationHistory() {
       <div className="divide-y divide-slate-800">
         {runs.map((run) => (
           <div
-            key={run.id}
+            key={run.optimizationRunId}
             className="flex items-center justify-between px-4 py-3 hover:bg-slate-800/40"
           >
             <div className="min-w-0 flex-1 space-y-0.5">
@@ -147,7 +147,7 @@ function OptimizationHistory() {
               </div>
             </div>
             <Link
-              href={`/optimize/${run.id}`}
+              href={`/optimize/${run.optimizationRunId}`}
               className="ml-4 shrink-0 rounded-lg border border-slate-700 px-3 py-1.5 text-xs font-medium text-slate-400 transition-colors hover:border-indigo-500 hover:text-indigo-400"
             >
               View

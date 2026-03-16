@@ -402,8 +402,8 @@ export interface OptimizeResponse {
  * detail response (GET /api/v1/optimize/{id}) carries the entries array.
  */
 export interface OptimizationRunSummary {
-  /** UUID of the saved optimization run. */
-  id: string;
+  /** UUID of the saved optimization run (API returns as optimizationRunId). */
+  optimizationRunId: string;
   /** Strategy name used in this optimization, e.g. "ma_crossover". */
   strategyName: string;
   /** OHLCV timeframe used, e.g. "1h". */
