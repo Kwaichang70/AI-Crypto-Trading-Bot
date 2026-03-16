@@ -45,6 +45,14 @@ from trading.performance_analyzer import (
     RegimeStats,
 )
 from trading.portfolio import PortfolioAccounting
+from trading.reporting import (
+    AlertEvent,
+    AlertLevel,
+    AlertType,
+    DailyReport,
+    ReportingService,
+    WeeklyReport,
+)
 from trading.risk import BaseRiskManager, RiskParameters
 from trading.safety import (
     CircuitBreaker,
@@ -123,6 +131,13 @@ __all__ = [
     "RSIBucketStats",
     "PairAnalysis",
     "PairStats",
+    # Reporting (Sprint 35)
+    "ReportingService",
+    "AlertEvent",
+    "AlertLevel",
+    "AlertType",
+    "DailyReport",
+    "WeeklyReport",
     # Portfolio
     "PortfolioAccounting",
     # Models
