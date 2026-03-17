@@ -40,7 +40,7 @@ from typing import Annotated, Any
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import delete, func, select
+from sqlalchemy import String, cast, delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.db.models import EquitySnapshotORM, FillORM, OrderORM, PositionSnapshotORM, RunORM, SkippedTradeORM, TradeORM
@@ -1875,6 +1875,22 @@ async def list_runs(
         str | None,
         Query(alias="status", description="Filter by status: running, stopped, error"),
     ] = None,
+    strategy: Annotated[
+        str | None,
+        Query(description="Filter by strategy name (exact match on config JSONB)"),
+    ] = None,
+    symbol: Annotated[
+        str | None,
+        Query(description="Filter by symbol (runs containing this symbol)"),
+    ] = None,
+    created_after: Annotated[
+        str | None,
+        Query(description="Filter runs created after this ISO date"),
+    ] = None,
+    created_before: Annotated[
+        str | None,
+        Query(description="Filter runs created before this ISO date"),
+    ] = None,
 ) -> RunListResponse:
     """
     List all trading runs with pagination and optional server-side filtering.
@@ -1893,13 +1909,31 @@ async def list_runs(
     run_status:
         Optional filter by run status (query param name: status).  Must be
         one of running, stopped, or error when supplied.
+    strategy:
+        Optional exact match on the strategy_name key inside the config JSONB.
+    symbol:
+        Optional substring match against the symbols array in config JSONB.
+    created_after:
+        Optional ISO-8601 lower bound on created_at (inclusive).
+    created_before:
+        Optional ISO-8601 upper bound on created_at (inclusive).
 
     Returns
     -------
     RunListResponse
         Paginated list of run records matching the supplied filters.
     """
-    log = logger.bind(endpoint="list_runs", offset=offset, limit=limit, mode=mode, status=run_status)
+    log = logger.bind(
+        endpoint="list_runs",
+        offset=offset,
+        limit=limit,
+        mode=mode,
+        status=run_status,
+        strategy=strategy,
+        symbol=symbol,
+        created_after=created_after,
+        created_before=created_before,
+    )
     log.info("runs.list_requested")
 
     # Validate optional filter values
@@ -1920,6 +1954,35 @@ async def list_runs(
         filters.append(RunORM.run_mode == mode)
     if run_status is not None:
         filters.append(RunORM.status == run_status)
+
+    # Strategy filter — exact match on config->strategy_name (JSONB text extraction)
+    if strategy is not None:
+        filters.append(RunORM.config["strategy_name"].astext == strategy)
+
+    # Symbol filter — substring match against the JSON-serialised symbols array
+    if symbol is not None:
+        filters.append(cast(RunORM.config["symbols"], String).contains(symbol))
+
+    # Date range filters — parse ISO-8601, raise 422 for malformed input
+    if created_after is not None:
+        try:
+            dt_after = datetime.fromisoformat(created_after.replace("Z", "+00:00"))
+            filters.append(RunORM.created_at >= dt_after)
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Invalid created_after date: {created_after}",
+            )
+
+    if created_before is not None:
+        try:
+            dt_before = datetime.fromisoformat(created_before.replace("Z", "+00:00"))
+            filters.append(RunORM.created_at <= dt_before)
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Invalid created_before date: {created_before}",
+            )
 
     # Count total matching rows
     count_stmt = select(func.count()).select_from(RunORM)

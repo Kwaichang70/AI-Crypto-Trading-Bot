@@ -143,6 +143,27 @@ export default function RunsPage() {
   const [page, setPage] = useState(0);
   const [pageSize, setPageSize] = useState<number>(25);
 
+  // Advanced filter state
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [strategyFilter, setStrategyFilter] = useState("");
+  const [symbolFilter, setSymbolFilter] = useState("");
+  const [dateAfter, setDateAfter] = useState("");
+  const [dateBefore, setDateBefore] = useState("");
+
+  // Debounced versions — only used in fetchRuns call to avoid per-keystroke fetches
+  const [debouncedStrategy, setDebouncedStrategy] = useState("");
+  const [debouncedSymbol, setDebouncedSymbol] = useState("");
+
+  useEffect(() => {
+    const timer = setTimeout(() => setDebouncedStrategy(strategyFilter), 500);
+    return () => clearTimeout(timer);
+  }, [strategyFilter]);
+
+  useEffect(() => {
+    const timer = setTimeout(() => setDebouncedSymbol(symbolFilter), 500);
+    return () => clearTimeout(timer);
+  }, [symbolFilter]);
+
   useEffect(() => {
     async function load() {
       setIsLoading(true);
@@ -152,6 +173,10 @@ export default function RunsPage() {
         limit: pageSize,
         ...(modeFilter !== "all" ? { mode: modeFilter } : {}),
         ...(statusFilter !== "all" ? { status: statusFilter } : {}),
+        ...(debouncedStrategy ? { strategy: debouncedStrategy } : {}),
+        ...(debouncedSymbol ? { symbol: debouncedSymbol } : {}),
+        ...(dateAfter ? { createdAfter: new Date(dateAfter).toISOString() } : {}),
+        ...(dateBefore ? { createdBefore: new Date(dateBefore).toISOString() } : {}),
       });
       if (result.ok) {
         setRuns(result.data.items);
@@ -162,7 +187,7 @@ export default function RunsPage() {
       setIsLoading(false);
     }
     void load();
-  }, [page, pageSize, modeFilter, statusFilter]);
+  }, [page, pageSize, modeFilter, statusFilter, debouncedStrategy, debouncedSymbol, dateAfter, dateBefore]);
 
   // Pagination derived values.
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
@@ -213,7 +238,7 @@ export default function RunsPage() {
           </button>
         ))}
       </div>
-      <div className="flex flex-wrap gap-2">
+      <div className="flex flex-wrap items-center gap-2">
         {STATUS_OPTIONS.map((opt) => (
           <button
             key={opt.value}
@@ -228,7 +253,92 @@ export default function RunsPage() {
             {opt.label}
           </button>
         ))}
+
+        {/* Advanced filters toggle */}
+        <button
+          type="button"
+          onClick={() => setShowAdvanced(!showAdvanced)}
+          className="ml-2 flex items-center gap-1 text-xs text-slate-500 hover:text-slate-300"
+        >
+          <svg
+            className="h-3.5 w-3.5"
+            fill="none"
+            viewBox="0 0 24 24"
+            stroke="currentColor"
+            strokeWidth={2}
+          >
+            <path
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z"
+            />
+          </svg>
+          {showAdvanced ? "Hide" : "More"} Filters
+        </button>
       </div>
+
+      {showAdvanced && (
+        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4 rounded-lg border border-slate-800 bg-slate-900/40 p-3">
+          <div>
+            <label className="mb-1 block text-xs font-medium text-slate-500">
+              Strategy
+            </label>
+            <input
+              type="text"
+              value={strategyFilter}
+              onChange={(e) => {
+                setStrategyFilter(e.target.value);
+                setPage(0);
+              }}
+              placeholder="e.g. rsi_mean_reversion"
+              className="w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-1.5 text-xs text-slate-200 placeholder-slate-600 focus:border-indigo-500 focus:outline-none"
+            />
+          </div>
+          <div>
+            <label className="mb-1 block text-xs font-medium text-slate-500">
+              Symbol
+            </label>
+            <input
+              type="text"
+              value={symbolFilter}
+              onChange={(e) => {
+                setSymbolFilter(e.target.value);
+                setPage(0);
+              }}
+              placeholder="e.g. BTC/USD"
+              className="w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-1.5 text-xs text-slate-200 placeholder-slate-600 focus:border-indigo-500 focus:outline-none"
+            />
+          </div>
+          <div>
+            <label className="mb-1 block text-xs font-medium text-slate-500">
+              From
+            </label>
+            <input
+              type="date"
+              value={dateAfter}
+              onChange={(e) => {
+                setDateAfter(e.target.value);
+                setPage(0);
+              }}
+              className="w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-1.5 text-xs text-slate-200 focus:border-indigo-500 focus:outline-none"
+            />
+          </div>
+          <div>
+            <label className="mb-1 block text-xs font-medium text-slate-500">
+              Until
+            </label>
+            <input
+              type="date"
+              value={dateBefore}
+              onChange={(e) => {
+                setDateBefore(e.target.value);
+                setPage(0);
+              }}
+              className="w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-1.5 text-xs text-slate-200 focus:border-indigo-500 focus:outline-none"
+            />
+          </div>
+        </div>
+      )}
 
       {error && (
         <div className="rounded-lg border border-red-800 bg-red-900/20 px-4 py-3 text-sm text-red-400">

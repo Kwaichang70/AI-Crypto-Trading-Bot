@@ -215,12 +215,20 @@ export async function fetchRuns(params?: {
   limit?: number;
   mode?: string;
   status?: string;
+  strategy?: string;
+  symbol?: string;
+  createdAfter?: string;
+  createdBefore?: string;
 }): Promise<ApiResult<RunListResponse>> {
   const qs = new URLSearchParams();
   if (params?.offset !== undefined) qs.set("offset", String(params.offset));
   if (params?.limit !== undefined) qs.set("limit", String(params.limit));
   if (params?.mode) qs.set("mode", params.mode);
   if (params?.status) qs.set("status", params.status);
+  if (params?.strategy) qs.set("strategy", params.strategy);
+  if (params?.symbol) qs.set("symbol", params.symbol);
+  if (params?.createdAfter) qs.set("created_after", params.createdAfter);
+  if (params?.createdBefore) qs.set("created_before", params.createdBefore);
   const query = qs.toString() ? `?${qs.toString()}` : "";
   return apiGet<RunListResponse>(`/api/v1/runs${query}`, {
     cache: "no-store",
