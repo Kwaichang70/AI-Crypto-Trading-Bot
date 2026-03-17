@@ -5,6 +5,7 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { fetchRuns, formatPct } from "@/lib/api";
 import type { Run, RunMode, RunStatus } from "@/lib/types";
 import type { CsvColumn } from "@/lib/csv-export";
@@ -29,109 +30,141 @@ const STATUS_OPTIONS: { value: RunStatus | "all"; label: string }[] = [
 
 const PAGE_SIZE_OPTIONS = [10, 25, 50, 100] as const;
 
-const COLUMNS: Column<Run>[] = [
-  {
-    key: "id",
-    header: "Run ID",
-    render: (run) => (
-      <Link
-        href={`/runs/${run.id}`}
-        className="font-mono text-xs text-indigo-400 hover:text-indigo-300 hover:underline"
-      >
-        {run.id.slice(0, 8)}…
-      </Link>
-    ),
-  },
-  {
-    key: "mode",
-    header: "Mode",
-    render: (run) => (
-      <span className="capitalize text-slate-400">{run.runMode}</span>
-    ),
-  },
-  {
-    key: "strategy",
-    header: "Strategy",
-    render: (run) => (
-      <span className="text-slate-300">{run.config?.strategy_name ?? "—"}</span>
-    ),
-  },
-  {
-    key: "status",
-    header: "Status",
-    render: (run) => <RunStatusBadge status={run.status} />,
-  },
-  {
-    key: "returnPct",
-    header: "Return %",
-    sortable: true,
-    sortValue: (run) => run.backtestMetrics?.totalReturnPct ?? 0,
-    render: (run) => {
-      const val = run.backtestMetrics?.totalReturnPct;
-      if (val === undefined || val === null) {
-        return <span className="text-slate-600 text-xs">—</span>;
-      }
-      const isPositive = val >= 0;
-      return (
-        <span
-          className={`font-mono text-xs font-medium ${isPositive ? "text-profit" : "text-loss"}`}
+const MAX_COMPARE = 5;
+
+/**
+ * Build the column list. The checkbox column is first and captures the
+ * selectedIds set + toggle handler via closure — this means the columns array
+ * must be computed inside the component render rather than at module scope.
+ */
+function buildColumns(
+  selectedIds: ReadonlySet<string>,
+  onToggle: (id: string) => void,
+): Column<Run>[] {
+  return [
+    {
+      key: "_select",
+      header: "",
+      className: "w-10",
+      render: (run) => {
+        const checked = selectedIds.has(run.id);
+        const atLimit = selectedIds.size >= MAX_COMPARE && !checked;
+        return (
+          <input
+            type="checkbox"
+            checked={checked}
+            disabled={atLimit}
+            onChange={() => onToggle(run.id)}
+            onClick={(e) => e.stopPropagation()}
+            aria-label={`Select run ${run.id.slice(0, 8)}`}
+            className="h-4 w-4 cursor-pointer rounded border-slate-600 bg-slate-800 accent-indigo-500 disabled:cursor-not-allowed disabled:opacity-40"
+          />
+        );
+      },
+    },
+    {
+      key: "id",
+      header: "Run ID",
+      render: (run) => (
+        <Link
+          href={`/runs/${run.id}`}
+          className="font-mono text-xs text-indigo-400 hover:text-indigo-300 hover:underline"
         >
-          {isPositive ? "+" : ""}{formatPct(val)}
+          {run.id.slice(0, 8)}…
+        </Link>
+      ),
+    },
+    {
+      key: "mode",
+      header: "Mode",
+      render: (run) => (
+        <span className="capitalize text-slate-400">{run.runMode}</span>
+      ),
+    },
+    {
+      key: "strategy",
+      header: "Strategy",
+      render: (run) => (
+        <span className="text-slate-300">{run.config?.strategy_name ?? "—"}</span>
+      ),
+    },
+    {
+      key: "status",
+      header: "Status",
+      render: (run) => <RunStatusBadge status={run.status} />,
+    },
+    {
+      key: "returnPct",
+      header: "Return %",
+      sortable: true,
+      sortValue: (run) => run.backtestMetrics?.totalReturnPct ?? 0,
+      render: (run) => {
+        const val = run.backtestMetrics?.totalReturnPct;
+        if (val === undefined || val === null) {
+          return <span className="text-slate-600 text-xs">—</span>;
+        }
+        const isPositive = val >= 0;
+        return (
+          <span
+            className={`font-mono text-xs font-medium ${isPositive ? "text-profit" : "text-loss"}`}
+          >
+            {isPositive ? "+" : ""}{formatPct(val)}
+          </span>
+        );
+      },
+    },
+    {
+      key: "trades",
+      header: "Trades",
+      sortable: true,
+      sortValue: (run) => run.backtestMetrics?.totalTrades ?? 0,
+      render: (run) => {
+        const val = run.backtestMetrics?.totalTrades;
+        if (val === undefined || val === null) {
+          return <span className="text-slate-600 text-xs">—</span>;
+        }
+        return <span className="font-mono text-xs text-slate-300">{val}</span>;
+      },
+    },
+    {
+      key: "sharpe",
+      header: "Sharpe",
+      sortable: true,
+      sortValue: (run) => run.backtestMetrics?.sharpeRatio ?? 0,
+      render: (run) => {
+        const val = run.backtestMetrics?.sharpeRatio;
+        if (val === undefined || val === null) {
+          return <span className="text-slate-600 text-xs">—</span>;
+        }
+        const colorClass =
+          val >= 1.0 ? "text-profit" : val < 0 ? "text-loss" : "text-slate-300";
+        return (
+          <span className={`font-mono text-xs font-medium ${colorClass}`}>
+            {val.toFixed(2)}
+          </span>
+        );
+      },
+    },
+    {
+      key: "symbols",
+      header: "Symbols",
+      render: (run) => (
+        <span className="font-mono text-xs text-slate-400">
+          {run.config?.symbols?.join(", ") ?? "—"}
         </span>
-      );
+      ),
     },
-  },
-  {
-    key: "trades",
-    header: "Trades",
-    sortable: true,
-    sortValue: (run) => run.backtestMetrics?.totalTrades ?? 0,
-    render: (run) => {
-      const val = run.backtestMetrics?.totalTrades;
-      if (val === undefined || val === null) {
-        return <span className="text-slate-600 text-xs">—</span>;
-      }
-      return <span className="font-mono text-xs text-slate-300">{val}</span>;
-    },
-  },
-  {
-    key: "sharpe",
-    header: "Sharpe",
-    sortable: true,
-    sortValue: (run) => run.backtestMetrics?.sharpeRatio ?? 0,
-    render: (run) => {
-      const val = run.backtestMetrics?.sharpeRatio;
-      if (val === undefined || val === null) {
-        return <span className="text-slate-600 text-xs">—</span>;
-      }
-      const colorClass =
-        val >= 1.0 ? "text-profit" : val < 0 ? "text-loss" : "text-slate-300";
-      return (
-        <span className={`font-mono text-xs font-medium ${colorClass}`}>
-          {val.toFixed(2)}
+    {
+      key: "created",
+      header: "Created",
+      render: (run) => (
+        <span className="font-mono text-xs text-slate-500">
+          {new Date(run.createdAt).toLocaleString()}
         </span>
-      );
+      ),
     },
-  },
-  {
-    key: "symbols",
-    header: "Symbols",
-    render: (run) => (
-      <span className="font-mono text-xs text-slate-400">
-        {run.config?.symbols?.join(", ") ?? "—"}
-      </span>
-    ),
-  },
-  {
-    key: "created",
-    header: "Created",
-    render: (run) => (
-      <span className="font-mono text-xs text-slate-500">
-        {new Date(run.createdAt).toLocaleString()}
-      </span>
-    ),
-  },
-];
+  ];
+}
 
 const RUNS_CSV_COLUMNS: CsvColumn<Run>[] = [
   { header: "Run ID", value: (r) => r.id },
@@ -158,6 +191,8 @@ const RUNS_CSV_COLUMNS: CsvColumn<Run>[] = [
 ];
 
 export default function RunsPage() {
+  const router = useRouter();
+
   const [runs, setRuns] = useState<readonly Run[]>([]);
   const [total, setTotal] = useState(0);
   const [modeFilter, setModeFilter] = useState<RunMode | "all">("all");
@@ -179,6 +214,9 @@ export default function RunsPage() {
   // Debounced versions — only used in fetchRuns call to avoid per-keystroke fetches
   const [debouncedStrategy, setDebouncedStrategy] = useState("");
   const [debouncedSymbol, setDebouncedSymbol] = useState("");
+
+  // Run comparison selection — max MAX_COMPARE runs
+  const [selectedIds, setSelectedIds] = useState<ReadonlySet<string>>(new Set());
 
   useEffect(() => {
     const timer = setTimeout(() => setDebouncedStrategy(strategyFilter), 500);
@@ -232,6 +270,25 @@ export default function RunsPage() {
     setPage(0);
   }
 
+  function handleToggleSelect(id: string) {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else if (next.size < MAX_COMPARE) {
+        next.add(id);
+      }
+      return next;
+    });
+  }
+
+  function handleCompare() {
+    const ids = Array.from(selectedIds).join(",");
+    router.push(`/runs/compare?ids=${ids}`);
+  }
+
+  const columns = buildColumns(selectedIds, handleToggleSelect);
+
   return (
     <div className="space-y-6">
       <Header
@@ -239,6 +296,14 @@ export default function RunsPage() {
         subtitle={`${total} total trading runs`}
         actions={
           <div className="flex items-center gap-2">
+            {selectedIds.size >= 2 && (
+              <button
+                onClick={handleCompare}
+                className="rounded-lg bg-emerald-700 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-emerald-600"
+              >
+                Compare ({selectedIds.size})
+              </button>
+            )}
             <ExportCsvButton
               filename="runs.csv"
               columns={RUNS_CSV_COLUMNS}
@@ -311,6 +376,21 @@ export default function RunsPage() {
           </svg>
           {showAdvanced ? "Hide" : "More"} Filters
         </button>
+
+        {/* Selection hint */}
+        {selectedIds.size > 0 && (
+          <span className="ml-auto text-xs text-slate-500">
+            {selectedIds.size} / {MAX_COMPARE} selected
+            {selectedIds.size >= 2 && (
+              <button
+                onClick={() => setSelectedIds(new Set())}
+                className="ml-2 text-slate-600 hover:text-slate-400"
+              >
+                Clear
+              </button>
+            )}
+          </span>
+        )}
       </div>
 
       {showAdvanced && (
@@ -383,7 +463,7 @@ export default function RunsPage() {
       )}
 
       <DataTable
-        columns={COLUMNS}
+        columns={columns}
         data={runs}
         keyExtractor={(r) => r.id}
         emptyMessage="No runs found. Create your first backtest."
