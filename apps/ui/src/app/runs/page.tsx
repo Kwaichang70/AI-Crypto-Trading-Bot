@@ -7,6 +7,8 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { fetchRuns, formatPct } from "@/lib/api";
 import type { Run, RunMode, RunStatus } from "@/lib/types";
+import type { CsvColumn } from "@/lib/csv-export";
+import { ExportCsvButton } from "@/components/ui/export-csv-button";
 import { DataTable, type Column } from "@/components/ui/data-table";
 import { RunStatusBadge } from "@/components/ui/status-badge";
 import { Header } from "@/components/layout/header";
@@ -131,6 +133,30 @@ const COLUMNS: Column<Run>[] = [
   },
 ];
 
+const RUNS_CSV_COLUMNS: CsvColumn<Run>[] = [
+  { header: "Run ID", value: (r) => r.id },
+  { header: "Mode", value: (r) => r.runMode },
+  { header: "Strategy", value: (r) => r.config?.strategy_name ?? "" },
+  { header: "Status", value: (r) => r.status },
+  {
+    header: "Return %",
+    value: (r) =>
+      r.backtestMetrics?.totalReturnPct != null
+        ? (r.backtestMetrics.totalReturnPct * 100).toFixed(2)
+        : "",
+  },
+  { header: "Trades", value: (r) => r.backtestMetrics?.totalTrades ?? "" },
+  {
+    header: "Sharpe",
+    value: (r) =>
+      r.backtestMetrics?.sharpeRatio != null
+        ? r.backtestMetrics.sharpeRatio.toFixed(4)
+        : "",
+  },
+  { header: "Symbols", value: (r) => r.config?.symbols?.join("; ") ?? "" },
+  { header: "Created At", value: (r) => r.createdAt },
+];
+
 export default function RunsPage() {
   const [runs, setRuns] = useState<readonly Run[]>([]);
   const [total, setTotal] = useState(0);
@@ -212,12 +238,22 @@ export default function RunsPage() {
         title="Runs"
         subtitle={`${total} total trading runs`}
         actions={
-          <Link
-            href="/runs/new"
-            className="rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-indigo-500"
-          >
-            New Run
-          </Link>
+          <div className="flex items-center gap-2">
+            <ExportCsvButton
+              filename="runs.csv"
+              columns={RUNS_CSV_COLUMNS}
+              data={runs}
+              disabled={isLoading}
+              size="sm"
+              label="Export Page"
+            />
+            <Link
+              href="/runs/new"
+              className="rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-indigo-500"
+            >
+              New Run
+            </Link>
+          </div>
         }
       />
 

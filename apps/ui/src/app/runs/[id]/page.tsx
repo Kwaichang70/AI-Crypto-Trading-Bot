@@ -16,6 +16,8 @@ import {
   formatPct,
 } from "@/lib/api";
 import type { Run, Portfolio, EquityPoint, Trade, Order, Fill, Position } from "@/lib/types";
+import type { CsvColumn } from "@/lib/csv-export";
+import { ExportCsvButton } from "@/components/ui/export-csv-button";
 import { Header } from "@/components/layout/header";
 import { RunStatusBadge } from "@/components/ui/status-badge";
 import { StatCard } from "@/components/ui/stat-card";
@@ -253,6 +255,55 @@ const POSITION_COLUMNS: Column<Position>[] = [
       </span>
     ),
   },
+];
+
+// ---------------------------------------------------------------------------
+// CSV column specs — plain scalar values for export
+// ---------------------------------------------------------------------------
+
+const TRADE_CSV_COLUMNS: CsvColumn<Trade>[] = [
+  { header: "Symbol", value: (t) => t.symbol },
+  { header: "Side", value: (t) => t.side },
+  { header: "Entry Price", value: (t) => t.entryPrice },
+  { header: "Exit Price", value: (t) => t.exitPrice },
+  { header: "Quantity", value: (t) => t.quantity },
+  { header: "PnL", value: (t) => t.realisedPnl },
+  { header: "Total Fees", value: (t) => t.totalFees },
+  { header: "Entry At", value: (t) => t.entryAt },
+  { header: "Exit At", value: (t) => t.exitAt },
+];
+
+const ORDER_CSV_COLUMNS: CsvColumn<Order>[] = [
+  { header: "Symbol", value: (o) => o.symbol },
+  { header: "Side", value: (o) => o.side },
+  { header: "Type", value: (o) => o.orderType },
+  { header: "Quantity", value: (o) => o.quantity },
+  { header: "Price", value: (o) => o.price ?? "" },
+  { header: "Status", value: (o) => o.status },
+  { header: "Filled Qty", value: (o) => o.filledQuantity },
+  { header: "Avg Fill Price", value: (o) => o.averageFillPrice ?? "" },
+  { header: "Created At", value: (o) => o.createdAt },
+];
+
+const FILL_CSV_COLUMNS: CsvColumn<Fill>[] = [
+  { header: "Symbol", value: (f) => f.symbol },
+  { header: "Side", value: (f) => f.side },
+  { header: "Quantity", value: (f) => f.quantity },
+  { header: "Price", value: (f) => f.price },
+  { header: "Fee", value: (f) => f.fee },
+  { header: "Fee Currency", value: (f) => f.feeCurrency },
+  { header: "Maker", value: (f) => (f.isMaker ? "Yes" : "No") },
+  { header: "Executed At", value: (f) => f.executedAt },
+];
+
+const POSITION_CSV_COLUMNS: CsvColumn<Position>[] = [
+  { header: "Symbol", value: (p) => p.symbol },
+  { header: "Quantity", value: (p) => p.quantity },
+  { header: "Avg Entry Price", value: (p) => p.averageEntryPrice },
+  { header: "Current Price", value: (p) => p.currentPrice },
+  { header: "Unrealised PnL", value: (p) => p.unrealisedPnl },
+  { header: "Notional Value", value: (p) => p.notionalValue },
+  { header: "Opened At", value: (p) => p.openedAt },
 ];
 
 // ---------------------------------------------------------------------------
@@ -552,39 +603,75 @@ export default function RunDetailPage() {
             )}
 
             {activeTab === "trades" && (
-              <DataTable
-                columns={TRADE_COLUMNS}
-                data={trades}
-                keyExtractor={(t) => t.id}
-                emptyMessage="No completed trades for this run."
-              />
+              <div className="space-y-2">
+                <div className="flex justify-end">
+                  <ExportCsvButton
+                    filename={`run-${id.slice(0, 8)}-trades.csv`}
+                    columns={TRADE_CSV_COLUMNS}
+                    data={trades}
+                  />
+                </div>
+                <DataTable
+                  columns={TRADE_COLUMNS}
+                  data={trades}
+                  keyExtractor={(t) => t.id}
+                  emptyMessage="No completed trades for this run."
+                />
+              </div>
             )}
 
             {activeTab === "orders" && (
-              <DataTable
-                columns={ORDER_COLUMNS}
-                data={orders}
-                keyExtractor={(o) => o.id}
-                emptyMessage="No orders for this run."
-              />
+              <div className="space-y-2">
+                <div className="flex justify-end">
+                  <ExportCsvButton
+                    filename={`run-${id.slice(0, 8)}-orders.csv`}
+                    columns={ORDER_CSV_COLUMNS}
+                    data={orders}
+                  />
+                </div>
+                <DataTable
+                  columns={ORDER_COLUMNS}
+                  data={orders}
+                  keyExtractor={(o) => o.id}
+                  emptyMessage="No orders for this run."
+                />
+              </div>
             )}
 
             {activeTab === "fills" && (
-              <DataTable
-                columns={FILL_COLUMNS}
-                data={fills}
-                keyExtractor={(f) => f.id}
-                emptyMessage="No fills for this run."
-              />
+              <div className="space-y-2">
+                <div className="flex justify-end">
+                  <ExportCsvButton
+                    filename={`run-${id.slice(0, 8)}-fills.csv`}
+                    columns={FILL_CSV_COLUMNS}
+                    data={fills}
+                  />
+                </div>
+                <DataTable
+                  columns={FILL_COLUMNS}
+                  data={fills}
+                  keyExtractor={(f) => f.id}
+                  emptyMessage="No fills for this run."
+                />
+              </div>
             )}
 
             {activeTab === "positions" && (
-              <DataTable
-                columns={POSITION_COLUMNS}
-                data={positions}
-                keyExtractor={(p) => p.symbol}
-                emptyMessage="No open positions for this run."
-              />
+              <div className="space-y-2">
+                <div className="flex justify-end">
+                  <ExportCsvButton
+                    filename={`run-${id.slice(0, 8)}-positions.csv`}
+                    columns={POSITION_CSV_COLUMNS}
+                    data={positions}
+                  />
+                </div>
+                <DataTable
+                  columns={POSITION_COLUMNS}
+                  data={positions}
+                  keyExtractor={(p) => p.symbol}
+                  emptyMessage="No open positions for this run."
+                />
+              </div>
             )}
           </>
         )}
