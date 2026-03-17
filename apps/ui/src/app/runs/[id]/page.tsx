@@ -306,6 +306,16 @@ const POSITION_CSV_COLUMNS: CsvColumn<Position>[] = [
   { header: "Opened At", value: (p) => p.openedAt },
 ];
 
+const EQUITY_CSV_COLUMNS: CsvColumn<EquityPoint>[] = [
+  { header: "Timestamp", value: (e) => e.timestamp },
+  { header: "Equity", value: (e) => e.equity },
+  { header: "Cash", value: (e) => e.cash },
+  { header: "Unrealised PnL", value: (e) => e.unrealisedPnl },
+  { header: "Realised PnL", value: (e) => e.realisedPnl },
+  { header: "Drawdown %", value: (e) => (e.drawdownPct * 100).toFixed(4) },
+  { header: "Bar Index", value: (e) => e.barIndex },
+];
+
 // ---------------------------------------------------------------------------
 // Page
 // ---------------------------------------------------------------------------
@@ -536,7 +546,14 @@ export default function RunDetailPage() {
 
                 {/* Equity curve */}
                 <div className="card">
-                  <h3 className="mb-3 text-sm font-semibold text-slate-300">Equity Curve</h3>
+                  <div className="mb-3 flex items-center justify-between">
+                    <h3 className="text-sm font-semibold text-slate-300">Equity Curve</h3>
+                    <ExportCsvButton
+                      filename={`run-${id.slice(0, 8)}-equity.csv`}
+                      columns={EQUITY_CSV_COLUMNS}
+                      data={equityPoints}
+                    />
+                  </div>
                   <EquityCurveChart points={equityPoints} height={260} />
                 </div>
 
