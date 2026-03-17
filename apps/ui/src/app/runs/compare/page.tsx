@@ -10,7 +10,7 @@
  */
 "use client";
 
-import { useEffect, useState } from "react";
+import { Suspense, useEffect, useState } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import {
@@ -314,6 +314,14 @@ function ComparisonTooltip({ active, payload, label, items }: ComparisonTooltipP
 // ---------------------------------------------------------------------------
 
 export default function RunComparePage() {
+  return (
+    <Suspense fallback={<LoadingSkeleton />}>
+      <RunCompareInner />
+    </Suspense>
+  );
+}
+
+function RunCompareInner() {
   const searchParams = useSearchParams();
   const idsParam = searchParams.get("ids") ?? "";
 
