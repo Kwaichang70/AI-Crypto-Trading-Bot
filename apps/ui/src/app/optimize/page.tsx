@@ -77,10 +77,10 @@ function OptimizationHistory() {
   if (isLoading) {
     return (
       <div className="card p-4">
-        <h2 className="mb-3 text-sm font-semibold text-slate-300">Recent Optimization Runs</h2>
+        <h2 className="mb-3 text-sm font-semibold text-slate-700 dark:text-slate-300">Recent Optimization Runs</h2>
         <div className="space-y-2">
           {[...Array(3)].map((_, i) => (
-            <div key={i} className="h-10 animate-pulse rounded bg-slate-800" />
+            <div key={i} className="h-10 animate-pulse rounded bg-slate-200 dark:bg-slate-800" />
           ))}
         </div>
       </div>
@@ -90,7 +90,7 @@ function OptimizationHistory() {
   if (error) {
     return (
       <div className="card p-4">
-        <h2 className="mb-3 text-sm font-semibold text-slate-300">Recent Optimization Runs</h2>
+        <h2 className="mb-3 text-sm font-semibold text-slate-700 dark:text-slate-300">Recent Optimization Runs</h2>
         <p className="text-sm text-slate-500">{error}</p>
       </div>
     );
@@ -99,7 +99,7 @@ function OptimizationHistory() {
   if (runs.length === 0) {
     return (
       <div className="card p-4">
-        <h2 className="mb-3 text-sm font-semibold text-slate-300">Recent Optimization Runs</h2>
+        <h2 className="mb-3 text-sm font-semibold text-slate-700 dark:text-slate-300">Recent Optimization Runs</h2>
         <p className="text-sm text-slate-500">No saved optimization runs yet. Run your first grid search above.</p>
       </div>
     );
@@ -107,21 +107,21 @@ function OptimizationHistory() {
 
   return (
     <div className="card overflow-hidden">
-      <div className="border-b border-slate-800 px-4 py-3">
-        <h2 className="text-sm font-semibold text-slate-300">Recent Optimization Runs</h2>
+      <div className="border-b border-slate-200 px-4 py-3 dark:border-slate-800">
+        <h2 className="text-sm font-semibold text-slate-700 dark:text-slate-300">Recent Optimization Runs</h2>
       </div>
-      <div className="divide-y divide-slate-800">
+      <div className="divide-y divide-slate-200 dark:divide-slate-800">
         {runs.map((run) => (
           <div
             key={run.optimizationRunId}
-            className="flex items-center justify-between px-4 py-3 hover:bg-slate-800/40"
+            className="flex items-center justify-between px-4 py-3 hover:bg-slate-50 dark:hover:bg-slate-800/40"
           >
             <div className="min-w-0 flex-1 space-y-0.5">
               <div className="flex items-center gap-2">
-                <span className="text-sm font-medium text-slate-200">
+                <span className="text-sm font-medium text-slate-800 dark:text-slate-200">
                   {run.strategyName}
                 </span>
-                <span className="rounded bg-slate-700 px-1.5 py-0.5 font-mono text-xs text-slate-400">
+                <span className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-xs text-slate-600 dark:bg-slate-700 dark:text-slate-400">
                   {run.timeframe}
                 </span>
                 <span className="text-xs text-slate-500">
@@ -378,7 +378,7 @@ export default function OptimizePage() {
       <form onSubmit={handleSubmit} className="space-y-4">
         {/* Strategy */}
         <div className="card space-y-3 p-4">
-          <h2 className="text-sm font-semibold text-slate-300">Strategy</h2>
+          <h2 className="text-sm font-semibold text-slate-700 dark:text-slate-300">Strategy</h2>
           {strategies.length === 0 ? (
             <p className="text-sm text-slate-500">Loading strategies…</p>
           ) : (
@@ -388,7 +388,7 @@ export default function OptimizePage() {
                 const s = strategies.find((st) => st.name === e.target.value) ?? null;
                 setSelectedStrategy(s);
               }}
-              className="w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-200 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+              className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus:border-indigo-500 focus:outline-none dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200 focus:ring-1 focus:ring-indigo-500"
             >
               <option value="">Select a strategy…</option>
               {strategies.map((s) => (
@@ -403,7 +403,7 @@ export default function OptimizePage() {
         {/* Parameter grid */}
         {selectedStrategy && (
           <div className="card space-y-3 p-4">
-            <h2 className="text-sm font-semibold text-slate-300">Parameter Grid</h2>
+            <h2 className="text-sm font-semibold text-slate-700 dark:text-slate-300">Parameter Grid</h2>
             <p className="text-xs text-slate-500">
               For each parameter, enter a comma-separated list of values to test.
             </p>
@@ -418,7 +418,7 @@ export default function OptimizePage() {
 
         {/* Symbols */}
         <div className="card space-y-3 p-4">
-          <h2 className="text-sm font-semibold text-slate-300">Symbols</h2>
+          <h2 className="text-sm font-semibold text-slate-700 dark:text-slate-300">Symbols</h2>
           <div className="flex flex-wrap gap-2">
             {COMMON_SYMBOLS.map((sym) => (
               <button
@@ -428,8 +428,8 @@ export default function OptimizePage() {
                 className={[
                   "rounded-lg border px-3 py-1.5 text-sm font-medium transition-colors",
                   symbols.includes(sym)
-                    ? "border-indigo-500 bg-indigo-600/20 text-indigo-300"
-                    : "border-slate-700 text-slate-400 hover:border-slate-600 hover:text-slate-200",
+                    ? "border-indigo-500 bg-indigo-600/20 text-indigo-600 dark:text-indigo-300"
+                    : "border-slate-300 text-slate-600 hover:border-slate-400 hover:text-slate-900 dark:border-slate-700 dark:text-slate-400 dark:hover:border-slate-600 dark:hover:text-slate-200",
                 ].join(" ")}
               >
                 {sym}
@@ -443,7 +443,7 @@ export default function OptimizePage() {
               onChange={(e) => setCustomSymbol(e.target.value)}
               onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); addCustomSymbol(); } }}
               placeholder="Custom symbol, e.g. LTC/USD"
-              className="flex-1 rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-200 placeholder-slate-500 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+              className="flex-1 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 placeholder-slate-400 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200 dark:placeholder-slate-500"
             />
             <button
               type="button"
@@ -458,7 +458,7 @@ export default function OptimizePage() {
               {symbols.map((s) => (
                 <span
                   key={s}
-                  className="flex items-center gap-1 rounded bg-slate-700 px-2 py-0.5 text-xs text-slate-300"
+                  className="flex items-center gap-1 rounded bg-slate-100 px-2 py-0.5 text-xs text-slate-700 dark:bg-slate-700 dark:text-slate-300"
                 >
                   {s}
                   <button
@@ -476,10 +476,10 @@ export default function OptimizePage() {
 
         {/* Backtest config */}
         <div className="card space-y-3 p-4">
-          <h2 className="text-sm font-semibold text-slate-300">Backtest Configuration</h2>
+          <h2 className="text-sm font-semibold text-slate-700 dark:text-slate-300">Backtest Configuration</h2>
           <div className="grid grid-cols-2 gap-4">
             <div>
-              <label className="block text-sm text-slate-400">Timeframe</label>
+              <label className="block text-sm text-slate-600 dark:text-slate-400">Timeframe</label>
               <div className="mt-1 flex flex-wrap gap-2">
                 {TIMEFRAMES.map((tf) => (
                   <button
@@ -489,7 +489,7 @@ export default function OptimizePage() {
                     className={[
                       "rounded-lg border px-3 py-1 text-sm font-medium",
                       timeframe === tf
-                        ? "border-indigo-500 bg-indigo-600/20 text-indigo-300"
+                        ? "border-indigo-500 bg-indigo-600/20 text-indigo-600 dark:text-indigo-300"
                         : "border-slate-700 text-slate-400 hover:border-slate-600",
                     ].join(" ")}
                   >
@@ -499,32 +499,32 @@ export default function OptimizePage() {
               </div>
             </div>
             <div>
-              <label className="block text-sm text-slate-400">Initial Capital</label>
+              <label className="block text-sm text-slate-600 dark:text-slate-400">Initial Capital</label>
               <input
                 type="number"
                 value={initialCapital}
                 min="100"
                 step="100"
                 onChange={(e) => setInitialCapital(e.target.value)}
-                className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-200 focus:border-indigo-500 focus:outline-none"
+                className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus:border-indigo-500 focus:outline-none dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200"
               />
             </div>
             <div>
-              <label className="block text-sm text-slate-400">Start Date</label>
+              <label className="block text-sm text-slate-600 dark:text-slate-400">Start Date</label>
               <input
                 type="datetime-local"
                 value={backtestStart}
                 onChange={(e) => setBacktestStart(e.target.value)}
-                className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-200 focus:border-indigo-500 focus:outline-none"
+                className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus:border-indigo-500 focus:outline-none dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200"
               />
             </div>
             <div>
-              <label className="block text-sm text-slate-400">End Date</label>
+              <label className="block text-sm text-slate-600 dark:text-slate-400">End Date</label>
               <input
                 type="datetime-local"
                 value={backtestEnd}
                 onChange={(e) => setBacktestEnd(e.target.value)}
-                className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-200 focus:border-indigo-500 focus:outline-none"
+                className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus:border-indigo-500 focus:outline-none dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200"
               />
             </div>
           </div>
@@ -532,14 +532,14 @@ export default function OptimizePage() {
 
         {/* Optimizer settings */}
         <div className="card space-y-3 p-4">
-          <h2 className="text-sm font-semibold text-slate-300">Optimizer Settings</h2>
+          <h2 className="text-sm font-semibold text-slate-700 dark:text-slate-300">Optimizer Settings</h2>
           <div className="grid grid-cols-3 gap-4">
             <div>
-              <label className="block text-sm text-slate-400">Rank By</label>
+              <label className="block text-sm text-slate-600 dark:text-slate-400">Rank By</label>
               <select
                 value={rankBy}
                 onChange={(e) => setRankBy(e.target.value)}
-                className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-200 focus:border-indigo-500 focus:outline-none"
+                className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus:border-indigo-500 focus:outline-none dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200"
               >
                 {RANK_OPTIONS.map((o) => (
                   <option key={o.value} value={o.value}>
@@ -549,25 +549,25 @@ export default function OptimizePage() {
               </select>
             </div>
             <div>
-              <label className="block text-sm text-slate-400">Top N Results</label>
+              <label className="block text-sm text-slate-600 dark:text-slate-400">Top N Results</label>
               <input
                 type="number"
                 value={topN}
                 min={1}
                 max={100}
                 onChange={(e) => setTopN(parseInt(e.target.value, 10))}
-                className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-200 focus:border-indigo-500 focus:outline-none"
+                className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus:border-indigo-500 focus:outline-none dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200"
               />
             </div>
             <div>
-              <label className="block text-sm text-slate-400">Max Combinations</label>
+              <label className="block text-sm text-slate-600 dark:text-slate-400">Max Combinations</label>
               <input
                 type="number"
                 value={maxCombinations}
                 min={1}
                 max={1000}
                 onChange={(e) => setMaxCombinations(parseInt(e.target.value, 10))}
-                className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-200 focus:border-indigo-500 focus:outline-none"
+                className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus:border-indigo-500 focus:outline-none dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200"
               />
             </div>
           </div>
@@ -575,7 +575,7 @@ export default function OptimizePage() {
 
         {/* Error banner */}
         {phase.kind === "error" && (
-          <div className="rounded-lg border border-red-700/50 bg-red-900/20 p-3 text-sm text-red-400">
+          <div className="rounded-lg border border-red-300 bg-red-50 p-3 text-sm text-red-600 dark:border-red-700/50 dark:bg-red-900/20 dark:text-red-400">
             {phase.message}
           </div>
         )}
@@ -604,7 +604,7 @@ export default function OptimizePage() {
           <div className="card p-4">
             <div className="flex flex-wrap items-center gap-4 text-sm">
               <span className="text-slate-400">
-                Strategy: <span className="text-slate-200">{phase.data.strategyName}</span>
+                Strategy: <span className="text-slate-800 dark:text-slate-200">{phase.data.strategyName}</span>
               </span>
               <span className="text-slate-600">·</span>
               <span className="text-slate-400">
@@ -627,7 +627,7 @@ export default function OptimizePage() {
               )}
               <span className="text-slate-600">·</span>
               <span className="text-slate-400">
-                Elapsed: <span className="text-slate-200">{phase.data.elapsedSeconds}s</span>
+                Elapsed: <span className="text-slate-800 dark:text-slate-200">{phase.data.elapsedSeconds}s</span>
               </span>
               {/* Link to saved detail page — only shown when the backend has persisted the run */}
               {phase.data.optimizationRunId && (
@@ -652,7 +652,7 @@ export default function OptimizePage() {
           ) : (
             <>
               {launchError && (
-                <div className="rounded-lg border border-red-700/50 bg-red-900/20 p-3 text-sm text-red-400">
+                <div className="rounded-lg border border-red-300 bg-red-50 p-3 text-sm text-red-600 dark:border-red-700/50 dark:bg-red-900/20 dark:text-red-400">
                   {launchError}
                 </div>
               )}

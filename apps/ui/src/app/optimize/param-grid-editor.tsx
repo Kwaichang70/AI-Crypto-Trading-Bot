@@ -75,7 +75,7 @@ export function ParamGridEditor({
             <select
               value={row.paramName}
               onChange={(e) => updateRow(idx, { paramName: e.target.value })}
-              className="w-44 shrink-0 rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-200 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+              className="w-44 shrink-0 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200"
             >
               {paramNames.map((name) => (
                 <option key={name} value={name}>
@@ -91,7 +91,7 @@ export function ParamGridEditor({
                 value={row.valuesRaw}
                 placeholder={`Comma-separated ${typeHint}, e.g. 5, 10, 20`}
                 onChange={(e) => updateRow(idx, { valuesRaw: e.target.value })}
-                className="w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-200 placeholder-slate-500 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 placeholder-slate-400 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200 dark:placeholder-slate-500"
               />
             </div>
 
@@ -99,7 +99,7 @@ export function ParamGridEditor({
             <button
               type="button"
               onClick={() => removeRow(idx)}
-              className="mt-0.5 rounded p-1.5 text-slate-500 hover:bg-slate-700 hover:text-red-400"
+              className="mt-0.5 rounded p-1.5 text-slate-500 hover:bg-slate-100 hover:text-red-500 dark:hover:bg-slate-700 dark:hover:text-red-400"
               title="Remove parameter"
             >
               <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
@@ -115,7 +115,7 @@ export function ParamGridEditor({
           type="button"
           onClick={addRow}
           disabled={paramNames.length === 0}
-          className="flex items-center gap-1.5 rounded-lg border border-slate-700 px-3 py-1.5 text-sm text-slate-400 hover:border-indigo-500 hover:text-indigo-400 disabled:cursor-not-allowed disabled:opacity-40"
+          className="flex items-center gap-1.5 rounded-lg border border-slate-300 px-3 py-1.5 text-sm text-slate-600 hover:border-indigo-500 hover:text-indigo-600 disabled:cursor-not-allowed disabled:opacity-40 dark:border-slate-700 dark:text-slate-400 dark:hover:text-indigo-400"
         >
           <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
             <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" />
