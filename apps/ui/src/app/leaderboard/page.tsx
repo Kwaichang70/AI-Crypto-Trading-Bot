@@ -161,12 +161,21 @@ export default function LeaderboardPage() {
     async function load() {
       setIsLoading(true);
       setError(null);
-      const result = await fetchRuns({ limit: 1000, offset: 0 });
-      if (result.ok) {
-        setStats(aggregateByStrategy(result.data.items));
-      } else {
-        setError(result.error.message);
+      // Fetch all runs in pages of 500 (API max limit).
+      const allRuns: Run[] = [];
+      let offset = 0;
+      const PAGE = 500;
+      while (true) {
+        const result = await fetchRuns({ limit: PAGE, offset });
+        if (!result.ok) {
+          setError(result.error.message);
+          break;
+        }
+        allRuns.push(...result.data.items);
+        if (allRuns.length >= result.data.total) break;
+        offset += PAGE;
       }
+      setStats(aggregateByStrategy(allRuns));
       setIsLoading(false);
     }
     void load();
