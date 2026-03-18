@@ -102,6 +102,8 @@ function NewRunInner() {
   const [backtestStart, setBacktestStart] = useState("2024-01-01T00:00");
   const [backtestEnd, setBacktestEnd] = useState("2024-12-31T23:59");
   const [confirmToken, setConfirmToken] = useState("");
+  const [enableLearning, setEnableLearning] = useState(false);
+  const [autoApplyLearning, setAutoApplyLearning] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [isLoadingStrategies, setIsLoadingStrategies] = useState(true);
@@ -196,6 +198,8 @@ function NewRunInner() {
       backtestStart: mode === "backtest" ? new Date(backtestStart).toISOString() : null,
       backtestEnd: mode === "backtest" ? new Date(backtestEnd).toISOString() : null,
       confirmToken: mode === "live" ? confirmToken : undefined,
+      enableAdaptiveLearning: mode !== "backtest" ? enableLearning : undefined,
+      autoApplyLearning: mode === "paper" && enableLearning ? autoApplyLearning : undefined,
     };
 
     const result = await createRun(body);
@@ -451,6 +455,60 @@ function NewRunInner() {
             </div>
           )}
         </div>
+
+        {/* Adaptive Learning (paper/live only) */}
+        {mode !== "backtest" && (
+          <div className="card space-y-3">
+            <h2 className="text-sm font-semibold text-slate-800 dark:text-slate-200">Adaptive Learning</h2>
+            <p className="text-xs text-slate-500">
+              When enabled, the bot analyzes its own trades and proposes parameter improvements automatically.
+            </p>
+            <div className="space-y-3">
+              <div className="flex items-center justify-between">
+                <div>
+                  <label className="text-sm text-slate-700 dark:text-slate-300">
+                    Enable Adaptive Learning
+                  </label>
+                  <p className="text-xs text-slate-500">
+                    Runs PerformanceAnalyzer + AdaptiveOptimizer every 50 trades
+                  </p>
+                </div>
+                <input
+                  type="checkbox"
+                  checked={enableLearning}
+                  onChange={(e) => {
+                    setEnableLearning(e.target.checked);
+                    if (!e.target.checked) setAutoApplyLearning(false);
+                  }}
+                  className="h-4 w-4 rounded border-slate-300 bg-white accent-indigo-500 dark:border-slate-700 dark:bg-slate-800"
+                />
+              </div>
+              {enableLearning && mode === "paper" && (
+                <div className="flex items-center justify-between rounded-lg border border-slate-200 bg-slate-50 p-3 dark:border-slate-800 dark:bg-slate-900/40">
+                  <div>
+                    <label className="text-sm text-slate-700 dark:text-slate-300">
+                      Auto-Apply Changes
+                    </label>
+                    <p className="text-xs text-slate-500">
+                      Automatically apply parameter adjustments (max 20% change per cycle, rollback at -5% PnL)
+                    </p>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={autoApplyLearning}
+                    onChange={(e) => setAutoApplyLearning(e.target.checked)}
+                    className="h-4 w-4 rounded border-slate-300 bg-white accent-indigo-500 dark:border-slate-700 dark:bg-slate-800"
+                  />
+                </div>
+              )}
+              {enableLearning && mode === "live" && (
+                <p className="text-xs text-amber-600 dark:text-amber-400">
+                  In live mode, learning runs in observation-only mode. Parameter changes are logged but never auto-applied.
+                </p>
+              )}
+            </div>
+          </div>
+        )}
 
         {submitError && (
           <div className="rounded-lg border border-red-300 bg-red-50 px-4 py-3 text-sm text-red-600 dark:border-red-800 dark:bg-red-900/20 dark:text-red-400">
