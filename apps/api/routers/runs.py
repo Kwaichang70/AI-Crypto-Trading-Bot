@@ -67,6 +67,9 @@ logger = structlog.get_logger(__name__)
 # ---------------------------------------------------------------------------
 _RUN_TASKS: dict[str, asyncio.Task[None]] = {}
 
+# Adaptive learning task instances -- keyed by run_id for API state queries
+_LEARNING_INSTANCES: dict[str, Any] = {}
+
 
 @dataclass
 class _IncrementalFlushState:
@@ -797,6 +800,7 @@ async def _run_paper_engine(
                 min_trades_per_cycle=50,
             )
             portfolio.on_trade_recorded = adaptive_learner.ingest_trade
+            _LEARNING_INSTANCES[run_id_str] = adaptive_learner
             log.info(
                 "runs.adaptive_learning_enabled",
                 auto_apply=auto_apply_learning,
@@ -912,6 +916,7 @@ async def _run_paper_engine(
 
         # Remove from task registry
         _RUN_TASKS.pop(run_id_str, None)
+        _LEARNING_INSTANCES.pop(run_id_str, None)
 
         # Final incremental flush captures any remaining data not covered by
         # the last periodic flush cycle  -- must run BEFORE status update so
@@ -1074,6 +1079,7 @@ async def _run_live_engine(
                 min_trades_per_cycle=50,
             )
             portfolio.on_trade_recorded = adaptive_learner.ingest_trade
+            _LEARNING_INSTANCES[run_id_str] = adaptive_learner
             log.info("runs.adaptive_learning_enabled", auto_apply=False)
 
         # Build engine config  -- include trailing stop if configured
@@ -1183,6 +1189,7 @@ async def _run_live_engine(
 
         # Remove from task registry
         _RUN_TASKS.pop(run_id_str, None)
+        _LEARNING_INSTANCES.pop(run_id_str, None)
 
         # Final incremental flush captures any remaining data not covered by
         # the last periodic flush cycle  -- must run BEFORE status update so

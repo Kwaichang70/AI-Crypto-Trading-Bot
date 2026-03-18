@@ -11,11 +11,12 @@ import {
   fetchOrders,
   fetchFills,
   fetchPositions,
+  fetchLearningState,
   stopRun,
   formatCurrency,
   formatPct,
 } from "@/lib/api";
-import type { Run, Portfolio, EquityPoint, Trade, Order, Fill, Position } from "@/lib/types";
+import type { Run, Portfolio, EquityPoint, Trade, Order, Fill, Position, LearningState } from "@/lib/types";
 import type { CsvColumn } from "@/lib/csv-export";
 import { ExportCsvButton } from "@/components/ui/export-csv-button";
 import { Header } from "@/components/layout/header";
@@ -332,12 +333,13 @@ export default function RunDetailPage() {
   const [orders, setOrders] = useState<readonly Order[]>([]);
   const [fills, setFills] = useState<readonly Fill[]>([]);
   const [positions, setPositions] = useState<readonly Position[]>([]);
+  const [learning, setLearning] = useState<LearningState | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [isStopping, setIsStopping] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const loadData = useCallback(async () => {
-    const [runRes, portRes, curveRes, tradesRes, ordersRes, fillsRes, posRes] = await Promise.all([
+    const [runRes, portRes, curveRes, tradesRes, ordersRes, fillsRes, posRes, learnRes] = await Promise.all([
       fetchRun(id),
       fetchPortfolio(id),
       fetchEquityCurve(id, 500),
@@ -345,6 +347,7 @@ export default function RunDetailPage() {
       fetchOrders(id, { limit: 100 }),
       fetchFills(id, { limit: 100 }),
       fetchPositions(id),
+      fetchLearningState(id),
     ]);
 
     if (!runRes.ok) {
@@ -354,6 +357,7 @@ export default function RunDetailPage() {
 
     setRun(runRes.data);
     if (portRes.ok) setPortfolio(portRes.data);
+    setLearning(learnRes.ok ? learnRes.data : null);
     if (curveRes.ok) setEquityPoints(curveRes.data.points);
     if (tradesRes.ok) setTrades(tradesRes.data.items);
     if (ordersRes.ok) setOrders(ordersRes.data.items);
@@ -500,6 +504,7 @@ export default function RunDetailPage() {
           { id: "orders", label: `Orders (${orders.length})` },
           { id: "fills", label: `Fills (${fills.length})` },
           { id: "positions", label: `Positions (${positions.length})` },
+          ...(learning ? [{ id: "learning", label: "Learning" }] : []),
         ]}
       >
         {(activeTab) => (
@@ -688,6 +693,136 @@ export default function RunDetailPage() {
                   keyExtractor={(p) => p.symbol}
                   emptyMessage="No open positions for this run."
                 />
+              </div>
+            )}
+
+            {activeTab === "learning" && learning && (
+              <div className="space-y-4">
+                {/* Optimizer status */}
+                <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+                  <StatCard
+                    label="Learning Cycles"
+                    value={learning.cycleCount}
+                    subValue={`${learning.tradesIngested} trades ingested`}
+                  />
+                  <StatCard
+                    label="Auto-Apply"
+                    value={learning.autoApply ? "ON" : "OFF"}
+                    trend={learning.autoApply ? "up" : "neutral"}
+                  />
+                  <StatCard
+                    label="Optimizer"
+                    value={learning.optimizerState.isEnabled ? "Enabled" : "Disabled"}
+                    subValue={learning.optimizerState.disabledReason ?? undefined}
+                    trend={learning.optimizerState.isEnabled ? "up" : "down"}
+                  />
+                  <StatCard
+                    label="Rollbacks (30d)"
+                    value={learning.optimizerState.rollbackCount30d}
+                    trend={learning.optimizerState.rollbackCount30d > 0 ? "down" : "neutral"}
+                  />
+                </div>
+
+                {/* Progress toward next cycle */}
+                <div className="card">
+                  <h3 className="mb-2 text-sm font-semibold text-slate-700 dark:text-slate-300">Next Cycle Progress</h3>
+                  <div className="flex items-center gap-3">
+                    <div className="h-2 flex-1 rounded-full bg-slate-200 dark:bg-slate-800">
+                      <div
+                        className="h-2 rounded-full bg-indigo-500 transition-all"
+                        style={{
+                          width: `${Math.min(100, ((learning.tradesIngested - learning.tradesAtLastCycle) / learning.minTradesPerCycle) * 100)}%`,
+                        }}
+                      />
+                    </div>
+                    <span className="text-xs text-slate-500 tabular-nums">
+                      {learning.tradesIngested - learning.tradesAtLastCycle} / {learning.minTradesPerCycle} trades
+                    </span>
+                  </div>
+                </div>
+
+                {/* Last analysis */}
+                {learning.lastAnalysis && (
+                  <div className="card">
+                    <h3 className="mb-3 text-sm font-semibold text-slate-700 dark:text-slate-300">Last Analysis</h3>
+                    <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+                      <StatCard
+                        label="Confidence"
+                        value={`${(learning.lastAnalysis.confidence * 100).toFixed(0)}%`}
+                        trend={learning.lastAnalysis.confidence >= 0.65 ? "up" : "neutral"}
+                      />
+                      <StatCard
+                        label="Actionable"
+                        value={learning.lastAnalysis.isActionable ? "Yes" : "No"}
+                        trend={learning.lastAnalysis.isActionable ? "up" : "neutral"}
+                      />
+                      {learning.lastAnalysis.bestRegime && (
+                        <StatCard
+                          label="Best Regime"
+                          value={learning.lastAnalysis.bestRegime}
+                        />
+                      )}
+                      {learning.lastAnalysis.mostPredictiveIndicator && (
+                        <StatCard
+                          label="Top Indicator"
+                          value={learning.lastAnalysis.mostPredictiveIndicator}
+                        />
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {/* Last adjustment */}
+                {learning.lastAdjustment && (
+                  <div className="card">
+                    <h3 className="mb-3 text-sm font-semibold text-slate-700 dark:text-slate-300">Last Parameter Adjustment</h3>
+                    <div className="mb-2 flex items-center gap-2 text-xs">
+                      <span className={learning.lastAdjustment.actionable
+                        ? "rounded-full bg-emerald-100 px-2 py-0.5 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400"
+                        : "rounded-full bg-slate-100 px-2 py-0.5 text-slate-600 dark:bg-slate-800 dark:text-slate-400"
+                      }>
+                        {learning.lastAdjustment.actionable ? "Applied" : "Skipped"}
+                      </span>
+                      <span className="text-slate-500">
+                        Confidence: {(learning.lastAdjustment.confidence * 100).toFixed(0)}%
+                      </span>
+                    </div>
+                    <p className="mb-3 text-xs text-slate-500">{learning.lastAdjustment.reason}</p>
+                    {learning.lastAdjustment.changes.length > 0 && (
+                      <div className="overflow-x-auto rounded-lg border border-slate-200 dark:border-slate-800">
+                        <table className="w-full text-xs">
+                          <thead>
+                            <tr className="border-b border-slate-200 bg-slate-50 dark:border-slate-800 dark:bg-slate-900/50">
+                              <th className="px-3 py-2 text-left font-medium text-slate-500">Parameter</th>
+                              <th className="px-3 py-2 text-left font-medium text-slate-500">Old Value</th>
+                              <th className="px-3 py-2 text-left font-medium text-slate-500">New Value</th>
+                              <th className="px-3 py-2 text-left font-medium text-slate-500">Change</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {learning.lastAdjustment.changes.map((c) => (
+                              <tr key={c.paramName} className="border-b border-slate-100 dark:border-slate-800/50">
+                                <td className="px-3 py-2 font-mono text-slate-700 dark:text-slate-300">{c.paramName}</td>
+                                <td className="px-3 py-2 font-mono text-slate-500">{String(c.oldValue)}</td>
+                                <td className="px-3 py-2 font-mono text-slate-700 dark:text-slate-300">{String(c.newValue)}</td>
+                                <td className={`px-3 py-2 font-mono ${c.changePct >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-red-600 dark:text-red-400"}`}>
+                                  {c.changePct >= 0 ? "+" : ""}{(c.changePct * 100).toFixed(1)}%
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* Cooldown notice */}
+                {learning.optimizerState.cooldownUntil && (
+                  <div className="rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-xs text-amber-700 dark:border-amber-800 dark:bg-amber-900/20 dark:text-amber-400">
+                    Optimizer in cooldown until {new Date(learning.optimizerState.cooldownUntil).toLocaleString()}
+                  </div>
+                )}
               </div>
             )}
           </>

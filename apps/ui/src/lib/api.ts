@@ -14,6 +14,7 @@ import type {
   AggregatePortfolio,
   EquityCurveResponse,
   FillListResponse,
+  LearningState,
   ModelVersion,
   ModelVersionListResponse,
   OptimizationRunListResponse,
@@ -335,6 +336,19 @@ export async function fetchPositions(
   runId: string,
 ): Promise<ApiResult<PositionListResponse>> {
   return apiGet<PositionListResponse>(`/api/v1/runs/${runId}/positions`, {
+    cache: "no-store",
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Adaptive Learning
+// ---------------------------------------------------------------------------
+
+/** GET /api/v1/runs/{runId}/learning — adaptive learning state for a running engine. */
+export async function fetchLearningState(
+  runId: string,
+): Promise<ApiResult<LearningState>> {
+  return apiGet<LearningState>(`/api/v1/runs/${runId}/learning`, {
     cache: "no-store",
   });
 }

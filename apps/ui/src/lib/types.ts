@@ -431,3 +431,52 @@ export interface OptimizationRunListResponse {
   offset: number;
   limit: number;
 }
+
+// ---------------------------------------------------------------------------
+// Adaptive Learning State
+// ---------------------------------------------------------------------------
+
+export interface ParameterChange {
+  paramName: string;
+  oldValue: unknown;
+  newValue: unknown;
+  changePct: number;
+}
+
+export interface LearningAdjustment {
+  actionable: boolean;
+  confidence: number;
+  reason: string;
+  changes: readonly ParameterChange[];
+}
+
+export interface LearningAnalysis {
+  confidence: number;
+  isActionable: boolean;
+  totalTrades: number;
+  totalSkipped: number;
+  bestRegime?: string | null;
+  worstRegime?: string | null;
+  mostPredictiveIndicator?: string | null;
+}
+
+export interface OptimizerStateSummary {
+  isEnabled: boolean;
+  rollbackCount30d: number;
+  cooldownUntil: string | null;
+  disabledReason: string | null;
+  preAdjustmentPnlPct: number | null;
+}
+
+export interface LearningState {
+  enabled: boolean;
+  autoApply: boolean;
+  cycleCount: number;
+  tradesIngested: number;
+  skippedIngested: number;
+  tradesAtLastCycle: number;
+  minTradesPerCycle: number;
+  optimizerState: OptimizerStateSummary;
+  lastAdjustment: LearningAdjustment | null;
+  lastAnalysis: LearningAnalysis | null;
+}
