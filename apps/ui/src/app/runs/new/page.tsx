@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { Suspense, useEffect, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import {
   fetchStrategies,
@@ -72,6 +72,14 @@ function ParamInput({
 }
 
 export default function NewRunPage() {
+  return (
+    <Suspense fallback={<div className="h-64 animate-pulse rounded-xl bg-slate-200 dark:bg-slate-800" />}>
+      <NewRunInner />
+    </Suspense>
+  );
+}
+
+function NewRunInner() {
   const router = useRouter();
   const searchParams = useSearchParams();
 
