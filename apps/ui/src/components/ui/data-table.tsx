@@ -44,7 +44,7 @@ export function DataTable<T>({
         {[...Array(5)].map((_, i) => (
           <div
             key={i}
-            className="h-12 animate-pulse rounded bg-slate-800"
+            className="h-12 animate-pulse rounded bg-slate-200 dark:bg-slate-800"
           />
         ))}
       </div>
@@ -63,16 +63,16 @@ export function DataTable<T>({
       : data;
 
   return (
-    <div className="overflow-x-auto rounded-xl border border-slate-800">
+    <div className="overflow-x-auto rounded-xl border border-slate-200 dark:border-slate-800">
       <table className="w-full text-sm">
         <thead>
-          <tr className="border-b border-slate-800 bg-slate-900/50">
+          <tr className="border-b border-slate-200 bg-slate-50 dark:border-slate-800 dark:bg-slate-900/50">
             {columns.map((col) => (
               <th
                 key={col.key}
                 className={[
                   "px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-slate-500",
-                  col.sortable ? "cursor-pointer select-none hover:text-slate-300" : "",
+                  col.sortable ? "cursor-pointer select-none hover:text-slate-700 dark:hover:text-slate-300" : "",
                   col.className ?? "",
                 ].join(" ")}
                 onClick={col.sortable ? () => handleSort(col.key) : undefined}
@@ -94,7 +94,7 @@ export function DataTable<T>({
             <tr>
               <td
                 colSpan={columns.length}
-                className="px-4 py-8 text-center text-slate-500"
+                className="px-4 py-8 text-center text-slate-400 dark:text-slate-500"
               >
                 {emptyMessage}
               </td>
@@ -103,13 +103,13 @@ export function DataTable<T>({
             displayData.map((row) => (
               <tr
                 key={keyExtractor(row)}
-                className="border-b border-slate-800/50 transition-colors hover:bg-slate-800/30"
+                className="border-b border-slate-100 transition-colors hover:bg-slate-50 dark:border-slate-800/50 dark:hover:bg-slate-800/30"
               >
                 {columns.map((col) => (
                   <td
                     key={col.key}
                     className={[
-                      "px-4 py-3 text-slate-300",
+                      "px-4 py-3 text-slate-700 dark:text-slate-300",
                       col.className ?? "",
                     ].join(" ")}
                   >

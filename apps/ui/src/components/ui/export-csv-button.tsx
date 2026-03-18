@@ -28,8 +28,8 @@ export function ExportCsvButton<T>({
 
   const sizeClasses =
     size === "sm"
-      ? "px-3 py-2 text-sm text-slate-300"
-      : "px-3 py-1.5 text-xs text-slate-400";
+      ? "px-3 py-2 text-sm text-slate-600 dark:text-slate-300"
+      : "px-3 py-1.5 text-xs text-slate-500 dark:text-slate-400";
 
   const iconSize = size === "sm" ? "h-4 w-4" : "h-3.5 w-3.5";
 
@@ -39,7 +39,7 @@ export function ExportCsvButton<T>({
       disabled={isDisabled}
       onClick={() => exportToCsv(filename, columns, data)}
       aria-label={`Export ${filename} as CSV`}
-      className={`flex items-center gap-1.5 rounded-lg border border-slate-700 bg-slate-800 font-medium transition-colors hover:border-indigo-500 hover:bg-indigo-600/10 hover:text-indigo-300 disabled:cursor-not-allowed disabled:opacity-40 ${sizeClasses}`}
+      className={`flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white font-medium transition-colors hover:border-indigo-500 hover:bg-indigo-50 hover:text-indigo-600 dark:border-slate-700 dark:bg-slate-800 dark:hover:bg-indigo-600/10 dark:hover:text-indigo-300 disabled:cursor-not-allowed disabled:opacity-40 ${sizeClasses}`}
     >
       <svg
         className={iconSize}

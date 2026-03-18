@@ -23,8 +23,8 @@ export function StatCard({
   if (isLoading) {
     return (
       <div className="card space-y-2">
-        <div className="h-3 w-24 animate-pulse rounded bg-slate-800" />
-        <div className="h-7 w-32 animate-pulse rounded bg-slate-800" />
+        <div className="h-3 w-24 animate-pulse rounded bg-slate-200 dark:bg-slate-800" />
+        <div className="h-7 w-32 animate-pulse rounded bg-slate-200 dark:bg-slate-800" />
       </div>
     );
   }

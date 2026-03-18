@@ -57,7 +57,7 @@ function buildColumns(
             onChange={() => onToggle(run.id)}
             onClick={(e) => e.stopPropagation()}
             aria-label={`Select run ${run.id.slice(0, 8)}`}
-            className="h-4 w-4 cursor-pointer rounded border-slate-600 bg-slate-800 accent-indigo-500 disabled:cursor-not-allowed disabled:opacity-40"
+            className="h-4 w-4 cursor-pointer rounded border-slate-300 bg-white accent-indigo-500 disabled:cursor-not-allowed disabled:opacity-40 dark:border-slate-600 dark:bg-slate-800"
           />
         );
       },
@@ -68,7 +68,7 @@ function buildColumns(
       render: (run) => (
         <Link
           href={`/runs/${run.id}`}
-          className="font-mono text-xs text-indigo-400 hover:text-indigo-300 hover:underline"
+          className="font-mono text-xs text-indigo-600 dark:text-indigo-400 hover:text-indigo-500 dark:hover:text-indigo-300 hover:underline"
         >
           {run.id.slice(0, 8)}…
         </Link>
@@ -78,14 +78,14 @@ function buildColumns(
       key: "mode",
       header: "Mode",
       render: (run) => (
-        <span className="capitalize text-slate-400">{run.runMode}</span>
+        <span className="capitalize text-slate-500 dark:text-slate-400">{run.runMode}</span>
       ),
     },
     {
       key: "strategy",
       header: "Strategy",
       render: (run) => (
-        <span className="text-slate-300">{run.config?.strategy_name ?? "—"}</span>
+        <span className="text-slate-700 dark:text-slate-300">{run.config?.strategy_name ?? "—"}</span>
       ),
     },
     {
@@ -101,7 +101,7 @@ function buildColumns(
       render: (run) => {
         const val = run.backtestMetrics?.totalReturnPct;
         if (val === undefined || val === null) {
-          return <span className="text-slate-600 text-xs">—</span>;
+          return <span className="text-slate-400 dark:text-slate-600 text-xs">—</span>;
         }
         const isPositive = val >= 0;
         return (
@@ -121,9 +121,9 @@ function buildColumns(
       render: (run) => {
         const val = run.backtestMetrics?.totalTrades;
         if (val === undefined || val === null) {
-          return <span className="text-slate-600 text-xs">—</span>;
+          return <span className="text-slate-400 dark:text-slate-600 text-xs">—</span>;
         }
-        return <span className="font-mono text-xs text-slate-300">{val}</span>;
+        return <span className="font-mono text-xs text-slate-700 dark:text-slate-300">{val}</span>;
       },
     },
     {
@@ -134,10 +134,10 @@ function buildColumns(
       render: (run) => {
         const val = run.backtestMetrics?.sharpeRatio;
         if (val === undefined || val === null) {
-          return <span className="text-slate-600 text-xs">—</span>;
+          return <span className="text-slate-400 dark:text-slate-600 text-xs">—</span>;
         }
         const colorClass =
-          val >= 1.0 ? "text-profit" : val < 0 ? "text-loss" : "text-slate-300";
+          val >= 1.0 ? "text-profit" : val < 0 ? "text-loss" : "text-slate-700 dark:text-slate-300";
         return (
           <span className={`font-mono text-xs font-medium ${colorClass}`}>
             {val.toFixed(2)}
@@ -149,7 +149,7 @@ function buildColumns(
       key: "symbols",
       header: "Symbols",
       render: (run) => (
-        <span className="font-mono text-xs text-slate-400">
+        <span className="font-mono text-xs text-slate-500 dark:text-slate-400">
           {run.config?.symbols?.join(", ") ?? "—"}
         </span>
       ),
@@ -332,7 +332,7 @@ export default function RunsPage() {
               "rounded-full px-3 py-1 text-xs font-medium transition-colors",
               modeFilter === opt.value
                 ? "bg-indigo-600 text-white"
-                : "bg-slate-800 text-slate-400 hover:bg-slate-700 hover:text-slate-200",
+                : "bg-slate-100 text-slate-600 hover:bg-slate-200 hover:text-slate-900 dark:bg-slate-800 dark:text-slate-400 dark:hover:bg-slate-700 dark:hover:text-slate-200",
             ].join(" ")}
           >
             {opt.label}
@@ -348,7 +348,7 @@ export default function RunsPage() {
               "rounded-full px-3 py-1 text-xs font-medium transition-colors",
               statusFilter === opt.value
                 ? "bg-emerald-600 text-white"
-                : "bg-slate-800 text-slate-400 hover:bg-slate-700 hover:text-slate-200",
+                : "bg-slate-100 text-slate-600 hover:bg-slate-200 hover:text-slate-900 dark:bg-slate-800 dark:text-slate-400 dark:hover:bg-slate-700 dark:hover:text-slate-200",
             ].join(" ")}
           >
             {opt.label}
@@ -394,7 +394,7 @@ export default function RunsPage() {
       </div>
 
       {showAdvanced && (
-        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4 rounded-lg border border-slate-800 bg-slate-900/40 p-3">
+        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/40 p-3">
           <div>
             <label className="mb-1 block text-xs font-medium text-slate-500">
               Strategy
@@ -407,7 +407,7 @@ export default function RunsPage() {
                 setPage(0);
               }}
               placeholder="e.g. rsi_mean_reversion"
-              className="w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-1.5 text-xs text-slate-200 placeholder-slate-600 focus:border-indigo-500 focus:outline-none"
+              className="w-full rounded-lg border border-slate-300 bg-white text-slate-900 placeholder-slate-400 focus:border-indigo-500 focus:outline-none px-3 py-1.5 text-xs dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200 dark:placeholder-slate-600"
             />
           </div>
           <div>
@@ -422,7 +422,7 @@ export default function RunsPage() {
                 setPage(0);
               }}
               placeholder="e.g. BTC/USD"
-              className="w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-1.5 text-xs text-slate-200 placeholder-slate-600 focus:border-indigo-500 focus:outline-none"
+              className="w-full rounded-lg border border-slate-300 bg-white text-slate-900 placeholder-slate-400 focus:border-indigo-500 focus:outline-none px-3 py-1.5 text-xs dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200 dark:placeholder-slate-600"
             />
           </div>
           <div>
@@ -436,7 +436,7 @@ export default function RunsPage() {
                 setDateAfter(e.target.value);
                 setPage(0);
               }}
-              className="w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-1.5 text-xs text-slate-200 focus:border-indigo-500 focus:outline-none"
+              className="w-full rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs text-slate-900 focus:border-indigo-500 focus:outline-none dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200"
             />
           </div>
           <div>
@@ -450,14 +450,14 @@ export default function RunsPage() {
                 setDateBefore(e.target.value);
                 setPage(0);
               }}
-              className="w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-1.5 text-xs text-slate-200 focus:border-indigo-500 focus:outline-none"
+              className="w-full rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs text-slate-900 focus:border-indigo-500 focus:outline-none dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200"
             />
           </div>
         </div>
       )}
 
       {error && (
-        <div className="rounded-lg border border-red-800 bg-red-900/20 px-4 py-3 text-sm text-red-400">
+        <div className="rounded-lg border border-red-300 bg-red-50 px-4 py-3 text-sm text-red-600 dark:border-red-800 dark:bg-red-900/20 dark:text-red-400">
           {error}
         </div>
       )}
@@ -471,10 +471,10 @@ export default function RunsPage() {
       />
 
       {/* Pagination controls */}
-      <div className="flex flex-wrap items-center justify-between gap-4 rounded-lg bg-slate-800 px-4 py-3 text-sm">
+      <div className="flex flex-wrap items-center justify-between gap-4 rounded-lg bg-slate-100 dark:bg-slate-800 px-4 py-3 text-sm">
         {/* Left: rows per page */}
         <div className="flex items-center gap-2">
-          <span className="text-slate-400">Rows per page</span>
+          <span className="text-slate-500 dark:text-slate-400">Rows per page</span>
           <select
             value={pageSize}
             onChange={(e) => {
@@ -484,7 +484,7 @@ export default function RunsPage() {
                 setPage(0);
               }
             }}
-            className="rounded bg-slate-700 px-2 py-1 text-xs text-slate-200 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+            className="rounded bg-slate-200 dark:bg-slate-700 px-2 py-1 text-xs text-slate-800 dark:text-slate-200 focus:outline-none focus:ring-1 focus:ring-indigo-500"
             aria-label="Rows per page"
           >
             {PAGE_SIZE_OPTIONS.map((size) => (
@@ -496,7 +496,7 @@ export default function RunsPage() {
         </div>
 
         {/* Center: range display */}
-        <span className="text-slate-400 tabular-nums">
+        <span className="text-slate-500 dark:text-slate-400 tabular-nums">
           {displayCount === 0
             ? "No results"
             : `${rangeStart}–${rangeEnd} of ${total}`}
@@ -507,7 +507,7 @@ export default function RunsPage() {
           <button
             onClick={() => setPage((p) => Math.max(0, p - 1))}
             disabled={page === 0}
-            className="rounded px-3 py-1 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:text-slate-600 enabled:text-slate-300 enabled:hover:bg-slate-700 enabled:hover:text-slate-100"
+            className="rounded px-3 py-1 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:text-slate-400 dark:disabled:text-slate-600 enabled:text-slate-700 dark:enabled:text-slate-300 enabled:hover:bg-slate-200 dark:enabled:hover:bg-slate-700 enabled:hover:text-slate-900 dark:enabled:hover:text-slate-100"
             aria-label="Previous page"
           >
             Prev
@@ -518,7 +518,7 @@ export default function RunsPage() {
           <button
             onClick={() => setPage((p) => Math.min(totalPages - 1, p + 1))}
             disabled={page >= totalPages - 1}
-            className="rounded px-3 py-1 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:text-slate-600 enabled:text-slate-300 enabled:hover:bg-slate-700 enabled:hover:text-slate-100"
+            className="rounded px-3 py-1 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:text-slate-400 dark:disabled:text-slate-600 enabled:text-slate-700 dark:enabled:text-slate-300 enabled:hover:bg-slate-200 dark:enabled:hover:bg-slate-700 enabled:hover:text-slate-900 dark:enabled:hover:text-slate-100"
             aria-label="Next page"
           >
             Next

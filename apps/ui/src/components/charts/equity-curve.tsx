@@ -108,7 +108,7 @@ export function EquityCurveChart({
   if (points.length === 0) {
     return (
       <div
-        className="flex items-center justify-center rounded-lg border border-slate-800 bg-slate-900/40 text-slate-500 text-sm"
+        className="flex items-center justify-center rounded-lg border border-slate-200 bg-slate-50 text-slate-400 text-sm dark:border-slate-800 dark:bg-slate-900/40 dark:text-slate-500"
         style={{ height }}
       >
         No equity data yet
@@ -124,7 +124,7 @@ export function EquityCurveChart({
   }));
 
   return (
-    <div className="w-full rounded-lg border border-slate-800 bg-slate-900/40 p-3">
+    <div className="w-full rounded-lg border border-slate-200 bg-white p-3 dark:border-slate-800 dark:bg-slate-900/40">
       <ResponsiveContainer width="100%" height={height}>
         <AreaChart
           data={data}

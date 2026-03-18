@@ -63,12 +63,12 @@ export function EquityOverview() {
   }, []);
 
   if (loading) {
-    return <div className="mt-3 h-12 animate-pulse rounded bg-slate-800" />;
+    return <div className="mt-3 h-12 animate-pulse rounded bg-slate-200 dark:bg-slate-800" />;
   }
 
   if (sparkData.length < 2) {
     return (
-      <p className="mt-2 text-xs text-slate-600">
+      <p className="mt-2 text-xs text-slate-400 dark:text-slate-600">
         Run a backtest to see equity trend
       </p>
     );
@@ -84,7 +84,7 @@ export function EquityOverview() {
     <div className="mt-3">
       <div className="mb-1 flex items-center justify-between text-xs text-slate-500">
         <span>Latest Run Equity</span>
-        <span className={isPositive ? "text-emerald-400" : "text-red-400"}>
+        <span className={isPositive ? "text-emerald-600 dark:text-emerald-400" : "text-red-600 dark:text-red-400"}>
           {isPositive ? "+" : ""}
           {returnPct.toFixed(2)}%
         </span>
