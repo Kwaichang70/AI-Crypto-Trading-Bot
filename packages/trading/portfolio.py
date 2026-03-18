@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, date
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Any
+from typing import Any, Callable
 
 import structlog
 
@@ -84,6 +84,9 @@ class PortfolioAccounting:
 
         # Position snapshots: symbol -> last known Position (for unrealised PnL)
         self._position_snapshots: dict[str, Position] = {}
+
+        # Optional callback fired after each trade is recorded (for adaptive learning)
+        self.on_trade_recorded: Callable[[TradeResult], None] | None = None
 
         self._log = structlog.get_logger(__name__).bind(
             run_id=run_id,
@@ -510,6 +513,13 @@ class PortfolioAccounting:
             realised_pnl=str(trade.realised_pnl),
             return_pct=f"{trade.return_pct:.4%}",
         )
+
+        # Fire adaptive learning callback (CR-001: log errors, never corrupt portfolio)
+        if self.on_trade_recorded is not None:
+            try:
+                self.on_trade_recorded(trade)
+            except Exception:
+                self._log.warning("portfolio.trade_callback_error", exc_info=True)
 
     def get_trade_history(self) -> list[TradeResult]:
         """

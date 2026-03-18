@@ -213,6 +213,18 @@ class RunCreateRequest(BaseModel):
             "environment variable. Ignored for backtest and paper modes."
         ),
     )
+    enable_adaptive_learning: bool = Field(
+        default=False,
+        description="Enable adaptive learning pipeline (paper/live only, ignored for backtest).",
+    )
+    auto_apply_learning: bool = Field(
+        default=False,
+        description=(
+            "If True, automatically apply parameter adjustments proposed by the "
+            "adaptive optimizer. Only effective when enable_adaptive_learning=True "
+            "and mode=paper. Always forced to False for live mode."
+        ),
+    )
 
     @field_validator("initial_capital")
     @classmethod

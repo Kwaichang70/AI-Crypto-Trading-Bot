@@ -681,6 +681,8 @@ async def _run_paper_engine(
     timeframe: TimeFrame,
     initial_capital: str,
     trailing_stop_pct: float | None = None,
+    enable_adaptive_learning: bool = False,
+    auto_apply_learning: bool = False,
 ) -> None:
     """
     Background coroutine that runs a paper trading engine for a single run.
@@ -738,6 +740,10 @@ async def _run_paper_engine(
     flush_state = _IncrementalFlushState()
     flush_task: asyncio.Task[None] | None = None
 
+    # Adaptive learning task -- opt-in per run
+    learning_task: asyncio.Task[None] | None = None
+    learning_stop_event: asyncio.Event | None = None
+
     try:
         settings = get_settings()
         capital = Decimal(initial_capital)
@@ -778,6 +784,24 @@ async def _run_paper_engine(
             params=strategy_params,
         )
 
+        # Adaptive learning pipeline (opt-in per run)
+        if enable_adaptive_learning:
+            from trading.adaptive_learning import AdaptiveLearningTask
+
+            learning_stop_event = asyncio.Event()
+            adaptive_learner = AdaptiveLearningTask(
+                strategies=[strategy_instance],
+                auto_apply=auto_apply_learning,
+                original_params=dict(strategy_params),
+                check_interval_seconds=60.0,
+                min_trades_per_cycle=50,
+            )
+            portfolio.on_trade_recorded = adaptive_learner.ingest_trade
+            log.info(
+                "runs.adaptive_learning_enabled",
+                auto_apply=auto_apply_learning,
+            )
+
         # Build engine config  -- include trailing stop if configured
         engine_config: dict[str, object] = {}
         if trailing_stop_pct is not None:
@@ -813,10 +837,24 @@ async def _run_paper_engine(
             )
         )
 
+        # Start adaptive learning as parallel background task
+        if learning_stop_event is not None:
+            learning_task = asyncio.create_task(
+                adaptive_learner.run(learning_stop_event)
+            )
+
         await engine.run_live_loop()
 
     except asyncio.CancelledError:
         log.info("runs.paper_engine_cancelled")
+        if learning_stop_event is not None:
+            learning_stop_event.set()
+        if learning_task is not None and not learning_task.done():
+            learning_task.cancel()
+            try:
+                await learning_task
+            except (asyncio.CancelledError, Exception):
+                pass
         if flush_task is not None and not flush_task.done():
             flush_task.cancel()
             try:
@@ -833,6 +871,14 @@ async def _run_paper_engine(
     except Exception:
         final_status = "error"
         log.exception("runs.paper_engine_error")
+        if learning_stop_event is not None:
+            learning_stop_event.set()
+        if learning_task is not None and not learning_task.done():
+            learning_task.cancel()
+            try:
+                await learning_task
+            except (asyncio.CancelledError, Exception):
+                pass
         if flush_task is not None and not flush_task.done():
             flush_task.cancel()
             try:
@@ -846,6 +892,16 @@ async def _run_paper_engine(
                 log.exception("runs.paper_engine_stop_error")
 
     finally:
+        # Belt-and-suspenders: cancel learning task if it somehow survived
+        if learning_stop_event is not None:
+            learning_stop_event.set()
+        if learning_task is not None and not learning_task.done():
+            learning_task.cancel()
+            try:
+                await learning_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
         # Belt-and-suspenders: cancel flush task if it somehow survived
         if flush_task is not None and not flush_task.done():
             flush_task.cancel()
@@ -905,6 +961,7 @@ async def _run_live_engine(
     timeframe: TimeFrame,
     initial_capital: str,
     trailing_stop_pct: float | None = None,
+    enable_adaptive_learning: bool = False,
 ) -> None:
     """
     Background coroutine that runs a live trading engine for a single run.
@@ -941,6 +998,10 @@ async def _run_live_engine(
     # Incremental flush state  -- mirrors paper engine pattern (Sprint 25)
     flush_state = _IncrementalFlushState()
     flush_task: asyncio.Task[None] | None = None
+
+    # Adaptive learning task -- opt-in, auto_apply always False for live
+    learning_task: asyncio.Task[None] | None = None
+    learning_stop_event: asyncio.Event | None = None
 
     try:
         settings = get_settings()
@@ -999,6 +1060,22 @@ async def _run_live_engine(
             params=strategy_params,
         )
 
+        # Adaptive learning pipeline (opt-in, auto_apply always False for live)
+        # Safety invariant: auto_apply is never enabled for live mode
+        if enable_adaptive_learning:
+            from trading.adaptive_learning import AdaptiveLearningTask
+
+            learning_stop_event = asyncio.Event()
+            adaptive_learner = AdaptiveLearningTask(
+                strategies=[strategy_instance],
+                auto_apply=False,  # Safety: never auto-apply in live mode
+                original_params=dict(strategy_params),
+                check_interval_seconds=60.0,
+                min_trades_per_cycle=50,
+            )
+            portfolio.on_trade_recorded = adaptive_learner.ingest_trade
+            log.info("runs.adaptive_learning_enabled", auto_apply=False)
+
         # Build engine config  -- include trailing stop if configured
         live_engine_config: dict[str, object] = {}
         if trailing_stop_pct is not None:
@@ -1031,10 +1108,24 @@ async def _run_live_engine(
             )
         )
 
+        # Start adaptive learning as parallel background task
+        if learning_stop_event is not None:
+            learning_task = asyncio.create_task(
+                adaptive_learner.run(learning_stop_event)
+            )
+
         await engine.run_live_loop()
 
     except asyncio.CancelledError:
         log.info("runs.live_engine_cancelled")
+        if learning_stop_event is not None:
+            learning_stop_event.set()
+        if learning_task is not None and not learning_task.done():
+            learning_task.cancel()
+            try:
+                await learning_task
+            except (asyncio.CancelledError, Exception):
+                pass
         if flush_task is not None and not flush_task.done():
             flush_task.cancel()
             try:
@@ -1051,6 +1142,14 @@ async def _run_live_engine(
     except Exception:
         final_status = "error"
         log.exception("runs.live_engine_error")
+        if learning_stop_event is not None:
+            learning_stop_event.set()
+        if learning_task is not None and not learning_task.done():
+            learning_task.cancel()
+            try:
+                await learning_task
+            except (asyncio.CancelledError, Exception):
+                pass
         if flush_task is not None and not flush_task.done():
             flush_task.cancel()
             try:
@@ -1064,6 +1163,16 @@ async def _run_live_engine(
                 log.exception("runs.live_engine_stop_error")
 
     finally:
+        # Belt-and-suspenders: cancel learning task if it somehow survived
+        if learning_stop_event is not None:
+            learning_stop_event.set()
+        if learning_task is not None and not learning_task.done():
+            learning_task.cancel()
+            try:
+                await learning_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
         # Belt-and-suspenders: cancel flush task if it somehow survived
         if flush_task is not None and not flush_task.done():
             flush_task.cancel()
@@ -1819,6 +1928,8 @@ async def create_run(
                 timeframe=timeframe,
                 initial_capital=body.initial_capital,
                 trailing_stop_pct=_trailing_stop_pct,
+                enable_adaptive_learning=body.enable_adaptive_learning,
+                auto_apply_learning=body.auto_apply_learning,
             ),
             name=f"paper-engine-{run_id}",
         )
@@ -1840,6 +1951,7 @@ async def create_run(
                 timeframe=timeframe,
                 initial_capital=body.initial_capital,
                 trailing_stop_pct=_trailing_stop_pct,
+                enable_adaptive_learning=body.enable_adaptive_learning,
             ),
             name=f"live-engine-{run_id}",
         )
