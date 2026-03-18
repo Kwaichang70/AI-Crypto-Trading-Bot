@@ -420,10 +420,10 @@ export default function RunDetailPage() {
   if (isLoading) {
     return (
       <div className="space-y-6">
-        <div className="h-8 w-64 animate-pulse rounded bg-slate-800" />
+        <div className="h-8 w-64 animate-pulse rounded bg-slate-200 dark:bg-slate-800" />
         <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
           {[...Array(4)].map((_, i) => (
-            <div key={i} className="h-24 animate-pulse rounded-xl bg-slate-800" />
+            <div key={i} className="h-24 animate-pulse rounded-xl bg-slate-200 dark:bg-slate-800" />
           ))}
         </div>
       </div>
@@ -433,10 +433,10 @@ export default function RunDetailPage() {
   if (error ?? !run) {
     return (
       <div className="space-y-4">
-        <Link href="/runs" className="text-sm text-indigo-400 hover:underline">
+        <Link href="/runs" className="text-sm text-indigo-600 dark:text-indigo-400 hover:underline">
           Back to Runs
         </Link>
-        <div className="rounded-lg border border-red-800 bg-red-900/20 px-4 py-3 text-sm text-red-400">
+        <div className="rounded-lg border border-red-300 bg-red-50 px-4 py-3 text-sm text-red-600 dark:border-red-800 dark:bg-red-900/20 dark:text-red-400">
           {error ?? "Run not found."}
         </div>
       </div>
@@ -452,7 +452,7 @@ export default function RunDetailPage() {
   return (
     <div className="space-y-6">
       {/* Back link */}
-      <Link href="/runs" className="text-sm text-slate-500 hover:text-slate-300 hover:underline">
+      <Link href="/runs" className="text-sm text-slate-500 hover:text-slate-700 dark:hover:text-slate-300 hover:underline">
         Back to Runs
       </Link>
 
@@ -466,7 +466,7 @@ export default function RunDetailPage() {
               <button
                 onClick={() => void handleStop()}
                 disabled={isStopping}
-                className="rounded-lg border border-red-700 bg-red-900/20 px-4 py-2 text-sm font-medium text-red-400 transition-colors hover:bg-red-900/40 disabled:opacity-50"
+                className="rounded-lg border border-red-300 bg-red-50 px-4 py-2 text-sm font-medium text-red-600 transition-colors hover:bg-red-100 dark:border-red-700 dark:bg-red-900/20 dark:text-red-400 dark:hover:bg-red-900/40 disabled:opacity-50"
               >
                 {isStopping ? "Stopping…" : "Stop Run"}
               </button>
@@ -474,7 +474,7 @@ export default function RunDetailPage() {
             {isDone && (
               <button
                 onClick={handleDuplicate}
-                className="rounded-lg border border-slate-700 bg-slate-800/60 px-4 py-2 text-sm font-medium text-slate-300 transition-colors hover:border-indigo-500 hover:bg-indigo-600/10 hover:text-indigo-300"
+                className="rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800/60 px-4 py-2 text-sm font-medium text-slate-700 dark:text-slate-300 transition-colors hover:border-indigo-500 hover:bg-indigo-600/10 hover:text-indigo-600 dark:hover:text-indigo-300"
               >
                 Duplicate Run
               </button>
@@ -484,7 +484,7 @@ export default function RunDetailPage() {
       />
 
       {/* Status + metadata row */}
-      <div className="flex flex-wrap items-center gap-3 text-sm text-slate-400">
+      <div className="flex flex-wrap items-center gap-3 text-sm text-slate-500 dark:text-slate-400">
         <RunStatusBadge status={run.status} />
         <span>Started {new Date(run.startedAt).toLocaleString()}</span>
         {run.stoppedAt && (
@@ -547,7 +547,7 @@ export default function RunDetailPage() {
                 {/* Equity curve */}
                 <div className="card">
                   <div className="mb-3 flex items-center justify-between">
-                    <h3 className="text-sm font-semibold text-slate-300">Equity Curve</h3>
+                    <h3 className="text-sm font-semibold text-slate-700 dark:text-slate-300">Equity Curve</h3>
                     <ExportCsvButton
                       filename={`run-${id.slice(0, 8)}-equity.csv`}
                       columns={EQUITY_CSV_COLUMNS}
@@ -560,7 +560,7 @@ export default function RunDetailPage() {
                 {/* Backtest performance metrics — shown only for completed backtests */}
                 {run.runMode === "backtest" && run.backtestMetrics && (
                   <div className="card">
-                    <h3 className="mb-3 text-sm font-semibold text-slate-300">Backtest Performance</h3>
+                    <h3 className="mb-3 text-sm font-semibold text-slate-700 dark:text-slate-300">Backtest Performance</h3>
                     <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
                       <StatCard
                         label="Sharpe Ratio"

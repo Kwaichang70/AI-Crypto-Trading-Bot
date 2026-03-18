@@ -55,7 +55,7 @@ function RecentRunsTable({ runs }: { runs: readonly Run[] }) {
     <div className="overflow-x-auto">
       <table className="w-full text-sm">
         <thead>
-          <tr className="border-b border-slate-800">
+          <tr className="border-b border-slate-200 dark:border-slate-800">
             <th className="px-4 py-2 text-left text-xs font-semibold uppercase tracking-wide text-slate-500">ID</th>
             <th className="px-4 py-2 text-left text-xs font-semibold uppercase tracking-wide text-slate-500">Mode</th>
             <th className="px-4 py-2 text-left text-xs font-semibold uppercase tracking-wide text-slate-500">Strategy</th>
@@ -65,17 +65,17 @@ function RecentRunsTable({ runs }: { runs: readonly Run[] }) {
         </thead>
         <tbody>
           {runs.map((run) => (
-            <tr key={run.id} className="border-b border-slate-800/50 hover:bg-slate-800/20">
+            <tr key={run.id} className="border-b border-slate-100 dark:border-slate-800/50 hover:bg-slate-50 dark:hover:bg-slate-800/20">
               <td className="px-4 py-3">
                 <Link
                   href={`/runs/${run.id}`}
-                  className="font-mono text-xs text-indigo-400 hover:text-indigo-300 hover:underline"
+                  className="font-mono text-xs text-indigo-600 dark:text-indigo-400 hover:text-indigo-500 dark:hover:text-indigo-300 hover:underline"
                 >
                   {run.id.slice(0, 8)}…
                 </Link>
               </td>
-              <td className="px-4 py-3 text-slate-400">{run.runMode}</td>
-              <td className="px-4 py-3 text-slate-300">{run.config?.strategy_name ?? "—"}</td>
+              <td className="px-4 py-3 text-slate-500 dark:text-slate-400">{run.runMode}</td>
+              <td className="px-4 py-3 text-slate-700 dark:text-slate-300">{run.config?.strategy_name ?? "—"}</td>
               <td className="px-4 py-3">
                 <RunStatusBadge status={run.status} />
               </td>
@@ -207,7 +207,7 @@ export default async function DashboardPage() {
 
       {/* Equity sparkline — client island, lazy-fetches from most recent stopped run */}
       <section aria-label="Equity overview" className="card p-4">
-        <h2 className="text-sm font-semibold text-slate-200">Equity Trend</h2>
+        <h2 className="text-sm font-semibold text-slate-800 dark:text-slate-200">Equity Trend</h2>
         <EquityOverview />
       </section>
 
@@ -215,10 +215,10 @@ export default async function DashboardPage() {
       <section aria-label="Recent runs">
         <div className="card">
           <div className="mb-4 flex items-center justify-between">
-            <h2 className="text-sm font-semibold text-slate-200">Recent Runs</h2>
+            <h2 className="text-sm font-semibold text-slate-800 dark:text-slate-200">Recent Runs</h2>
             <Link
               href="/runs"
-              className="text-xs text-indigo-400 hover:text-indigo-300 hover:underline"
+              className="text-xs text-indigo-600 dark:text-indigo-400 hover:text-indigo-500 dark:hover:text-indigo-300 hover:underline"
             >
               View all
             </Link>
@@ -229,7 +229,7 @@ export default async function DashboardPage() {
 
       {/* API error notice */}
       {!runsResult.ok && (
-        <div className="rounded-lg border border-red-800 bg-red-900/20 px-4 py-3 text-sm text-red-400">
+        <div className="rounded-lg border border-red-300 bg-red-50 px-4 py-3 text-sm text-red-600 dark:border-red-800 dark:bg-red-900/20 dark:text-red-400">
           Could not load run data: {runsResult.error.message}
         </div>
       )}

@@ -257,9 +257,9 @@ function mergeEquityCurves(
 function LoadingSkeleton() {
   return (
     <div className="space-y-6">
-      <div className="h-8 w-48 animate-pulse rounded bg-slate-800" />
-      <div className="h-64 animate-pulse rounded-xl bg-slate-800" />
-      <div className="h-80 animate-pulse rounded-xl bg-slate-800" />
+      <div className="h-8 w-48 animate-pulse rounded bg-slate-200 dark:bg-slate-800" />
+      <div className="h-64 animate-pulse rounded-xl bg-slate-200 dark:bg-slate-800" />
+      <div className="h-80 animate-pulse rounded-xl bg-slate-200 dark:bg-slate-800" />
     </div>
   );
 }
@@ -391,10 +391,10 @@ function RunCompareInner() {
   if (fatalError) {
     return (
       <div className="space-y-4">
-        <Link href="/runs" className="text-sm text-indigo-400 hover:underline">
+        <Link href="/runs" className="text-sm text-indigo-600 dark:text-indigo-400 hover:underline">
           Back to Runs
         </Link>
-        <div className="rounded-lg border border-red-800 bg-red-900/20 px-4 py-3 text-sm text-red-400">
+        <div className="rounded-lg border border-red-300 bg-red-50 px-4 py-3 text-sm text-red-600 dark:border-red-800 dark:bg-red-900/20 dark:text-red-400">
           {fatalError}
         </div>
       </div>
@@ -406,7 +406,7 @@ function RunCompareInner() {
   return (
     <div className="space-y-6">
       {/* Back link */}
-      <Link href="/runs" className="text-sm text-slate-500 hover:text-slate-300 hover:underline">
+      <Link href="/runs" className="text-sm text-slate-500 hover:text-slate-700 dark:hover:text-slate-300 hover:underline">
         Back to Runs
       </Link>
 
@@ -419,13 +419,13 @@ function RunCompareInner() {
       {/* Overlaid equity curves                                              */}
       {/* ------------------------------------------------------------------ */}
       <div className="card">
-        <h3 className="mb-3 text-sm font-semibold text-slate-300">Equity Curves</h3>
+        <h3 className="mb-3 text-sm font-semibold text-slate-700 dark:text-slate-300">Equity Curves</h3>
         {chartData.length === 0 ? (
-          <div className="flex h-48 items-center justify-center rounded-lg border border-slate-800 bg-slate-900/40 text-sm text-slate-500">
+          <div className="flex h-48 items-center justify-center rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/40 text-sm text-slate-500">
             No equity data available
           </div>
         ) : (
-          <div className="w-full rounded-lg border border-slate-800 bg-slate-900/40 p-3">
+          <div className="w-full rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/40 p-3">
             <ResponsiveContainer width="100%" height={280}>
               <LineChart
                 data={chartData}
@@ -489,10 +489,10 @@ function RunCompareInner() {
       {/* Metrics comparison table                                            */}
       {/* ------------------------------------------------------------------ */}
       <div className="card overflow-x-auto">
-        <h3 className="mb-3 text-sm font-semibold text-slate-300">Metrics</h3>
+        <h3 className="mb-3 text-sm font-semibold text-slate-700 dark:text-slate-300">Metrics</h3>
         <table className="w-full text-sm">
           <thead>
-            <tr className="border-b border-slate-800 bg-slate-900/50">
+            <tr className="border-b border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/50">
               {/* Row label column */}
               <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-slate-500 w-40">
                 Metric
@@ -519,7 +519,7 @@ function RunCompareInner() {
               return (
                 <tr
                   key={row.label}
-                  className="border-b border-slate-800/50 hover:bg-slate-800/20"
+                  className="border-b border-slate-100 dark:border-slate-800/50 hover:bg-slate-50 dark:hover:bg-slate-800/20"
                 >
                   <td className="px-4 py-2.5 text-xs font-medium text-slate-500">
                     {row.label}
@@ -535,8 +535,8 @@ function RunCompareInner() {
                         className={[
                           "px-4 py-2.5 font-mono text-xs tabular-nums",
                           isBest && !isTextOnlyRow
-                            ? "font-semibold text-emerald-400"
-                            : "text-slate-300",
+                            ? "font-semibold text-emerald-600 dark:text-emerald-400"
+                            : "text-slate-700 dark:text-slate-300",
                         ].join(" ")}
                       >
                         {row.label === "Status" ? (
@@ -556,7 +556,7 @@ function RunCompareInner() {
 
       {/* Per-run secondary data warnings */}
       {items.some((d) => d.error !== null) && (
-        <div className="rounded-lg border border-amber-800 bg-amber-900/20 px-4 py-3 text-xs text-amber-400">
+        <div className="rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-xs text-amber-700 dark:border-amber-800 dark:bg-amber-900/20 dark:text-amber-400">
           Some secondary data (portfolio / equity curve) could not be loaded for one or more runs.
           Metrics that depend on that data will show "—".
         </div>

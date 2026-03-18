@@ -216,7 +216,7 @@ export default function LeaderboardPage() {
                 "rounded-full px-3 py-1 text-xs font-medium transition-colors",
                 sortBy === opt.value
                   ? "bg-indigo-600 text-white"
-                  : "bg-slate-800 text-slate-400 hover:bg-slate-700 hover:text-slate-200",
+                  : "bg-slate-100 text-slate-600 hover:bg-slate-200 hover:text-slate-900 dark:bg-slate-800 dark:text-slate-400 dark:hover:bg-slate-700 dark:hover:text-slate-200",
               ].join(" ")}
             >
               {opt.label}
@@ -226,7 +226,7 @@ export default function LeaderboardPage() {
       </div>
 
       {error && (
-        <div className="rounded-lg border border-red-800 bg-red-900/20 px-4 py-3 text-sm text-red-400">
+        <div className="rounded-lg border border-red-300 bg-red-50 px-4 py-3 text-sm text-red-600 dark:border-red-800 dark:bg-red-900/20 dark:text-red-400">
           {error}
         </div>
       )}
@@ -234,18 +234,18 @@ export default function LeaderboardPage() {
       {isLoading ? (
         <div className="space-y-2">
           {[...Array(4)].map((_, i) => (
-            <div key={i} className="h-16 animate-pulse rounded-xl bg-slate-800" />
+            <div key={i} className="h-16 animate-pulse rounded-xl bg-slate-200 dark:bg-slate-800" />
           ))}
         </div>
       ) : sorted.length === 0 ? (
-        <div className="rounded-lg border border-slate-800 bg-slate-900/40 py-12 text-center text-sm text-slate-500">
+        <div className="rounded-lg border border-slate-200 bg-slate-50 py-12 text-center text-sm text-slate-500 dark:border-slate-800 dark:bg-slate-900/40">
           No runs with metrics found. Run some backtests first.
         </div>
       ) : (
-        <div className="overflow-x-auto rounded-xl border border-slate-800">
+        <div className="overflow-x-auto rounded-xl border border-slate-200 dark:border-slate-800">
           <table className="w-full text-sm">
             <thead>
-              <tr className="border-b border-slate-800 bg-slate-900/50">
+              <tr className="border-b border-slate-200 bg-slate-50 dark:border-slate-800 dark:bg-slate-900/50">
                 <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-slate-500 w-8">
                   #
                 </th>
@@ -282,7 +282,7 @@ export default function LeaderboardPage() {
               {sorted.map((s, idx) => (
                 <tr
                   key={s.name}
-                  className="border-b border-slate-800/50 transition-colors hover:bg-slate-800/30"
+                  className="border-b border-slate-100 transition-colors hover:bg-slate-50 dark:border-slate-800/50 dark:hover:bg-slate-800/30"
                 >
                   <td className="px-4 py-3">
                     <span className={`font-mono text-xs font-bold ${

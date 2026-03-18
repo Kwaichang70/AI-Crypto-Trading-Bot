@@ -29,7 +29,7 @@ function ParamInput({
   if (schema.type === "boolean") {
     return (
       <div className="flex items-center justify-between">
-        <label className="text-sm text-slate-300">
+        <label className="text-sm text-slate-700 dark:text-slate-300">
           {label}
           {schema.description && (
             <span className="ml-1 text-xs text-slate-500"> — {schema.description}</span>
@@ -39,7 +39,7 @@ function ParamInput({
           type="checkbox"
           checked={Boolean(value)}
           onChange={(e) => onChange(e.target.checked)}
-          className="h-4 w-4 rounded border-slate-700 bg-slate-800 accent-indigo-500"
+          className="h-4 w-4 rounded border-slate-300 bg-white accent-indigo-500 dark:border-slate-700 dark:bg-slate-800"
         />
       </div>
     );
@@ -47,7 +47,7 @@ function ParamInput({
 
   return (
     <div>
-      <label className="block text-sm font-medium text-slate-300">
+      <label className="block text-sm font-medium text-slate-700 dark:text-slate-300">
         {label}
         {schema.description && (
           <span className="ml-1 text-xs font-normal text-slate-500"> — {schema.description}</span>
@@ -65,7 +65,7 @@ function ParamInput({
           else if (schema.type === "number") onChange(parseFloat(raw));
           else onChange(raw);
         }}
-        className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-200 placeholder-slate-500 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+        className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 placeholder-slate-400 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200 dark:placeholder-slate-500"
       />
     </div>
   );
@@ -208,7 +208,7 @@ export default function NewRunPage() {
       />
 
       {preStrategy && (
-        <div className="rounded-lg border border-indigo-800 bg-indigo-900/20 px-4 py-2 text-xs text-indigo-400">
+        <div className="rounded-lg border border-indigo-300 bg-indigo-50 px-4 py-2 text-xs text-indigo-600 dark:border-indigo-800 dark:bg-indigo-900/20 dark:text-indigo-400">
           Pre-filled from a previous run. Adjust settings as needed and click Start Run.
         </div>
       )}
@@ -216,7 +216,7 @@ export default function NewRunPage() {
       <form onSubmit={(e) => void handleSubmit(e)} className="space-y-6 lg:max-w-2xl">
         {/* Mode selector */}
         <div className="card space-y-3">
-          <h2 className="text-sm font-semibold text-slate-200">Run Mode</h2>
+          <h2 className="text-sm font-semibold text-slate-800 dark:text-slate-200">Run Mode</h2>
           <div className="flex gap-3">
             {(["backtest", "paper", "live"] as const).map((m) => (
               <label
@@ -224,8 +224,8 @@ export default function NewRunPage() {
                 className={[
                   "flex flex-1 cursor-pointer items-center justify-center rounded-lg border py-3 text-sm font-medium transition-colors",
                   mode === m
-                    ? "border-indigo-500 bg-indigo-600/20 text-indigo-400"
-                    : "border-slate-700 text-slate-400 hover:border-slate-600 hover:text-slate-300",
+                    ? "border-indigo-500 bg-indigo-600/20 text-indigo-600 dark:text-indigo-400"
+                    : "border-slate-300 dark:border-slate-700 text-slate-500 dark:text-slate-400 hover:border-slate-400 dark:hover:border-slate-600 hover:text-slate-700 dark:hover:text-slate-300",
                 ].join(" ")}
               >
                 <input
@@ -249,7 +249,7 @@ export default function NewRunPage() {
           </p>
           {mode === "live" && (
             <div>
-              <label className="block text-sm font-medium text-slate-300">
+              <label className="block text-sm font-medium text-slate-700 dark:text-slate-300">
                 Confirm Token
               </label>
               <input
@@ -257,7 +257,7 @@ export default function NewRunPage() {
                 value={confirmToken}
                 onChange={(e) => setConfirmToken(e.target.value)}
                 placeholder="LIVE_TRADING_CONFIRM_TOKEN from .env"
-                className="mt-1 w-full rounded-lg border border-red-800 bg-slate-800 px-3 py-2 text-sm text-slate-200 focus:border-red-500 focus:outline-none focus:ring-1 focus:ring-red-500"
+                className="mt-1 w-full rounded-lg border border-red-300 dark:border-red-800 bg-white dark:bg-slate-800 px-3 py-2 text-sm text-slate-900 dark:text-slate-200 focus:border-red-500 focus:outline-none focus:ring-1 focus:ring-red-500"
               />
               <p className="mt-1 text-xs text-red-400">
                 This will place real orders. Ensure ENABLE_LIVE_TRADING=true and your API key are set in .env.
@@ -268,14 +268,14 @@ export default function NewRunPage() {
 
         {/* Strategy selection */}
         <div className="card space-y-3">
-          <h2 className="text-sm font-semibold text-slate-200">Strategy</h2>
+          <h2 className="text-sm font-semibold text-slate-800 dark:text-slate-200">Strategy</h2>
           {isLoadingStrategies ? (
-            <div className="h-10 animate-pulse rounded bg-slate-800" />
+            <div className="h-10 animate-pulse rounded bg-slate-200 dark:bg-slate-800" />
           ) : (
             <select
               value={selectedStrategy?.name ?? ""}
               onChange={(e) => void handleStrategyChange(e.target.value)}
-              className="w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-200 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+              className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200"
             >
               {strategies.map((s) => (
                 <option key={s.name} value={s.name}>
@@ -292,7 +292,7 @@ export default function NewRunPage() {
           {/* Dynamic strategy parameters */}
           {selectedStrategy &&
             Object.keys(selectedStrategy.parameterSchema.properties).length > 0 && (
-              <div className="space-y-3 border-t border-slate-800 pt-3">
+              <div className="space-y-3 border-t border-slate-200 dark:border-slate-800 pt-3">
                 <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
                   Parameters
                 </p>
@@ -315,7 +315,7 @@ export default function NewRunPage() {
 
         {/* Symbols */}
         <div className="card space-y-3">
-          <h2 className="text-sm font-semibold text-slate-200">Symbols</h2>
+          <h2 className="text-sm font-semibold text-slate-800 dark:text-slate-200">Symbols</h2>
           <div className="flex flex-wrap gap-2">
             {COMMON_SYMBOLS.map((sym) => (
               <button
@@ -326,7 +326,7 @@ export default function NewRunPage() {
                   "rounded-full px-3 py-1 font-mono text-xs font-medium transition-colors",
                   symbols.includes(sym)
                     ? "bg-indigo-600 text-white"
-                    : "bg-slate-800 text-slate-400 hover:bg-slate-700 hover:text-slate-200",
+                    : "bg-slate-100 text-slate-600 hover:bg-slate-200 hover:text-slate-900 dark:bg-slate-800 dark:text-slate-400 dark:hover:bg-slate-700 dark:hover:text-slate-200",
                 ].join(" ")}
               >
                 {sym}
@@ -345,12 +345,12 @@ export default function NewRunPage() {
                   addCustomSymbol();
                 }
               }}
-              className="flex-1 rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-200 placeholder-slate-500 focus:border-indigo-500 focus:outline-none"
+              className="flex-1 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 placeholder-slate-400 focus:border-indigo-500 focus:outline-none dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200 dark:placeholder-slate-500"
             />
             <button
               type="button"
               onClick={addCustomSymbol}
-              className="rounded-lg border border-slate-700 px-3 py-2 text-sm text-slate-400 hover:border-slate-600 hover:text-slate-200 transition-colors"
+              className="rounded-lg border border-slate-300 dark:border-slate-700 px-3 py-2 text-sm text-slate-500 dark:text-slate-400 hover:border-slate-400 dark:hover:border-slate-600 hover:text-slate-700 dark:hover:text-slate-200 transition-colors"
             >
               Add
             </button>
@@ -360,7 +360,7 @@ export default function NewRunPage() {
               {symbols.map((s) => (
                 <span
                   key={s}
-                  className="flex items-center gap-1 rounded bg-slate-800 px-2 py-0.5 font-mono text-xs text-slate-300"
+                  className="flex items-center gap-1 rounded bg-slate-100 dark:bg-slate-800 px-2 py-0.5 font-mono text-xs text-slate-700 dark:text-slate-300"
                 >
                   {s}
                   <button
@@ -379,7 +379,7 @@ export default function NewRunPage() {
 
         {/* Timeframe */}
         <div className="card space-y-3">
-          <h2 className="text-sm font-semibold text-slate-200">Timeframe</h2>
+          <h2 className="text-sm font-semibold text-slate-800 dark:text-slate-200">Timeframe</h2>
           <div className="flex flex-wrap gap-2">
             {TIMEFRAMES.map((tf) => (
               <button
@@ -390,7 +390,7 @@ export default function NewRunPage() {
                   "rounded-full px-3 py-1 font-mono text-xs font-medium transition-colors",
                   timeframe === tf
                     ? "bg-indigo-600 text-white"
-                    : "bg-slate-800 text-slate-400 hover:bg-slate-700 hover:text-slate-200",
+                    : "bg-slate-100 text-slate-600 hover:bg-slate-200 hover:text-slate-900 dark:bg-slate-800 dark:text-slate-400 dark:hover:bg-slate-700 dark:hover:text-slate-200",
                 ].join(" ")}
               >
                 {tf}
@@ -401,9 +401,9 @@ export default function NewRunPage() {
 
         {/* Capital + backtest dates */}
         <div className="card space-y-3">
-          <h2 className="text-sm font-semibold text-slate-200">Capital & Dates</h2>
+          <h2 className="text-sm font-semibold text-slate-800 dark:text-slate-200">Capital & Dates</h2>
           <div>
-            <label className="block text-sm font-medium text-slate-300">
+            <label className="block text-sm font-medium text-slate-700 dark:text-slate-300">
               Initial Capital (USD)
             </label>
             <input
@@ -412,32 +412,32 @@ export default function NewRunPage() {
               step="1"
               value={initialCapital}
               onChange={(e) => setInitialCapital(e.target.value)}
-              className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-200 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+              className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200"
             />
           </div>
 
           {mode === "backtest" && (
             <div className="grid grid-cols-2 gap-3">
               <div>
-                <label className="block text-sm font-medium text-slate-300">
+                <label className="block text-sm font-medium text-slate-700 dark:text-slate-300">
                   Backtest Start
                 </label>
                 <input
                   type="datetime-local"
                   value={backtestStart}
                   onChange={(e) => setBacktestStart(e.target.value)}
-                  className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-200 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                  className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200"
                 />
               </div>
               <div>
-                <label className="block text-sm font-medium text-slate-300">
+                <label className="block text-sm font-medium text-slate-700 dark:text-slate-300">
                   Backtest End
                 </label>
                 <input
                   type="datetime-local"
                   value={backtestEnd}
                   onChange={(e) => setBacktestEnd(e.target.value)}
-                  className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-200 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                  className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200"
                 />
               </div>
             </div>
@@ -445,7 +445,7 @@ export default function NewRunPage() {
         </div>
 
         {submitError && (
-          <div className="rounded-lg border border-red-800 bg-red-900/20 px-4 py-3 text-sm text-red-400">
+          <div className="rounded-lg border border-red-300 bg-red-50 px-4 py-3 text-sm text-red-600 dark:border-red-800 dark:bg-red-900/20 dark:text-red-400">
             {submitError}
           </div>
         )}

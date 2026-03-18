@@ -17,7 +17,7 @@ export const dynamic = "force-dynamic";
 
 function TagPill({ tag }: { tag: string }) {
   return (
-    <span className="rounded-full bg-slate-800 px-2 py-0.5 text-xs text-slate-400">
+    <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs text-slate-600 dark:bg-slate-800 dark:text-slate-400">
       {tag}
     </span>
   );
@@ -34,7 +34,7 @@ function ParameterSchemaTable({ strategy }: { strategy: Strategy }) {
   return (
     <table className="mt-2 w-full text-xs">
       <thead>
-        <tr className="border-b border-slate-800 text-left text-slate-500">
+        <tr className="border-b border-slate-200 text-left text-slate-500 dark:border-slate-800">
           <th className="py-1 pr-3 font-medium">Parameter</th>
           <th className="py-1 pr-3 font-medium">Type</th>
           <th className="py-1 pr-3 font-medium">Default</th>
@@ -43,8 +43,8 @@ function ParameterSchemaTable({ strategy }: { strategy: Strategy }) {
       </thead>
       <tbody>
         {entries.map(([name, prop]) => (
-          <tr key={name} className="border-b border-slate-800/40">
-            <td className="py-1.5 pr-3 font-mono text-slate-300">{name}</td>
+          <tr key={name} className="border-b border-slate-100 dark:border-slate-800/40">
+            <td className="py-1.5 pr-3 font-mono text-slate-700 dark:text-slate-300">{name}</td>
             <td className="py-1.5 pr-3 text-slate-500">{prop.type}</td>
             <td className="py-1.5 pr-3 font-mono text-slate-400">
               {prop.default !== undefined ? String(prop.default) : "—"}
@@ -66,7 +66,7 @@ function StrategyCard({ strategy }: { strategy: Strategy }) {
     <div className="card space-y-3">
       <div className="flex items-start justify-between gap-2">
         <div>
-          <h2 className="text-base font-semibold text-slate-100">
+          <h2 className="text-base font-semibold text-slate-900 dark:text-slate-100">
             {strategy.displayName}
           </h2>
           <p className="text-xs text-slate-500">
@@ -75,7 +75,7 @@ function StrategyCard({ strategy }: { strategy: Strategy }) {
         </div>
       </div>
 
-      <p className="text-sm text-slate-400">{strategy.description}</p>
+      <p className="text-sm text-slate-500 dark:text-slate-400">{strategy.description}</p>
 
       {strategy.tags.length > 0 && (
         <div className="flex flex-wrap gap-1">
@@ -87,7 +87,7 @@ function StrategyCard({ strategy }: { strategy: Strategy }) {
 
       {/* Parameter schema */}
       <details className="group">
-        <summary className="cursor-pointer list-none text-xs font-medium text-slate-500 hover:text-slate-300">
+        <summary className="cursor-pointer list-none text-xs font-medium text-slate-500 hover:text-slate-700 dark:hover:text-slate-300">
           <span className="group-open:hidden">Show parameters</span>
           <span className="hidden group-open:inline">Hide parameters</span>
         </summary>
