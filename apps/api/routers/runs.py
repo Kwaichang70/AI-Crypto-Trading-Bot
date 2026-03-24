@@ -145,22 +145,16 @@ def _run_orm_to_response(run: RunORM) -> RunResponse:
 def _normalize_exchange_secret(secret: str) -> str:
     """Normalize exchange API secret for CCXT compatibility.
 
-    Coinbase Ed25519 CDP keys are often stored in PEM format
-    (-----BEGIN EC PRIVATE KEY-----\n...\n-----END EC PRIVATE KEY-----)
-    but CCXT expects raw base64 (88 chars) for EdDSA signing.
-    This strips PEM headers and converts escaped newlines.
+    Coinbase CDP keys are stored in PEM format. CCXT's Coinbase driver
+    calls ecdsa.SigningKey.from_pem() which requires the full PEM envelope
+    (-----BEGIN EC PRIVATE KEY----- ... -----END EC PRIVATE KEY-----).
+
+    The only normalization needed is converting literal backslash-n (as
+    stored in .env files) to real newline characters so the PEM parser
+    can split the lines correctly.
     """
-    # Convert literal backslash-n to real newlines
-    normalized = secret.replace("\\n", "\n")
-    # Strip PEM headers if present
-    lines = [
-        line.strip()
-        for line in normalized.splitlines()
-        if line.strip() and "-----" not in line
-    ]
-    if lines:
-        return "".join(lines)
-    return normalized
+    # Convert literal backslash-n to real newlines (common in .env files)
+    return secret.replace("\\n", "\n")
 
 
 def _run_orm_to_detail_response(run: RunORM) -> RunDetailResponse:

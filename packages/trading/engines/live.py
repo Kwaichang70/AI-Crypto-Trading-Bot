@@ -484,11 +484,6 @@ class LiveExecutionEngine(BaseExecutionEngine):
         self._enforce_live_gate()
 
         if signal.direction == SignalDirection.HOLD:
-            self._log.debug(
-                "live.signal_hold",
-                strategy_id=signal.strategy_id,
-                symbol=signal.symbol,
-            )
             return []
 
         side = (
@@ -501,7 +496,7 @@ class LiveExecutionEngine(BaseExecutionEngine):
         if side == OrderSide.SELL:
             position = self._positions.get(signal.symbol)
             if position is None or position.is_flat:
-                self._log.debug(
+                self._log.info(
                     "live.sell_no_position",
                     strategy_id=signal.strategy_id,
                     symbol=signal.symbol,
@@ -540,10 +535,13 @@ class LiveExecutionEngine(BaseExecutionEngine):
         )
 
         if quantity <= Decimal("0"):
-            self._log.debug(
+            self._log.warning(
                 "live.zero_quantity",
                 strategy_id=signal.strategy_id,
                 symbol=signal.symbol,
+                equity=str(equity),
+                last_price=str(last_price),
+                confidence=signal.confidence,
             )
             return []
 
