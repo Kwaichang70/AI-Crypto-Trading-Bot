@@ -35,6 +35,30 @@ interface StrategyStats {
 // Aggregation
 // ---------------------------------------------------------------------------
 
+/**
+ * Extract backtest metrics from a run, checking both the top-level
+ * `backtestMetrics` field (detail response) and the nested
+ * `config.backtest_metrics` field (list response fallback).
+ */
+function getMetrics(run: Run): {
+  totalReturnPct: number;
+  sharpeRatio: number;
+  winRate: number;
+  totalTrades: number;
+  profitFactor: number;
+} | null {
+  if (run.backtestMetrics) return run.backtestMetrics;
+  const cfgBm = (run.config as unknown as Record<string, unknown>)?.backtest_metrics as Record<string, unknown> | undefined;
+  if (!cfgBm) return null;
+  return {
+    totalReturnPct: Number(cfgBm.total_return_pct ?? 0),
+    sharpeRatio: Number(cfgBm.sharpe_ratio ?? 0),
+    winRate: Number(cfgBm.win_rate ?? 0),
+    totalTrades: Number(cfgBm.total_trades ?? 0),
+    profitFactor: Number(cfgBm.profit_factor ?? 0),
+  };
+}
+
 function aggregateByStrategy(runs: readonly Run[]): StrategyStats[] {
   const groups = new Map<string, Run[]>();
 
@@ -51,7 +75,10 @@ function aggregateByStrategy(runs: readonly Run[]): StrategyStats[] {
   const stats: StrategyStats[] = [];
 
   for (const [name, group] of groups) {
-    const withMetrics = group.filter((r) => r.backtestMetrics != null);
+    const withMetrics = group
+      .map((r) => ({ run: r, m: getMetrics(r) }))
+      .filter((x): x is { run: Run; m: NonNullable<ReturnType<typeof getMetrics>> } => x.m != null);
+
     if (withMetrics.length === 0) {
       stats.push({
         name,
@@ -67,11 +94,11 @@ function aggregateByStrategy(runs: readonly Run[]): StrategyStats[] {
       continue;
     }
 
-    const returns = withMetrics.map((r) => r.backtestMetrics!.totalReturnPct);
-    const sharpes = withMetrics.map((r) => r.backtestMetrics!.sharpeRatio);
-    const winRates = withMetrics.map((r) => r.backtestMetrics!.winRate);
-    const trades = withMetrics.map((r) => r.backtestMetrics!.totalTrades);
-    const profitFactors = withMetrics.map((r) => r.backtestMetrics!.profitFactor);
+    const returns = withMetrics.map((x) => x.m.totalReturnPct);
+    const sharpes = withMetrics.map((x) => x.m.sharpeRatio);
+    const winRates = withMetrics.map((x) => x.m.winRate);
+    const trades = withMetrics.map((x) => x.m.totalTrades);
+    const profitFactors = withMetrics.map((x) => x.m.profitFactor);
 
     const avg = (arr: number[]) => arr.reduce((a, b) => a + b, 0) / arr.length;
 
