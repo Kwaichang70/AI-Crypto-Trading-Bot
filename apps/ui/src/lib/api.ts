@@ -362,7 +362,7 @@ export async function fetchLearningState(
 // Live Diagnostics
 // ---------------------------------------------------------------------------
 
-/** GET /api/v1/runs/{id}/diagnostics — real-time engine state for a running run. */
+/** GET /api/v1/runs/{id}/diagnostics - real-time engine state for a running run. */
 export async function fetchDiagnostics(
   runId: string,
 ): Promise<ApiResult<Record<string, unknown>>> {
