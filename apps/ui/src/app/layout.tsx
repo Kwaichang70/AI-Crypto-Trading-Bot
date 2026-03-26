@@ -1,6 +1,7 @@
 import type { Metadata, Viewport } from "next";
 import { Inter } from "next/font/google";
 import { Sidebar } from "@/components/layout/sidebar";
+import { MobileNav } from "@/components/layout/mobile-nav";
 import { ThemeProvider } from "@/components/theme-provider";
 import { ThemeToggle } from "@/components/ui/theme-toggle";
 import { ToastProvider } from "@/components/ui/toast";
@@ -50,14 +51,8 @@ export default function RootLayout({
                 <span className="text-sm font-semibold tracking-tight text-slate-900 dark:text-slate-100">
                   Trading Bot
                 </span>
-                <div className="flex items-center gap-4">
-                  <nav className="flex items-center gap-4 lg:hidden" aria-label="Mobile navigation">
-                    <a href="/" className="text-xs text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200">Dashboard</a>
-                    <a href="/runs" className="text-xs text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200">Runs</a>
-                    <a href="/runs/new" className="text-xs text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200">New Run</a>
-                    <a href="/strategies" className="text-xs text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200">Strategies</a>
-                    <a href="/models" className="text-xs text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200">Models</a>
-                  </nav>
+                <div className="flex items-center gap-2">
+                  <MobileNav />
                   <ThemeToggle />
                 </div>
               </div>

@@ -30,6 +30,8 @@ from typing import Any, Callable, TypeVar
 
 import structlog
 
+from trading.ccxt_errors import translate_ccxt_error
+
 __all__ = ["ccxt_retry"]
 
 logger = structlog.get_logger(__name__)
@@ -105,6 +107,7 @@ async def ccxt_retry(
                 max_retries=max_retries,
                 delay=round(delay, 2),
                 error=str(exc)[:200],
+                user_message=translate_ccxt_error(exc),
             )
 
             await asyncio.sleep(delay)
@@ -114,5 +117,6 @@ async def ccxt_retry(
         operation=operation,
         max_retries=max_retries,
         error=str(last_exc)[:200],
+        user_message=translate_ccxt_error(last_exc) if last_exc is not None else "Unknown error",
     )
     raise last_exc  # type: ignore[misc]

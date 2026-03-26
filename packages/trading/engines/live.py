@@ -32,6 +32,7 @@ import structlog
 
 from common.types import OrderSide, OrderStatus, OrderType, SignalDirection
 from trading.execution import BaseExecutionEngine
+from trading.ccxt_errors import translate_ccxt_error
 from trading.ccxt_retry import ccxt_retry
 from trading.models import Fill, Order, Position, Signal
 from trading.risk import BaseRiskManager
@@ -329,6 +330,7 @@ class LiveExecutionEngine(BaseExecutionEngine):
                 order_id=str(order.order_id),
                 symbol=order.symbol,
                 error=str(exc),
+                user_message=translate_ccxt_error(exc),
             )
             order = self._transition(order, OrderStatus.REJECTED)
         except ccxt_async.AuthenticationError as exc:
@@ -337,6 +339,7 @@ class LiveExecutionEngine(BaseExecutionEngine):
                 order_id=str(order.order_id),
                 symbol=order.symbol,
                 error=str(exc),
+                user_message=translate_ccxt_error(exc),
             )
             order = self._transition(order, OrderStatus.REJECTED)
         except ccxt_async.InsufficientFunds as exc:
@@ -345,6 +348,7 @@ class LiveExecutionEngine(BaseExecutionEngine):
                 order_id=str(order.order_id),
                 symbol=order.symbol,
                 error=str(exc),
+                user_message=translate_ccxt_error(exc),
             )
             order = self._transition(order, OrderStatus.REJECTED)
         except ccxt_async.ExchangeError as exc:
@@ -353,6 +357,7 @@ class LiveExecutionEngine(BaseExecutionEngine):
                 order_id=str(order.order_id),
                 symbol=order.symbol,
                 error=str(exc),
+                user_message=translate_ccxt_error(exc),
             )
             order = self._transition(order, OrderStatus.REJECTED)
         except Exception as exc:
@@ -423,6 +428,7 @@ class LiveExecutionEngine(BaseExecutionEngine):
                 order_id=str(order_id),
                 exchange_order_id=exchange_order_id,
                 error=str(exc),
+                user_message=translate_ccxt_error(exc),
             )
             # Reconcile: fetch actual state from exchange
             order = await self._reconcile_order(order)
@@ -529,6 +535,7 @@ class LiveExecutionEngine(BaseExecutionEngine):
                 "live.ticker_fetch_failed",
                 symbol=signal.symbol,
                 error=str(exc),
+                user_message=translate_ccxt_error(exc),
             )
             return []
 
@@ -728,6 +735,7 @@ class LiveExecutionEngine(BaseExecutionEngine):
                 order_id=str(order_id),
                 exchange_order_id=exchange_order_id,
                 error=str(exc),
+                user_message=translate_ccxt_error(exc),
             )
             return sorted(cached_fills, key=lambda f: f.executed_at)
 
@@ -833,6 +841,7 @@ class LiveExecutionEngine(BaseExecutionEngine):
                 order_id=str(order.order_id),
                 exchange_order_id=exchange_order_id,
                 error=str(exc),
+                user_message=translate_ccxt_error(exc),
             )
 
         return order
@@ -869,6 +878,7 @@ class LiveExecutionEngine(BaseExecutionEngine):
             self._log.warning(
                 "live.balance_fetch_failed",
                 error=str(exc),
+                user_message=translate_ccxt_error(exc),
             )
 
         # Fallback: compute from local tracking
@@ -977,6 +987,7 @@ class LiveExecutionEngine(BaseExecutionEngine):
             self._log.error(
                 "live.engine_start_failed",
                 error=str(exc),
+                user_message=translate_ccxt_error(exc),
             )
             raise
 
@@ -1013,6 +1024,7 @@ class LiveExecutionEngine(BaseExecutionEngine):
             self._log.warning(
                 "live.exchange_close_failed",
                 error=str(exc),
+                user_message=translate_ccxt_error(exc),
             )
 
         self._log.info(

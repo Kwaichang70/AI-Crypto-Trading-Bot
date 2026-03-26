@@ -32,6 +32,7 @@ export default function OptimizationRunDetailPage() {
   const [phase, setPhase] = useState<PagePhase>({ kind: "loading" });
   const [launchingRank, setLaunchingRank] = useState<number | null>(null);
   const [launchError, setLaunchError] = useState<string | null>(null);
+  const [launchCapital, setLaunchCapital] = useState("10000");
 
   useEffect(() => {
     if (!id) {
@@ -59,8 +60,7 @@ export default function OptimizationRunDetailPage() {
       symbols: [...phase.data.symbols],
       timeframe: phase.data.timeframe,
       mode: "backtest",
-      initialCapital: "10000", // Default — saved optimization runs do not store initialCapital.
-                                // TODO(sprint-32): surface initialCapital input on this page.
+      initialCapital: launchCapital,
       backtestStart: null,
       backtestEnd: null,
     });
@@ -148,6 +148,35 @@ export default function OptimizationRunDetailPage() {
           <span className="text-slate-400">
             Elapsed: <span className="text-slate-200">{data.elapsedSeconds}s</span>
           </span>
+        </div>
+      </div>
+
+      {/* Launch configuration */}
+      <div className="card p-4">
+        <div className="flex flex-wrap items-center gap-4">
+          <h2 className="text-sm font-semibold text-slate-700 dark:text-slate-300">
+            Launch Configuration
+          </h2>
+          <div className="flex items-center gap-2">
+            <label
+              htmlFor="launch-capital"
+              className="text-sm text-slate-500 dark:text-slate-400"
+            >
+              Initial Capital:
+            </label>
+            <input
+              id="launch-capital"
+              type="number"
+              value={launchCapital}
+              onChange={(e) => setLaunchCapital(e.target.value)}
+              min="100"
+              step="100"
+              className="w-32 rounded-lg border border-slate-300 bg-white px-2 py-1 text-sm text-slate-900 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200"
+            />
+          </div>
+          <p className="text-xs text-slate-500">
+            Applied to all runs launched from this page. Saved optimization results do not store the original capital.
+          </p>
         </div>
       </div>
 
