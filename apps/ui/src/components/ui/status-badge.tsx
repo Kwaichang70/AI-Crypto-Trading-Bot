@@ -11,6 +11,7 @@ const RUN_STATUS_VARIANTS: Record<RunStatus, BadgeVariant> = {
   running: "success",
   stopped: "neutral",
   error: "danger",
+  archived: "neutral",
 };
 
 const ORDER_STATUS_VARIANTS: Record<OrderStatus, BadgeVariant> = {
