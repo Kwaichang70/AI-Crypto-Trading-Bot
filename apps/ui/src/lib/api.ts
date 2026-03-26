@@ -410,6 +410,25 @@ export async function retrainModel(
 }
 
 /**
+ * POST /api/v1/ml/train — train a new model from OHLCV data.
+ * Unlike retrain (which needs 50+ trades), this always works.
+ */
+export async function trainModel(
+  symbol: string,
+  timeframe: string,
+  bars: number = 2000,
+  exchange: string = "coinbase",
+): Promise<ApiResult<Record<string, unknown>>> {
+  const params = new URLSearchParams({
+    symbol,
+    timeframe,
+    bars: String(bars),
+    exchange,
+  });
+  return apiPost<Record<string, unknown>>(`/api/v1/ml/train?${params.toString()}`);
+}
+
+/**
  * PUT /api/v1/ml/models/{id}/activate — mark a model version as active.
  * Returns the updated ModelVersion record.
  *
