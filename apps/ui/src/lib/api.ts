@@ -359,6 +359,20 @@ export async function fetchLearningState(
 }
 
 // ---------------------------------------------------------------------------
+// Live Diagnostics
+// ---------------------------------------------------------------------------
+
+/** GET /api/v1/runs/{id}/diagnostics — real-time engine state for a running run. */
+export async function fetchDiagnostics(
+  runId: string,
+): Promise<ApiResult<Record<string, unknown>>> {
+  return apiGet<Record<string, unknown>>(
+    `/api/v1/runs/${runId}/diagnostics`,
+    { cache: "no-store" },
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Strategies
 // ---------------------------------------------------------------------------
 

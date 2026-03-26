@@ -291,6 +291,16 @@ class Settings(BaseSettings):
     )
 
     # ------------------------------------------------------------------
+    # Data retention
+    # ------------------------------------------------------------------
+    equity_snapshot_retention_days: int = Field(
+        default=90,
+        ge=1,
+        le=365,
+        description="Days to keep raw equity snapshots before pruning. "                    "Snapshots older than this are deleted daily at UTC midnight.",
+    )
+
+    # ------------------------------------------------------------------
     # Validators
     # ------------------------------------------------------------------
     @field_validator("database_url")

@@ -74,6 +74,11 @@ _retraining_service: Any = None
 # ---------------------------------------------------------------------------
 _fgi_client: Any = None
 
+# ---------------------------------------------------------------------------
+# Module-level equity pruning task
+# ---------------------------------------------------------------------------
+_equity_prune_task: Any = None
+
 
 # ---------------------------------------------------------------------------
 # Application lifespan
@@ -203,6 +208,59 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log.warning("fgi_client.startup_error", exc_info=True)
 
     # ------------------------------------------------------------------
+    # 6. Equity snapshot pruning (daily background task)
+    # ------------------------------------------------------------------
+    import asyncio as _asyncio
+
+    global _equity_prune_task  # noqa: PLW0603
+
+    async def _equity_prune_loop() -> None:
+        """Delete equity snapshots older than retention period, once per day."""
+        from datetime import UTC as _UTC, datetime as _dt, timedelta as _td
+
+        from api.db.models import EquitySnapshotORM
+        from api.db.session import get_session_factory as _get_sf
+        from sqlalchemy import delete as _sa_delete
+
+        _sf = _get_sf()
+
+        while True:
+            try:
+                await _asyncio.sleep(86400)  # Sleep first, prune after 24 h
+            except _asyncio.CancelledError:
+                break
+
+            try:
+                cutoff = _dt.now(_UTC) - _td(
+                    days=settings.equity_snapshot_retention_days
+                )
+                async with _sf() as session:
+                    del_result = await session.execute(
+                        _sa_delete(EquitySnapshotORM).where(
+                            EquitySnapshotORM.timestamp < cutoff
+                        )
+                    )
+                    deleted: int = del_result.rowcount  # type: ignore[attr-defined]
+                    await session.commit()
+                    if deleted > 0:
+                        log.info(
+                            "equity_prune.completed",
+                            deleted=deleted,
+                            cutoff=str(cutoff),
+                            retention_days=settings.equity_snapshot_retention_days,
+                        )
+            except Exception:
+                log.warning("equity_prune.error", exc_info=True)
+
+    _equity_prune_task = _asyncio.create_task(
+        _equity_prune_loop(), name="equity_prune"
+    )
+    log.info(
+        "equity_prune.scheduled",
+        retention_days=settings.equity_snapshot_retention_days,
+    )
+
+    # ------------------------------------------------------------------
     # Future: Redis connection init goes here
     # ------------------------------------------------------------------
 
@@ -234,6 +292,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     if _retraining_service is not None:
         await _retraining_service.stop()
         _retraining_service = None
+
+    # Stop equity snapshot pruning task
+    if _equity_prune_task is not None and not _equity_prune_task.done():
+        _equity_prune_task.cancel()
+        await asyncio.gather(_equity_prune_task, return_exceptions=True)
 
     # Close FearGreedClient session (Sprint 32)
     if _fgi_client is not None:

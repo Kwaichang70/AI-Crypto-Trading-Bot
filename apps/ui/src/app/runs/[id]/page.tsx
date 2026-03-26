@@ -11,6 +11,7 @@ import {
   fetchOrders,
   fetchFills,
   fetchPositions,
+  fetchDiagnostics,
   fetchLearningState,
   stopRun,
   archiveRun,
@@ -337,6 +338,7 @@ export default function RunDetailPage() {
   const [fills, setFills] = useState<readonly Fill[]>([]);
   const [positions, setPositions] = useState<readonly Position[]>([]);
   const [learning, setLearning] = useState<LearningState | null>(null);
+  const [diagnostics, setDiagnostics] = useState<Record<string, unknown> | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [isStopping, setIsStopping] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -399,6 +401,21 @@ export default function RunDetailPage() {
       document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
   }, [run?.status, loadData]);
+
+  // Poll diagnostics every 10 seconds for running runs
+  useEffect(() => {
+    if (run?.status !== "running") return;
+
+    const fetchAndSet = () => {
+      void fetchDiagnostics(id).then((res) => {
+        if (res.ok) setDiagnostics(res.data);
+      });
+    };
+
+    fetchAndSet(); // immediate fetch on mount / run becoming active
+    const intervalId = setInterval(fetchAndSet, 10_000);
+    return () => clearInterval(intervalId);
+  }, [run?.status, id]);
 
   async function handleStop() {
     if (!run) return;
@@ -584,6 +601,74 @@ export default function RunDetailPage() {
                   </div>
                   <EquityCurveChart points={equityPoints} height={260} />
                 </div>
+
+                {/* Live Diagnostics -- shown only for running runs */}
+                {run.status === "running" && diagnostics && (
+                  <div className="card">
+                    <h3 className="mb-3 text-sm font-semibold text-slate-700 dark:text-slate-300">
+                      Live Diagnostics
+                    </h3>
+                    <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+                      <StatCard
+                        label="Current Equity"
+                        value={
+                          typeof diagnostics.currentEquity === "string"
+                            ? `$${formatCurrency(diagnostics.currentEquity)}`
+                            : "--"
+                        }
+                      />
+                      <StatCard
+                        label="Drawdown"
+                        value={
+                          typeof diagnostics.drawdownPct === "number"
+                            ? formatPct(diagnostics.drawdownPct)
+                            : "--"
+                        }
+                        trend={
+                          typeof diagnostics.drawdownPct === "number" && diagnostics.drawdownPct > 0.1
+                            ? "down"
+                            : "neutral"
+                        }
+                      />
+                      <StatCard
+                        label="Trades / Orders"
+                        value={
+                          typeof diagnostics.tradeCount === "number" &&
+                          typeof diagnostics.orderCount === "number"
+                            ? `${String(diagnostics.tradeCount)} / ${String(diagnostics.orderCount)}`
+                            : "--"
+                        }
+                      />
+                      <StatCard
+                        label="Fear and Greed"
+                        value={
+                          typeof diagnostics.fearGreedIndex === "number"
+                            ? String(Math.round(diagnostics.fearGreedIndex))
+                            : "N/A"
+                        }
+                        subValue={
+                          typeof diagnostics.fearGreedRegime === "string"
+                            ? diagnostics.fearGreedRegime
+                            : undefined
+                        }
+                        trend={
+                          typeof diagnostics.fearGreedIndex === "number"
+                            ? diagnostics.fearGreedIndex > 55
+                              ? "up"
+                              : diagnostics.fearGreedIndex < 45
+                                ? "down"
+                                : "neutral"
+                            : "neutral"
+                        }
+                      />
+                    </div>
+                    {typeof diagnostics.lastUpdated === "string" && (
+                      <p className="mt-2 text-xs text-slate-500">
+                        Last updated: {new Date(diagnostics.lastUpdated).toLocaleString()}
+                      </p>
+                    )}
+                  </div>
+                )}
 
                 {/* Backtest performance metrics — shown only for completed backtests */}
                 {run.runMode === "backtest" && run.backtestMetrics && (

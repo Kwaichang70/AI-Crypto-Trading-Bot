@@ -2366,6 +2366,114 @@ async def archive_run(
 
 
 # ---------------------------------------------------------------------------
+# Live diagnostics endpoint
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/{run_id}/diagnostics",
+    summary="Get live diagnostics for a running run",
+)
+async def get_diagnostics(
+    run_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> dict[str, Any]:
+    """
+    Return current indicator values and engine state for a running run.
+
+    Provides a lightweight status snapshot: current equity, drawdown, trade/order
+    counts, and the latest Fear & Greed Index reading.  The endpoint is read-only
+    and works for runs in any status, but the equity values are most meaningful
+    while the run is in the *running* state.
+
+    Parameters
+    ----------
+    run_id:
+        UUID of the run to inspect.
+    db:
+        Injected async database session.
+
+    Returns
+    -------
+    dict
+        JSON object with run metadata and real-time diagnostic values.
+
+    Raises
+    ------
+    HTTPException 404:
+        When no run with the given ID exists.
+    """
+    result = await db.execute(select(RunORM).where(RunORM.id == run_id))
+    run: RunORM | None = result.scalar_one_or_none()
+    if run is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Run {run_id} not found",
+        )
+
+    # Most-recent equity snapshot (ordered by timestamp DESC)
+    eq_result = await db.execute(
+        select(EquitySnapshotORM)
+        .where(EquitySnapshotORM.run_id == run_id)
+        .order_by(EquitySnapshotORM.timestamp.desc())
+        .limit(1)
+    )
+    latest_equity: EquitySnapshotORM | None = eq_result.scalar_one_or_none()
+
+    # Trade count
+    trade_count_result = await db.execute(
+        select(func.count()).select_from(TradeORM).where(TradeORM.run_id == run_id)
+    )
+    trade_count: int = trade_count_result.scalar() or 0
+
+    # Order count
+    order_count_result = await db.execute(
+        select(func.count()).select_from(OrderORM).where(OrderORM.run_id == run_id)
+    )
+    order_count: int = order_count_result.scalar() or 0
+
+    # Fear & Greed Index (best-effort - None when FGI client not available)
+    fgi_value: float | None = None
+    fgi_regime: str | None = None
+    try:
+        from data.sentiment import get_global_client
+
+        client = get_global_client()
+        if client is not None:
+            fgi_value = client.cached_value
+            if fgi_value is not None:
+                if fgi_value < 25:
+                    fgi_regime = "EXTREME_FEAR"
+                elif fgi_value < 45:
+                    fgi_regime = "FEAR"
+                elif fgi_value <= 55:
+                    fgi_regime = "NEUTRAL"
+                elif fgi_value <= 75:
+                    fgi_regime = "GREED"
+                else:
+                    fgi_regime = "EXTREME_GREED"
+    except Exception:  # noqa: BLE001 - best-effort; FGI must never break diagnostics
+        pass
+
+    return {
+        "runId": str(run_id),
+        "status": run.status,
+        "mode": run.run_mode,
+        "strategy": run.config.get("strategy_name") if run.config else None,
+        "symbols": run.config.get("symbols", []) if run.config else [],
+        "timeframe": run.config.get("timeframe") if run.config else None,
+        "currentEquity": str(latest_equity.equity) if latest_equity else None,
+        "drawdownPct": float(latest_equity.drawdown_pct) if latest_equity else None,
+        "lastUpdated": latest_equity.timestamp.isoformat() if latest_equity else None,
+        "tradeCount": trade_count,
+        "orderCount": order_count,
+        "fearGreedIndex": fgi_value,
+        "fearGreedRegime": fgi_regime,
+        "isRunning": run.status == "running",
+    }
+
+
+# ---------------------------------------------------------------------------
 # Parameter schema validation helper
 # ---------------------------------------------------------------------------
 

@@ -32,6 +32,7 @@ import structlog
 
 from common.types import OrderSide, OrderStatus, OrderType, SignalDirection
 from trading.execution import BaseExecutionEngine
+from trading.ccxt_retry import ccxt_retry
 from trading.models import Fill, Order, Position, Signal
 from trading.risk import BaseRiskManager
 
@@ -245,12 +246,14 @@ class LiveExecutionEngine(BaseExecutionEngine):
             if order.client_order_id:
                 params["clientOrderId"] = order.client_order_id
 
-            ccxt_response = await self._exchange.create_order(
-                symbol=order.symbol,
-                type=ccxt_order_type,
-                side=ccxt_side,
-                amount=str(order.quantity),
-                price=price_param,
+            ccxt_response = await ccxt_retry(
+                self._exchange.create_order,
+                order.symbol,
+                ccxt_order_type,
+                ccxt_side,
+                str(order.quantity),
+                price_param,
+                max_retries=2, base_delay=1.0, operation=f"create_order({order.symbol})",
                 params=params,
             )
 
@@ -508,7 +511,11 @@ class LiveExecutionEngine(BaseExecutionEngine):
         # - Use cached ticker data to avoid rate-limit pressure
         # - Fall back to last known price if ticker fetch fails
         try:
-            ticker = await self._exchange.fetch_ticker(signal.symbol)
+            ticker = await ccxt_retry(
+                self._exchange.fetch_ticker, signal.symbol,
+                max_retries=2, base_delay=1.0,
+                operation=f"fetch_ticker({signal.symbol})",
+            )
             last_price = Decimal(str(ticker.get("last", "0")))
             if last_price <= Decimal("0"):
                 self._log.error(
@@ -955,7 +962,10 @@ class LiveExecutionEngine(BaseExecutionEngine):
             # - Validate API key permissions (trade, read)
             # - Load exchange markets for symbol validation
             # - Sync existing positions
-            await self._exchange.load_markets()
+            await ccxt_retry(
+                self._exchange.load_markets,
+                max_retries=3, base_delay=2.0, operation="load_markets",
+            )
             # Seed peak equity so the first drawdown check has a baseline.
             self._peak_equity = await self._fetch_equity()
             self._log.info(
