@@ -297,7 +297,20 @@ class Settings(BaseSettings):
         default=90,
         ge=1,
         le=365,
-        description="Days to keep raw equity snapshots before pruning. "                    "Snapshots older than this are deleted daily at UTC midnight.",
+        description="Days to keep raw equity snapshots before pruning. "
+                    "Snapshots older than this are deleted daily at UTC midnight.",
+    )
+    max_run_duration_hours: int = Field(
+        default=168,  # 7 days
+        ge=1,
+        le=8760,  # 1 year
+        description=(
+            "Maximum duration in hours that a paper or live run may remain active "
+            "before it is automatically stopped.  When the timeout fires, the engine "
+            "stop event is set and the run transitions to 'stopped' via the normal "
+            "finally-block path (incremental flush + DB status update).  "
+            "Default 168 h = 7 days.  Override with MAX_RUN_DURATION_HOURS env var."
+        ),
     )
 
     # ------------------------------------------------------------------

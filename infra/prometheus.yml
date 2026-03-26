@@ -1,0 +1,29 @@
+# =============================================================================
+# Prometheus scrape configuration for AI Crypto Trading Bot
+#
+# Usage:
+#   This file is mounted read-only into the prometheus container at
+#   /etc/prometheus/prometheus.yml via docker-compose.yml.
+#
+# Targets:
+#   trading-bot-api  -- FastAPI backend exposing GET /metrics in Prometheus
+#                       text exposition format (prometheus-client library).
+#                       The endpoint is unconditionally public (no auth).
+# =============================================================================
+
+global:
+  # How often Prometheus polls each target.
+  scrape_interval: 15s
+  # How often Prometheus evaluates alerting rules.
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: "trading-bot-api"
+    metrics_path: /metrics
+    # The api service is reachable within the 'internal' Docker bridge network
+    # at hostname 'api' on port 8000.
+    static_configs:
+      - targets: ["api:8000"]
+        labels:
+          env: "docker"
+          service: "api"

@@ -1,6 +1,7 @@
 # =============================================================================
 # AI Crypto Trading Bot — Docker Compose v2
 # Orchestrates: api (FastAPI) + ui (Next.js) + postgres (PostgreSQL 16) + redis (Redis 7)
+#               + prometheus (metrics collection) + grafana (metrics dashboard)
 #
 # Usage:
 #   cp .env.example .env        # populate secrets
@@ -18,6 +19,10 @@ volumes:
   postgres_data:
     driver: local
   redis_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
     driver: local
 
 # ---------------------------------------------------------------------------
@@ -214,3 +219,67 @@ services:
           cpus: "1.0"
         reservations:
           memory: 128m
+
+  # --------------------------------------------------------------------------
+  # Prometheus — time-series metrics collection
+  #
+  # Scrapes GET /metrics from the api service every 15 s (see prometheus.yml).
+  # Bound to 127.0.0.1 so the UI is not exposed on all interfaces by default.
+  # Access: http://localhost:9090
+  # --------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v3.4.0
+    restart: unless-stopped
+    networks:
+      - internal
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+      - "--web.enable-lifecycle"
+    ports:
+      - "127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"
+    depends_on:
+      api:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+          cpus: "0.5"
+        reservations:
+          memory: 64m
+
+  # --------------------------------------------------------------------------
+  # Grafana — metrics visualisation dashboard
+  #
+  # Add Prometheus as a data source (URL: http://prometheus:9090) and import
+  # community dashboards for Node.js/FastAPI or build custom ones.
+  # Default login: admin / ${GRAFANA_PASSWORD:-admin}  (change in production!)
+  # Access: http://localhost:3001
+  # --------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:11.6.0
+    restart: unless-stopped
+    networks:
+      - internal
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      # Serve behind a sub-path if needed: GF_SERVER_ROOT_URL=http://host/grafana/
+    volumes:
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:${GRAFANA_PORT:-3001}:3000"
+    depends_on:
+      - prometheus
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+          cpus: "0.5"
+        reservations:
+          memory: 64m

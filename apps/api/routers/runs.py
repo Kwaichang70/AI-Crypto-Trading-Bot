@@ -42,6 +42,7 @@ import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import String, cast, delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import noload
 
 from api.db.models import EquitySnapshotORM, FillORM, OrderORM, PositionSnapshotORM, RunORM, SkippedTradeORM, TradeORM
 from api.db.session import get_db
@@ -490,6 +491,50 @@ async def _incremental_flush_loop(
         log.info("runs.incremental_flush_stopped")
 
 
+
+# ---------------------------------------------------------------------------
+# Helper: auto-stop task -- fires when max run duration is exceeded
+# ---------------------------------------------------------------------------
+
+async def _auto_stop_after(
+    stop_event: asyncio.Event,
+    max_seconds: float,
+    run_id: str,
+    log: Any,
+) -> None:
+    """
+    Sleep for ``max_seconds`` then set ``stop_event`` to trigger a clean
+    engine shutdown.
+
+    Designed to run as a parallel asyncio.Task alongside the engine loop.
+    When cancelled (normal stop path), it exits silently without setting
+    the event so the engine's own stop logic remains authoritative.
+
+    Parameters
+    ----------
+    stop_event:
+        The StrategyEngine's internal stop event.  Setting it initiates
+        a graceful shutdown of ``run_live_loop()``.
+    max_seconds:
+        Duration to wait before auto-stopping.
+    run_id:
+        String UUID used only for structured log context.
+    log:
+        Bound structlog logger for contextual logging.
+    """
+    try:
+        await asyncio.sleep(max_seconds)
+        log.warning(
+            "runs.auto_stop_max_duration",
+            run_id=run_id,
+            max_hours=max_seconds / 3600,
+        )
+        stop_event.set()
+    except asyncio.CancelledError:
+        # Cancelled by the engine's finally block on normal/early shutdown.
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Helper: persist paper engine results to DB
 # ---------------------------------------------------------------------------
@@ -751,6 +796,9 @@ async def _run_paper_engine(
     learning_task: asyncio.Task[None] | None = None
     learning_stop_event: asyncio.Event | None = None
 
+    # Auto-stop timeout task -- cancelled on normal stop (Feature: max_run_duration)
+    auto_stop_task: asyncio.Task[None] | None = None
+
     try:
         settings = get_settings()
         capital = Decimal(initial_capital)
@@ -845,6 +893,16 @@ async def _run_paper_engine(
             )
         )
 
+        # Auto-stop timeout task -- cancels itself on normal stop
+        auto_stop_task = asyncio.create_task(
+            _auto_stop_after(
+                stop_event=engine._stop_event,
+                max_seconds=settings.max_run_duration_hours * 3600.0,
+                run_id=run_id_str,
+                log=log,
+            )
+        )
+
         # Start adaptive learning as parallel background task
         if learning_stop_event is not None:
             learning_task = asyncio.create_task(
@@ -855,6 +913,12 @@ async def _run_paper_engine(
 
     except asyncio.CancelledError:
         log.info("runs.paper_engine_cancelled")
+        if auto_stop_task is not None and not auto_stop_task.done():
+            auto_stop_task.cancel()
+            try:
+                await auto_stop_task
+            except (asyncio.CancelledError, Exception):
+                pass
         if learning_stop_event is not None:
             learning_stop_event.set()
         if learning_task is not None and not learning_task.done():
@@ -879,6 +943,12 @@ async def _run_paper_engine(
     except Exception:
         final_status = "error"
         log.exception("runs.paper_engine_error")
+        if auto_stop_task is not None and not auto_stop_task.done():
+            auto_stop_task.cancel()
+            try:
+                await auto_stop_task
+            except (asyncio.CancelledError, Exception):
+                pass
         if learning_stop_event is not None:
             learning_stop_event.set()
         if learning_task is not None and not learning_task.done():
@@ -900,6 +970,14 @@ async def _run_paper_engine(
                 log.exception("runs.paper_engine_stop_error")
 
     finally:
+        # Cancel auto-stop timeout task (normal stop path)
+        if auto_stop_task is not None and not auto_stop_task.done():
+            auto_stop_task.cancel()
+            try:
+                await auto_stop_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
         # Belt-and-suspenders: cancel learning task if it somehow survived
         if learning_stop_event is not None:
             learning_stop_event.set()
@@ -1012,6 +1090,9 @@ async def _run_live_engine(
     learning_task: asyncio.Task[None] | None = None
     learning_stop_event: asyncio.Event | None = None
 
+    # Auto-stop timeout task -- cancelled on normal stop (Feature: max_run_duration)
+    auto_stop_task: asyncio.Task[None] | None = None
+
     try:
         settings = get_settings()
         capital = Decimal(initial_capital)
@@ -1118,6 +1199,16 @@ async def _run_live_engine(
             )
         )
 
+        # Auto-stop timeout task -- cancels itself on normal stop
+        auto_stop_task = asyncio.create_task(
+            _auto_stop_after(
+                stop_event=engine._stop_event,
+                max_seconds=settings.max_run_duration_hours * 3600.0,
+                run_id=run_id_str,
+                log=log,
+            )
+        )
+
         # Start adaptive learning as parallel background task
         if learning_stop_event is not None:
             learning_task = asyncio.create_task(
@@ -1128,6 +1219,12 @@ async def _run_live_engine(
 
     except asyncio.CancelledError:
         log.info("runs.live_engine_cancelled")
+        if auto_stop_task is not None and not auto_stop_task.done():
+            auto_stop_task.cancel()
+            try:
+                await auto_stop_task
+            except (asyncio.CancelledError, Exception):
+                pass
         if learning_stop_event is not None:
             learning_stop_event.set()
         if learning_task is not None and not learning_task.done():
@@ -1152,6 +1249,12 @@ async def _run_live_engine(
     except Exception:
         final_status = "error"
         log.exception("runs.live_engine_error")
+        if auto_stop_task is not None and not auto_stop_task.done():
+            auto_stop_task.cancel()
+            try:
+                await auto_stop_task
+            except (asyncio.CancelledError, Exception):
+                pass
         if learning_stop_event is not None:
             learning_stop_event.set()
         if learning_task is not None and not learning_task.done():
@@ -1173,6 +1276,14 @@ async def _run_live_engine(
                 log.exception("runs.live_engine_stop_error")
 
     finally:
+        # Cancel auto-stop timeout task (normal stop path)
+        if auto_stop_task is not None and not auto_stop_task.done():
+            auto_stop_task.cancel()
+            try:
+                await auto_stop_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
         # Belt-and-suspenders: cancel learning task if it somehow survived
         if learning_stop_event is not None:
             learning_stop_event.set()
@@ -2122,7 +2233,19 @@ async def list_runs(
     total: int = (await db.execute(count_stmt)).scalar_one()
 
     # Fetch the page
-    page_stmt = select(RunORM)
+    # noload() explicitly prevents any lazy relationship traversal on the
+    # list response (RunResponse only uses scalar columns).  This is a
+    # defensive N+1 guard: if a future serializer accidentally iterates a
+    # relationship, SQLAlchemy raises an error instead of silently firing
+    # one query per row (2.0-safe lazy-load hygiene, CR-N1-001).
+    page_stmt = select(RunORM).options(
+        noload(RunORM.trades),
+        noload(RunORM.orders),
+        noload(RunORM.equity_snapshots),
+        noload(RunORM.position_snapshots),
+        noload(RunORM.signals),
+        noload(RunORM.skipped_trades),
+    )
     if filters:
         page_stmt = page_stmt.where(*filters)
     page_stmt = page_stmt.order_by(RunORM.created_at.desc()).offset(offset).limit(limit)
