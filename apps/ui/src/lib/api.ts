@@ -256,9 +256,287 @@ export async function stopRun(id: string): Promise<ApiResult<Run>> {
   return apiDelete<Run>(`/api/v1/runs/${id}`);
 }
 
-
-/** PATCH /api/v1/runs/{id}/archive — soft-archive a stopped or error run. */
+/** PATCH /api/v1/runs/{id}/archive — archive a stopped/error run. */
 export async function archiveRun(id: string): Promise<ApiResult<Run>> {
   return apiFetch<Run>(`/api/v1/runs/${id}/archive`, { method: "PATCH" });
 }
 
+// ---------------------------------------------------------------------------
+// Portfolio
+// ---------------------------------------------------------------------------
+
+/** GET /api/v1/runs/{id}/portfolio — portfolio summary. */
+export async function fetchPortfolio(
+  runId: string,
+): Promise<ApiResult<Portfolio>> {
+  return apiGet<Portfolio>(`/api/v1/runs/${runId}/portfolio`, {
+    cache: "no-store",
+  });
+}
+
+/** GET /api/v1/portfolio/summary — aggregate cross-run portfolio. */
+export async function fetchAggregatePortfolio(): Promise<ApiResult<AggregatePortfolio>> {
+  return apiGet<AggregatePortfolio>("/api/v1/portfolio/summary", {
+    cache: "no-store",
+  });
+}
+
+/** GET /api/v1/runs/{id}/equity-curve — equity curve time series. */
+export async function fetchEquityCurve(
+  runId: string,
+  limit = 1000,
+): Promise<ApiResult<EquityCurveResponse>> {
+  return apiGet<EquityCurveResponse>(
+    `/api/v1/runs/${runId}/equity-curve?limit=${limit}`,
+    { cache: "no-store" },
+  );
+}
+
+/** GET /api/v1/runs/{id}/trades — completed trades. */
+export async function fetchTrades(
+  runId: string,
+  params?: { offset?: number; limit?: number },
+): Promise<ApiResult<TradeListResponse>> {
+  const qs = new URLSearchParams();
+  if (params?.offset !== undefined) qs.set("offset", String(params.offset));
+  if (params?.limit !== undefined) qs.set("limit", String(params.limit));
+  const query = qs.toString() ? `?${qs.toString()}` : "";
+  return apiGet<TradeListResponse>(`/api/v1/runs/${runId}/trades${query}`, {
+    cache: "no-store",
+  });
+}
+
+/** GET /api/v1/runs/{id}/orders — orders for a run. */
+export async function fetchOrders(
+  runId: string,
+  params?: { offset?: number; limit?: number; status?: string },
+): Promise<ApiResult<OrderListResponse>> {
+  const qs = new URLSearchParams();
+  if (params?.offset !== undefined) qs.set("offset", String(params.offset));
+  if (params?.limit !== undefined) qs.set("limit", String(params.limit));
+  if (params?.status) qs.set("status", params.status);
+  const query = qs.toString() ? `?${qs.toString()}` : "";
+  return apiGet<OrderListResponse>(`/api/v1/runs/${runId}/orders${query}`, {
+    cache: "no-store",
+  });
+}
+
+/** GET /api/v1/runs/{id}/fills — execution fills for a run. */
+export async function fetchFills(
+  runId: string,
+  params?: { offset?: number; limit?: number; symbol?: string },
+): Promise<ApiResult<FillListResponse>> {
+  const qs = new URLSearchParams();
+  if (params?.offset !== undefined) qs.set("offset", String(params.offset));
+  if (params?.limit !== undefined) qs.set("limit", String(params.limit));
+  if (params?.symbol) qs.set("symbol", params.symbol);
+  const query = qs.toString() ? `?${qs.toString()}` : "";
+  return apiGet<FillListResponse>(`/api/v1/runs/${runId}/fills${query}`, {
+    cache: "no-store",
+  });
+}
+
+/** GET /api/v1/runs/{id}/positions — open positions. */
+export async function fetchPositions(
+  runId: string,
+): Promise<ApiResult<PositionListResponse>> {
+  return apiGet<PositionListResponse>(`/api/v1/runs/${runId}/positions`, {
+    cache: "no-store",
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Adaptive Learning
+// ---------------------------------------------------------------------------
+
+/** GET /api/v1/runs/{runId}/learning — adaptive learning state for a running engine. */
+export async function fetchLearningState(
+  runId: string,
+): Promise<ApiResult<LearningState>> {
+  return apiGet<LearningState>(`/api/v1/runs/${runId}/learning`, {
+    cache: "no-store",
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Strategies
+// ---------------------------------------------------------------------------
+
+/** GET /api/v1/strategies — list all available strategies. */
+export async function fetchStrategies(): Promise<ApiResult<StrategyListResponse>> {
+  return apiGet<StrategyListResponse>("/api/v1/strategies", { cache: "no-store" });
+}
+
+/** GET /api/v1/strategies/{name}/schema — strategy parameter schema. */
+export async function fetchStrategySchema(
+  name: string,
+): Promise<ApiResult<Strategy>> {
+  return apiGet<Strategy>(`/api/v1/strategies/${name}/schema`);
+}
+
+// ---------------------------------------------------------------------------
+// ML Model Versions
+// ---------------------------------------------------------------------------
+
+/**
+ * GET /api/v1/ml/models — list trained model versions.
+ *
+ * @param symbol  Optional filter by trading pair (e.g. "BTC/USD").
+ * @param activeOnly  When true, return only the active version per symbol.
+ */
+export async function fetchModelVersions(
+  symbol?: string,
+  activeOnly?: boolean,
+): Promise<ApiResult<ModelVersionListResponse>> {
+  const qs = new URLSearchParams();
+  if (symbol) qs.set("symbol", symbol);
+  if (activeOnly !== undefined) qs.set("active_only", String(activeOnly));
+  const query = qs.toString() ? `?${qs.toString()}` : "";
+  return apiGet<ModelVersionListResponse>(`/api/v1/ml/models${query}`, {
+    cache: "no-store",
+  });
+}
+
+/**
+ * POST /api/v1/ml/retrain/{symbol} — trigger a model retrain for a symbol.
+ * The backend returns 202 Accepted with a JSON body; the function returns ApiResult<void>.
+ *
+ * @param symbol    Trading pair to retrain, e.g. "BTC/USD".
+ * @param timeframe OHLCV timeframe, e.g. "1h".
+ */
+export async function retrainModel(
+  symbol: string,
+  timeframe: string,
+): Promise<ApiResult<void>> {
+  const encodedSymbol = encodeURIComponent(symbol);
+  return apiPost<void>(
+    `/api/v1/ml/retrain/${encodedSymbol}?timeframe=${encodeURIComponent(timeframe)}`,
+  );
+}
+
+/**
+ * POST /api/v1/ml/train — train a new model from OHLCV data.
+ * Unlike retrain (which needs 50+ trades), this always works.
+ */
+export async function trainModel(
+  symbol: string,
+  timeframe: string,
+  bars: number = 2000,
+  exchange: string = "coinbase",
+): Promise<ApiResult<Record<string, unknown>>> {
+  const params = new URLSearchParams({
+    symbol,
+    timeframe,
+    bars: String(bars),
+    exchange,
+  });
+  return apiPost<Record<string, unknown>>(`/api/v1/ml/train?${params.toString()}`);
+}
+
+/**
+ * PUT /api/v1/ml/models/{id}/activate — mark a model version as active.
+ * Returns the updated ModelVersion record.
+ *
+ * @param id  UUID of the model version to activate.
+ */
+export async function activateModelVersion(
+  id: string,
+): Promise<ApiResult<ModelVersion>> {
+  return apiFetch<ModelVersion>(`/api/v1/ml/models/${id}/activate`, {
+    method: "PUT",
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Internal utilities
+// ---------------------------------------------------------------------------
+
+function httpStatusMessage(status: number): string {
+  const messages: Partial<Record<number, string>> = {
+    400: "Bad request — the server rejected the input.",
+    401: "Unauthorised — authentication is required.",
+    403: "Forbidden — you do not have permission.",
+    404: "Not found — the resource does not exist.",
+    409: "Conflict — the request could not be completed due to a conflict.",
+    422: "Validation error — check the request payload.",
+    429: "Rate limited — too many requests, please slow down.",
+    500: "Internal server error — the API encountered an unexpected error.",
+    502: "Bad gateway — the API is unreachable.",
+    503: "Service unavailable — the API is temporarily down.",
+    504: "Gateway timeout — the API took too long to respond.",
+  };
+  return messages[status] ?? `HTTP ${status} — an error occurred.`;
+}
+
+// ---------------------------------------------------------------------------
+// Optimization
+// ---------------------------------------------------------------------------
+
+/**
+ * POST /api/v1/optimize — run a parameter grid search.
+ *
+ * Uses a 300 s timeout because a large grid (e.g. 500 combinations) can take
+ * several minutes of sequential backtest execution on the server.
+ */
+export async function runOptimization(
+  body: OptimizeRequest,
+): Promise<ApiResult<OptimizeResponse>> {
+  return apiFetch<OptimizeResponse>(
+    "/api/v1/optimize",
+    {
+      method: "POST",
+      body: JSON.stringify(body),
+    },
+    300_000,
+  );
+}
+
+/**
+ * GET /api/v1/optimize — paginated list of saved optimization run summaries.
+ * Does NOT include the entries array — use fetchOptimizationRun(id) for full detail.
+ */
+export async function fetchOptimizationRuns(params?: {
+  offset?: number;
+  limit?: number;
+}): Promise<ApiResult<OptimizationRunListResponse>> {
+  const qs = new URLSearchParams();
+  if (params?.offset !== undefined) qs.set("offset", String(params.offset));
+  if (params?.limit !== undefined) qs.set("limit", String(params.limit));
+  const query = qs.toString() ? `?${qs.toString()}` : "";
+  return apiGet<OptimizationRunListResponse>(`/api/v1/optimize${query}`, {
+    cache: "no-store",
+  });
+}
+
+/**
+ * GET /api/v1/optimize/{id} — full detail of a saved optimization run, including all entries.
+ *
+ * Uses a 30 s timeout — the entries JSONB column can be large on cold DB connections.
+ */
+export async function fetchOptimizationRun(
+  id: string,
+): Promise<ApiResult<OptimizeResponse>> {
+  // 30 s: entries JSONB column can be large on cold DB connections.
+  return apiFetch<OptimizeResponse>(`/api/v1/optimize/${id}`, {
+    cache: "no-store",
+  }, 30_000);
+}
+
+// ---------------------------------------------------------------------------
+// Display helpers
+// ---------------------------------------------------------------------------
+
+/** Format a monetary string for display (2 decimal places, with commas). */
+export function formatCurrency(value: string, decimals = 2): string {
+  const n = parseFloat(value);
+  if (isNaN(n)) return value;
+  return new Intl.NumberFormat("en-US", {
+    minimumFractionDigits: decimals,
+    maximumFractionDigits: decimals,
+  }).format(n);
+}
+
+/** Format a percent fraction (0.0-1.0) as a percentage string. */
+export function formatPct(value: number, decimals = 2): string {
+  return `${(value * 100).toFixed(decimals)}%`;
+}
