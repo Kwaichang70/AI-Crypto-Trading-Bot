@@ -25,6 +25,7 @@ import { StatCard } from "@/components/ui/stat-card";
 import { DataTable, type Column } from "@/components/ui/data-table";
 import { Tabs } from "@/components/ui/tabs";
 import { EquityCurveChart } from "@/components/charts/equity-curve";
+import { useToast } from "@/components/ui/toast";
 
 // ---------------------------------------------------------------------------
 // Trade columns
@@ -325,6 +326,7 @@ export default function RunDetailPage() {
   const params = useParams();
   const router = useRouter();
   const id = params.id as string;
+  const { toast } = useToast();
 
   const [run, setRun] = useState<Run | null>(null);
   const [portfolio, setPortfolio] = useState<Portfolio | null>(null);
@@ -403,6 +405,7 @@ export default function RunDetailPage() {
     const result = await stopRun(run.id);
     if (result.ok) {
       setRun(result.data);
+      toast("Run stopped", "success");
     } else {
       setError(result.error.message);
     }

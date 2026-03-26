@@ -17,6 +17,7 @@ import { fetchModelVersions, retrainModel, trainModel, activateModelVersion } fr
 import type { ModelVersion } from "@/lib/types";
 import { DataTable, type Column } from "@/components/ui/data-table";
 import { Header } from "@/components/layout/header";
+import { useToast } from "@/components/ui/toast";
 
 // ---------------------------------------------------------------------------
 // Badge helpers
@@ -176,6 +177,8 @@ function buildColumns(
 // ---------------------------------------------------------------------------
 
 export default function ModelsPage() {
+  const { toast } = useToast();
+
   const [models, setModels] = useState<readonly ModelVersion[]>([]);
   const [total, setTotal] = useState(0);
   const [isLoading, setIsLoading] = useState(true);
@@ -190,8 +193,6 @@ export default function ModelsPage() {
   const [retrainTimeframe, setRetrainTimeframe] = useState("1h");
   const [isRetraining, setIsRetraining] = useState(false);
   const [isTraining, setIsTraining] = useState(false);
-  const [retrainError, setRetrainError] = useState<string | null>(null);
-  const [retrainSuccess, setRetrainSuccess] = useState<string | null>(null);
   const [activatingId, setActivatingId] = useState<string | null>(null);
 
   // ---------------------------------------------------------------------------
@@ -226,8 +227,6 @@ export default function ModelsPage() {
     const sym = retrainSymbol.trim();
     if (!sym) return;
     setIsTraining(true);
-    setRetrainError(null);
-    setRetrainSuccess(null);
 
     const result = await trainModel(sym, retrainTimeframe);
     setIsTraining(false);
@@ -235,13 +234,13 @@ export default function ModelsPage() {
     if (result.ok) {
       const acc = result.data?.metrics as Record<string, unknown> | undefined;
       const accuracy = acc?.accuracy != null ? `${(Number(acc.accuracy) * 100).toFixed(1)}%` : "";
-      setRetrainSuccess(`Model trained${accuracy ? ` — ${accuracy} accuracy` : ""}`);
-      setTimeout(() => {
-        setRetrainSuccess(null);
-        void load();
-      }, 2000);
+      toast(
+        `Model trained${accuracy ? ` — ${accuracy} accuracy` : ""}`,
+        "success",
+      );
+      void load();
     } else {
-      setRetrainError(result.error.message);
+      toast(result.error.message, "error");
     }
   }
 
@@ -249,20 +248,15 @@ export default function ModelsPage() {
     const sym = retrainSymbol.trim();
     if (!sym) return;
     setIsRetraining(true);
-    setRetrainError(null);
-    setRetrainSuccess(null);
 
     const result = await retrainModel(sym, retrainTimeframe);
     setIsRetraining(false);
 
     if (result.ok) {
-      setRetrainSuccess("Retrain accepted — requires 50+ trades with this strategy");
-      setTimeout(() => {
-        setRetrainSuccess(null);
-        void load();
-      }, 3000);
+      toast("Retrain accepted — requires 50+ trades with this strategy", "info");
+      setTimeout(() => void load(), 3000);
     } else {
-      setRetrainError(result.error.message);
+      toast(result.error.message, "error");
     }
   }
 
@@ -271,6 +265,7 @@ export default function ModelsPage() {
     const result = await activateModelVersion(id);
     setActivatingId(null);
     if (result.ok) {
+      toast("Model activated", "success");
       // Optimistic refresh — replace the updated record in local state so the
       // dot flips immediately without a full round-trip.
       setModels((prev) =>
@@ -282,6 +277,7 @@ export default function ModelsPage() {
       );
     } else {
       setError(result.error.message);
+      toast(result.error.message, "error");
     }
   }
 
@@ -402,16 +398,6 @@ export default function ModelsPage() {
         >
           {isRetraining ? "Retraining\u2026" : "Retrain"}
         </button>
-
-        {/* Feedback messages */}
-        {retrainSuccess && (
-          <span className="self-end text-xs font-medium text-emerald-400">
-            {retrainSuccess}
-          </span>
-        )}
-        {retrainError && (
-          <span className="self-end text-xs text-red-400">{retrainError}</span>
-        )}
       </div>
 
       {/* General error banner */}

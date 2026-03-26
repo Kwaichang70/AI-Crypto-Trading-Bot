@@ -9,6 +9,7 @@ import {
 } from "@/lib/api";
 import type { Strategy, JsonSchemaProperty, RunMode } from "@/lib/types";
 import { Header } from "@/components/layout/header";
+import { useToast } from "@/components/ui/toast";
 
 const TIMEFRAMES = ["1m", "5m", "15m", "1h", "4h", "1d"];
 const COMMON_SYMBOLS = ["BTC/EUR", "ETH/EUR", "SOL/EUR", "XRP/EUR", "ADA/EUR"];
@@ -82,6 +83,7 @@ export default function NewRunPage() {
 function NewRunInner() {
   const router = useRouter();
   const searchParams = useSearchParams();
+  const { toast } = useToast();
 
   // Read pre-fill params supplied by the Duplicate Run button.
   const preStrategy = searchParams.get("strategy") ?? "";
@@ -205,6 +207,7 @@ function NewRunInner() {
     const result = await createRun(body);
 
     if (result.ok) {
+      toast("Run started successfully", "success");
       router.push(`/runs/${result.data.id}`);
     } else {
       setSubmitError(result.error.message);

@@ -3,6 +3,7 @@ import { Inter } from "next/font/google";
 import { Sidebar } from "@/components/layout/sidebar";
 import { ThemeProvider } from "@/components/theme-provider";
 import { ThemeToggle } from "@/components/ui/theme-toggle";
+import { ToastProvider } from "@/components/ui/toast";
 import "./globals.css";
 
 const inter = Inter({
@@ -42,32 +43,34 @@ export default function RootLayout({
     >
       <body className="min-h-screen font-sans antialiased">
         <ThemeProvider>
-          {/* Top navigation bar */}
-          <header className="sticky top-0 z-40 border-b border-slate-200 bg-white/80 backdrop-blur-sm dark:border-slate-800 dark:bg-slate-950/80">
-            <div className="mx-auto flex h-14 max-w-screen-2xl items-center justify-between px-4 sm:px-6 lg:px-8">
-              <span className="text-sm font-semibold tracking-tight text-slate-900 dark:text-slate-100">
-                Trading Bot
-              </span>
-              <div className="flex items-center gap-4">
-                <nav className="flex items-center gap-4 lg:hidden" aria-label="Mobile navigation">
-                  <a href="/" className="text-xs text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200">Dashboard</a>
-                  <a href="/runs" className="text-xs text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200">Runs</a>
-                  <a href="/runs/new" className="text-xs text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200">New Run</a>
-                  <a href="/strategies" className="text-xs text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200">Strategies</a>
-                  <a href="/models" className="text-xs text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200">Models</a>
-                </nav>
-                <ThemeToggle />
+          <ToastProvider>
+            {/* Top navigation bar */}
+            <header className="sticky top-0 z-40 border-b border-slate-200 bg-white/80 backdrop-blur-sm dark:border-slate-800 dark:bg-slate-950/80">
+              <div className="mx-auto flex h-14 max-w-screen-2xl items-center justify-between px-4 sm:px-6 lg:px-8">
+                <span className="text-sm font-semibold tracking-tight text-slate-900 dark:text-slate-100">
+                  Trading Bot
+                </span>
+                <div className="flex items-center gap-4">
+                  <nav className="flex items-center gap-4 lg:hidden" aria-label="Mobile navigation">
+                    <a href="/" className="text-xs text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200">Dashboard</a>
+                    <a href="/runs" className="text-xs text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200">Runs</a>
+                    <a href="/runs/new" className="text-xs text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200">New Run</a>
+                    <a href="/strategies" className="text-xs text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200">Strategies</a>
+                    <a href="/models" className="text-xs text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200">Models</a>
+                  </nav>
+                  <ThemeToggle />
+                </div>
               </div>
-            </div>
-          </header>
+            </header>
 
-          {/* Two-column shell: sidebar + main */}
-          <div className="mx-auto flex max-w-screen-2xl gap-8 px-4 sm:px-6 lg:px-8">
-            <Sidebar />
-            <main className="min-w-0 flex-1 py-6">
-              {children}
-            </main>
-          </div>
+            {/* Two-column shell: sidebar + main */}
+            <div className="mx-auto flex max-w-screen-2xl gap-8 px-4 sm:px-6 lg:px-8">
+              <Sidebar />
+              <main className="min-w-0 flex-1 py-6">
+                {children}
+              </main>
+            </div>
+          </ToastProvider>
         </ThemeProvider>
       </body>
     </html>
