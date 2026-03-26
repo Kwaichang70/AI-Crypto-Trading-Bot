@@ -17,7 +17,7 @@
 // ---------------------------------------------------------------------------
 
 export type RunMode = "backtest" | "paper" | "live";
-export type RunStatus = "running" | "stopped" | "error";
+export type RunStatus = "running" | "stopped" | "error" | "archived";
 
 export interface RunConfig {
   strategy_name: string;

@@ -550,6 +550,52 @@ class LiveExecutionEngine(BaseExecutionEngine):
             position = self._positions[signal.symbol]
             quantity = min(quantity, position.quantity)
 
+        # ------------------------------------------------------------------
+        # Exchange minimum order size validation
+        # Checked after all quantity adjustments (position cap, etc.) so we
+        # evaluate the final quantity that would actually be submitted.
+        # markets is populated by load_markets() in on_start(); if markets is
+        # not yet loaded (e.g. in disabled-gate mode) the dict will be empty
+        # and the guard is skipped gracefully.
+        # ------------------------------------------------------------------
+        markets: dict[str, Any] = getattr(self._exchange, "markets", {}) or {}
+        market = markets.get(signal.symbol)
+        if market:
+            limits: dict[str, Any] = market.get("limits") or {}
+            amount_limits: dict[str, Any] = limits.get("amount") or {}
+            cost_limits: dict[str, Any] = limits.get("cost") or {}
+
+            min_amount = amount_limits.get("min")
+            min_cost = cost_limits.get("min")
+
+            notional = quantity * last_price
+
+            if min_amount is not None and float(quantity) < float(min_amount):
+                self._log.warning(
+                    "live.below_min_amount",
+                    symbol=signal.symbol,
+                    quantity=str(quantity),
+                    min_amount=str(min_amount),
+                    msg=(
+                        f"Order quantity {quantity} below exchange minimum "
+                        f"{min_amount} for {signal.symbol}"
+                    ),
+                )
+                return []
+
+            if min_cost is not None and float(notional) < float(min_cost):
+                self._log.warning(
+                    "live.below_min_cost",
+                    symbol=signal.symbol,
+                    notional=str(notional),
+                    min_cost=str(min_cost),
+                    msg=(
+                        f"Order notional {notional} below exchange minimum cost "
+                        f"{min_cost} for {signal.symbol}"
+                    ),
+                )
+                return []
+
         # Build the proposed order
         client_order_id = f"{self._run_id}-{uuid4().hex[:12]}"
         proposed_order = Order(

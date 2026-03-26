@@ -112,7 +112,7 @@ class RunORM(Base):
             name="ck_runs_run_mode",
         ),
         CheckConstraint(
-            "status IN ('running', 'stopped', 'error')",
+            "status IN ('running', 'stopped', 'error', 'archived')",
             name="ck_runs_status",
         ),
         CheckConstraint(
@@ -140,7 +140,7 @@ class RunORM(Base):
         String(16),
         nullable=False,
         default="running",
-        comment="Current run state: running | stopped | error",
+        comment="Current run state: running | stopped | error | archived",
     )
 
     # Strategy configuration snapshot  -- stored at run creation time.

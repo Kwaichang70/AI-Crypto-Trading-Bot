@@ -1977,7 +1977,7 @@ async def create_run(
 # ---------------------------------------------------------------------------
 
 _VALID_MODES: frozenset[str] = frozenset({"backtest", "paper", "live"})
-_VALID_STATUSES: frozenset[str] = frozenset({"running", "stopped", "error"})
+_VALID_STATUSES: frozenset[str] = frozenset({"running", "stopped", "error", "archived"})
 
 
 @router.get(
@@ -2014,6 +2014,10 @@ async def list_runs(
         str | None,
         Query(description="Filter runs created before this ISO date"),
     ] = None,
+    include_archived: Annotated[
+        bool,
+        Query(description="When true, include archived runs in results (default: false)"),
+    ] = False,
 ) -> RunListResponse:
     """
     List all trading runs with pagination and optional server-side filtering.
@@ -2077,6 +2081,10 @@ async def list_runs(
         filters.append(RunORM.run_mode == mode)
     if run_status is not None:
         filters.append(RunORM.status == run_status)
+
+    # Exclude archived runs by default -- callers must opt-in to see them
+    if not include_archived:
+        filters.append(RunORM.status != "archived")
 
     # Strategy filter — exact match on config->strategy_name (JSONB text extraction)
     if strategy is not None:
@@ -2271,6 +2279,89 @@ async def stop_run(
         log.info("runs.engine_task_cancelled", run_id=str(run_id))
 
     log.info("runs.stopped", run_id=str(run_id))
+    return _run_orm_to_detail_response(run)
+
+
+
+# ---------------------------------------------------------------------------
+# PATCH /api/v1/runs/{run_id}/archive  -- soft-archive a finished run
+# ---------------------------------------------------------------------------
+
+@router.patch(
+    "/{run_id}/archive",
+    response_model=RunDetailResponse,
+    responses={
+        400: {"model": ErrorResponse, "description": "Run is still running"},
+        404: {"model": ErrorResponse, "description": "Run not found"},
+    },
+    summary="Archive a stopped or error run",
+    description=(
+        "Transitions a run to \'archived\' status, hiding it from the default "
+        "list view.  Only runs that are already stopped or in error state may "
+        "be archived.  Use GET /runs?include_archived=true to retrieve archived runs."
+    ),
+)
+async def archive_run(
+    run_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> RunDetailResponse:
+    """
+    Archive a finished trading run.
+
+    Archiving is a soft operation: the run record is retained in the database
+    with status='archived' and is excluded from the default listing.  It
+    remains accessible via GET /runs/{run_id} and via
+    GET /runs?include_archived=true.
+
+    Parameters
+    ----------
+    run_id:
+        UUID of the run to archive.
+    db:
+        Injected async database session.
+
+    Returns
+    -------
+    RunDetailResponse
+        The updated run record with status='archived'.
+
+    Raises
+    ------
+    HTTPException 404:
+        When no run with the given ID exists.
+    HTTPException 400:
+        When the run is currently running (must be stopped first).
+    """
+    log = logger.bind(endpoint="archive_run", run_id=str(run_id))
+    log.info("runs.archive_requested")
+
+    stmt = select(RunORM).where(RunORM.id == run_id)
+    result = await db.execute(stmt)
+    run = result.scalar_one_or_none()
+
+    if run is None:
+        log.warning("runs.not_found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Run {run_id} not found",
+        )
+
+    if run.status == "running":
+        log.warning("runs.archive_blocked_running", current_status=run.status)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Cannot archive run {run_id}: run is currently active. "
+                "Stop it first, then archive."
+            ),
+        )
+
+    run.status = "archived"
+    run.updated_at = datetime.now(tz=UTC)
+    await db.commit()
+    await db.refresh(run)
+
+    log.info("runs.archived", run_id=str(run_id))
     return _run_orm_to_detail_response(run)
 
 

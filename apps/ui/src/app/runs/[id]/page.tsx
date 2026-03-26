@@ -13,6 +13,7 @@ import {
   fetchPositions,
   fetchLearningState,
   stopRun,
+  archiveRun,
   formatCurrency,
   formatPct,
 } from "@/lib/api";
@@ -424,6 +425,17 @@ export default function RunDetailPage() {
     router.push(`/runs/new?${params.toString()}`);
   }
 
+  async function handleArchive() {
+    if (!run) return;
+    const result = await archiveRun(run.id);
+    if (result.ok) {
+      toast("Run archived", "success");
+      router.push("/runs");
+    } else {
+      toast(result.error.message, "error");
+    }
+  }
+
   if (isLoading) {
     return (
       <div className="space-y-6">
@@ -484,6 +496,14 @@ export default function RunDetailPage() {
                 className="rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800/60 px-4 py-2 text-sm font-medium text-slate-700 dark:text-slate-300 transition-colors hover:border-indigo-500 hover:bg-indigo-600/10 hover:text-indigo-600 dark:hover:text-indigo-300"
               >
                 Duplicate Run
+              </button>
+            )}
+            {isDone && run.status !== "archived" && (
+              <button
+                onClick={() => void handleArchive()}
+                className="rounded-lg border border-slate-300 dark:border-slate-700 px-4 py-2 text-sm font-medium text-slate-500 dark:text-slate-400 transition-colors hover:border-red-400 hover:text-red-500 dark:hover:border-red-500 dark:hover:text-red-400"
+              >
+                Archive
               </button>
             )}
           </div>
