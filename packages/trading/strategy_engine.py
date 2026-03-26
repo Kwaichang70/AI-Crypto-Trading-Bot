@@ -874,6 +874,24 @@ class StrategyEngine:
             elapsed_ms=round(bar_elapsed_ms, 2),
         )
 
+        # 8. Update Prometheus-compatible metrics
+        try:
+            from common.metrics import metrics as _mc
+            _mc.increment("bars_processed_total")
+            if len(bar_signals) > 0:
+                _mc.increment("signals_generated_total", len(bar_signals))
+            if bar_orders > 0:
+                _mc.increment("orders_submitted_total", bar_orders)
+            if bar_fills > 0:
+                _mc.increment("fills_executed_total", bar_fills)
+            _summary = self._portfolio.get_summary()
+            _mc.gauge("portfolio_equity", float(_summary["current_equity"]))
+            _mc.gauge("portfolio_drawdown_pct", float(_summary["drawdown_pct"]))
+            _mc.gauge("active_positions", float(_summary["open_positions"]))
+            _mc.observe("bar_processing_duration_seconds", bar_elapsed_ms / 1000.0)
+        except Exception:
+            pass  # Never fail on metrics
+
     # ------------------------------------------------------------------
     # Strategy invocation
     # ------------------------------------------------------------------
