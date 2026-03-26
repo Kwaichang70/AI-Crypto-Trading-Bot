@@ -58,7 +58,7 @@ function ParamInput({
         value={String(value ?? schema.default ?? "")}
         min={schema.minimum}
         max={schema.maximum}
-        step={schema.type === "integer" ? 1 : undefined}
+        step={schema.type === "integer" ? 1 : "any"}
         onChange={(e) => {
           const raw = e.target.value;
           if (schema.type === "integer") onChange(parseInt(raw, 10));
