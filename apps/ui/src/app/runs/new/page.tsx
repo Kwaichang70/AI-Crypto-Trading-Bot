@@ -11,7 +11,7 @@ import type { Strategy, JsonSchemaProperty, RunMode } from "@/lib/types";
 import { Header } from "@/components/layout/header";
 
 const TIMEFRAMES = ["1m", "5m", "15m", "1h", "4h", "1d"];
-const COMMON_SYMBOLS = ["BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "ADA/USD"];
+const COMMON_SYMBOLS = ["BTC/EUR", "ETH/EUR", "SOL/EUR", "XRP/EUR", "ADA/EUR"];
 
 function ParamInput({
   name,
@@ -93,7 +93,7 @@ function NewRunInner() {
   const [selectedStrategy, setSelectedStrategy] = useState<Strategy | null>(null);
   const [strategyParams, setStrategyParams] = useState<Record<string, unknown>>({});
   const [symbols, setSymbols] = useState<string[]>(
-    preSymbols ? preSymbols.split(",").map((s) => s.trim()).filter(Boolean) : ["BTC/USD"],
+    preSymbols ? preSymbols.split(",").map((s) => s.trim()).filter(Boolean) : ["BTC/EUR"],
   );
   const [customSymbol, setCustomSymbol] = useState("");
   const [timeframe, setTimeframe] = useState(preTimeframe || "1h");

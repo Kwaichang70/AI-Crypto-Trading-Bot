@@ -28,7 +28,7 @@ import { buildResultColumns } from "./result-columns";
 // ---------------------------------------------------------------------------
 
 const TIMEFRAMES = ["1m", "5m", "15m", "1h", "4h", "1d"];
-const COMMON_SYMBOLS = ["BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "ADA/USD"];
+const COMMON_SYMBOLS = ["BTC/EUR", "ETH/EUR", "SOL/EUR", "XRP/EUR", "ADA/EUR"];
 
 const RANK_OPTIONS: { value: string; label: string }[] = [
   { value: "sharpe_ratio", label: "Sharpe Ratio" },
@@ -173,7 +173,7 @@ export default function OptimizePage() {
 
   // --- Form ---
   const [paramGridRows, setParamGridRows] = useState<ParamGridRow[]>([]);
-  const [symbols, setSymbols] = useState<string[]>(["BTC/USD"]);
+  const [symbols, setSymbols] = useState<string[]>(["BTC/EUR"]);
   const [customSymbol, setCustomSymbol] = useState("");
   const [timeframe, setTimeframe] = useState("1h");
   const [backtestStart, setBacktestStart] = useState("2024-01-01T00:00");
