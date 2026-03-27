@@ -18,6 +18,11 @@ secrets/
 # Keep .env.example — it documents required variables without real values
 !.env.example
 
+# Private project files — not for public repos
+CLAUDE.local.md
+.claude/settings.local.json
+reports/
+
 
 # =============================================================================
 # PYTHON
