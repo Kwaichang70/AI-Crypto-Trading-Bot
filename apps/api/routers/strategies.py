@@ -62,6 +62,7 @@ def _build_registry() -> dict[str, dict[str, Any]]:
     """
     from trading.strategies import (
         BreakoutStrategy,
+        DCARSIHybridStrategy,
         MACrossoverStrategy,
         ModelStrategy,
         RSIMeanReversionStrategy,
@@ -74,6 +75,7 @@ def _build_registry() -> dict[str, dict[str, Any]]:
         ("rsi_mean_reversion", RSIMeanReversionStrategy),
         ("breakout", BreakoutStrategy),
         ("model_strategy", ModelStrategy),
+        ("dca_rsi_hybrid", DCARSIHybridStrategy),
     ]
 
     for name, cls in entries:
