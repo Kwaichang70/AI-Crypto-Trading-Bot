@@ -104,6 +104,7 @@ def _get_strategy_registry() -> dict[str, Any]:
     if _STRATEGY_REGISTRY is None:
         from trading.strategies import (
             BreakoutStrategy,
+            DCARSIHybridStrategy,
             MACrossoverStrategy,
             ModelStrategy,
             RSIMeanReversionStrategy,
@@ -114,6 +115,7 @@ def _get_strategy_registry() -> dict[str, Any]:
             "rsi_mean_reversion": RSIMeanReversionStrategy,
             "breakout": BreakoutStrategy,
             "model_strategy": ModelStrategy,
+            "dca_rsi_hybrid": DCARSIHybridStrategy,
         }
     return _STRATEGY_REGISTRY
 

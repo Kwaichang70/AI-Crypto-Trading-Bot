@@ -12,6 +12,7 @@ Available strategies
 - **RSIMeanReversionStrategy** -- RSI overbought/oversold mean-reversion
 - **BreakoutStrategy** -- Donchian channel breakout with ATR scaling
 - **ModelStrategy** -- ML model-based strategy (Sprint 2 placeholder)
+- **DCARSIHybridStrategy** -- DCA + RSI hybrid (systematic accumulation)
 
 Usage::
 
@@ -24,6 +25,7 @@ Usage::
 """
 
 from trading.strategies.breakout import BreakoutStrategy
+from trading.strategies.dca_rsi_hybrid import DCARSIHybridStrategy
 from trading.strategies.ma_crossover import MACrossoverStrategy
 from trading.strategies.model_strategy import ModelStrategy
 from trading.strategies.rsi_mean_reversion import RSIMeanReversionStrategy
@@ -33,4 +35,5 @@ __all__ = [
     "RSIMeanReversionStrategy",
     "BreakoutStrategy",
     "ModelStrategy",
+    "DCARSIHybridStrategy",
 ]
