@@ -867,9 +867,9 @@ class LiveExecutionEngine(BaseExecutionEngine):
             # - Use the appropriate quote currency balance
             balance = await self._exchange.fetch_balance()
             total = balance.get("total", {})
-            # Try common quote currencies
-            for quote in ("USDT", "BUSD", "USD", "USDC"):
-                if quote in total and total[quote] is not None:
+            # Try common quote currencies (including EUR for European exchanges)
+            for quote in ("EUR", "USDT", "BUSD", "USD", "USDC"):
+                if quote in total and total[quote] is not None and float(total[quote]) > 0:
                     return Decimal(str(total[quote]))
 
             # Fallback: sum all position values
