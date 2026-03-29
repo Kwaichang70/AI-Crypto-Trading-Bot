@@ -14,6 +14,7 @@ Responsibilities
 - Expose the /api/v1/metrics endpoint (always available, no auth)
 - Start/stop RetrainingService when ml_auto_retrain=True (Sprint 23)
 - Recover orphaned paper/live runs left running after a crash/restart (Sprint 24)
+- Create TelegramNotifier when TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID are set
 
 The ``lifespan`` context manager is the recommended FastAPI pattern for
 startup/shutdown logic (replaces deprecated on_event handlers).
@@ -60,7 +61,7 @@ from api.rate_limit import setup_rate_limiting
 from common.logging import configure_logging
 from common.metrics import metrics
 
-__all__ = ["app", "create_app"]
+__all__ = ["app", "create_app", "get_telegram_notifier"]
 
 logger = structlog.get_logger(__name__)
 
@@ -79,6 +80,20 @@ _fgi_client: Any = None
 # ---------------------------------------------------------------------------
 _equity_prune_task: Any = None
 
+# ---------------------------------------------------------------------------
+# Module-level TelegramNotifier instance (None when not configured)
+# ---------------------------------------------------------------------------
+_telegram_notifier: Any = None
+
+
+def get_telegram_notifier() -> Any:
+    """Return the module-level TelegramNotifier, or None when not configured.
+
+    Used by routers that want to fire-and-forget trade/alert notifications
+    without importing the notifier class directly.
+    """
+    return _telegram_notifier
+
 
 # ---------------------------------------------------------------------------
 # Application lifespan
@@ -96,6 +111,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     3. Initialise SQLAlchemy async engine and connection pool
     4. Start RetrainingService if ml_auto_retrain=True (Sprint 23)
     5. Recover orphaned paper/live runs (Sprint 24)
+    6. Start Fear & Greed Index client (Sprint 32)
+    7. Telegram notifier (optional — requires TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID)
 
     Shutdown (after yield)
     ----------------------
@@ -104,7 +121,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     3. Close database engine (dispose connection pool)
     4. Log clean shutdown
     """
-    global _retraining_service
+    global _retraining_service, _telegram_notifier
 
     settings = get_settings()
 
@@ -261,6 +278,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
 
     # ------------------------------------------------------------------
+    # 7. Telegram notifier (optional)
+    # ------------------------------------------------------------------
+    if settings.telegram_bot_token and settings.telegram_chat_id:
+        try:
+            from trading.telegram import TelegramNotifier
+
+            _telegram_notifier = TelegramNotifier(
+                bot_token=settings.telegram_bot_token,
+                chat_id=settings.telegram_chat_id,
+            )
+            log.info("telegram.configured", chat_id=settings.telegram_chat_id)
+        except ImportError:
+            log.warning("telegram.skipped", reason="trading.telegram not importable")
+        except Exception:
+            log.warning("telegram.startup_error", exc_info=True)
+    else:
+        log.info("telegram.disabled", reason="TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set")
+
+    # ------------------------------------------------------------------
     # Future: Redis connection init goes here
     # ------------------------------------------------------------------
 
@@ -302,6 +338,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     if _fgi_client is not None:
         try:
             await _fgi_client.close()
+        except Exception:
+            pass
+
+    # Close TelegramNotifier session
+    if _telegram_notifier is not None:
+        try:
+            await _telegram_notifier.close()
         except Exception:
             pass
 

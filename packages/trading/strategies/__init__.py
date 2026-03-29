@@ -13,6 +13,7 @@ Available strategies
 - **BreakoutStrategy** -- Donchian channel breakout with ATR scaling
 - **ModelStrategy** -- ML model-based strategy (Sprint 2 placeholder)
 - **DCARSIHybridStrategy** -- DCA + RSI hybrid (systematic accumulation)
+- **GridTradingStrategy** -- Grid trading (buy low / sell high at fixed levels)
 
 Usage::
 
@@ -26,6 +27,7 @@ Usage::
 
 from trading.strategies.breakout import BreakoutStrategy
 from trading.strategies.dca_rsi_hybrid import DCARSIHybridStrategy
+from trading.strategies.grid_trading import GridTradingStrategy
 from trading.strategies.ma_crossover import MACrossoverStrategy
 from trading.strategies.model_strategy import ModelStrategy
 from trading.strategies.rsi_mean_reversion import RSIMeanReversionStrategy
@@ -36,4 +38,5 @@ __all__ = [
     "BreakoutStrategy",
     "ModelStrategy",
     "DCARSIHybridStrategy",
+    "GridTradingStrategy",
 ]

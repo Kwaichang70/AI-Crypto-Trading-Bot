@@ -72,6 +72,38 @@ _RUN_TASKS: dict[str, asyncio.Task[None]] = {}
 _LEARNING_INSTANCES: dict[str, Any] = {}
 
 
+# ---------------------------------------------------------------------------
+# Telegram trade notification helper
+# ---------------------------------------------------------------------------
+
+async def _notify_trade_telegram(trade_orm: TradeORM) -> None:
+    """
+    Fire-and-forget Telegram notification for a newly persisted trade.
+
+    Never raises -- failure to notify must never impact the flush path.
+
+    Parameters
+    ----------
+    trade_orm:
+        The persisted TradeORM row whose details will be formatted for Telegram.
+    """
+    try:
+        from api.main import get_telegram_notifier
+        notifier = get_telegram_notifier()
+        if notifier is None:
+            return
+        await notifier.send_trade(
+            symbol=trade_orm.symbol,
+            side=trade_orm.side,
+            quantity=str(trade_orm.quantity),
+            price=str(trade_orm.exit_price),
+            pnl=str(trade_orm.realised_pnl) if trade_orm.realised_pnl is not None else None,
+            run_id=str(trade_orm.run_id),
+        )
+    except Exception:
+        pass  # Never fail the flush path on notification errors
+
+
 @dataclass
 class _IncrementalFlushState:
     """Watermark state for incremental DB persistence during paper runs."""
@@ -105,6 +137,7 @@ def _get_strategy_registry() -> dict[str, Any]:
         from trading.strategies import (
             BreakoutStrategy,
             DCARSIHybridStrategy,
+            GridTradingStrategy,
             MACrossoverStrategy,
             ModelStrategy,
             RSIMeanReversionStrategy,
@@ -116,6 +149,7 @@ def _get_strategy_registry() -> dict[str, Any]:
             "breakout": BreakoutStrategy,
             "model_strategy": ModelStrategy,
             "dca_rsi_hybrid": DCARSIHybridStrategy,
+            "grid_trading": GridTradingStrategy,
         }
     return _STRATEGY_REGISTRY
 
@@ -461,6 +495,11 @@ async def _flush_incremental(
             except Exception:
                 await db.rollback()
                 log.exception("runs.incremental_flush_db_error")
+                trade_orms = []  # Do not notify on failed commit
+
+        # Fire-and-forget Telegram trade notifications (outside DB session)
+        for _trade_orm in trade_orms:
+            asyncio.create_task(_notify_trade_telegram(_trade_orm))
     except Exception:
         log.exception("runs.incremental_flush_session_failed")
 

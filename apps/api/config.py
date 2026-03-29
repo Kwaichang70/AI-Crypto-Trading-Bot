@@ -314,6 +314,18 @@ class Settings(BaseSettings):
     )
 
     # ------------------------------------------------------------------
+    # Telegram alerts (optional)
+    # ------------------------------------------------------------------
+    telegram_bot_token: str | None = Field(
+        default=None,
+        description="Telegram Bot API token for alerts (from @BotFather)",
+    )
+    telegram_chat_id: str | None = Field(
+        default=None,
+        description="Telegram chat/group ID to send alerts to",
+    )
+
+    # ------------------------------------------------------------------
     # Validators
     # ------------------------------------------------------------------
     @field_validator("database_url")
