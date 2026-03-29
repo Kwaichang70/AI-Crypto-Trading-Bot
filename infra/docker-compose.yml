@@ -161,6 +161,9 @@ services:
       ML_MIN_ACCURACY_THRESHOLD:    ${ML_MIN_ACCURACY_THRESHOLD:-0.38}
       ML_MAX_MODEL_VERSIONS:        ${ML_MAX_MODEL_VERSIONS:-5}
       ML_RETRAIN_INTERVAL_MINUTES:  ${ML_RETRAIN_INTERVAL_MINUTES:-60}
+      # -- Telegram alerts --
+      TELEGRAM_BOT_TOKEN:           ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID:             ${TELEGRAM_CHAT_ID:-}
     ports:
       - "${API_PORT:-8000}:8000"
     healthcheck:
