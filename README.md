@@ -4,12 +4,12 @@ A production-grade cryptocurrency trading platform with automated strategy execu
 
 ![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)
 ![Next.js 14](https://img.shields.io/badge/Next.js-14-black.svg)
-![Tests](https://img.shields.io/badge/tests-1444%20passing-brightgreen.svg)
+![Tests](https://img.shields.io/badge/tests-1500%2B%20passing-brightgreen.svg)
 ![Coverage](https://img.shields.io/badge/coverage-88%25-brightgreen.svg)
 
 ## Features
 
-- **4 Trading Strategies** — RSI Mean Reversion, MA Crossover, Breakout, ML Model
+- **6 Trading Strategies** — DCA+RSI Hybrid, Grid Trading, RSI Mean Reversion, MA Crossover, Breakout, ML Model
 - **3 Run Modes** — Backtest (historical), Paper (simulated live), Live (real orders)
 - **Adaptive Learning** — Self-improving parameter optimization from trade outcomes
 - **Risk Management** — Graduated circuit breaker, position sizing, daily loss limits
@@ -18,7 +18,10 @@ A production-grade cryptocurrency trading platform with automated strategy execu
 - **ML Training Pipeline** — Train and hot-swap scikit-learn models from the UI
 - **Fear & Greed Index** — Contrarian sentiment signal from alternative.me API
 - **Multi-Timeframe Analysis** — Higher-timeframe context for strategy decisions
-- **Prometheus + Grafana** — Production monitoring with auto-provisioned dashboard
+- **Telegram Alerts** — Trade notifications, error alerts, daily summaries to your phone
+- **Prometheus + Grafana** — Production monitoring with auto-provisioned 12-panel dashboard
+- **CSV Export** — Export trades, orders, fills, positions, and runs to CSV
+- **Dark/Light Mode** — System-aware theme toggle with localStorage persistence
 
 ## Tech Stack
 
@@ -69,6 +72,8 @@ The web dashboard provides:
 - **Optimize** — Parameter grid search with ranked results
 - **Models** — ML model management (train, retrain, activate, version history)
 - **Dark/Light Mode** — System-aware theme toggle
+- **Mobile Responsive** — Hamburger menu navigation for tablet/phone
+- **Toast Notifications** — Visual feedback for all user actions
 
 ---
 
@@ -76,6 +81,8 @@ The web dashboard provides:
 
 | Strategy | ID | Description |
 |----------|-----|-------------|
+| **DCA + RSI Hybrid** | `dca_rsi_hybrid` | Systematic buying every N bars with RSI-based dip boost and profit taking. Trades in ALL market conditions. |
+| **Grid Trading** | `grid_trading` | Buy/sell at configurable grid levels above/below reference price. Profits from price oscillations. |
 | RSI Mean Reversion | `rsi_mean_reversion` | RSI crossover signals with configurable oversold/overbought thresholds |
 | MA Crossover | `ma_crossover` | Fast/slow moving average crossover with trend confirmation |
 | Breakout | `breakout` | Donchian channel breakout with ATR-based position sizing |
@@ -101,6 +108,25 @@ The bot can learn from its own trades and improve over time:
 5. **Reporting** — Daily/weekly reports, 9 alert types (circuit breaker, rollback, ATH)
 
 Enable via the New Run page: toggle "Enable Adaptive Learning" for paper/live runs.
+
+---
+
+## Telegram Alerts
+
+Get notified on your phone for every trade, error, and circuit breaker event.
+
+```bash
+# 1. Create a bot via @BotFather on Telegram
+# 2. Add to your .env:
+TELEGRAM_BOT_TOKEN=your-bot-token
+TELEGRAM_CHAT_ID=your-chat-id
+```
+
+You'll receive:
+- 🟢 **BUY** / 🔴 **SELL** notifications with symbol, quantity, price, and PnL
+- 🚨 **Circuit breaker** activations
+- ↩️ **Rollback** alerts when adaptive learning reverts parameters
+- 📋 **Daily summaries** with equity, PnL, and trade count
 
 ---
 
@@ -158,7 +184,10 @@ All endpoints (except `/health` and `/metrics`) require `X-API-Key` header when 
 │           └── lib/             # API client, types, CSV export
 ├── packages/
 │   ├── trading/                 # Core trading engine
-│   │   ├── strategies/          # RSI, MA Crossover, Breakout, Model
+│   │   ├── strategies/          # DCA+RSI, Grid, RSI, MA Crossover, Breakout, Model
+│   │   ├── telegram.py          # Telegram Bot API notifications
+│   │   ├── ccxt_retry.py        # Exponential backoff for exchange calls
+│   │   ├── ccxt_errors.py       # User-friendly CCXT error translation
 │   │   ├── engines/             # Paper + Live execution engines
 │   │   ├── adaptive_learning.py # Background learning pipeline
 │   │   ├── adaptive_optimizer.py # Conservative parameter tuning
@@ -190,7 +219,7 @@ All endpoints (except `/health` and `/metrics`) require `X-API-Key` header when 
 │   ├── db_maintenance.sh        # Weekly VACUUM + cleanup
 │   └── install_maintenance_cron.sh
 ├── tests/
-│   ├── unit/                    # 1400+ unit tests
+│   ├── unit/                    # 1500+ unit tests
 │   └── integration/             # API integration tests
 └── docs/                        # Architecture, risk model, strategy guide
 ```
