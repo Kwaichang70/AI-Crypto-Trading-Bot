@@ -239,10 +239,26 @@ class LiveExecutionEngine(BaseExecutionEngine):
             ccxt_side = order.side.value  # 'buy' or 'sell'
             price_param = str(order.price) if order.price is not None else None
 
-            # TODO: implement full exchange integration
-            # - Add retry with exponential backoff for transient errors
-            # - Handle rate limiting (exchange.rateLimit)
-            # - Add idempotency via clientOrderId where supported
+            # Coinbase requires a price for market BUY orders on spot markets
+            # to calculate total cost (amount * price). Fetch last price if needed.
+            if (
+                price_param is None
+                and ccxt_order_type == "market"
+                and ccxt_side == "buy"
+                and self._exchange.id == "coinbase"
+            ):
+                try:
+                    ticker = await ccxt_retry(
+                        self._exchange.fetch_ticker, order.symbol,
+                        max_retries=1, base_delay=0.5, operation=f"fetch_ticker_for_buy({order.symbol})",
+                    )
+                    price_param = str(ticker.get("last", "0"))
+                except Exception:
+                    self._log.warning(
+                        "live.market_buy_price_fallback_failed",
+                        symbol=order.symbol,
+                    )
+
             params: dict[str, Any] = {}
             if order.client_order_id:
                 params["clientOrderId"] = order.client_order_id
