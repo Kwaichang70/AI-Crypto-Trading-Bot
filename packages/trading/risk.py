@@ -47,17 +47,17 @@ class RiskParameters:
     """
 
     # Position limits
-    max_open_positions: int = 3
-    max_position_size_pct: float = 0.10   # max 10% of equity per position
-    max_portfolio_exposure_pct: float = 0.30  # max 30% of equity in open positions
+    max_open_positions: int = 10
+    max_position_size_pct: float = 0.15   # max 15% of equity per position
+    max_portfolio_exposure_pct: float = 0.60  # max 60% of equity in open positions
 
     # Trade-level risk
-    per_trade_risk_pct: float = 0.01      # risk 1% of equity per trade
+    per_trade_risk_pct: float = 0.02      # risk 2% of equity per trade
     max_order_size_quote: Decimal = Decimal("10000")  # hard cap per order
 
     # Run-level circuit breakers
-    max_daily_loss_pct: float = 0.05      # halt if daily loss >= 5% of start equity
-    max_drawdown_pct: float = 0.15        # halt if drawdown >= 15% of peak equity
+    max_daily_loss_pct: float = 0.08      # halt if daily loss >= 8% of start equity
+    max_drawdown_pct: float = 0.30        # halt if drawdown >= 30% of peak equity
 
     # Fee / slippage model (Coinbase Advanced Trade lowest tier)
     taker_fee_pct: float = 0.006          # 0.60% taker fee
