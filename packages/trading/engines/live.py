@@ -897,11 +897,14 @@ class LiveExecutionEngine(BaseExecutionEngine):
                 user_message=translate_ccxt_error(exc),
             )
 
-        # Fallback: compute from local tracking
-        self._log.error(
-            "live.equity_fallback_unreliable",
-            msg="Falling back to position-only equity -- cash balance unknown. "
-                "Risk checks may be inaccurate until exchange balance is available.",
+        # Fallback: use peak_equity (last known good value) or position tracking
+        if self._peak_equity > Decimal("0"):
+            self._log.debug("live.equity_fallback_to_peak", peak=str(self._peak_equity))
+            return self._peak_equity
+
+        self._log.warning(
+            "live.equity_fallback_to_positions",
+            msg="Using position-only equity -- cash balance unknown.",
         )
         total = Decimal("0")
         for pos in self._positions.values():
@@ -913,7 +916,10 @@ class LiveExecutionEngine(BaseExecutionEngine):
         """
         Return the highest equity observed during this run.
 
-        Updates the internal peak tracker on each call.
+        Uses the INTERNAL peak tracker (seeded at startup from current
+        exchange balance). This ensures drawdown is calculated relative
+        to THIS run's starting equity, not a historical account high
+        from before this run started.
 
         Returns
         -------
@@ -921,7 +927,10 @@ class LiveExecutionEngine(BaseExecutionEngine):
             Peak equity (highest equity seen since engine start).
         """
         current = await self._fetch_equity()
-        if current > self._peak_equity:
+        # If peak is 0 (not yet seeded), initialize to current equity
+        if self._peak_equity <= Decimal("0"):
+            self._peak_equity = current
+        elif current > self._peak_equity:
             self._peak_equity = current
         return self._peak_equity
 
