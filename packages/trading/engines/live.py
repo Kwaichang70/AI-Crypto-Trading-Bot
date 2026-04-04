@@ -22,6 +22,7 @@ functional.
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import UTC, datetime
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any
@@ -89,6 +90,10 @@ class LiveExecutionEngine(BaseExecutionEngine):
         # Peak equity tracker for drawdown calculation
         self._peak_equity: Decimal = Decimal("0")
 
+        # Balance cache: (result, monotonic timestamp) — 10s TTL
+        self._balance_cache: dict[str, Any] | None = None
+        self._balance_cache_time: float = 0.0
+
         # Map internal order_id -> exchange order ID for reconciliation
         self._exchange_order_map: dict[UUID, str] = {}
 
@@ -143,6 +148,32 @@ class LiveExecutionEngine(BaseExecutionEngine):
                 "to place real orders. This is a safety gate to prevent "
                 "accidental capital deployment."
             )
+
+    async def _fetch_balance_cached(self) -> dict[str, Any] | None:
+        """
+        Fetch account balance with a 10-second TTL cache.
+
+        Returns None on failure (CR-002: never re-raises).
+        """
+        now = time.monotonic()
+        if self._balance_cache is not None and (now - self._balance_cache_time) < 10.0:
+            return self._balance_cache
+
+        try:
+            balance = await ccxt_retry(
+                self._exchange.fetch_balance,
+                max_retries=2, base_delay=1.0, operation="fetch_balance",
+            )
+            self._balance_cache = balance
+            self._balance_cache_time = now
+            return dict(balance)
+        except Exception as exc:
+            self._log.warning(
+                "live.balance_fetch_failed",
+                error=str(exc),
+                user_message=translate_ccxt_error(exc),
+            )
+            return None
 
     # ------------------------------------------------------------------
     # CCXT response mapping
@@ -420,14 +451,15 @@ class LiveExecutionEngine(BaseExecutionEngine):
 
         try:
             if exchange_order_id:
-                # TODO: implement full exchange integration
-                # - Handle 'order already filled' race condition gracefully
-                # - Add retry for transient errors
-                await self._exchange.cancel_order(
-                    id=exchange_order_id,
-                    symbol=order.symbol,
+                await ccxt_retry(
+                    self._exchange.cancel_order,
+                    exchange_order_id,
+                    order.symbol,
+                    max_retries=2, base_delay=1.0,
+                    operation=f"cancel_order({order.symbol})",
                 )
 
+            # CR-003: transition inside success branch only
             order = self._transition(order, OrderStatus.CANCELED)
 
             self._log.info(
@@ -437,8 +469,16 @@ class LiveExecutionEngine(BaseExecutionEngine):
                 symbol=order.symbol,
             )
 
+        except (ccxt_async.OrderNotFound, ccxt_async.InvalidOrder):
+            # Race condition: order was already filled on exchange
+            self._log.info(
+                "live.cancel_already_terminal",
+                order_id=str(order_id),
+                exchange_order_id=exchange_order_id,
+            )
+            order = await self._reconcile_order(order)
+
         except Exception as exc:
-            # The order may have already been filled on the exchange
             self._log.warning(
                 "live.cancel_failed",
                 order_id=str(order_id),
@@ -446,7 +486,6 @@ class LiveExecutionEngine(BaseExecutionEngine):
                 error=str(exc),
                 user_message=translate_ccxt_error(exc),
             )
-            # Reconcile: fetch actual state from exchange
             order = await self._reconcile_order(order)
 
         return order
@@ -794,12 +833,12 @@ class LiveExecutionEngine(BaseExecutionEngine):
             return order
 
         try:
-            # TODO: implement full exchange integration
-            # - Handle exchange-specific response formats
-            # - Retry on transient failures
-            ccxt_order = await self._exchange.fetch_order(
-                id=exchange_order_id,
-                symbol=order.symbol,
+            ccxt_order = await ccxt_retry(
+                self._exchange.fetch_order,
+                exchange_order_id,
+                order.symbol,
+                max_retries=2, base_delay=1.0,
+                operation=f"reconcile_order({order.symbol})",
             )
 
             # Update fill data
@@ -877,25 +916,13 @@ class LiveExecutionEngine(BaseExecutionEngine):
         Decimal:
             Total account equity in quote currency.
         """
-        try:
-            # TODO: implement full exchange integration
-            # - Cache balance to avoid excessive API calls
-            # - Use the appropriate quote currency balance
-            balance = await self._exchange.fetch_balance()
+        balance = await self._fetch_balance_cached()
+        if balance is not None:
             total = balance.get("total", {})
-            # Try common quote currencies (including EUR for European exchanges)
             for quote in ("EUR", "USDT", "BUSD", "USD", "USDC"):
                 if quote in total and total[quote] is not None and float(total[quote]) > 0:
                     return Decimal(str(total[quote]))
-
-            # Fallback: sum all position values
             self._log.warning("live.equity_fallback_to_local")
-        except Exception as exc:
-            self._log.warning(
-                "live.balance_fetch_failed",
-                error=str(exc),
-                user_message=translate_ccxt_error(exc),
-            )
 
         # Fallback: use peak_equity (last known good value) or position tracking
         if self._peak_equity > Decimal("0"):
@@ -966,11 +993,55 @@ class LiveExecutionEngine(BaseExecutionEngine):
         dict[str, Position]:
             Updated positions keyed by symbol.
         """
-        # TODO: implement full exchange integration
-        # - Fetch exchange balances
-        # - Reconcile with local position state
-        # - Handle positions opened outside the bot
-        self._log.info("live.sync_positions_stub")
+        balance = await self._fetch_balance_cached()
+        if balance is None:
+            self._log.warning("live.sync_positions_balance_unavailable")
+            return dict(self._positions)
+
+        markets: dict[str, Any] = getattr(self._exchange, "markets", {}) or {}
+        total_balances: dict[str, Any] = balance.get("total", {})
+
+        seen_symbols: set[str] = set()
+
+        for asset, amount_raw in total_balances.items():
+            if amount_raw is None or float(amount_raw) <= 0:
+                continue
+            # Find a market pair for this asset
+            for symbol, market in markets.items():
+                if market.get("base") == asset:
+                    seen_symbols.add(symbol)
+                    amount = Decimal(str(amount_raw))
+                    existing = self._positions.get(symbol)
+                    if existing is not None:
+                        # Preserve local tracking (entry_price, realised_pnl)
+                        self._positions[symbol] = existing.model_copy(
+                            update={"quantity": amount}
+                        )
+                    else:
+                        # External position — entry_price unknown
+                        self._positions[symbol] = Position(
+                            symbol=symbol,
+                            run_id=self._run_id,
+                            quantity=amount,
+                            average_entry_price=Decimal("0"),
+                            current_price=Decimal("0"),
+                        )
+                    break
+
+        # Zero out disappeared positions
+        for symbol in list(self._positions.keys()):
+            if symbol not in seen_symbols:
+                pos = self._positions[symbol]
+                if not pos.is_flat:
+                    self._positions[symbol] = pos.model_copy(
+                        update={"quantity": Decimal("0")}
+                    )
+
+        self._log.info(
+            "live.sync_positions_completed",
+            active_positions=len([p for p in self._positions.values() if not p.is_flat]),
+            total_tracked=len(self._positions),
+        )
         return dict(self._positions)
 
     # ------------------------------------------------------------------
@@ -1024,15 +1095,25 @@ class LiveExecutionEngine(BaseExecutionEngine):
         """
         # Cancel all open orders directly via exchange (bypass live gate for shutdown)
         open_orders = self.get_open_orders()
+        cancel_count = 0
         for order in open_orders:
             try:
                 exchange_order_id = self._exchange_order_map.get(order.order_id)
                 if exchange_order_id:
-                    await self._exchange.cancel_order(
-                        id=exchange_order_id,
-                        symbol=order.symbol,
+                    await ccxt_retry(
+                        self._exchange.cancel_order,
+                        exchange_order_id,
+                        order.symbol,
+                        max_retries=1, base_delay=0.5,
+                        operation=f"shutdown_cancel({order.symbol})",
                     )
                 self._transition(order, OrderStatus.CANCELED)
+                cancel_count += 1
+            except (ccxt_async.OrderNotFound, ccxt_async.InvalidOrder):
+                self._log.debug(
+                    "live.cancel_already_terminal_on_stop",
+                    order_id=str(order.order_id),
+                )
             except Exception:
                 self._log.warning(
                     "live.cancel_failed_on_stop",
@@ -1056,6 +1137,7 @@ class LiveExecutionEngine(BaseExecutionEngine):
             "live.engine_stopped",
             total_orders=len(self._orders),
             total_fills=sum(len(f) for f in self._fills.values()),
+            canceled_on_stop=cancel_count,
         )
 
         await super().on_stop()

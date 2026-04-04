@@ -13,6 +13,7 @@ This module is intentionally *synchronous* -- zero I/O in the hot path.
 
 from __future__ import annotations
 
+import math
 from decimal import ROUND_DOWN, Decimal
 from typing import Sequence
 
@@ -182,6 +183,14 @@ class DefaultRiskManager(BaseRiskManager):
             6. Return min of all values, rounded DOWN to 8 decimal places.
         """
         if equity <= Decimal(0) or entry_price <= Decimal(0):
+            return Decimal(0)
+
+        if not math.isfinite(confidence):
+            self._log.warning(
+                "risk.invalid_confidence",
+                confidence=confidence,
+                msg="Confidence is NaN or Inf; returning zero position size.",
+            )
             return Decimal(0)
 
         confidence_d = Decimal(str(max(0.0, min(1.0, confidence))))

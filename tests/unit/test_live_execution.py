@@ -564,11 +564,11 @@ class TestSubmitOrder:
         order = _make_market_order(side=OrderSide.BUY, quantity=qty)
         await engine.submit_order(order)
         ex.create_order.assert_called_once_with(
-            symbol=_SYMBOL,
-            type="market",
-            side="buy",
-            amount=str(qty),
-            price=None,
+            _SYMBOL,
+            "market",
+            "buy",
+            str(qty),
+            None,
             params={"clientOrderId": order.client_order_id},
         )
 
@@ -602,9 +602,10 @@ class TestCancelOrder:
 
         await engine.cancel_order(submitted.order_id)
 
+        # ccxt_retry passes positional args to the underlying exchange call
         ex.cancel_order.assert_called_once_with(
-            id=exchange_order_id,
-            symbol=_SYMBOL,
+            exchange_order_id,
+            _SYMBOL,
         )
 
     @pytest.mark.asyncio

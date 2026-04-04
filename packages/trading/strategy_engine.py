@@ -253,6 +253,11 @@ class StrategyEngine:
         """Direct access to the portfolio accounting instance."""
         return self._portfolio
 
+    @property
+    def circuit_breaker(self) -> Any:
+        """The circuit breaker instance, or None if not configured."""
+        return self._circuit_breaker
+
     # ------------------------------------------------------------------
     # Lifecycle: start
     # ------------------------------------------------------------------

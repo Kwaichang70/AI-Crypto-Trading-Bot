@@ -68,6 +68,9 @@ logger = structlog.get_logger(__name__)
 # ---------------------------------------------------------------------------
 _RUN_TASKS: dict[str, asyncio.Task[None]] = {}
 
+# Engine registry -- keyed by run_id for circuit breaker and live introspection
+_RUN_ENGINES: dict[str, Any] = {}
+
 # Adaptive learning task instances -- keyed by run_id for API state queries
 _LEARNING_INSTANCES: dict[str, Any] = {}
 
@@ -916,6 +919,7 @@ async def _run_paper_engine(
             config=engine_config if engine_config else None,
         )
 
+        _RUN_ENGINES[run_id_str] = engine
         await engine.start(run_id_str)
         log.info("runs.paper_engine_running")
 
@@ -1039,6 +1043,7 @@ async def _run_paper_engine(
 
         # Remove from task registry
         _RUN_TASKS.pop(run_id_str, None)
+        _RUN_ENGINES.pop(run_id_str, None)
         _LEARNING_INSTANCES.pop(run_id_str, None)
 
         # Final incremental flush captures any remaining data not covered by
@@ -1225,6 +1230,7 @@ async def _run_live_engine(
             config=live_engine_config if live_engine_config else None,
         )
 
+        _RUN_ENGINES[run_id_str] = engine
         await engine.start(run_id_str)
         log.info("runs.live_engine_running")
 
@@ -1345,6 +1351,7 @@ async def _run_live_engine(
 
         # Remove from task registry
         _RUN_TASKS.pop(run_id_str, None)
+        _RUN_ENGINES.pop(run_id_str, None)
         _LEARNING_INSTANCES.pop(run_id_str, None)
 
         # Final incremental flush captures any remaining data not covered by
@@ -2438,6 +2445,7 @@ async def stop_run(
 
     # Cancel the background task if one exists for this run
     task = _RUN_TASKS.pop(str(run_id), None)
+    _RUN_ENGINES.pop(str(run_id), None)
     if task is not None and not task.done():
         task.cancel()
         log.info("runs.engine_task_cancelled", run_id=str(run_id))

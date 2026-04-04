@@ -66,6 +66,7 @@ model_dir : str
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 from collections.abc import Sequence
 from decimal import Decimal
@@ -287,6 +288,24 @@ class ModelStrategy(BaseStrategy):
     # Sprint 23: hot-swap check
     # ------------------------------------------------------------------ #
 
+    def _load_model_with_timeout(self, path: str, timeout: float = 5.0) -> Any:
+        """Load a model file with a timeout to prevent I/O hangs.
+
+        Uses a thread pool to enforce the timeout since joblib.load is
+        synchronous blocking I/O.
+        """
+        import joblib
+
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(joblib.load, path)
+        try:
+            return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            executor.shutdown(wait=False)
+            raise
+        finally:
+            executor.shutdown(wait=False)
+
     def _check_model_version(self, symbol: str) -> None:
         """Check sidecar JSON for a new model version and hot-swap if changed.
 
@@ -318,9 +337,7 @@ class ModelStrategy(BaseStrategy):
 
             # Version changed — reload model
             new_model_path: str = data["model_path"]
-            import joblib
-
-            new_model = joblib.load(new_model_path)
+            new_model = self._load_model_with_timeout(new_model_path)
             self._model = new_model
             self._model_loaded = True
             self._active_version_id = sidecar_version_id

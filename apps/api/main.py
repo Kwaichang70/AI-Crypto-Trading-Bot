@@ -241,12 +241,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
         _sf = _get_sf()
 
-        while True:
-            try:
-                await _asyncio.sleep(86400)  # Sleep first, prune after 24 h
-            except _asyncio.CancelledError:
-                break
+        # CR-008: 60s startup delay to let connection pool settle
+        try:
+            await _asyncio.sleep(60)
+        except _asyncio.CancelledError:
+            return
 
+        while True:
             try:
                 cutoff = _dt.now(_UTC) - _td(
                     days=settings.equity_snapshot_retention_days
@@ -266,8 +267,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                             cutoff=str(cutoff),
                             retention_days=settings.equity_snapshot_retention_days,
                         )
+            except _asyncio.CancelledError:
+                break
             except Exception:
                 log.warning("equity_prune.error", exc_info=True)
+
+            try:
+                await _asyncio.sleep(86400)
+            except _asyncio.CancelledError:
+                break
 
     _equity_prune_task = _asyncio.create_task(
         _equity_prune_loop(), name="equity_prune"
@@ -459,7 +467,7 @@ def _register_routes(application: FastAPI) -> None:
             "timestamp": dt.now(tz=UTC).isoformat(),
         }
 
-    from api.routers import learning, ml, optimize, orders, portfolio, runs, strategies
+    from api.routers import circuit_breaker, learning, ml, optimize, orders, portfolio, runs, strategies
 
     _V1 = "/api/v1"
 
@@ -467,6 +475,13 @@ def _register_routes(application: FastAPI) -> None:
         runs.router,
         prefix=_V1,
         tags=["runs"],
+        dependencies=[Depends(require_api_key)],
+    )
+
+    application.include_router(
+        circuit_breaker.router,
+        prefix=_V1,
+        tags=["circuit-breaker"],
         dependencies=[Depends(require_api_key)],
     )
 
