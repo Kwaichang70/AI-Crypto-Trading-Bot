@@ -15,6 +15,9 @@ this strategy generates BUY signals at a regular cadence (every
   chance to capture gains without waiting for the next DCA cycle.
 - **FGI Integration:** Apply the same Fear & Greed Index confidence
   adjustment as the RSI mean-reversion strategy.
+- **CoinGecko Integration:** BTC dominance and market cap momentum signals.
+- **FRED Macro Integration:** Yield curve regime adjustment.
+- **Whale Alert Integration:** On-chain flow accumulation/distribution signal.
 
 Parameters
 ----------
@@ -61,7 +64,7 @@ Take-profit SELL confidence scales with how far RSI is above
 
     confidence = (rsi - take_profit_rsi) / (100 - take_profit_rsi)
 
-Both clamped to [0.1, 1.0] before FGI adjustment.
+Both clamped to [0.1, 1.0] before signal boosts.
 """
 
 from __future__ import annotations
@@ -268,6 +271,136 @@ class DCARSIHybridStrategy(BaseStrategy):
         return 0.0
 
     # ------------------------------------------------------------------
+    # CoinGecko BTC dominance confidence modifier
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _btc_dominance_boost(dominance: float | None, direction: SignalDirection) -> float:
+        """
+        Return a confidence delta based on BTC dominance from CoinGecko.
+
+        High BTC dominance (>55%) signals risk-off for altcoins — whales
+        are rotating into BTC and out of alts.  Low dominance (<45%)
+        signals alt-season — altcoins outperform BTC in these regimes.
+
+        Note: This boost is only meaningful for non-BTC trading pairs.
+        For BTC itself the signal is directionally neutral.
+
+        Parameters
+        ----------
+        dominance : float | None
+            BTC market cap dominance percentage in [0, 100], or None if
+            not available.
+        direction : SignalDirection
+            The signal direction (BUY or SELL).
+
+        Returns
+        -------
+        float
+            Confidence delta in [-0.05, +0.05].  Returns 0.0 if
+            ``dominance`` is None (signal not available).
+        """
+        if dominance is None:
+            return 0.0
+        if direction == SignalDirection.BUY:
+            if dominance < 45.0:
+                return 0.05    # Alt rally regime: accumulation favourable
+            if dominance > 55.0:
+                return -0.05   # BTC dominance surge: risk-off for alts
+        elif direction == SignalDirection.SELL:
+            if dominance < 45.0:
+                return -0.05   # Alt rally: less conviction for take-profit
+            if dominance > 55.0:
+                return 0.05    # Risk-off: more conviction for profit-taking
+        return 0.0
+
+    # ------------------------------------------------------------------
+    # FRED yield curve macro confidence modifier
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _macro_boost(yield_spread: float | None, direction: SignalDirection) -> float:
+        """
+        Return a confidence delta based on the 10Y-2Y yield curve spread.
+
+        The yield curve spread is a well-established macro indicator:
+        - Deep inversion (< -0.5%) historically precedes recession and
+          broad risk-asset drawdowns including crypto.
+        - Healthy positive spread (> 1.0%) indicates a growth-favouring
+          macro environment where risk assets tend to perform well.
+
+        Parameters
+        ----------
+        yield_spread : float | None
+            10-Year minus 2-Year Treasury yield spread in percent.
+            Negative = inverted curve.  None if not available.
+        direction : SignalDirection
+            The signal direction (BUY or SELL).
+
+        Returns
+        -------
+        float
+            Confidence delta in [-0.05, +0.05].  Returns 0.0 if
+            ``yield_spread`` is None (signal not available).
+        """
+        if yield_spread is None:
+            return 0.0
+        if direction == SignalDirection.BUY:
+            if yield_spread < -0.5:
+                return -0.05  # Deep inversion: recession risk, reduce BUY conviction
+            if yield_spread > 1.0:
+                return 0.05   # Healthy curve: risk-on macro, increase BUY conviction
+        elif direction == SignalDirection.SELL:
+            if yield_spread < -0.5:
+                return 0.05   # Recession signal: more conviction for taking profit
+            if yield_spread > 1.0:
+                return -0.05  # Healthy macro: less urgency to take profit
+        return 0.0
+
+    # ------------------------------------------------------------------
+    # Whale Alert on-chain flow confidence modifier
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _whale_flow_boost(net_flow: float | None, direction: SignalDirection) -> float:
+        """
+        Return a confidence delta based on Whale Alert net exchange flow.
+
+        Large on-chain flows indicate institutional activity:
+        - Heavy outflow from exchanges (negative net_flow) → whales moving
+          assets to cold storage.  Historically bullish (accumulation).
+        - Heavy inflow to exchanges (positive net_flow) → whales depositing
+          to sell.  Historically bearish (distribution / sell pressure).
+
+        Parameters
+        ----------
+        net_flow : float | None
+            Net USD flow: positive = to exchanges, negative = from exchanges.
+            None if not available.
+        direction : SignalDirection
+            The signal direction (BUY or SELL).
+
+        Returns
+        -------
+        float
+            Confidence delta in [-0.05, +0.05].  Returns 0.0 if
+            ``net_flow`` is None (signal not available).
+        """
+        if net_flow is None:
+            return 0.0
+        if direction == SignalDirection.BUY:
+            if net_flow < -5_000_000:
+                return 0.05    # Heavy outflow: whale accumulation signal
+            if net_flow > 5_000_000:
+                return -0.05   # Heavy inflow: distribution / sell pressure
+        elif direction == SignalDirection.SELL:
+            if net_flow < -5_000_000:
+                return -0.05   # Accumulation: less conviction for selling
+            if net_flow > 5_000_000:
+                return 0.05    # Distribution: more conviction for taking profit
+        return 0.0
+
+    # ------------------------------------------------------------------
     # Parameter validation
     # ------------------------------------------------------------------
 
@@ -307,7 +440,8 @@ class DCARSIHybridStrategy(BaseStrategy):
         bars : Sequence[OHLCVBar]
             OHLCV bars ordered oldest-first. The last element is current.
         mtf_context : MultiTimeframeContext | None
-            Optional higher-timeframe context including Fear & Greed Index.
+            Optional higher-timeframe context including Fear & Greed Index,
+            CoinGecko dominance, FRED yield curve, and Whale Alert flow.
 
         Returns
         -------
@@ -346,10 +480,17 @@ class DCARSIHybridStrategy(BaseStrategy):
 
         current_bar = bars[-1]
 
-        # Extract FGI value once; used for both BUY and SELL paths.
+        # Extract external signal values once; used for both BUY and SELL paths.
         fgi_value: int | None = None
-        if mtf_context is not None and mtf_context.fear_greed_index is not None:
-            fgi_value = mtf_context.fear_greed_index
+        btc_dominance: float | None = None
+        yield_curve_spread: float | None = None
+        whale_net_flow: float | None = None
+        if mtf_context is not None:
+            if mtf_context.fear_greed_index is not None:
+                fgi_value = mtf_context.fear_greed_index
+            btc_dominance = mtf_context.btc_dominance
+            yield_curve_spread = mtf_context.yield_curve_spread
+            whale_net_flow = mtf_context.whale_net_flow
 
         # ------------------------------------------------------------------
         # Path A: DCA bar — consider buying
@@ -383,10 +524,26 @@ class DCARSIHybridStrategy(BaseStrategy):
 
             # Apply Fear & Greed Index boost.
             if fgi_value is not None:
-                fgi_boost = DCARSIHybridStrategy._fgi_confidence_boost(
+                confidence += DCARSIHybridStrategy._fgi_confidence_boost(
                     fgi_value, SignalDirection.BUY
                 )
-                confidence = min(1.0, max(0.1, confidence + fgi_boost))
+
+            # Apply BTC dominance boost.
+            confidence += DCARSIHybridStrategy._btc_dominance_boost(
+                btc_dominance, SignalDirection.BUY
+            )
+
+            # Apply yield curve macro boost.
+            confidence += DCARSIHybridStrategy._macro_boost(
+                yield_curve_spread, SignalDirection.BUY
+            )
+
+            # Apply whale flow boost.
+            confidence += DCARSIHybridStrategy._whale_flow_boost(
+                whale_net_flow, SignalDirection.BUY
+            )
+
+            confidence = min(1.0, max(0.1, confidence))
 
             signal = Signal(
                 strategy_id=self._strategy_id,
@@ -402,6 +559,9 @@ class DCARSIHybridStrategy(BaseStrategy):
                     "bar_counter": self._bar_counter,
                     "is_dca_bar": True,
                     "fear_greed_index": fgi_value,
+                    "btc_dominance": btc_dominance,
+                    "yield_curve_spread": yield_curve_spread,
+                    "whale_net_flow": whale_net_flow,
                 },
             )
 
@@ -427,10 +587,26 @@ class DCARSIHybridStrategy(BaseStrategy):
 
             # Apply Fear & Greed Index boost.
             if fgi_value is not None:
-                fgi_boost = DCARSIHybridStrategy._fgi_confidence_boost(
+                confidence += DCARSIHybridStrategy._fgi_confidence_boost(
                     fgi_value, SignalDirection.SELL
                 )
-                confidence = min(1.0, max(0.1, confidence + fgi_boost))
+
+            # Apply BTC dominance boost.
+            confidence += DCARSIHybridStrategy._btc_dominance_boost(
+                btc_dominance, SignalDirection.SELL
+            )
+
+            # Apply yield curve macro boost.
+            confidence += DCARSIHybridStrategy._macro_boost(
+                yield_curve_spread, SignalDirection.SELL
+            )
+
+            # Apply whale flow boost.
+            confidence += DCARSIHybridStrategy._whale_flow_boost(
+                whale_net_flow, SignalDirection.SELL
+            )
+
+            confidence = min(1.0, max(0.1, confidence))
 
             sell_amount = position_size * take_profit_pct
 
@@ -448,6 +624,9 @@ class DCARSIHybridStrategy(BaseStrategy):
                     "bar_counter": self._bar_counter,
                     "is_dca_bar": False,
                     "fear_greed_index": fgi_value,
+                    "btc_dominance": btc_dominance,
+                    "yield_curve_spread": yield_curve_spread,
+                    "whale_net_flow": whale_net_flow,
                 },
             )
 

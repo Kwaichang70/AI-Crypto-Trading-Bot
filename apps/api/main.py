@@ -15,6 +15,7 @@ Responsibilities
 - Start/stop RetrainingService when ml_auto_retrain=True (Sprint 23)
 - Recover orphaned paper/live runs left running after a crash/restart (Sprint 24)
 - Create TelegramNotifier when TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID are set
+- Start CoinGeckoClient, FREDClient, WhaleAlertClient on startup (Sprint 37)
 
 The ``lifespan`` context manager is the recommended FastAPI pattern for
 startup/shutdown logic (replaces deprecated on_event handlers).
@@ -76,6 +77,21 @@ _retraining_service: Any = None
 _fgi_client: Any = None
 
 # ---------------------------------------------------------------------------
+# Module-level CoinGeckoClient instance (Sprint 37)
+# ---------------------------------------------------------------------------
+_coingecko_client: Any = None
+
+# ---------------------------------------------------------------------------
+# Module-level FREDClient instance (Sprint 37)
+# ---------------------------------------------------------------------------
+_fred_client: Any = None
+
+# ---------------------------------------------------------------------------
+# Module-level WhaleAlertClient instance (Sprint 37)
+# ---------------------------------------------------------------------------
+_whale_alert_client: Any = None
+
+# ---------------------------------------------------------------------------
 # Module-level equity pruning task
 # ---------------------------------------------------------------------------
 _equity_prune_task: Any = None
@@ -113,15 +129,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     5. Recover orphaned paper/live runs (Sprint 24)
     6. Start Fear & Greed Index client (Sprint 32)
     7. Telegram notifier (optional — requires TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID)
+    8. Start CoinGecko client (Sprint 37 — always-on, no key required)
+    9. Start FRED client (Sprint 37 — requires FRED_API_KEY)
+    10. Start Whale Alert client (Sprint 37 — requires WHALE_ALERT_API_KEY)
 
     Shutdown (after yield)
     ----------------------
     1. Cancel all active paper/live trading engine tasks
     2. Stop RetrainingService if running
-    3. Close database engine (dispose connection pool)
-    4. Log clean shutdown
+    3. Close all external signal clients (FGI, CoinGecko, FRED, Whale Alert)
+    4. Close database engine (dispose connection pool)
+    5. Log clean shutdown
     """
     global _retraining_service, _telegram_notifier
+    global _coingecko_client, _fred_client, _whale_alert_client
 
     settings = get_settings()
 
@@ -305,6 +326,78 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log.info("telegram.disabled", reason="TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set")
 
     # ------------------------------------------------------------------
+    # 8. CoinGecko client — always-on, no API key required (Sprint 37)
+    # ------------------------------------------------------------------
+    try:
+        from data.market_signals import CoinGeckoClient, set_global_client as _set_cg
+
+        _cg_instance = CoinGeckoClient()
+        _set_cg(_cg_instance)
+        # Warm up cache on startup (best-effort; never block startup)
+        try:
+            await _cg_instance.get_latest()
+            log.info("coingecko_client.warmed_up")
+        except Exception:
+            log.warning("coingecko_client.warmup_failed", exc_info=True)
+
+        _coingecko_client = _cg_instance
+        log.info("coingecko_client.started")
+    except ImportError:
+        log.info("coingecko_client.skipped", reason="aiohttp not installed")
+    except Exception:
+        log.warning("coingecko_client.startup_error", exc_info=True)
+
+    # ------------------------------------------------------------------
+    # 9. FRED macro client — requires FRED_API_KEY (Sprint 37)
+    # ------------------------------------------------------------------
+    if settings.fred_api_key:
+        try:
+            from data.macro_data import FREDClient, set_global_client as _set_fred
+
+            _fred_instance = FREDClient(api_key=settings.fred_api_key)
+            _set_fred(_fred_instance)
+            # Warm up cache on startup (best-effort; FRED data rarely changes)
+            try:
+                await _fred_instance.get_latest()
+                log.info("fred_client.warmed_up")
+            except Exception:
+                log.warning("fred_client.warmup_failed", exc_info=True)
+
+            _fred_client = _fred_instance
+            log.info("fred_client.started")
+        except ImportError:
+            log.info("fred_client.skipped", reason="aiohttp not installed")
+        except Exception:
+            log.warning("fred_client.startup_error", exc_info=True)
+    else:
+        log.info("fred_client.disabled", reason="FRED_API_KEY not set")
+
+    # ------------------------------------------------------------------
+    # 10. Whale Alert client — requires WHALE_ALERT_API_KEY (Sprint 37)
+    # ------------------------------------------------------------------
+    if settings.whale_alert_api_key:
+        try:
+            from data.whale_tracker import WhaleAlertClient, set_global_client as _set_whale
+
+            _whale_instance = WhaleAlertClient(api_key=settings.whale_alert_api_key)
+            _set_whale(_whale_instance)
+            # Warm up cache on startup (best-effort)
+            try:
+                await _whale_instance.get_latest()
+                log.info("whale_alert_client.warmed_up")
+            except Exception:
+                log.warning("whale_alert_client.warmup_failed", exc_info=True)
+
+            _whale_alert_client = _whale_instance
+            log.info("whale_alert_client.started")
+        except ImportError:
+            log.info("whale_alert_client.skipped", reason="aiohttp not installed")
+        except Exception:
+            log.warning("whale_alert_client.startup_error", exc_info=True)
+    else:
+        log.info("whale_alert_client.disabled", reason="WHALE_ALERT_API_KEY not set")
+
+    # ------------------------------------------------------------------
     # Future: Redis connection init goes here
     # ------------------------------------------------------------------
 
@@ -346,6 +439,27 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     if _fgi_client is not None:
         try:
             await _fgi_client.close()
+        except Exception:
+            pass
+
+    # Close CoinGeckoClient session (Sprint 37)
+    if _coingecko_client is not None:
+        try:
+            await _coingecko_client.close()
+        except Exception:
+            pass
+
+    # Close FREDClient session (Sprint 37)
+    if _fred_client is not None:
+        try:
+            await _fred_client.close()
+        except Exception:
+            pass
+
+    # Close WhaleAlertClient session (Sprint 37)
+    if _whale_alert_client is not None:
+        try:
+            await _whale_alert_client.close()
         except Exception:
             pass
 

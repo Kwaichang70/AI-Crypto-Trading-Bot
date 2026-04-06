@@ -37,6 +37,15 @@ Deeper penetration into the extreme zone yields higher confidence:
 
 Both clamped to [0.1, 1.0].
 
+External signal integration (Sprint 37)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Three additional confidence modifiers sourced from MultiTimeframeContext:
+- BTC dominance (CoinGecko)
+- 10Y-2Y yield curve spread (FRED)
+- Whale net exchange flow (Whale Alert)
+
+All three are best-effort and return 0.0 when not available.
+
 Parameters
 ----------
 rsi_period : int
@@ -240,6 +249,123 @@ class RSIMeanReversionStrategy(BaseStrategy):
         return 0.0
 
     # ------------------------------------------------------------------ #
+    # CoinGecko BTC dominance confidence modifier (Sprint 37)
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _btc_dominance_boost(dominance: float | None, direction: SignalDirection) -> float:
+        """
+        Return a confidence delta based on BTC dominance from CoinGecko.
+
+        High BTC dominance (>55%) signals risk-off for altcoins.
+        Low dominance (<45%) signals alt-season.
+
+        Parameters
+        ----------
+        dominance : float | None
+            BTC market cap dominance percentage in [0, 100], or None if
+            not available.
+        direction : SignalDirection
+            The signal direction (BUY or SELL).
+
+        Returns
+        -------
+        float
+            Confidence delta in [-0.05, +0.05].  Returns 0.0 if None.
+        """
+        if dominance is None:
+            return 0.0
+        if direction == SignalDirection.BUY:
+            if dominance < 45.0:
+                return 0.05    # Alt rally regime: accumulation favourable
+            if dominance > 55.0:
+                return -0.05   # BTC dominance surge: risk-off for alts
+        elif direction == SignalDirection.SELL:
+            if dominance < 45.0:
+                return -0.05   # Alt rally: less conviction for taking profit
+            if dominance > 55.0:
+                return 0.05    # Risk-off: more conviction for profit-taking
+        return 0.0
+
+    # ------------------------------------------------------------------ #
+    # FRED yield curve macro confidence modifier (Sprint 37)
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _macro_boost(yield_spread: float | None, direction: SignalDirection) -> float:
+        """
+        Return a confidence delta based on the 10Y-2Y yield curve spread.
+
+        Deep inversion (< -0.5%) historically precedes recession.
+        Healthy spread (> 1.0%) indicates a risk-on macro environment.
+
+        Parameters
+        ----------
+        yield_spread : float | None
+            10-Year minus 2-Year Treasury yield spread (percent).
+            None if not available.
+        direction : SignalDirection
+            The signal direction (BUY or SELL).
+
+        Returns
+        -------
+        float
+            Confidence delta in [-0.05, +0.05].  Returns 0.0 if None.
+        """
+        if yield_spread is None:
+            return 0.0
+        if direction == SignalDirection.BUY:
+            if yield_spread < -0.5:
+                return -0.05  # Deep inversion: recession risk, reduce BUY conviction
+            if yield_spread > 1.0:
+                return 0.05   # Healthy curve: risk-on macro, increase BUY conviction
+        elif direction == SignalDirection.SELL:
+            if yield_spread < -0.5:
+                return 0.05   # Recession signal: more conviction for taking profit
+            if yield_spread > 1.0:
+                return -0.05  # Healthy macro: less urgency to take profit
+        return 0.0
+
+    # ------------------------------------------------------------------ #
+    # Whale Alert on-chain flow confidence modifier (Sprint 37)
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _whale_flow_boost(net_flow: float | None, direction: SignalDirection) -> float:
+        """
+        Return a confidence delta based on Whale Alert net exchange flow.
+
+        Heavy outflow from exchanges → whale accumulation (bullish signal).
+        Heavy inflow to exchanges → whale distribution (bearish signal).
+
+        Parameters
+        ----------
+        net_flow : float | None
+            Net USD flow: positive = to exchanges, negative = from exchanges.
+            None if not available.
+        direction : SignalDirection
+            The signal direction (BUY or SELL).
+
+        Returns
+        -------
+        float
+            Confidence delta in [-0.05, +0.05].  Returns 0.0 if None.
+        """
+        if net_flow is None:
+            return 0.0
+        if direction == SignalDirection.BUY:
+            if net_flow < -5_000_000:
+                return 0.05    # Heavy outflow: whale accumulation signal
+            if net_flow > 5_000_000:
+                return -0.05   # Heavy inflow: distribution / sell pressure
+        elif direction == SignalDirection.SELL:
+            if net_flow < -5_000_000:
+                return -0.05   # Accumulation: less conviction for selling
+            if net_flow > 5_000_000:
+                return 0.05    # Distribution: more conviction for taking profit
+        return 0.0
+
+    # ------------------------------------------------------------------ #
     # Parameter validation
     # ------------------------------------------------------------------ #
 
@@ -301,6 +427,9 @@ class RSIMeanReversionStrategy(BaseStrategy):
         bars : Sequence[OHLCVBar]
             OHLCV bars ordered oldest-first.  The last element is the
             current (most recent) bar.
+        mtf_context : MultiTimeframeContext | None
+            Optional context carrying external market signals (FGI,
+            CoinGecko, FRED, Whale Alert).
 
         Returns
         -------
@@ -370,12 +499,33 @@ class RSIMeanReversionStrategy(BaseStrategy):
 
         current_bar = bars[-1]
 
-        # Sprint 32: apply Fear & Greed Index confidence boost
+        # Extract external signal values from context.
         fgi_value: int | None = None
-        if mtf_context is not None and mtf_context.fear_greed_index is not None:
-            fgi_value = mtf_context.fear_greed_index
+        btc_dominance: float | None = None
+        yield_curve_spread: float | None = None
+        whale_net_flow: float | None = None
+        if mtf_context is not None:
+            if mtf_context.fear_greed_index is not None:
+                fgi_value = mtf_context.fear_greed_index
+            btc_dominance = mtf_context.btc_dominance
+            yield_curve_spread = mtf_context.yield_curve_spread
+            whale_net_flow = mtf_context.whale_net_flow
+
+        # Sprint 32: apply Fear & Greed Index confidence boost.
+        if fgi_value is not None:
             fgi_boost = RSIMeanReversionStrategy._fgi_confidence_boost(fgi_value, direction)
-            confidence = min(1.0, max(0.0, confidence + fgi_boost))
+            confidence += fgi_boost
+
+        # Sprint 37: apply CoinGecko BTC dominance boost.
+        confidence += RSIMeanReversionStrategy._btc_dominance_boost(btc_dominance, direction)
+
+        # Sprint 37: apply FRED yield curve macro boost.
+        confidence += RSIMeanReversionStrategy._macro_boost(yield_curve_spread, direction)
+
+        # Sprint 37: apply Whale Alert on-chain flow boost.
+        confidence += RSIMeanReversionStrategy._whale_flow_boost(whale_net_flow, direction)
+
+        confidence = min(1.0, max(0.0, confidence))
 
         signal = Signal(
             strategy_id=self._strategy_id,
@@ -391,6 +541,9 @@ class RSIMeanReversionStrategy(BaseStrategy):
                 "overbought": overbought,
                 "close": str(current_bar.close),
                 "fear_greed_index": fgi_value,
+                "btc_dominance": btc_dominance,
+                "yield_curve_spread": yield_curve_spread,
+                "whale_net_flow": whale_net_flow,
             },
         )
 

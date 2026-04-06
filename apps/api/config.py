@@ -326,6 +326,28 @@ class Settings(BaseSettings):
     )
 
     # ------------------------------------------------------------------
+    # External market signal API keys (Sprint 37)
+    # ------------------------------------------------------------------
+    fred_api_key: str | None = Field(
+        default=None,
+        description=(
+            "FRED (Federal Reserve Economic Data) API key. "
+            "Register for free at https://fred.stlouisfed.org/docs/api/api_key.html. "
+            "When set, enables macro yield-curve signal injection into MultiTimeframeContext. "
+            "When None (default), FRED signals are disabled."
+        ),
+    )
+    whale_alert_api_key: str | None = Field(
+        default=None,
+        description=(
+            "Whale Alert API key for on-chain large transaction monitoring. "
+            "Register at https://whale-alert.io/. "
+            "When set, enables whale net flow signal injection into MultiTimeframeContext. "
+            "When None (default), Whale Alert signals are disabled."
+        ),
+    )
+
+    # ------------------------------------------------------------------
     # Validators
     # ------------------------------------------------------------------
     @field_validator("database_url")

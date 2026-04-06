@@ -947,7 +947,11 @@ class StrategyEngine:
         Build a MultiTimeframeContext filtered to prevent look-ahead bias.
 
         Only includes HTF bars whose full period has completed before
-        the current primary bar timestamp.
+        the current primary bar timestamp.  Also injects all available
+        external market signal values from module-level singleton clients
+        (FGI, CoinGecko, FRED, Whale Alert).  All signal reads are
+        best-effort: any exception is swallowed to ensure bar processing
+        never crashes due to a failed external signal fetch.
         """
         # Sprint 32: read cached FGI value (best-effort, never crashes)
         fgi_value: int | None = None
@@ -959,10 +963,71 @@ class StrategyEngine:
         except Exception:
             pass  # FGI is best-effort; never crash bar processing
 
-        # CR-003: Return context with FGI even when no HTF bars exist
+        # CoinGecko market structure signals (best-effort)
+        btc_dominance: float | None = None
+        market_cap_change_24h: float | None = None
+        total_volume_change_24h: float | None = None
+        try:
+            from data.market_signals import get_global_client as _get_cg_client
+            _cg_client = _get_cg_client()
+            if _cg_client is not None:
+                _cg_snap = _cg_client.cached_value
+                if _cg_snap is not None:
+                    btc_dominance = _cg_snap.btc_dominance
+                    market_cap_change_24h = _cg_snap.market_cap_change_24h
+                    total_volume_change_24h = _cg_snap.total_volume_change_24h
+        except Exception:
+            pass  # CoinGecko is best-effort; never crash bar processing
+
+        # FRED macro-economic signals (best-effort)
+        fed_funds_rate: float | None = None
+        yield_curve_spread: float | None = None
+        try:
+            from data.macro_data import get_global_client as _get_fred_client
+            _fred_client = _get_fred_client()
+            if _fred_client is not None:
+                _fred_snap = _fred_client.cached_value
+                if _fred_snap is not None:
+                    fed_funds_rate = _fred_snap.fed_funds_rate
+                    yield_curve_spread = _fred_snap.yield_curve_spread
+        except Exception:
+            pass  # FRED is best-effort; never crash bar processing
+
+        # Whale Alert on-chain flow signals (best-effort)
+        whale_net_flow: float | None = None
+        try:
+            from data.whale_tracker import get_global_client as _get_whale_client
+            _whale_client = _get_whale_client()
+            if _whale_client is not None:
+                _whale_snap = _whale_client.cached_value
+                if _whale_snap is not None:
+                    whale_net_flow = _whale_snap.net_flow
+        except Exception:
+            pass  # Whale Alert is best-effort; never crash bar processing
+
+        # Build kwargs for MultiTimeframeContext — only include non-None signal
+        # fields so the frozen dataclass default values are used for all absent
+        # signals, preserving backward compatibility with existing tests.
+        ctx_kwargs: dict[str, Any] = {}
+        if fgi_value is not None:
+            ctx_kwargs["fear_greed_index"] = fgi_value
+        if btc_dominance is not None:
+            ctx_kwargs["btc_dominance"] = btc_dominance
+        if market_cap_change_24h is not None:
+            ctx_kwargs["market_cap_change_24h"] = market_cap_change_24h
+        if total_volume_change_24h is not None:
+            ctx_kwargs["total_volume_change_24h"] = total_volume_change_24h
+        if fed_funds_rate is not None:
+            ctx_kwargs["fed_funds_rate"] = fed_funds_rate
+        if yield_curve_spread is not None:
+            ctx_kwargs["yield_curve_spread"] = yield_curve_spread
+        if whale_net_flow is not None:
+            ctx_kwargs["whale_net_flow"] = whale_net_flow
+
+        # CR-003: Return context with signal fields even when no HTF bars exist
         if self._htf_bars is None:
-            if fgi_value is not None:
-                return MultiTimeframeContext(fear_greed_index=fgi_value)
+            if ctx_kwargs:
+                return MultiTimeframeContext(**ctx_kwargs)
             return None
 
         filtered: dict[str, dict[str, list[OHLCVBar]]] = {}
@@ -989,7 +1054,7 @@ class StrategyEngine:
                 ]
             filtered[tf_str] = filtered_sym
 
-        return MultiTimeframeContext(htf_bars=filtered, fear_greed_index=fgi_value)
+        return MultiTimeframeContext(htf_bars=filtered, **ctx_kwargs)
 
     # ------------------------------------------------------------------
     # Regime classification (Sprint 32 CR-001)
