@@ -521,6 +521,17 @@ async def _incremental_flush_loop(
     try:
         while True:
             await asyncio.sleep(flush_interval)
+
+            # Reconcile open orders with the exchange before flushing.
+            # Coinbase processes market orders asynchronously — orders may
+            # stay OPEN after submission.  Reconciliation polls the exchange
+            # and transitions them to FILLED so position tracking is correct.
+            if execution_engine is not None and hasattr(execution_engine, "reconcile_open_orders"):
+                try:
+                    await execution_engine.reconcile_open_orders()
+                except Exception:
+                    log.exception("runs.reconcile_open_orders_error")
+
             try:
                 await _flush_incremental(
                     run_id_str=run_id_str,

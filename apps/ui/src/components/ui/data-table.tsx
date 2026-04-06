@@ -72,10 +72,18 @@ export function DataTable<T>({
                 key={col.key}
                 className={[
                   "px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-slate-500",
-                  col.sortable ? "cursor-pointer select-none hover:text-slate-700 dark:hover:text-slate-300" : "",
+                  col.sortable ? "cursor-pointer select-none hover:text-slate-700 dark:hover:text-slate-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500" : "",
                   col.className ?? "",
                 ].join(" ")}
                 onClick={col.sortable ? () => handleSort(col.key) : undefined}
+                onKeyDown={col.sortable ? (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); handleSort(col.key); } } : undefined}
+                tabIndex={col.sortable ? 0 : undefined}
+                role={col.sortable ? "button" : undefined}
+                aria-sort={
+                  col.sortable && sortKey === col.key
+                    ? sortDir === "asc" ? "ascending" : "descending"
+                    : col.sortable ? "none" : undefined
+                }
               >
                 <span className="flex items-center gap-1">
                   {col.header}

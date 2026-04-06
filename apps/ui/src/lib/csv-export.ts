@@ -27,6 +27,15 @@ export interface CsvColumn<T> {
 function escapeCell(raw: string | number | boolean | null | undefined): string {
   if (raw === null || raw === undefined) return "";
   const str = String(raw);
+
+  // Defense against CSV formula injection: cells starting with =, +, -, or @
+  // are treated as formulas by Excel/Google Sheets. Prefix with a single quote
+  // to force text interpretation.
+  const first = str.charAt(0);
+  if (first === "=" || first === "+" || first === "-" || first === "@") {
+    return `"'${str.replace(/"/g, '""')}"`;
+  }
+
   if (
     str.includes(",") ||
     str.includes('"') ||

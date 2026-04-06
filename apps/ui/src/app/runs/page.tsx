@@ -5,7 +5,7 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { fetchRuns, formatPct } from "@/lib/api";
 import type { Run, RunMode, RunStatus } from "@/lib/types";
 import type { CsvColumn } from "@/lib/csv-export";
@@ -192,24 +192,45 @@ const RUNS_CSV_COLUMNS: CsvColumn<Run>[] = [
 
 export default function RunsPage() {
   const router = useRouter();
+  const searchParams = useSearchParams();
 
   const [runs, setRuns] = useState<readonly Run[]>([]);
   const [total, setTotal] = useState(0);
-  const [modeFilter, setModeFilter] = useState<RunMode | "all">("all");
-  const [statusFilter, setStatusFilter] = useState<RunStatus | "all">("all");
+  const [modeFilter, setModeFilter] = useState<RunMode | "all">(
+    (searchParams.get("mode") as RunMode | "all") ?? "all",
+  );
+  const [statusFilter, setStatusFilter] = useState<RunStatus | "all">(
+    (searchParams.get("status") as RunStatus | "all") ?? "all",
+  );
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   // Pagination state — page is 0-indexed.
-  const [page, setPage] = useState(0);
-  const [pageSize, setPageSize] = useState<number>(25);
+  const [page, setPage] = useState<number>(() => {
+    const raw = searchParams.get("page");
+    const parsed = raw !== null ? parseInt(raw, 10) : NaN;
+    return isNaN(parsed) || parsed < 0 ? 0 : parsed;
+  });
+  const [pageSize, setPageSize] = useState<number>(() => {
+    const raw = searchParams.get("pageSize");
+    const parsed = raw !== null ? parseInt(raw, 10) : NaN;
+    return (PAGE_SIZE_OPTIONS as readonly number[]).includes(parsed) ? parsed : 25;
+  });
 
   // Advanced filter state
   const [showAdvanced, setShowAdvanced] = useState(false);
-  const [strategyFilter, setStrategyFilter] = useState("");
-  const [symbolFilter, setSymbolFilter] = useState("");
-  const [dateAfter, setDateAfter] = useState("");
-  const [dateBefore, setDateBefore] = useState("");
+  const [strategyFilter, setStrategyFilter] = useState(
+    searchParams.get("strategy") ?? "",
+  );
+  const [symbolFilter, setSymbolFilter] = useState(
+    searchParams.get("symbol") ?? "",
+  );
+  const [dateAfter, setDateAfter] = useState(
+    searchParams.get("dateAfter") ?? "",
+  );
+  const [dateBefore, setDateBefore] = useState(
+    searchParams.get("dateBefore") ?? "",
+  );
 
   // Debounced versions — only used in fetchRuns call to avoid per-keystroke fetches
   const [debouncedStrategy, setDebouncedStrategy] = useState("");
@@ -227,6 +248,21 @@ export default function RunsPage() {
     const timer = setTimeout(() => setDebouncedSymbol(symbolFilter), 500);
     return () => clearTimeout(timer);
   }, [symbolFilter]);
+
+  // Sync filter state to URL for persistence across refresh and shareable links.
+  useEffect(() => {
+    const params = new URLSearchParams();
+    if (modeFilter !== "all") params.set("mode", modeFilter);
+    if (statusFilter !== "all") params.set("status", statusFilter);
+    if (page !== 0) params.set("page", String(page));
+    if (pageSize !== 25) params.set("pageSize", String(pageSize));
+    if (strategyFilter) params.set("strategy", strategyFilter);
+    if (symbolFilter) params.set("symbol", symbolFilter);
+    if (dateAfter) params.set("dateAfter", dateAfter);
+    if (dateBefore) params.set("dateBefore", dateBefore);
+    const qs = params.toString();
+    router.replace(qs ? `/runs?${qs}` : "/runs", { scroll: false });
+  }, [modeFilter, statusFilter, page, pageSize, strategyFilter, symbolFilter, dateAfter, dateBefore, router]);
 
   useEffect(() => {
     async function load() {
