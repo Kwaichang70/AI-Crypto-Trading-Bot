@@ -2,6 +2,7 @@
  * Dashboard Home — Server Component.
  * Fetches health + recent runs + portfolio at request time.
  * EquityOverview is a client component island that lazy-fetches sparkline data.
+ * MarketSignals is a client component island that polls signals every 60 s.
  */
 
 import type { Metadata } from "next";
@@ -13,6 +14,7 @@ import { StatCard } from "@/components/ui/stat-card";
 import { RunStatusBadge } from "@/components/ui/status-badge";
 import { Header } from "@/components/layout/header";
 import { EquityOverview } from "@/components/dashboard/equity-overview";
+import { MarketSignals } from "@/components/dashboard/market-signals";
 
 export const metadata: Metadata = { title: "Dashboard" };
 export const dynamic = "force-dynamic";
@@ -209,6 +211,12 @@ export default async function DashboardPage() {
       <section aria-label="Equity overview" className="card p-4">
         <h2 className="text-sm font-semibold text-slate-800 dark:text-slate-200">Equity Trend</h2>
         <EquityOverview />
+      </section>
+
+      {/* Market signals — client island, polls every 60 s */}
+      <section aria-label="Market signals" className="card p-4">
+        <h2 className="mb-3 text-sm font-semibold text-slate-800 dark:text-slate-200">Market Signals</h2>
+        <MarketSignals />
       </section>
 
       {/* Recent runs */}

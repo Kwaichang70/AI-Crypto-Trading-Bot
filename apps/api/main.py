@@ -12,6 +12,7 @@ Responsibilities
 - Register all API routers under /api/v1/ with API key authentication
 - Expose the /health endpoint (always available, no auth)
 - Expose the /api/v1/metrics endpoint (always available, no auth)
+- Expose the /api/v1/signals/current endpoint (always available, no auth — public market data)
 - Start/stop RetrainingService when ml_auto_retrain=True (Sprint 23)
 - Recover orphaned paper/live runs left running after a crash/restart (Sprint 24)
 - Create TelegramNotifier when TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID are set
@@ -23,8 +24,8 @@ startup/shutdown logic (replaces deprecated on_event handlers).
 Authentication
 --------------
 When ``require_api_auth=True`` in settings, all /api/v1/* endpoints
-(except /health and /api/v1/metrics) require a valid API key via the
-``X-API-Key`` header or ``?api_key=`` query parameter.
+(except /health, /api/v1/metrics, and /api/v1/signals/current) require a
+valid API key via the ``X-API-Key`` header or ``?api_key=`` query parameter.
 See ``api.auth`` for implementation details.
 """
 
@@ -581,7 +582,7 @@ def _register_routes(application: FastAPI) -> None:
             "timestamp": dt.now(tz=UTC).isoformat(),
         }
 
-    from api.routers import circuit_breaker, learning, ml, optimize, orders, portfolio, runs, strategies
+    from api.routers import circuit_breaker, learning, ml, optimize, orders, portfolio, runs, signals, strategies
 
     _V1 = "/api/v1"
 
@@ -644,6 +645,12 @@ def _register_routes(application: FastAPI) -> None:
         learning.router,
         tags=["learning"],
         dependencies=[Depends(require_api_key)],
+    )
+
+    # Signals router — unauthenticated (public read-only market data cache)
+    application.include_router(
+        signals.router,
+        prefix=_V1,
     )
 
 

@@ -554,3 +554,14 @@ export function formatCurrency(value: string, decimals = 2): string {
 export function formatPct(value: number, decimals = 2): string {
   return `${(value * 100).toFixed(decimals)}%`;
 }
+
+// ---------------------------------------------------------------------------
+// Market Signals
+// ---------------------------------------------------------------------------
+
+/** GET /api/v1/signals/current — current cached values for all market signal sources. */
+export async function fetchMarketSignals(): Promise<ApiResult<Record<string, unknown>>> {
+  return apiGet<Record<string, unknown>>("/api/v1/signals/current", {
+    cache: "no-store",
+  });
+}
