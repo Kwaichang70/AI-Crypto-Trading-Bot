@@ -168,6 +168,11 @@ services:
       # -- Telegram alerts --
       TELEGRAM_BOT_TOKEN:           ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_CHAT_ID:             ${TELEGRAM_CHAT_ID:-}
+      # -- Run management --
+      MAX_RUN_DURATION_HOURS:       ${MAX_RUN_DURATION_HOURS:-168}
+      # -- External signal APIs --
+      FRED_API_KEY:                 ${FRED_API_KEY:-}
+      WHALE_ALERT_API_KEY:          ${WHALE_ALERT_API_KEY:-}
     ports:
       - "${API_PORT:-8000}:8000"
     healthcheck:
