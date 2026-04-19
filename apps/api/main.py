@@ -17,6 +17,7 @@ Responsibilities
 - Recover orphaned paper/live runs left running after a crash/restart (Sprint 24)
 - Create TelegramNotifier when TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID are set
 - Start CoinGeckoClient, FREDClient, WhaleAlertClient on startup (Sprint 37)
+- Create AppContainer and wire all services into it (Sprint 40 Stap 1c)
 
 The ``lifespan`` context manager is the recommended FastAPI pattern for
 startup/shutdown logic (replaces deprecated on_event handlers).
@@ -68,46 +69,58 @@ __all__ = ["app", "create_app", "get_telegram_notifier"]
 logger = structlog.get_logger(__name__)
 
 # ---------------------------------------------------------------------------
-# Module-level RetrainingService instance (None when ml_auto_retrain=False)
+# Module-level RetrainingService instance — DEPRECATED: mirror of
+# container.services.retraining_service — sunset by Sprint 41
 # ---------------------------------------------------------------------------
 _retraining_service: Any = None
 
 # ---------------------------------------------------------------------------
-# Module-level FearGreedClient instance (Sprint 32)
+# Module-level FearGreedClient instance — DEPRECATED: mirror of
+# container.services.fgi_client — sunset by Sprint 41
 # ---------------------------------------------------------------------------
 _fgi_client: Any = None
 
 # ---------------------------------------------------------------------------
-# Module-level CoinGeckoClient instance (Sprint 37)
+# Module-level CoinGeckoClient instance — DEPRECATED: mirror of
+# container.services.coingecko_client — sunset by Sprint 41
 # ---------------------------------------------------------------------------
 _coingecko_client: Any = None
 
 # ---------------------------------------------------------------------------
-# Module-level FREDClient instance (Sprint 37)
+# Module-level FREDClient instance — DEPRECATED: mirror of
+# container.services.fred_client — sunset by Sprint 41
 # ---------------------------------------------------------------------------
 _fred_client: Any = None
 
 # ---------------------------------------------------------------------------
-# Module-level WhaleAlertClient instance (Sprint 37)
+# Module-level WhaleAlertClient instance — DEPRECATED: mirror of
+# container.services.whale_alert_client — sunset by Sprint 41
 # ---------------------------------------------------------------------------
 _whale_alert_client: Any = None
 
 # ---------------------------------------------------------------------------
-# Module-level equity pruning task
+# Module-level equity pruning task — DEPRECATED: mirror of
+# container.background_tasks.equity_prune_task — sunset by Sprint 41
 # ---------------------------------------------------------------------------
 _equity_prune_task: Any = None
 
 # ---------------------------------------------------------------------------
-# Module-level TelegramNotifier instance (None when not configured)
+# Module-level TelegramNotifier instance — DEPRECATED: mirror of
+# container.services.telegram_notifier — sunset by Sprint 41
 # ---------------------------------------------------------------------------
 _telegram_notifier: Any = None
 
 
 def get_telegram_notifier() -> Any:
-    """Return the module-level TelegramNotifier, or None when not configured.
+    """Return the TelegramNotifier, or None when not configured.
 
     Used by routers that want to fire-and-forget trade/alert notifications
     without importing the notifier class directly.
+
+    Reads from the module-level mirror variable which the lifespan writes
+    after populating container.services.telegram_notifier.  Router code
+    will be migrated to read from app.state.container.services.telegram_notifier
+    directly in Stap 1d.
     """
     return _telegram_notifier
 
@@ -123,20 +136,22 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     Startup (before yield)
     ----------------------
-    1. Configure structured logging with service-level context fields
-    2. Log application boot parameters
-    3. Initialise SQLAlchemy async engine and connection pool
-    4. Start RetrainingService if ml_auto_retrain=True (Sprint 23)
-    5. Recover orphaned paper/live runs (Sprint 24)
-    6. Start Fear & Greed Index client (Sprint 32)
-    7. Telegram notifier (optional — requires TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID)
-    8. Start CoinGecko client (Sprint 37 — always-on, no key required)
-    9. Start FRED client (Sprint 37 — requires FRED_API_KEY)
+    1.  Configure structured logging with service-level context fields
+    2.  Log application boot parameters
+    2b. Create AppContainer and attach to app.state.container (Sprint 40 Stap 1c)
+    3.  Initialise SQLAlchemy async engine and connection pool
+    4.  Start RetrainingService if ml_auto_retrain=True (Sprint 23)
+    5.  Recover orphaned paper/live runs (Sprint 24)
+    6.  Start Fear & Greed Index client (Sprint 32)
+    7.  Telegram notifier (optional — requires TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID)
+    8.  Start CoinGecko client (Sprint 37 — always-on, no key required)
+    9.  Start FRED client (Sprint 37 — requires FRED_API_KEY)
     10. Start Whale Alert client (Sprint 37 — requires WHALE_ALERT_API_KEY)
 
     Shutdown (after yield)
     ----------------------
-    1. Cancel all active paper/live trading engine tasks
+    0. container.shutdown() — cancels background tasks + run registry
+    1. Cancel all active paper/live trading engine tasks (belt-and-suspenders)
     2. Stop RetrainingService if running
     3. Close all external signal clients (FGI, CoinGecko, FRED, Whale Alert)
     4. Close database engine (dispose connection pool)
@@ -144,6 +159,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """
     global _retraining_service, _telegram_notifier
     global _coingecko_client, _fred_client, _whale_alert_client
+    global _fgi_client, _equity_prune_task
 
     settings = get_settings()
 
@@ -167,6 +183,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         ml_auto_retrain=settings.ml_auto_retrain,
     )
 
+    # ------------------------------------------------------------------
+    # 2b. Create AppContainer and attach to app.state (Sprint 40 Stap 1c)
+    # LS-001: Container created here, before any service is instantiated,
+    # so every downstream block can assign into container.services.*.
+    # ------------------------------------------------------------------
+    from api.container import AppContainer  # noqa: E402
+
+    container = AppContainer(settings=settings)
+    app.state.container = container
+    log.info("container.created")
+
     # Store boot timestamp on app state so /health can report uptime.
     app.state.started_at = time.monotonic()
 
@@ -177,6 +204,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     engine = get_engine()
     app.state.db_engine = engine
+    container.db_engine = engine  # LS-001: dual-write; app.state.db_engine preserved for Stap 1d routers
     log.info(
         "db.engine_initialised",
         pool_size=settings.db_pool_size,
@@ -216,6 +244,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
         set_retraining_service(_retraining_service)
         await _retraining_service.start()
+        container.services.retraining_service = _retraining_service  # LS-002
         log.info(
             "retraining_service.wired",
             interval_minutes=settings.ml_retrain_interval_minutes,
@@ -239,7 +268,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         except Exception:
             log.warning("fgi_client.warmup_failed", exc_info=True)
 
-        globals()["_fgi_client"] = _fgi_client_instance
+        _fgi_client = _fgi_client_instance
+        container.services.fgi_client = _fgi_client_instance  # LS-002
         log.info("fgi_client.started")
     except ImportError:
         log.info("fgi_client.skipped", reason="aiohttp not installed")
@@ -251,7 +281,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # ------------------------------------------------------------------
     import asyncio as _asyncio
 
-    global _equity_prune_task  # noqa: PLW0603
+    # _equity_prune_task global declared at top of function (LS-006)
 
     async def _equity_prune_loop() -> None:
         """Delete equity snapshots older than retention period, once per day."""
@@ -302,6 +332,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     _equity_prune_task = _asyncio.create_task(
         _equity_prune_loop(), name="equity_prune"
     )
+    container.background_tasks.equity_prune_task = _equity_prune_task  # LS-003
     log.info(
         "equity_prune.scheduled",
         retention_days=settings.equity_snapshot_retention_days,
@@ -318,6 +349,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 bot_token=settings.telegram_bot_token,
                 chat_id=settings.telegram_chat_id,
             )
+            container.services.telegram_notifier = _telegram_notifier  # LS-002
             log.info("telegram.configured", chat_id=settings.telegram_chat_id)
         except ImportError:
             log.warning("telegram.skipped", reason="trading.telegram not importable")
@@ -342,6 +374,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             log.warning("coingecko_client.warmup_failed", exc_info=True)
 
         _coingecko_client = _cg_instance
+        container.services.coingecko_client = _cg_instance  # LS-002
         log.info("coingecko_client.started")
     except ImportError:
         log.info("coingecko_client.skipped", reason="aiohttp not installed")
@@ -365,6 +398,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 log.warning("fred_client.warmup_failed", exc_info=True)
 
             _fred_client = _fred_instance
+            container.services.fred_client = _fred_instance  # LS-002
             log.info("fred_client.started")
         except ImportError:
             log.info("fred_client.skipped", reason="aiohttp not installed")
@@ -390,6 +424,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 log.warning("whale_alert_client.warmup_failed", exc_info=True)
 
             _whale_alert_client = _whale_instance
+            container.services.whale_alert_client = _whale_instance  # LS-002
             log.info("whale_alert_client.started")
         except ImportError:
             log.info("whale_alert_client.skipped", reason="aiohttp not installed")
@@ -408,6 +443,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Shutdown sequence
     # ------------------------------------------------------------------
     log.info("api.shutting_down")
+
+    # ------------------------------------------------------------------
+    # 0. container.shutdown() — cancels background tasks + run registry
+    #    (LS-004) Must run before the explicit _RUN_TASKS loop below so
+    #    run_registry.cancel_all() and background_tasks.cancel_all() fire
+    #    first.  The explicit loops beneath are belt-and-suspenders during
+    #    the Stap 1c transition period.
+    # ------------------------------------------------------------------
+    await container.shutdown()
 
     # Cancel all active paper/live trading engine tasks
     import asyncio
@@ -432,6 +476,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         _retraining_service = None
 
     # Stop equity snapshot pruning task
+    # Belt-and-suspenders: container.shutdown() already cancelled this task above.
+    # Remove in Sprint 41 when legacy shutdown paths are consolidated.
     if _equity_prune_task is not None and not _equity_prune_task.done():
         _equity_prune_task.cancel()
         await asyncio.gather(_equity_prune_task, return_exceptions=True)
