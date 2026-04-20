@@ -53,19 +53,37 @@ _ENDPOINT = "https://api.coingecko.com/api/v3/global"
 _CACHE_TTL_SECONDS = 1800  # 30 minutes
 
 # ---------------------------------------------------------------------------
-# Module-level singleton
+# Module-level singleton — DEPRECATED: sunset by Sprint 41.
+#
+# Since Sprint 40 Stap 1c the canonical owner is
+# ``app.state.container.services.coingecko_client``; main.py's lifespan
+# writes to both the container AND this module global during the transition
+# period.  New code should prefer the container lookup (see
+# apps/api/deps.py helpers or apps/api/routers/signals.py::_resolve_service).
 # ---------------------------------------------------------------------------
 _global_client: CoinGeckoClient | None = None
 
 
 def set_global_client(client: CoinGeckoClient) -> None:
-    """Register a CoinGeckoClient as the module-level singleton."""
+    """Register a CoinGeckoClient as the module-level singleton.
+
+    .. deprecated:: Sprint 40
+       Callers should register the client on
+       ``AppContainer.services.coingecko_client`` via the API lifespan.
+       Retained for backwards compatibility until Sprint 41.
+    """
     global _global_client
     _global_client = client
 
 
 def get_global_client() -> CoinGeckoClient | None:
-    """Return the module-level CoinGeckoClient singleton, or None if not set."""
+    """Return the module-level CoinGeckoClient singleton, or None if not set.
+
+    .. deprecated:: Sprint 40
+       Prefer reading from
+       ``request.app.state.container.services.coingecko_client`` in
+       request-scoped code.  Removed in Sprint 41.
+    """
     return _global_client
 
 

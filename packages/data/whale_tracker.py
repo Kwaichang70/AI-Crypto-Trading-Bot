@@ -82,19 +82,37 @@ _EXCHANGE_LABELS = frozenset({
 })
 
 # ---------------------------------------------------------------------------
-# Module-level singleton
+# Module-level singleton — DEPRECATED: sunset by Sprint 41.
+#
+# Since Sprint 40 Stap 1c the canonical owner is
+# ``app.state.container.services.whale_alert_client``; main.py's lifespan
+# writes to both the container AND this module global during the transition
+# period.  New code should prefer the container lookup (see
+# apps/api/deps.py helpers or apps/api/routers/signals.py::_resolve_service).
 # ---------------------------------------------------------------------------
 _global_client: WhaleAlertClient | None = None
 
 
 def set_global_client(client: WhaleAlertClient) -> None:
-    """Register a WhaleAlertClient as the module-level singleton."""
+    """Register a WhaleAlertClient as the module-level singleton.
+
+    .. deprecated:: Sprint 40
+       Callers should register the client on
+       ``AppContainer.services.whale_alert_client`` via the API lifespan.
+       Retained for backwards compatibility until Sprint 41.
+    """
     global _global_client
     _global_client = client
 
 
 def get_global_client() -> WhaleAlertClient | None:
-    """Return the module-level WhaleAlertClient singleton, or None if not set."""
+    """Return the module-level WhaleAlertClient singleton, or None if not set.
+
+    .. deprecated:: Sprint 40
+       Prefer reading from
+       ``request.app.state.container.services.whale_alert_client`` in
+       request-scoped code.  Removed in Sprint 41.
+    """
     return _global_client
 
 

@@ -52,19 +52,37 @@ _FNG_API_URL = "https://api.alternative.me/fng/"
 _CACHE_TTL_SECONDS = 6 * 3600  # 6 hours
 
 # ---------------------------------------------------------------------------
-# Module-level singleton
+# Module-level singleton — DEPRECATED: sunset by Sprint 41.
+#
+# Since Sprint 40 Stap 1c the canonical owner is
+# ``app.state.container.services.fgi_client``; main.py's lifespan writes to
+# both the container AND this module global during the transition period.
+# New code should prefer the container lookup (see apps/api/deps.py helpers
+# or apps/api/routers/signals.py::_resolve_service).
 # ---------------------------------------------------------------------------
 _global_client: FearGreedClient | None = None
 
 
 def set_global_client(client: FearGreedClient) -> None:
-    """Register a FearGreedClient as the module-level singleton."""
+    """Register a FearGreedClient as the module-level singleton.
+
+    .. deprecated:: Sprint 40
+       Callers should register the client on
+       ``AppContainer.services.fgi_client`` via the API lifespan instead.
+       This shim is retained for backwards compatibility until Sprint 41.
+    """
     global _global_client
     _global_client = client
 
 
 def get_global_client() -> FearGreedClient | None:
-    """Return the module-level FearGreedClient singleton, or None if not set."""
+    """Return the module-level FearGreedClient singleton, or None if not set.
+
+    .. deprecated:: Sprint 40
+       Prefer reading from
+       ``request.app.state.container.services.fgi_client`` in request-scoped
+       code.  This shim is removed in Sprint 41.
+    """
     return _global_client
 
 
