@@ -835,7 +835,7 @@ class TestModelVersionEndpoints:
         db.execute = AsyncMock(return_value=result)
 
         with pytest.raises(HTTPException) as exc_info:
-            await activate_model_version(model_id=uuid.uuid4(), db=db)
+            await activate_model_version(model_id=uuid.uuid4(), request=MagicMock(), db=db)
 
         assert exc_info.value.status_code == 404
 
@@ -854,7 +854,7 @@ class TestModelVersionEndpoints:
         result.scalar_one_or_none = MagicMock(return_value=mv)
         db.execute = AsyncMock(return_value=result)
 
-        response = await activate_model_version(model_id=mv.id, db=db)
+        response = await activate_model_version(model_id=mv.id, request=MagicMock(), db=db)
 
         # Only the initial SELECT must be executed
         assert db.execute.call_count == 1, (
@@ -884,7 +884,7 @@ class TestModelVersionEndpoints:
         db.execute = AsyncMock(return_value=select_result)
         db.refresh = AsyncMock(side_effect=lambda obj: None)
 
-        await activate_model_version(model_id=mv.id, db=db)
+        await activate_model_version(model_id=mv.id, request=MagicMock(), db=db)
 
         # 1 SELECT + 2 UPDATEs = 3 execute calls
         assert db.execute.call_count == 3, (

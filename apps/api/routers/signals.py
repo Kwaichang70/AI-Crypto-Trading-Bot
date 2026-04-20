@@ -26,12 +26,29 @@ from __future__ import annotations
 from typing import Any
 
 import structlog
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 
 __all__ = ["router"]
 
 router = APIRouter(prefix="/signals", tags=["signals"])
 logger = structlog.get_logger(__name__)
+
+
+def _resolve_service(request: Request, attr_name: str, fallback_getter: Any) -> Any:
+    """Prefer container.services.<attr_name>; fall back to module-global shim.
+
+    Sprint 40 Stap 1d migration: readers consult the canonical AppContainer first,
+    falling back to the data/* module global if the container is unavailable
+    (test harnesses without lifespan, early-boot access) or the field is None
+    (service did not start).  The fallback branch is removed in Sprint 41
+    when data/* set_global_client helpers are retired.
+    """
+    container = getattr(request.app.state, "container", None)
+    if container is not None:
+        service = getattr(container.services, attr_name, None)
+        if service is not None:
+            return service
+    return fallback_getter()
 
 
 # ---------------------------------------------------------------------------
@@ -48,7 +65,7 @@ logger = structlog.get_logger(__name__)
         "the source is not configured or has not yet populated its cache."
     ),
 )
-async def get_current_signals() -> dict[str, Any]:
+async def get_current_signals(request: Request) -> dict[str, Any]:
     """Return current cached values for all market signal sources."""
     result: dict[str, Any] = {
         "fearGreedIndex": None,
@@ -68,7 +85,7 @@ async def get_current_signals() -> dict[str, Any]:
     try:
         from data.sentiment import get_global_client as _get_fgi
 
-        fgi_client = _get_fgi()
+        fgi_client = _resolve_service(request, "fgi_client", _get_fgi)
         if fgi_client is not None and fgi_client.cached_value is not None:
             result["fearGreedIndex"] = fgi_client.cached_value
             # _latest_cache is a (FearGreedSnapshot, float) tuple; index 0 is
@@ -84,7 +101,7 @@ async def get_current_signals() -> dict[str, Any]:
     try:
         from data.market_signals import get_global_client as _get_cg
 
-        cg_client = _get_cg()
+        cg_client = _resolve_service(request, "coingecko_client", _get_cg)
         if cg_client is not None:
             cg_snap = cg_client.cached_value
             if cg_snap is not None:
@@ -100,7 +117,7 @@ async def get_current_signals() -> dict[str, Any]:
     try:
         from data.macro_data import get_global_client as _get_fred
 
-        fred_client = _get_fred()
+        fred_client = _resolve_service(request, "fred_client", _get_fred)
         if fred_client is not None:
             fred_snap = fred_client.cached_value
             if fred_snap is not None:
@@ -115,7 +132,7 @@ async def get_current_signals() -> dict[str, Any]:
     try:
         from data.whale_tracker import get_global_client as _get_whale
 
-        whale_client = _get_whale()
+        whale_client = _resolve_service(request, "whale_alert_client", _get_whale)
         if whale_client is not None:
             whale_snap = whale_client.cached_value
             if whale_snap is not None:

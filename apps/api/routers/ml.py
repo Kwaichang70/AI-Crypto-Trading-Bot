@@ -18,7 +18,7 @@ import uuid
 from typing import Any
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.db import get_db
@@ -31,10 +31,12 @@ logger = structlog.get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Module-level retraining service reference (set by main.py lifespan)
+# Module-level retraining service reference — DEPRECATED: mirror of
+# container.services.retraining_service — sunset by Sprint 41.
 # ---------------------------------------------------------------------------
-# This is set from main.py after the service is instantiated.
-# Using a module-level variable avoids threading the service through Depends().
+# Set from main.py lifespan via set_retraining_service() during transitional
+# period.  Endpoint handlers prefer _resolve_retraining_service(request) which
+# reads from app.state.container first and falls back to this global.
 _retraining_service: Any = None
 
 
@@ -42,6 +44,22 @@ def set_retraining_service(service: Any) -> None:
     """Called by main.py lifespan to wire the RetrainingService instance."""
     global _retraining_service
     _retraining_service = service
+
+
+def _resolve_retraining_service(request: Request) -> Any | None:
+    """Prefer container.services.retraining_service; fall back to module global.
+
+    Sprint 40 Stap 1d migration: canonical source is the AppContainer, which
+    main.py populates in the lifespan hook.  The module-level ``_retraining_service``
+    mirror is retained as a fallback for early-boot and test contexts, and is
+    removed in Sprint 41.
+    """
+    container = getattr(request.app.state, "container", None)
+    if container is not None:
+        svc = getattr(container.services, "retraining_service", None)
+        if svc is not None:
+            return svc
+    return _retraining_service
 
 
 # ---------------------------------------------------------------------------
@@ -281,12 +299,14 @@ async def list_model_versions(
 )
 async def manual_retrain(
     symbol: str,
+    request: Request,
     timeframe: str = Query(default="1h", description="Candle timeframe for OHLCV fetch"),
 ) -> dict[str, str]:
     """Trigger manual PnL-labeled retraining for a symbol."""
     log = logger.bind(endpoint="manual_retrain", symbol=symbol, timeframe=timeframe)
 
-    if _retraining_service is None:
+    retraining_service = _resolve_retraining_service(request)
+    if retraining_service is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=(
@@ -301,7 +321,7 @@ async def manual_retrain(
     # _do_retrain catches all exceptions internally; the DB row is only written
     # after training succeeds, so mid-flight abandonment on shutdown is safe.
     asyncio.create_task(
-        _retraining_service.manual_retrain(symbol=symbol, timeframe=timeframe),
+        retraining_service.manual_retrain(symbol=symbol, timeframe=timeframe),
         name=f"manual_retrain_{symbol}_{timeframe}",
     )
 
@@ -332,6 +352,7 @@ async def manual_retrain(
 )
 async def activate_model_version(
     model_id: uuid.UUID,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> ModelVersionResponse:
     """Activate a specific model version by UUID, deactivating the current active one."""
@@ -384,8 +405,9 @@ async def activate_model_version(
     await db.refresh(target)
 
     # Update the sidecar JSON so ModelStrategy hot-swaps immediately
-    if _retraining_service is not None:
-        _retraining_service._write_active_sidecar(
+    retraining_service = _resolve_retraining_service(request)
+    if retraining_service is not None:
+        retraining_service._write_active_sidecar(
             symbol=symbol,
             version_id=str(target.id),
             model_path=target.model_path,
