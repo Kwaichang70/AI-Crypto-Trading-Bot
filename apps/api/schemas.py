@@ -209,8 +209,11 @@ class RunCreateRequest(BaseModel):
     confirm_token: str | None = Field(
         default=None,
         description=(
-            "Required for LIVE mode. Must match the LIVE_TRADING_CONFIRM_TOKEN "
-            "environment variable. Ignored for backtest and paper modes."
+            "DEPRECATED since Sprint 41 (SEC-004) — prefer the "
+            "``X-Live-Confirm-Token`` request header.  Body-field accepted "
+            "as a transitional fallback; scheduled for removal once all "
+            "clients migrate.  Required for LIVE mode; must match "
+            "LIVE_TRADING_CONFIRM_TOKEN.  Ignored for backtest/paper modes."
         ),
     )
     enable_adaptive_learning: bool = Field(

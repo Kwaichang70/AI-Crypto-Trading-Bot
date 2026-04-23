@@ -39,7 +39,7 @@ from decimal import Decimal
 from typing import Annotated, Any
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from sqlalchemy import String, cast, delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import noload
@@ -302,6 +302,7 @@ async def _fetch_bars_for_backtest(
 async def create_run(
     body: RunCreateRequest,
     db: Annotated[AsyncSession, Depends(get_db)],
+    x_live_confirm_token: Annotated[str | None, Header()] = None,
 ) -> RunDetailResponse:
     """
     Start a new trading run.
@@ -312,6 +313,12 @@ async def create_run(
         Run configuration from the request body.
     db:
         Injected async database session.
+    x_live_confirm_token:
+        Live-mode confirmation token supplied via the ``X-Live-Confirm-Token``
+        header (SEC-004, Sprint 41).  Prefer this over ``body.confirm_token``
+        — header transport keeps the secret out of request-body logs that some
+        APM/proxy stacks capture.  Body-field still accepted as deprecated
+        fallback until all clients migrate.
 
     Returns
     -------
@@ -414,9 +421,20 @@ async def create_run(
 
         settings = get_settings()
         gate = LiveTradingGate()
+        # SEC-004: prefer the X-Live-Confirm-Token header — body-field is a
+        # deprecated fallback so existing clients keep working until they
+        # migrate.  Log a warning when the fallback is hit so migration
+        # progress is observable.
+        resolved_confirm_token = x_live_confirm_token
+        if resolved_confirm_token is None and body.confirm_token:
+            log.warning(
+                "runs.live_confirm_token_body_fallback",
+                reason="SEC-004 deprecated path; migrate clients to X-Live-Confirm-Token header",
+            )
+            resolved_confirm_token = body.confirm_token
         gate_result = gate.check_gate(
             settings=settings,
-            confirm_token=body.confirm_token or "",
+            confirm_token=resolved_confirm_token or "",
         )
 
         if not gate_result.passed:
