@@ -404,6 +404,23 @@ async def activate_model_version(
 
     await db.refresh(target)
 
+    # SEC-002: persist audit record for model activation (rollback / promotion
+    # of a ModelStrategy version is a security-sensitive state transition).
+    from api.services.audit_log import record_audit_event
+
+    await record_audit_event(
+        db,
+        event_type="model_activated",
+        resource_type="model_version",
+        resource_id=str(target.id),
+        request=request,
+        payload={
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "accuracy": float(target.accuracy),
+        },
+    )
+
     # Update the sidecar JSON so ModelStrategy hot-swaps immediately
     retraining_service = _resolve_retraining_service(request)
     if retraining_service is not None:

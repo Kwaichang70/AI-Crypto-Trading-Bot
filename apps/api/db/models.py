@@ -59,6 +59,7 @@ __all__ = [
     "ModelVersionORM",
     "OptimizationRunORM",
     "OptimizationEntryORM",
+    "AuditEventORM",
 ]
 
 # ---------------------------------------------------------------------------
@@ -1309,4 +1310,117 @@ class OptimizationEntryORM(Base):
         return (
             f"<OptimizationEntryORM run={self.optimization_run_id} "
             f"rank={self.rank} params={self.params}>"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 12. audit_events  -- Tamper-evident log of security-sensitive API actions
+# ---------------------------------------------------------------------------
+
+class AuditEventORM(Base):
+    """Persistent audit trail for security-sensitive API mutations.
+
+    Sprint 41 SEC-002 — the application previously logged sensitive state
+    transitions (live-trading enable, model activation, circuit-breaker
+    reset) only through structlog, which rotates away and cannot be
+    queried after an incident.  This table keeps a DB-persistent record
+    that survives log-shipping rotation and supports forensic queries.
+
+    Event types (enforced by ck_audit_events_event_type):
+        * ``live_trading_enabled`` — POST /runs passed LiveTradingGate.
+        * ``model_activated``      — PUT /ml/models/{id}/activate succeeded.
+        * ``circuit_breaker_reset``— POST /runs/{id}/circuit-breaker/reset.
+
+    Retention is intentionally unlimited in this sprint; a future sprint
+    will add an operator-configurable retention policy.
+    """
+
+    __tablename__ = "audit_events"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+
+    timestamp: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        index=True,
+        comment="UTC timestamp of the audited action",
+    )
+
+    actor: Mapped[str] = mapped_column(
+        String(128),
+        nullable=False,
+        comment=(
+            "Actor identifier — API key hash prefix (first 12 chars of "
+            "SHA-256), 'system' for lifespan-driven events, or 'unknown' "
+            "when require_api_auth=false."
+        ),
+    )
+
+    event_type: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        index=True,
+        comment="Event classifier (see class docstring for valid values)",
+    )
+
+    resource_type: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        comment="Resource classifier: 'run', 'model_version', 'circuit_breaker'",
+    )
+
+    resource_id: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        index=True,
+        comment="Resource identifier (typically a UUID string)",
+    )
+
+    ip_address: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+        comment="Client IP address captured from the request (when available)",
+    )
+
+    user_agent: Mapped[str | None] = mapped_column(
+        String(256),
+        nullable=True,
+        comment="Client User-Agent header (when available)",
+    )
+
+    payload: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB,
+        nullable=True,
+        comment=(
+            "Event-specific context (model version id on activation, "
+            "failed-layer names on rejected gate, etc.).  Never include "
+            "secret material — confirm tokens / API keys MUST be hashed "
+            "or omitted before persisting."
+        ),
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "event_type IN ("
+            "'live_trading_enabled', 'model_activated', 'circuit_breaker_reset'"
+            ")",
+            name="ck_audit_events_event_type",
+        ),
+        Index(
+            "ix_audit_events_timestamp_event_type",
+            "timestamp",
+            "event_type",
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<AuditEventORM ts={self.timestamp.isoformat()} "
+            f"actor={self.actor} event={self.event_type} "
+            f"resource={self.resource_type}:{self.resource_id}>"
         )

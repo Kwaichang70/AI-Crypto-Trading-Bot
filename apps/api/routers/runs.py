@@ -39,7 +39,7 @@ from decimal import Decimal
 from typing import Annotated, Any
 
 import structlog
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from sqlalchemy import String, cast, delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import noload
@@ -302,6 +302,7 @@ async def _fetch_bars_for_backtest(
 async def create_run(
     body: RunCreateRequest,
     db: Annotated[AsyncSession, Depends(get_db)],
+    request: Request,
     x_live_confirm_token: Annotated[str | None, Header()] = None,
 ) -> RunDetailResponse:
     """
@@ -491,6 +492,25 @@ async def create_run(
         created_at=now,
         updated_at=now,
     )
+
+    # SEC-002: persistent audit record for a passing live-trading gate.
+    # Called after run_id is known so the audit row references the actual
+    # run.  record_audit_event swallows DB errors so failure to audit never
+    # blocks the functional request.
+    if body.mode == "live":
+        from api.services.audit_log import record_audit_event
+
+        await record_audit_event(
+            db,
+            event_type="live_trading_enabled",
+            resource_type="run",
+            resource_id=str(run_id),
+            request=request,
+            payload={
+                "symbols": body.symbols,
+                "timeframe": str(body.timeframe),
+            },
+        )
 
     db.add(run_orm)
     await db.flush()  # Assign the PK within the transaction without committing
