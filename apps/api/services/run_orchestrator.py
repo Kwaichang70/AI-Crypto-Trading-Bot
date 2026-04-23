@@ -89,6 +89,59 @@ def _normalize_exchange_secret(secret: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Named constants
+# ---------------------------------------------------------------------------
+#: Interval (seconds) between incremental DB flushes during paper/live runs.
+#: Tune to balance DB write pressure vs dashboard freshness — 30 s keeps
+#: Grafana panels current without hammering the connection pool.
+_PAPER_FLUSH_INTERVAL_SECONDS: float = 30.0
+
+
+# ---------------------------------------------------------------------------
+# Shared helper: cancel engine side-tasks on engine teardown (CR-001)
+# ---------------------------------------------------------------------------
+
+async def _cancel_engine_side_tasks(
+    *,
+    auto_stop_task: asyncio.Task[None] | None,
+    learning_task: asyncio.Task[None] | None,
+    learning_stop_event: asyncio.Event | None,
+    flush_task: asyncio.Task[None] | None,
+) -> None:
+    """Cancel every long-lived side task spawned by the paper/live engine loop.
+
+    Called from the ``except asyncio.CancelledError``, ``except Exception`` and
+    ``finally`` branches of ``run_paper_engine`` and ``run_live_engine``.
+    Each task is cancelled only when it is still pending; the cancellation is
+    awaited so cleanup coroutines finish before the engine tears down, and
+    both ``CancelledError`` and other exceptions are swallowed so the
+    teardown never re-raises.
+    """
+    if auto_stop_task is not None and not auto_stop_task.done():
+        auto_stop_task.cancel()
+        try:
+            await auto_stop_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    if learning_stop_event is not None:
+        learning_stop_event.set()
+    if learning_task is not None and not learning_task.done():
+        learning_task.cancel()
+        try:
+            await learning_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    if flush_task is not None and not flush_task.done():
+        flush_task.cancel()
+        try:
+            await flush_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
+# ---------------------------------------------------------------------------
 # Background task registry for paper/live trading engines
 # ---------------------------------------------------------------------------
 _RUN_TASKS: dict[str, asyncio.Task[None]] = {}
@@ -550,6 +603,18 @@ async def run_paper_engine(
         Candle timeframe for the strategy.
     initial_capital:
         Starting capital in quote currency (will be converted to Decimal).
+    trailing_stop_pct:
+        Optional trailing-stop percentage (e.g. 0.02 for 2%).  When set the
+        engine composes a ``TrailingStopManager`` and emits SELL signals
+        whenever price drops ``trailing_stop_pct`` below the position's peak.
+    enable_adaptive_learning:
+        When ``True`` spawn an :class:`AdaptiveLearningTask` alongside the
+        engine so trade outcomes are analysed and strategy parameters may be
+        tuned during the run (see Sprint 36).
+    auto_apply_learning:
+        When ``True`` the adaptive-learning task is allowed to call
+        ``strategy.update_params(...)`` directly; when ``False`` the task
+        reports suggestions via logs only (dry-run mode, safer default).
     """
     from api.config import get_settings
     from api.db.models import RunORM
@@ -672,7 +737,7 @@ async def run_paper_engine(
                 portfolio=portfolio,
                 execution_engine=execution,
                 state=flush_state,
-                flush_interval=30.0,
+                flush_interval=_PAPER_FLUSH_INTERVAL_SECONDS,
                 log=log,
             )
         )
@@ -697,26 +762,12 @@ async def run_paper_engine(
 
     except asyncio.CancelledError:
         log.info("runs.paper_engine_cancelled")
-        if auto_stop_task is not None and not auto_stop_task.done():
-            auto_stop_task.cancel()
-            try:
-                await auto_stop_task
-            except (asyncio.CancelledError, Exception):
-                pass
-        if learning_stop_event is not None:
-            learning_stop_event.set()
-        if learning_task is not None and not learning_task.done():
-            learning_task.cancel()
-            try:
-                await learning_task
-            except (asyncio.CancelledError, Exception):
-                pass
-        if flush_task is not None and not flush_task.done():
-            flush_task.cancel()
-            try:
-                await flush_task
-            except (asyncio.CancelledError, Exception):
-                pass
+        await _cancel_engine_side_tasks(
+            auto_stop_task=auto_stop_task,
+            learning_task=learning_task,
+            learning_stop_event=learning_stop_event,
+            flush_task=flush_task,
+        )
         if engine is not None:
             try:
                 await engine.stop()
@@ -727,26 +778,12 @@ async def run_paper_engine(
     except Exception:
         final_status = "error"
         log.exception("runs.paper_engine_error")
-        if auto_stop_task is not None and not auto_stop_task.done():
-            auto_stop_task.cancel()
-            try:
-                await auto_stop_task
-            except (asyncio.CancelledError, Exception):
-                pass
-        if learning_stop_event is not None:
-            learning_stop_event.set()
-        if learning_task is not None and not learning_task.done():
-            learning_task.cancel()
-            try:
-                await learning_task
-            except (asyncio.CancelledError, Exception):
-                pass
-        if flush_task is not None and not flush_task.done():
-            flush_task.cancel()
-            try:
-                await flush_task
-            except (asyncio.CancelledError, Exception):
-                pass
+        await _cancel_engine_side_tasks(
+            auto_stop_task=auto_stop_task,
+            learning_task=learning_task,
+            learning_stop_event=learning_stop_event,
+            flush_task=flush_task,
+        )
         if engine is not None:
             try:
                 await engine.stop()
@@ -754,31 +791,15 @@ async def run_paper_engine(
                 log.exception("runs.paper_engine_stop_error")
 
     finally:
-        # Cancel auto-stop timeout task (normal stop path)
-        if auto_stop_task is not None and not auto_stop_task.done():
-            auto_stop_task.cancel()
-            try:
-                await auto_stop_task
-            except (asyncio.CancelledError, Exception):
-                pass
-
-        # Belt-and-suspenders: cancel learning task if it somehow survived
-        if learning_stop_event is not None:
-            learning_stop_event.set()
-        if learning_task is not None and not learning_task.done():
-            learning_task.cancel()
-            try:
-                await learning_task
-            except (asyncio.CancelledError, Exception):
-                pass
-
-        # Belt-and-suspenders: cancel flush task if it somehow survived
-        if flush_task is not None and not flush_task.done():
-            flush_task.cancel()
-            try:
-                await flush_task
-            except (asyncio.CancelledError, Exception):
-                pass
+        # Belt-and-suspenders teardown — idempotent no-op if the except
+        # branches already ran; still safe to call on the happy path when no
+        # side tasks were ever spawned.
+        await _cancel_engine_side_tasks(
+            auto_stop_task=auto_stop_task,
+            learning_task=learning_task,
+            learning_stop_event=learning_stop_event,
+            flush_task=flush_task,
+        )
 
         # Remove from task registry
         _RUN_TASKS.pop(run_id_str, None)
@@ -980,7 +1001,7 @@ async def run_live_engine(
                 portfolio=portfolio,
                 execution_engine=execution,
                 state=flush_state,
-                flush_interval=30.0,
+                flush_interval=_PAPER_FLUSH_INTERVAL_SECONDS,
                 log=log,
             )
         )
@@ -1005,26 +1026,12 @@ async def run_live_engine(
 
     except asyncio.CancelledError:
         log.info("runs.live_engine_cancelled")
-        if auto_stop_task is not None and not auto_stop_task.done():
-            auto_stop_task.cancel()
-            try:
-                await auto_stop_task
-            except (asyncio.CancelledError, Exception):
-                pass
-        if learning_stop_event is not None:
-            learning_stop_event.set()
-        if learning_task is not None and not learning_task.done():
-            learning_task.cancel()
-            try:
-                await learning_task
-            except (asyncio.CancelledError, Exception):
-                pass
-        if flush_task is not None and not flush_task.done():
-            flush_task.cancel()
-            try:
-                await flush_task
-            except (asyncio.CancelledError, Exception):
-                pass
+        await _cancel_engine_side_tasks(
+            auto_stop_task=auto_stop_task,
+            learning_task=learning_task,
+            learning_stop_event=learning_stop_event,
+            flush_task=flush_task,
+        )
         if engine is not None:
             try:
                 await engine.stop()
@@ -1035,26 +1042,12 @@ async def run_live_engine(
     except Exception:
         final_status = "error"
         log.exception("runs.live_engine_error")
-        if auto_stop_task is not None and not auto_stop_task.done():
-            auto_stop_task.cancel()
-            try:
-                await auto_stop_task
-            except (asyncio.CancelledError, Exception):
-                pass
-        if learning_stop_event is not None:
-            learning_stop_event.set()
-        if learning_task is not None and not learning_task.done():
-            learning_task.cancel()
-            try:
-                await learning_task
-            except (asyncio.CancelledError, Exception):
-                pass
-        if flush_task is not None and not flush_task.done():
-            flush_task.cancel()
-            try:
-                await flush_task
-            except (asyncio.CancelledError, Exception):
-                pass
+        await _cancel_engine_side_tasks(
+            auto_stop_task=auto_stop_task,
+            learning_task=learning_task,
+            learning_stop_event=learning_stop_event,
+            flush_task=flush_task,
+        )
         if engine is not None:
             try:
                 await engine.stop()
@@ -1062,31 +1055,15 @@ async def run_live_engine(
                 log.exception("runs.live_engine_stop_error")
 
     finally:
-        # Cancel auto-stop timeout task (normal stop path)
-        if auto_stop_task is not None and not auto_stop_task.done():
-            auto_stop_task.cancel()
-            try:
-                await auto_stop_task
-            except (asyncio.CancelledError, Exception):
-                pass
-
-        # Belt-and-suspenders: cancel learning task if it somehow survived
-        if learning_stop_event is not None:
-            learning_stop_event.set()
-        if learning_task is not None and not learning_task.done():
-            learning_task.cancel()
-            try:
-                await learning_task
-            except (asyncio.CancelledError, Exception):
-                pass
-
-        # Belt-and-suspenders: cancel flush task if it somehow survived
-        if flush_task is not None and not flush_task.done():
-            flush_task.cancel()
-            try:
-                await flush_task
-            except (asyncio.CancelledError, Exception):
-                pass
+        # Belt-and-suspenders teardown — idempotent no-op if the except
+        # branches already ran; still safe on the happy path when no side
+        # tasks were ever spawned.
+        await _cancel_engine_side_tasks(
+            auto_stop_task=auto_stop_task,
+            learning_task=learning_task,
+            learning_stop_event=learning_stop_event,
+            flush_task=flush_task,
+        )
 
         # Remove from task registry
         _RUN_TASKS.pop(run_id_str, None)

@@ -23,6 +23,7 @@ import type { CsvColumn } from "@/lib/csv-export";
 import { ExportCsvButton } from "@/components/ui/export-csv-button";
 import { Header } from "@/components/layout/header";
 import { RunStatusBadge } from "@/components/ui/status-badge";
+import { SideBadge } from "@/components/ui/side-badge";
 import { StatCard } from "@/components/ui/stat-card";
 import { DataTable, type Column } from "@/components/ui/data-table";
 import { Tabs } from "@/components/ui/tabs";
@@ -43,9 +44,7 @@ const TRADE_COLUMNS: Column<Trade>[] = [
     key: "side",
     header: "Side",
     render: (t) => (
-      <span className={t.side === "buy" ? "text-profit text-xs font-medium" : "text-loss text-xs font-medium"}>
-        {t.side.toUpperCase()}
-      </span>
+      <SideBadge side={t.side} />
     ),
   },
   {
@@ -104,9 +103,7 @@ const ORDER_COLUMNS: Column<Order>[] = [
     key: "side",
     header: "Side",
     render: (o) => (
-      <span className={o.side === "buy" ? "text-profit text-xs font-medium" : "text-loss text-xs font-medium"}>
-        {o.side.toUpperCase()}
-      </span>
+      <SideBadge side={o.side} />
     ),
   },
   {
@@ -158,9 +155,7 @@ const FILL_COLUMNS: Column<Fill>[] = [
     key: "side",
     header: "Side",
     render: (f) => (
-      <span className={f.side === "buy" ? "text-profit text-xs font-medium" : "text-loss text-xs font-medium"}>
-        {f.side.toUpperCase()}
-      </span>
+      <SideBadge side={f.side} />
     ),
   },
   {

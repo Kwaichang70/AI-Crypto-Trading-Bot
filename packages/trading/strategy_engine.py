@@ -41,7 +41,7 @@ from typing import Any
 import structlog
 
 from common.models import MultiTimeframeContext, OHLCVBar
-from common.types import OrderSide, RunMode, TimeFrame
+from common.types import OrderSide, RunMode, SignalDirection, TimeFrame
 from data.market_data import BaseMarketDataService, MarketDataError
 from trading.execution import BaseExecutionEngine
 from trading.models import Fill, Position, Signal, TradeResult
@@ -55,6 +55,17 @@ from trading.trailing_stop import TrailingStopManager
 __all__ = ["StrategyEngine", "EngineState"]
 
 logger = structlog.get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Named constants
+# ---------------------------------------------------------------------------
+#: Multiplier applied to each strategy's ``min_bars_required`` when deriving
+#: the auto-warmup window.  Doubling gives strategies enough history to fill
+#: rolling indicators (RSI/ATR/etc.) before signals start flowing.
+_DEFAULT_WARMUP_MULTIPLIER: int = 2
+#: Floor for the auto-warmup window even when strategies request less.
+_MIN_WARMUP_BARS: int = 50
 
 
 # ---------------------------------------------------------------------------
@@ -167,7 +178,9 @@ class StrategyEngine:
                 (s.min_bars_required for s in self._strategies),
                 default=0,
             )
-            self._warmup_bars = max(max_min_bars * 2, 50)
+            self._warmup_bars = max(
+                max_min_bars * _DEFAULT_WARMUP_MULTIPLIER, _MIN_WARMUP_BARS
+            )
         self._max_bars_history: int = int(
             self._config.get("max_bars_history", 500)
         )
@@ -315,8 +328,9 @@ class StrategyEngine:
 
             self._state = EngineState.RUNNING
 
-            # CR-002: Warn if strategies declare htf_timeframes in paper/live mode
-            # (HTF data is only auto-provided in backtest mode via run_backtest)
+            # Warn if strategies declare htf_timeframes in paper/live mode.
+            # HTF data is only auto-provided in backtest mode via run_backtest;
+            # paper/live would otherwise silently skip MTF analysis.
             if self._run_mode in (RunMode.PAPER, RunMode.LIVE):
                 for strategy in self._strategies:
                     if strategy.htf_timeframes:
@@ -376,7 +390,8 @@ class StrategyEngine:
         if self._trailing_stop is not None:
             self._trailing_stop.reset()
 
-        # Sprint 32: clear adaptive learning trackers
+        # Clear adaptive-learning trackers so a subsequent start() begins with
+        # a clean MAE/MFE baseline and empty skip-trade log.
         self._excursion_tracker.clear()
         skip_summary = self._skip_logger.get_skip_summary()
         if skip_summary:
@@ -638,7 +653,7 @@ class StrategyEngine:
         prices = {s: bar.close for s, bar in current_bars.items()}
         self._portfolio.update_market_prices(prices)
 
-        # C1. Update excursion tracker on every bar (Sprint 32)
+        # Update MAE/MFE excursion tracker for every open position.
         for sym, b in current_bars.items():
             self._excursion_tracker.on_bar(
                 symbol=sym, high=b.high, low=b.low, close=b.close
@@ -652,7 +667,8 @@ class StrategyEngine:
         # so strategies can still be monitored and signals recorded. The paper
         # execution engine's pre_trade_check will block actual order placement.
         if self._run_mode == RunMode.LIVE and self._risk_manager.kill_switch_active:
-            # C6: Log skipped trades on kill switch (Sprint 32)
+            # Record kill-switch-suppressed trades so the post-run audit shows
+            # exactly which symbols would have entered had the switch been off.
             if self._skip_logger is not None:
                 for sym, sym_bar in current_bars.items():
                     self._skip_logger.log_skip(
@@ -669,7 +685,7 @@ class StrategyEngine:
         # Count only bars that reach strategy processing
         self._bar_count += 1
 
-        # C2. Check graduated circuit breaker (Sprint 32).
+        # Check graduated circuit breaker.
         # DAILY_LIMIT: no new entries but trailing stops must still fire - do NOT return.
         # HALT: block all new signals (but fall through to trailing stop section 5b).
         _cb_response = CircuitBreakerResponse.OK
@@ -723,9 +739,8 @@ class StrategyEngine:
                     skip_count=len(bar_signals),
                 )
             # Log suppressed BUY signals as skipped trades
-            from common.types import SignalDirection as _SD
             for _sig in bar_signals:
-                if _sig.direction == _SD.BUY:
+                if _sig.direction == SignalDirection.BUY:
                     self._skip_logger.log_skip(
                         symbol=_sig.symbol,
                         skip_reason=f"circuit_breaker_{_cb_response}",
@@ -745,8 +760,7 @@ class StrategyEngine:
                     self._circuit_breaker is not None
                     and _cb_response == CircuitBreakerResponse.REDUCE
                 ):
-                    from common.types import SignalDirection as _SD2
-                    if signal.direction == _SD2.BUY:
+                    if signal.direction == SignalDirection.BUY:
                         _size_multiplier = self._circuit_breaker.get_position_size_multiplier()
                         if _size_multiplier < 1.0:
                             signal = signal.model_copy(
@@ -817,9 +831,9 @@ class StrategyEngine:
                     symbol=signal.symbol,
                     direction=signal.direction.value,
                 )
-                # C5: Log skipped trade on execution error (Sprint 32)
-                from common.types import SignalDirection as _SD3
-                if signal.direction == _SD3.BUY:
+                # Log skipped trade on execution error so the post-run audit
+                # captures decisions that never reached the execution engine.
+                if signal.direction == SignalDirection.BUY:
                     bar_ref = current_bars.get(signal.symbol)
                     self._skip_logger.log_skip(
                         symbol=signal.symbol,
@@ -895,7 +909,9 @@ class StrategyEngine:
             _mc.gauge("active_positions", float(_summary["open_positions"]))
             _mc.observe("bar_processing_duration_seconds", bar_elapsed_ms / 1000.0)
         except Exception:
-            pass  # Never fail on metrics
+            # Metrics must never crash bar processing; surface at debug level
+            # so operational regressions are still observable in verbose logs.
+            self._log.debug("engine.metrics_update_failed", exc_info=True)
 
     # ------------------------------------------------------------------
     # Strategy invocation
@@ -953,13 +969,14 @@ class StrategyEngine:
         best-effort: any exception is swallowed to ensure bar processing
         never crashes due to a failed external signal fetch.
         """
-        # Sprint 32: read cached FGI value (best-effort, never crashes)
+        # Read cached FGI value (best-effort; never crash bar processing
+        # if the client is unavailable or has not populated its cache yet).
         fgi_value: int | None = None
         try:
             from data.sentiment import get_global_client as _get_fgi_client
             _fgi_client = _get_fgi_client()
             if _fgi_client is not None:
-                fgi_value = _fgi_client.cached_value  # CR-002: public property
+                fgi_value = _fgi_client.cached_value
         except Exception:
             pass  # FGI is best-effort; never crash bar processing
 
@@ -1024,7 +1041,9 @@ class StrategyEngine:
         if whale_net_flow is not None:
             ctx_kwargs["whale_net_flow"] = whale_net_flow
 
-        # CR-003: Return context with signal fields even when no HTF bars exist
+        # Always return a context carrying the signal fields (fgi/btc_dom/...)
+        # even when no HTF bars exist — strategies may condition on sentiment
+        # or macro signals without needing multi-timeframe OHLCV.
         if self._htf_bars is None:
             if ctx_kwargs:
                 return MultiTimeframeContext(**ctx_kwargs)
@@ -1174,7 +1193,8 @@ class StrategyEngine:
 
         now = datetime.now(tz=UTC)
 
-        # Sprint 32: retrieve excursion data and exit reason
+        # Enrich the trade record with excursion (MAE/MFE) and exit
+        # classification so post-run analytics can slice by exit reason.
         excursion_data = self._excursion_tracker.on_position_close(fill.symbol)
         mae_pct: float | None = None
         mfe_pct: float | None = None
