@@ -586,7 +586,7 @@ class TestIncrementalFlushLoop:
         log = _make_log()
 
         with (
-            patch("api.routers.runs._flush_incremental", side_effect=_flush_side_effect) as mock_flush,
+            patch("api.services.run_orchestrator._flush_incremental", side_effect=_flush_side_effect) as mock_flush,
             patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
         ):
             try:
@@ -632,7 +632,7 @@ class TestIncrementalFlushLoop:
         log = _make_log()
 
         with (
-            patch("api.routers.runs._flush_incremental", side_effect=_flush_side_effect) as mock_flush,
+            patch("api.services.run_orchestrator._flush_incremental", side_effect=_flush_side_effect) as mock_flush,
             patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
         ):
             try:

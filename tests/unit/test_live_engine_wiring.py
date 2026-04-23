@@ -86,7 +86,7 @@ _PT_LIVE_ENGINE = "trading.engines.live.LiveExecutionEngine"
 _PT_PORTFOLIO = "trading.portfolio.PortfolioAccounting"
 _PT_RISK_MGR = "trading.risk_manager.DefaultRiskManager"
 _PT_STRAT_ENGINE = "trading.strategy_engine.StrategyEngine"
-_PT_FLUSH = "api.routers.runs._flush_incremental"
+_PT_FLUSH = "api.services.run_orchestrator._flush_incremental"
 _PT_FLUSH_LOOP = "api.routers.runs._incremental_flush_loop"
 
 # ---------------------------------------------------------------------------
