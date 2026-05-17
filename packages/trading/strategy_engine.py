@@ -894,20 +894,48 @@ class StrategyEngine:
         )
 
         # 8. Update Prometheus-compatible metrics
+        # TO-008 (Sprint 44): tag every counter / gauge / histogram with the
+        # ``run_id`` label so Grafana panels can isolate throughput, signal
+        # quality, and drawdown per-run instead of aggregating across all
+        # concurrent strategies.  When run_id is None (start() not yet
+        # called) we use 'unknown' as a stable placeholder.
         try:
             from common.metrics import metrics as _mc
-            _mc.increment("bars_processed_total")
+            _run_label = {"run_id": self._run_id or "unknown"}
+            _mc.increment("bars_processed_total", labels=_run_label)
             if len(bar_signals) > 0:
-                _mc.increment("signals_generated_total", len(bar_signals))
+                _mc.increment(
+                    "signals_generated_total", len(bar_signals), labels=_run_label
+                )
             if bar_orders > 0:
-                _mc.increment("orders_submitted_total", bar_orders)
+                _mc.increment(
+                    "orders_submitted_total", bar_orders, labels=_run_label
+                )
             if bar_fills > 0:
-                _mc.increment("fills_executed_total", bar_fills)
+                _mc.increment(
+                    "fills_executed_total", bar_fills, labels=_run_label
+                )
             _summary = self._portfolio.get_summary()
-            _mc.gauge("portfolio_equity", float(_summary["current_equity"]))
-            _mc.gauge("portfolio_drawdown_pct", float(_summary["drawdown_pct"]))
-            _mc.gauge("active_positions", float(_summary["open_positions"]))
-            _mc.observe("bar_processing_duration_seconds", bar_elapsed_ms / 1000.0)
+            _mc.gauge(
+                "portfolio_equity",
+                float(_summary["current_equity"]),
+                labels=_run_label,
+            )
+            _mc.gauge(
+                "portfolio_drawdown_pct",
+                float(_summary["drawdown_pct"]),
+                labels=_run_label,
+            )
+            _mc.gauge(
+                "active_positions",
+                float(_summary["open_positions"]),
+                labels=_run_label,
+            )
+            _mc.observe(
+                "bar_processing_duration_seconds",
+                bar_elapsed_ms / 1000.0,
+                labels=_run_label,
+            )
         except Exception:
             # Metrics must never crash bar processing; surface at debug level
             # so operational regressions are still observable in verbose logs.

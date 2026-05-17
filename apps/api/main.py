@@ -540,11 +540,32 @@ _PROBE_PATHS: frozenset[str] = frozenset({"/health", "/metrics", "/api/v1/metric
 async def _request_timing_middleware(request: Request, call_next: Any) -> Response:
     """
     Add X-Process-Time header and emit a structured HTTP request log entry.
+
+    TO-008 (Sprint 44): each request gets a UUID4 ``request_id`` bound into
+    the structlog contextvars frame for the lifetime of the call.  Every
+    log entry emitted by downstream code (routers, services, even tasks
+    spawned with ``contextvars`` inheritance) carries the same id so
+    multi-hop traces are correlatable post-incident.  The id is also
+    echoed in the ``X-Request-ID`` response header so clients and
+    proxies can stitch their own telemetry against it.
     """
+    import uuid as _uuid
+
+    import structlog.contextvars as _ctxvars
+
+    request_id = request.headers.get("X-Request-ID") or _uuid.uuid4().hex
+
     start = time.monotonic()
-    response = await call_next(request)
+
+    _ctxvars.bind_contextvars(request_id=request_id)
+    try:
+        response = await call_next(request)
+    finally:
+        _ctxvars.clear_contextvars()
+
     elapsed_ms = round((time.monotonic() - start) * 1000, 2)
     response.headers["X-Process-Time"] = str(elapsed_ms)
+    response.headers["X-Request-ID"] = request_id
 
     path = request.url.path
     log_fn = logger.debug if path in _PROBE_PATHS else logger.info
@@ -554,6 +575,7 @@ async def _request_timing_middleware(request: Request, call_next: Any) -> Respon
         path=path,
         status_code=response.status_code,
         duration_ms=elapsed_ms,
+        request_id=request_id,
     )
 
     return cast(Response, response)

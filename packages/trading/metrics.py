@@ -674,3 +674,229 @@ def compute_trade_statistics(
         gross_profit=gross_profit,
         gross_loss=gross_loss,
     )
+
+
+# ===================================================================
+# Sprint 44 QT-005: extended drawdown / tail-risk / regime metrics
+# ===================================================================
+
+
+def compute_ulcer_index(equity_curve: Sequence[EquityCurvePoint]) -> float:
+    """Ulcer Index — RMS of percentage drawdowns from running peak.
+
+    Penalises long, slow drawdowns far more than max-DD does.  Two
+    strategies with the same max-DD but different drawdown durations
+    will have meaningfully different Ulcer scores — useful for catching
+    "slow bleed" strategies that look fine by max-DD alone.
+
+    Formula::
+
+        peak_t        = max(E_0 .. E_t)
+        dd_t (%)      = (peak_t - E_t) / peak_t * 100      (>= 0)
+        Ulcer Index   = sqrt( mean( dd_t^2 ) )
+
+    Returns ``0.0`` for empty or single-point curves (no drawdown to
+    measure).  Always non-negative; lower is better.
+    """
+    if len(equity_curve) < 2:
+        return 0.0
+
+    peak = float(equity_curve[0].equity)
+    squared_dd = 0.0
+    n = 0
+    for point in equity_curve:
+        eq = float(point.equity)
+        if eq > peak:
+            peak = eq
+        if peak > 0.0:
+            dd_pct = (peak - eq) / peak * 100.0
+        else:
+            dd_pct = 0.0
+        squared_dd += dd_pct * dd_pct
+        n += 1
+
+    if n == 0:
+        return 0.0
+    import math as _m
+
+    return _m.sqrt(squared_dd / n)
+
+
+def compute_omega_ratio(
+    returns: Sequence[float],
+    threshold: float = 0.0,
+) -> float:
+    """Omega ratio at threshold ``θ``: ``sum(gains above θ) / sum(losses below θ)``.
+
+    Captures the entire return distribution rather than collapsing it
+    to a mean+variance like Sharpe / Sortino.  Omega(0) > 1 means more
+    upside than downside relative to zero; higher is better.
+
+    Returns ``inf`` when there are no returns below threshold and at
+    least one above (pure win-streak — informational, not actionable).
+    Returns ``0.0`` when there are no returns at all OR no returns above
+    threshold (the strategy never beat the benchmark).
+    """
+    if not returns:
+        return 0.0
+
+    gains = 0.0
+    losses = 0.0
+    for r in returns:
+        diff = r - threshold
+        if diff > 0:
+            gains += diff
+        elif diff < 0:
+            losses += -diff
+    if gains <= 0.0:
+        return 0.0
+    if losses <= 0.0:
+        return float("inf")
+    return gains / losses
+
+
+def compute_cvar(
+    returns: Sequence[float],
+    confidence: float = 0.95,
+) -> float:
+    """Conditional Value-at-Risk (Expected Shortfall) at ``confidence`` level.
+
+    The mean return across the WORST ``(1 - confidence)`` fraction of
+    observations.  At 95% confidence, CVaR is the average return on the
+    worst 5% of bars — a much sharper tail-risk measure than max-DD or
+    standard deviation because it directly captures left-tail mass.
+
+    Returns ``0.0`` for empty inputs.  Result is signed — negative
+    indicates an expected loss in the tail (the typical case).
+
+    Parameters
+    ----------
+    returns:
+        Per-period returns (e.g. from :func:`compute_returns_from_equity`).
+    confidence:
+        VaR confidence level; must be in ``(0, 1)``.  Default ``0.95``
+        meaning we look at the worst 5% of bars.
+    """
+    if not returns:
+        return 0.0
+    if not 0.0 < confidence < 1.0:
+        raise ValueError(f"confidence must be in (0, 1), got {confidence}")
+
+    sorted_returns = sorted(returns)
+    tail_fraction = 1.0 - confidence
+    # Number of observations in the tail — at least 1 so single-return
+    # inputs still yield a defined CVaR.
+    tail_n = max(1, int(len(sorted_returns) * tail_fraction))
+    tail = sorted_returns[:tail_n]
+    return sum(tail) / len(tail)
+
+
+def compute_exposure_adjusted_sharpe(
+    sharpe: float,
+    exposure_pct: float,
+) -> float:
+    """Sprint 44 QT-006 — divide Sharpe by ``sqrt(exposure)``.
+
+    Selective strategies that spend only 30 % of bars in market are
+    structurally penalised by the standard time-weighted Sharpe because
+    the idle bars contribute zero-variance noise that inflates the
+    sample count and deflates the ratio.  Dividing by ``sqrt(exposure)``
+    re-normalises so an always-in baseline (exposure=1.0) is unchanged
+    while a 25 %-exposure strategy gets its Sharpe doubled.
+
+    Returns the raw Sharpe when exposure is ``<= 0`` (degenerate input,
+    no trades) so callers cannot accidentally divide by zero.
+    """
+    if exposure_pct <= 0.0:
+        return sharpe
+    import math as _m
+
+    return sharpe / _m.sqrt(exposure_pct)
+
+
+# ===================================================================
+# Sprint 44 QT-012: buy-and-hold benchmark comparison
+# ===================================================================
+
+
+def compute_buy_and_hold_return(
+    benchmark_prices: Sequence[float],
+) -> float:
+    """Total return of a buy-and-hold benchmark over the same window.
+
+    Computed as ``(end_price - start_price) / start_price`` so it can be
+    compared directly against ``BacktestResult.total_return_pct``.
+    Returns ``0.0`` for empty / single-price inputs.
+    """
+    if len(benchmark_prices) < 2:
+        return 0.0
+    start = benchmark_prices[0]
+    end = benchmark_prices[-1]
+    if start == 0.0:
+        return 0.0
+    return (end - start) / start
+
+
+def compute_alpha_beta(
+    strategy_returns: Sequence[float],
+    benchmark_returns: Sequence[float],
+) -> tuple[float, float]:
+    """Ordinary least-squares regression of strategy returns on benchmark.
+
+    Returns ``(alpha, beta)`` where:
+
+    * ``beta``  = ``Cov(R_s, R_b) / Var(R_b)`` — sensitivity to benchmark.
+    * ``alpha`` = ``mean(R_s) - beta * mean(R_b)`` — return component
+      that is NOT explained by benchmark exposure.
+
+    Both series must be the same length; mismatched input returns
+    ``(0.0, 0.0)``.  ``Var(R_b) = 0`` returns ``(mean(R_s), 0.0)`` —
+    a flat benchmark yields zero beta by construction.
+    """
+    n = len(strategy_returns)
+    if n == 0 or n != len(benchmark_returns):
+        return 0.0, 0.0
+
+    mean_s = sum(strategy_returns) / n
+    mean_b = sum(benchmark_returns) / n
+
+    cov = sum(
+        (s - mean_s) * (b - mean_b)
+        for s, b in zip(strategy_returns, benchmark_returns, strict=False)
+    ) / n
+    var_b = sum((b - mean_b) ** 2 for b in benchmark_returns) / n
+
+    if var_b == 0.0:
+        return mean_s, 0.0
+
+    beta = cov / var_b
+    alpha = mean_s - beta * mean_b
+    return alpha, beta
+
+
+def compute_information_ratio(
+    strategy_returns: Sequence[float],
+    benchmark_returns: Sequence[float],
+) -> float:
+    """Information ratio = mean(active_return) / stdev(active_return).
+
+    Where ``active_return_t = R_strategy_t - R_benchmark_t``.  Measures
+    consistency of out-performance per unit of tracking-error risk.
+    Returns ``0.0`` on mismatched lengths or zero tracking error.
+    """
+    n = len(strategy_returns)
+    if n == 0 or n != len(benchmark_returns):
+        return 0.0
+
+    active = [
+        s - b for s, b in zip(strategy_returns, benchmark_returns, strict=False)
+    ]
+    mean_active = sum(active) / n
+    if n < 2:
+        return 0.0
+    var_active = sum((a - mean_active) ** 2 for a in active) / (n - 1)
+    if var_active == 0.0:
+        return 0.0
+    import math as _m
+
+    return mean_active / _m.sqrt(var_active)
