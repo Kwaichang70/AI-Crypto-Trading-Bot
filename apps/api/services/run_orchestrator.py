@@ -377,6 +377,9 @@ async def flush_incremental(
                 fee_currency=fill.fee_currency,
                 is_maker=fill.is_maker,
                 executed_at=fill.executed_at,
+                # QT-009: persist execution-quality telemetry when present
+                expected_price=getattr(fill, "expected_price", None),
+                slippage_bps_realized=getattr(fill, "slippage_bps_realized", None),
             )
         )
         new_fill_ids.append(fill.fill_id)

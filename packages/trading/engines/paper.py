@@ -231,6 +231,7 @@ class PaperExecutionEngine(BaseExecutionEngine):
         order: Order,
         fill_price: Decimal,
         is_maker: bool,
+        expected_price: Decimal | None = None,
     ) -> Fill:
         """
         Create a Fill object for a simulated execution.
@@ -243,6 +244,11 @@ class PaperExecutionEngine(BaseExecutionEngine):
             The execution price (already slippage-adjusted for MARKET).
         is_maker:
             Whether this fill qualifies for maker fee.
+        expected_price:
+            Pre-execution price expectation.  For MARKET orders this is
+            the bar's last price BEFORE slippage was applied; for LIMIT
+            orders it is the order's limit price.  Used to compute
+            ``slippage_bps_realized`` for QT-009 telemetry.
 
         Returns
         -------
@@ -255,6 +261,13 @@ class PaperExecutionEngine(BaseExecutionEngine):
         parts = order.symbol.split("/")
         fee_currency = parts[1] if len(parts) > 1 else "USDT"
 
+        # QT-009: compute realised slippage when an expectation is available.
+        slippage_bps_realized: Decimal | None = None
+        if expected_price is not None and expected_price > Decimal("0"):
+            slippage_bps_realized = (
+                abs(fill_price - expected_price) / expected_price * Decimal("10000")
+            ).quantize(Decimal("0.0001"))
+
         fill = Fill(
             order_id=order.order_id,
             symbol=order.symbol,
@@ -265,6 +278,8 @@ class PaperExecutionEngine(BaseExecutionEngine):
             fee_currency=fee_currency,
             is_maker=is_maker,
             executed_at=datetime.now(tz=UTC),
+            expected_price=expected_price,
+            slippage_bps_realized=slippage_bps_realized,
         )
 
         # Record fill
@@ -425,11 +440,16 @@ class PaperExecutionEngine(BaseExecutionEngine):
         last_price = self._get_last_price(symbol)
 
         if order.order_type == OrderType.MARKET:
-            # Apply slippage for market orders
+            # Apply slippage for market orders.  Capture the pre-slippage
+            # price so the resulting Fill carries QT-009 telemetry showing
+            # exactly how much we paid above (BUY) or received below (SELL)
+            # the indicated mid-market reference.
             fill_price = self._apply_slippage(last_price, order.side)
             is_maker = False
 
-            fill = self._simulate_fill(order, fill_price, is_maker)
+            fill = self._simulate_fill(
+                order, fill_price, is_maker, expected_price=last_price
+            )
 
             # Update order with fill data
             order = order.model_copy(update={
@@ -461,9 +481,14 @@ class PaperExecutionEngine(BaseExecutionEngine):
                 should_fill = True
 
             if should_fill:
-                # Fill at limit price (no slippage for limit orders)
+                # Fill at limit price (no slippage for limit orders).
+                # QT-009: expected_price == fill_price so slippage_bps == 0
+                # by construction — captured explicitly so reports can
+                # distinguish "zero slippage" from "no expectation captured".
                 fill_price = order.price
-                fill = self._simulate_fill(order, fill_price, is_maker)
+                fill = self._simulate_fill(
+                    order, fill_price, is_maker, expected_price=order.price
+                )
 
                 order = order.model_copy(update={
                     "filled_quantity": order.quantity,
@@ -746,7 +771,13 @@ class PaperExecutionEngine(BaseExecutionEngine):
 
             if should_fill:
                 fill_price = order.price  # Fill at limit price
-                fill = self._simulate_fill(order, fill_price, is_maker=True)
+                # QT-009: resting limit fill — expected equals fill_price
+                # because the engine never queues above the limit; this
+                # preserves the "no slippage on resting limits" invariant
+                # in the telemetry data.
+                fill = self._simulate_fill(
+                    order, fill_price, is_maker=True, expected_price=order.price
+                )
 
                 order = order.model_copy(update={
                     "filled_quantity": order.quantity,

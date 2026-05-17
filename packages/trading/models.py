@@ -146,6 +146,31 @@ class Fill(BaseModel):
         description="True if this fill earned maker fee (resting limit order)",
     )
     executed_at: datetime = Field(default_factory=lambda: datetime.now(tz=UTC))
+    # QT-009 (Sprint 42): execution-quality telemetry — when the engine
+    # had a pre-execution price expectation, capture both the expected price
+    # and the realised slippage so downstream reports can answer:
+    #   * is live trading more expensive than the paper model assumed?
+    #   * does the configured slippage_bps still calibrate against reality?
+    # Both fields are optional so historical fills (before this sprint) and
+    # exchange paths that don't expose an expected price stay valid.
+    expected_price: Decimal | None = Field(
+        default=None,
+        description=(
+            "Pre-execution price expectation in quote currency.  For market "
+            "orders this is the bar's last price before slippage; for limit "
+            "orders it is the order's limit price.  None when no expectation "
+            "is available (e.g. exchange-side market order on live engine)."
+        ),
+    )
+    slippage_bps_realized: Decimal | None = Field(
+        default=None,
+        description=(
+            "Absolute realised slippage in basis points: "
+            "|price - expected_price| / expected_price * 10000.  None when "
+            "expected_price is None.  Sign convention is direction-implicit "
+            "via Fill.side."
+        ),
+    )
 
 
 class Position(BaseModel):

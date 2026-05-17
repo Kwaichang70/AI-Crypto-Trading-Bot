@@ -1061,3 +1061,73 @@ class TestLifecycle:
         order_ids = [o.order_id for o in open_orders]
         assert resting_order.order_id in order_ids
         assert filled_order.order_id not in order_ids
+
+
+# ===================================================================
+# TestQT009ExecutionTelemetry — Sprint 42 QT-009
+# ===================================================================
+
+
+class TestQT009ExecutionTelemetry:
+    """QT-009: every Fill carries an ``expected_price`` and
+    ``slippage_bps_realized`` so post-run analytics can answer
+    "is the configured slippage_bps still calibrated against reality?"
+    """
+
+    @pytest.mark.asyncio
+    async def test_market_buy_records_realised_slippage(self) -> None:
+        """MARKET BUY: expected_price = pre-slippage last price;
+        realised slippage_bps_realized ≈ configured _SLIPPAGE_BPS."""
+        engine, _ = _make_engine(slippage_bps=5)
+        engine.set_last_price(_SYMBOL, _LAST_PRICE)
+        order = _make_market_order(side=OrderSide.BUY, quantity=Decimal("0.1"))
+
+        await engine.submit_order(order)
+
+        fills = await engine.get_fills(order.order_id)
+        assert len(fills) == 1
+        fill = fills[0]
+        assert fill.expected_price == _LAST_PRICE
+        assert fill.slippage_bps_realized is not None
+        # Configured engine slippage = 5 bps — must match within
+        # quantisation rounding on the Decimal(4 dp) telemetry value.
+        assert abs(fill.slippage_bps_realized - Decimal("5")) < Decimal("0.5")
+
+    @pytest.mark.asyncio
+    async def test_market_sell_records_realised_slippage(self) -> None:
+        engine, rm = _make_engine(slippage_bps=5)
+        engine.set_last_price(_SYMBOL, _LAST_PRICE)
+        # Seed a position via a BUY first
+        buy = _make_market_order(side=OrderSide.BUY, quantity=Decimal("0.1"))
+        await engine.submit_order(buy)
+
+        # SELL the position
+        sell = _make_market_order(side=OrderSide.SELL, quantity=Decimal("0.1"))
+        await engine.submit_order(sell)
+
+        sell_fills = await engine.get_fills(sell.order_id)
+        assert len(sell_fills) == 1
+        fill = sell_fills[0]
+        assert fill.expected_price == _LAST_PRICE
+        assert fill.slippage_bps_realized is not None
+        assert abs(fill.slippage_bps_realized - Decimal("5")) < Decimal("0.5")
+
+    @pytest.mark.asyncio
+    async def test_limit_fill_records_zero_slippage(self) -> None:
+        """LIMIT order filled at its limit price → realised slippage = 0,
+        with a populated expected_price so reports can distinguish "zero
+        slippage" from "no expectation captured" (NULL)."""
+        engine, _ = _make_engine()
+        engine.set_last_price(_SYMBOL, _LAST_PRICE)
+        # BUY LIMIT @ price >= last_price triggers immediate fill at limit price
+        order = _make_limit_order(
+            side=OrderSide.BUY, price=_LAST_PRICE + Decimal("5"), quantity=Decimal("0.1")
+        )
+
+        await engine.submit_order(order)
+
+        fills = await engine.get_fills(order.order_id)
+        assert len(fills) == 1
+        fill = fills[0]
+        assert fill.expected_price == _LAST_PRICE + Decimal("5")
+        assert fill.slippage_bps_realized == Decimal("0.0000")

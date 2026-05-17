@@ -294,6 +294,9 @@ async def persist_paper_results(
                     fee_currency=fill.fee_currency,
                     is_maker=fill.is_maker,
                     executed_at=fill.executed_at,
+                    # QT-009 (Sprint 42): execution-quality telemetry
+                    expected_price=getattr(fill, "expected_price", None),
+                    slippage_bps_realized=getattr(fill, "slippage_bps_realized", None),
                 )
             )
 
@@ -475,6 +478,9 @@ async def persist_backtest_results(
                     fee_currency=fill.fee_currency,
                     is_maker=fill.is_maker,
                     executed_at=fill.executed_at,
+                    # QT-009 (Sprint 42): execution-quality telemetry
+                    expected_price=getattr(fill, "expected_price", None),
+                    slippage_bps_realized=getattr(fill, "slippage_bps_realized", None),
                 )
             )
 

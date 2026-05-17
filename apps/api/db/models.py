@@ -482,6 +482,24 @@ class FillORM(Base):
         comment="UTC timestamp when the fill was executed on the exchange",
     )
 
+    # QT-009 (Sprint 42): execution-quality telemetry.
+    expected_price: Mapped[Decimal | None] = mapped_column(
+        _MONEY,
+        nullable=True,
+        comment=(
+            "Pre-execution price expectation (market: last price before slippage; "
+            "limit: order.price).  NULL on historical fills written before Sprint 42."
+        ),
+    )
+    slippage_bps_realized: Mapped[Decimal | None] = mapped_column(
+        Numeric(precision=10, scale=4),
+        nullable=True,
+        comment=(
+            "Realised slippage |price-expected|/expected*10000 in basis points.  "
+            "NULL when no expected_price was captured."
+        ),
+    )
+
     # Relationships
     order: Mapped[OrderORM] = relationship("OrderORM", back_populates="fills")
 
