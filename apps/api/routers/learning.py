@@ -15,7 +15,10 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException
 
-from api.routers.runs import _LEARNING_INSTANCES
+# _LEARNING_INSTANCES lives in api.services.run_orchestrator since Sprint 40
+# Stap 2b; routers/runs.py re-exports the dict but mypy strict doesn't see
+# aliased re-exports as explicit exports.
+from api.services.run_orchestrator import _LEARNING_INSTANCES
 
 router = APIRouter(prefix="/api/v1/runs", tags=["learning"])
 
