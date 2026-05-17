@@ -59,10 +59,30 @@ class Settings(BaseSettings):
     api_key_hash: str = Field(
         default="",
         description=(
-            "SHA-256 hex digest of the valid API key. "
+            "SHA-256 hex digest of the valid (primary) API key. "
             "Generate with: echo -n 'my-secret-key' | sha256sum | awk '{print $1}'. "
             "When empty and require_api_auth=False, auth is disabled (dev mode). "
             "NEVER store the raw API key here — only the hash."
+        ),
+    )
+    # SEC-003 (Sprint 45): zero-downtime API key rotation.
+    #
+    # Setting api_key_hash_secondary to the SHA-256 of a SECOND valid key
+    # lets that key authenticate alongside the primary during a rotation
+    # window.  Typical workflow:
+    #   1. Generate new key.  Move CURRENT hash to api_key_hash_secondary.
+    #      Put NEW hash in api_key_hash.  Reload settings (or restart).
+    #   2. Roll out the new raw key to all clients.
+    #   3. Once every client is migrated, clear api_key_hash_secondary.
+    #
+    # Both fields are compared via hmac.compare_digest so timing attacks
+    # cannot distinguish primary-match from secondary-match from invalid.
+    api_key_hash_secondary: str = Field(
+        default="",
+        description=(
+            "SHA-256 hex digest of a secondary (grace-period) API key.  "
+            "SEC-003 rotation aid: leave the previous hash here while "
+            "clients migrate to a new key, then clear after rollout."
         ),
     )
     require_api_auth: bool = Field(
@@ -336,6 +356,24 @@ class Settings(BaseSettings):
             "Default 168 h = 7 days.  Override with MAX_RUN_DURATION_HOURS env var."
         ),
     )
+    # AR-006 (Sprint 45): concurrency cap on simultaneously-running paper +
+    # live engines.  Each active run consumes DB connection-pool slots
+    # (incremental flush every 30 s) plus CCXT rate-limit budget; an
+    # unbounded number of runs can exhaust the pool and starve health
+    # checks.  Default 20 leaves comfortable headroom above the typical
+    # operator workload (~5 concurrent) while staying well below the
+    # db_pool_size + db_max_overflow ceiling.
+    max_concurrent_runs: int = Field(
+        default=20,
+        ge=1,
+        le=100,
+        description=(
+            "Hard cap on simultaneously-running paper + live engines. "
+            "POST /api/v1/runs returns 503 when the active count is at "
+            "or above this limit.  Backtest runs (which complete "
+            "synchronously inside the POST handler) are NOT counted."
+        ),
+    )
 
     # ------------------------------------------------------------------
     # Telegram alerts (optional)
@@ -388,10 +426,10 @@ class Settings(BaseSettings):
             )
         return v
 
-    @field_validator("api_key_hash")
+    @field_validator("api_key_hash", "api_key_hash_secondary")
     @classmethod
     def validate_api_key_hash(cls, v: str) -> str:
-        """Validate that api_key_hash is either empty or a valid SHA-256 hex digest."""
+        """Validate that api_key_hash[_secondary] is empty or a valid SHA-256 hex digest."""
         if v and len(v) != 64:
             raise ValueError(
                 "api_key_hash must be a 64-character SHA-256 hex digest. "
@@ -402,6 +440,26 @@ class Settings(BaseSettings):
                 "api_key_hash must contain only hexadecimal characters (0-9, a-f)"
             )
         return v.lower()  # Normalise to lowercase for consistent comparison
+
+    @model_validator(mode="after")
+    def _validate_api_key_hashes_differ(self) -> "Settings":
+        """SEC-003: primary and secondary hashes must differ when both set.
+
+        Identical hashes are a no-op rotation that just confuses the
+        operator — fail loudly at startup so the misconfiguration cannot
+        slip into production.
+        """
+        if (
+            self.api_key_hash
+            and self.api_key_hash_secondary
+            and self.api_key_hash == self.api_key_hash_secondary
+        ):
+            raise ValueError(
+                "api_key_hash and api_key_hash_secondary must be different "
+                "hashes — identical values defeat the purpose of a rotation "
+                "window (SEC-003)."
+            )
+        return self
 
 
 

@@ -1425,7 +1425,8 @@ class AuditEventORM(Base):
     __table_args__ = (
         CheckConstraint(
             "event_type IN ("
-            "'live_trading_enabled', 'model_activated', 'circuit_breaker_reset'"
+            "'live_trading_enabled', 'model_activated', "
+            "'circuit_breaker_reset', 'emergency_stop'"
             ")",
             name="ck_audit_events_event_type",
         ),

@@ -48,6 +48,11 @@ _VALID_EVENT_TYPES: frozenset[str] = frozenset(
         "live_trading_enabled",
         "model_activated",
         "circuit_breaker_reset",
+        # SEC-006 (Sprint 45): operator-triggered emergency stop of a
+        # running paper/live engine via the dedicated /emergency-stop
+        # endpoint.  Distinct from regular DELETE /runs/{id} so the
+        # post-incident audit can isolate emergency interventions.
+        "emergency_stop",
     }
 )
 

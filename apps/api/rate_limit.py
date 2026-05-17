@@ -363,6 +363,16 @@ async def _rate_limit_middleware(request: Request, call_next: Any) -> Response:
     if path in _EXEMPT_PATHS:
         return cast(Response, await call_next(request))
 
+    # SEC-006 (Sprint 45): exempt the emergency-stop endpoint from rate
+    # limits.  Operators MUST be able to kill a runaway live run during
+    # an incident even if the API key bucket is throttled by the same
+    # incident's symptoms (e.g. a misconfigured client hammering the
+    # /runs endpoint).  Availability of the kill switch is a security
+    # property — the audit_events row records every emergency-stop so
+    # abuse is detectable post-incident.
+    if path.endswith("/emergency-stop"):
+        return cast(Response, await call_next(request))
+
     # Determine the appropriate limit tier
     method = request.method.upper()
     if method == "GET":

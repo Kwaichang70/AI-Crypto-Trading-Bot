@@ -80,27 +80,43 @@ def _hash_key(raw_key: str) -> str:
     return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
 
 
-def verify_api_key(submitted_key: str, expected_hash: str) -> bool:
-    """
-    Hash the submitted key and compare against the stored hash.
+def verify_api_key(
+    submitted_key: str,
+    expected_hash: str,
+    secondary_hash: str = "",
+) -> bool:
+    """Hash the submitted key and compare against one or two stored hashes.
 
     Uses ``hmac.compare_digest`` for constant-time comparison to prevent
     timing side-channel attacks that could leak hash prefix information.
+
+    SEC-003 (Sprint 45): an optional ``secondary_hash`` enables a zero-
+    downtime API key rotation window — the submitted key authenticates
+    when it matches EITHER hash.  Both comparisons are always executed
+    (no short-circuit on the primary match) so timing remains uniform
+    regardless of which hash matched.
 
     Parameters
     ----------
     submitted_key:
         The raw API key submitted by the client (never stored or logged).
     expected_hash:
-        The SHA-256 hex digest of the valid API key, from configuration.
+        SHA-256 hex digest of the primary valid API key.
+    secondary_hash:
+        Optional SHA-256 hex digest of a grace-period secondary key.
+        Empty string disables the secondary check.
 
     Returns
     -------
     bool
-        True if the submitted key matches the expected hash; False otherwise.
+        True when the submitted key matches the primary OR secondary hash.
     """
     submitted_hash = _hash_key(submitted_key)
-    return hmac.compare_digest(submitted_hash, expected_hash)
+    primary_ok = hmac.compare_digest(submitted_hash, expected_hash)
+    secondary_ok = bool(secondary_hash) and hmac.compare_digest(
+        submitted_hash, secondary_hash
+    )
+    return primary_ok or secondary_ok
 
 
 # ---------------------------------------------------------------------------
@@ -195,8 +211,13 @@ async def require_api_key(
             headers={"WWW-Authenticate": "ApiKey"},
         )
 
-    # Verify the submitted key against the stored hash
-    if not verify_api_key(submitted_key, settings.api_key_hash):
+    # Verify the submitted key against the primary (and optional
+    # SEC-003 secondary) hash.  Either match passes.
+    if not verify_api_key(
+        submitted_key,
+        settings.api_key_hash,
+        settings.api_key_hash_secondary,
+    ):
         logger.warning(
             "auth.invalid_key",
             client=client_host,

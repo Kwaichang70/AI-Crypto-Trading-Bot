@@ -463,6 +463,34 @@ async def create_run(
 
     timeframe = TimeFrame(str(body.timeframe))
 
+    # AR-006 (Sprint 45): concurrency cap.  Each active paper/live engine
+    # holds DB-pool slots (incremental flush every 30 s) plus CCXT rate-
+    # limit budget; an unbounded number would exhaust the pool and starve
+    # health-check probes.  Backtest mode runs synchronously inside this
+    # handler so it does not affect the running cap — only paper/live count.
+    if body.mode in ("paper", "live"):
+        from api.config import get_settings as _get_settings
+
+        _settings = _get_settings()
+        _active_count = sum(
+            1 for t in _RUN_TASKS.values() if not t.done()
+        )
+        if _active_count >= _settings.max_concurrent_runs:
+            log.warning(
+                "runs.concurrency_cap_hit",
+                active=_active_count,
+                cap=_settings.max_concurrent_runs,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=(
+                    f"Concurrent run cap reached "
+                    f"({_active_count}/{_settings.max_concurrent_runs}).  "
+                    f"Stop an existing run before starting a new one, "
+                    f"or raise MAX_CONCURRENT_RUNS in settings."
+                ),
+            )
+
     # Build the config snapshot stored immutably on the run record
     run_id = uuid.uuid4()
     config_snapshot: dict[str, Any] = {
@@ -1003,6 +1031,104 @@ async def stop_run(
     log.info("runs.stopped", run_id=str(run_id))
     return _run_orm_to_detail_response(run)
 
+
+# ---------------------------------------------------------------------------
+# POST /api/v1/runs/{run_id}/emergency-stop  -- SEC-006 (Sprint 45)
+# ---------------------------------------------------------------------------
+
+@router.post(
+    "/{run_id}/emergency-stop",
+    status_code=status.HTTP_200_OK,
+    response_model=RunDetailResponse,
+    responses={
+        404: {"model": ErrorResponse, "description": "Run not found"},
+        409: {"model": ErrorResponse, "description": "Run already in terminal state"},
+    },
+    summary="Emergency-stop a running trading run",
+    description=(
+        "Hard-stop a running paper/live engine, bypassing the regular "
+        "rate-limit ceiling.  Every call is recorded in the audit_events "
+        "table with event_type='emergency_stop' so post-incident review "
+        "can isolate operator interventions.  Functionally equivalent to "
+        "DELETE /runs/{id} but always available — use this when the "
+        "API key bucket is throttled by the same incident you are trying "
+        "to halt (e.g. a stuck client retrying DELETE)."
+    ),
+)
+async def emergency_stop_run(
+    run_id: uuid.UUID,
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    reason: Annotated[str | None, Header(alias="X-Emergency-Reason")] = None,
+) -> RunDetailResponse:
+    """Hard-stop a run with persistent audit trail.
+
+    Body identical to DELETE /runs/{id}: transitions status to 'stopped',
+    cancels the engine task, removes from _RUN_ENGINES / _LEARNING_INSTANCES.
+
+    Additional SEC-006 behaviour:
+      * One ``audit_events`` row with ``event_type='emergency_stop'`` is
+        written BEFORE the cancel sequence so the trail survives even if
+        a subsequent step fails.
+      * Optional ``X-Emergency-Reason`` header is captured in the audit
+        payload so operators can leave a one-line incident note.
+    """
+    log = logger.bind(endpoint="emergency_stop_run", run_id=str(run_id))
+    log.warning("runs.emergency_stop_requested", reason=reason)
+
+    stmt = select(RunORM).where(RunORM.id == run_id)
+    result = await db.execute(stmt)
+    run = result.scalar_one_or_none()
+
+    if run is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Run {run_id} not found",
+        )
+
+    if run.status != "running":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Cannot emergency-stop run {run_id}: status is '{run.status}'. "
+                f"Only 'running' runs can be emergency-stopped."
+            ),
+        )
+
+    # SEC-002 + SEC-006: persist audit BEFORE state mutation so the trail
+    # survives even if engine teardown fails mid-cancel.
+    from api.services.audit_log import record_audit_event
+
+    await record_audit_event(
+        db,
+        event_type="emergency_stop",
+        resource_type="run",
+        resource_id=str(run_id),
+        request=request,
+        payload={
+            "run_mode": run.run_mode,
+            "strategy": (run.config or {}).get("strategy_name"),
+            "reason": reason,
+        },
+    )
+
+    now = datetime.now(tz=UTC)
+    run.status = "stopped"
+    run.stopped_at = now
+    run.updated_at = now
+
+    await db.flush()
+
+    # Cancel the background task — same teardown as DELETE /runs/{id}
+    task = _RUN_TASKS.pop(str(run_id), None)
+    _RUN_ENGINES.pop(str(run_id), None)
+    _LEARNING_INSTANCES.pop(str(run_id), None)
+    if task is not None and not task.done():
+        task.cancel()
+        log.warning("runs.emergency_engine_task_cancelled")
+
+    log.warning("runs.emergency_stopped", reason=reason)
+    return _run_orm_to_detail_response(run)
 
 
 # ---------------------------------------------------------------------------
