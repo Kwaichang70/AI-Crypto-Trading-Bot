@@ -418,3 +418,94 @@ class TestParameterOptimizerWithRSI:
         assert result.total_combinations == 8
         assert result.completed_combinations == 8
         assert result.failed_combinations == 0
+
+
+# ===================================================================
+# TestParameterOptimizerWalkForward — Sprint 41 QT-004
+# ===================================================================
+
+
+class TestParameterOptimizerWalkForward:
+    """walk_forward=True invokes the per-fold OOS evaluation path and
+    surfaces a Deflated Sharpe summary on the result object."""
+
+    @pytest.mark.asyncio
+    async def test_walk_forward_populates_oos_metrics(self) -> None:
+        opt = ParameterOptimizer(
+            strategy_cls=MACrossoverStrategy,
+            symbols=[SYMBOL],
+            timeframe=TF,
+            param_grid={
+                "fast_period": [5, 10],
+                "slow_period": [30, 50],
+            },
+            walk_forward=True,
+            walk_forward_folds=2,
+            walk_forward_train_fraction=0.6,
+        )
+        result = await opt.run(_bars_by_symbol(200))
+
+        assert result.walk_forward is True
+        assert result.num_folds == 2
+        assert result.total_combinations == 4
+        for entry in result.entries:
+            assert "is_sharpe_ratio" in entry.metrics
+            assert "oos_sharpe_ratio" in entry.metrics
+            assert "oos_sharpe_median" in entry.metrics
+            assert "oos_sharpe_mean" in entry.metrics
+            assert "oos_return_pct_mean" in entry.metrics
+            assert "oos_max_drawdown_pct_worst" in entry.metrics
+
+    @pytest.mark.asyncio
+    async def test_walk_forward_deflated_sharpe_present_for_multi_trial(self) -> None:
+        """Deflated Sharpe is only well-defined for >= 2 trials."""
+        import math as _math
+
+        opt = ParameterOptimizer(
+            strategy_cls=MACrossoverStrategy,
+            symbols=[SYMBOL],
+            timeframe=TF,
+            param_grid={
+                # Small windows so each test fold has enough warm-up bars
+                "fast_period": [5, 10, 20],
+                "slow_period": [30, 50, 80],
+            },
+            walk_forward=True,
+            walk_forward_folds=2,
+            walk_forward_train_fraction=0.6,
+        )
+        # Each fold needs >= _MIN_WARMUP_BARS (50) test bars after slicing
+        result = await opt.run(_bars_by_symbol(600))
+
+        assert result.completed_combinations >= 2
+        assert result.deflated_sharpe is not None
+        assert isinstance(result.deflated_sharpe, float)
+        assert _math.isfinite(result.deflated_sharpe)
+
+    @pytest.mark.asyncio
+    async def test_walk_forward_off_by_default(self) -> None:
+        """Backwards compatibility — existing callers observe the
+        in-sample path with no walk-forward fields populated."""
+        opt = ParameterOptimizer(
+            strategy_cls=MACrossoverStrategy,
+            symbols=[SYMBOL],
+            timeframe=TF,
+            param_grid={"fast_period": [5, 10], "slow_period": [30, 50]},
+        )
+        result = await opt.run(_bars_by_symbol(200))
+        assert result.walk_forward is False
+        assert result.num_folds == 0
+        assert result.deflated_sharpe is None
+        for entry in result.entries:
+            assert "oos_sharpe_ratio" not in entry.metrics
+
+    def test_walk_forward_rejects_invalid_mode(self) -> None:
+        with pytest.raises(ValueError, match="walk_forward_mode"):
+            ParameterOptimizer(
+                strategy_cls=MACrossoverStrategy,
+                symbols=[SYMBOL],
+                timeframe=TF,
+                param_grid={"fast_period": [5], "slow_period": [30]},
+                walk_forward=True,
+                walk_forward_mode="diagonal",
+            )
