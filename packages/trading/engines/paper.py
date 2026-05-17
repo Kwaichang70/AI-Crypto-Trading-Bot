@@ -78,11 +78,23 @@ class PaperExecutionEngine(BaseExecutionEngine):
         slippage_bps: int = 5,
         initial_cash: Decimal = Decimal("10000"),
         config: dict[str, Any] | None = None,
+        impact_coefficient_bps: int = 0,
     ) -> None:
         super().__init__(run_id=run_id, config=config)
         self._risk_manager = risk_manager
         self._fill_latency_ms = fill_latency_ms
         self._slippage_bps = slippage_bps
+        # QT-001 (Sprint 42): square-root market-impact coefficient.
+        # When > 0 the engine adds ``impact_coefficient_bps * sqrt(qty/volume)``
+        # to the base slippage_bps, modelling the price impact of taking
+        # liquidity proportional to bar volume.  Default 0 keeps legacy
+        # fixed-slippage behaviour for callers that have not yet calibrated
+        # an impact coefficient from QT-009 telemetry data.
+        if impact_coefficient_bps < 0:
+            raise ValueError(
+                f"impact_coefficient_bps must be >= 0, got {impact_coefficient_bps}"
+            )
+        self._impact_coefficient_bps = impact_coefficient_bps
         self._initial_cash = initial_cash
         self._cash = initial_cash
 
@@ -94,10 +106,14 @@ class PaperExecutionEngine(BaseExecutionEngine):
 
         # Last known prices: symbol -> Decimal (updated via set_last_price)
         self._last_prices: dict[str, Decimal] = {}
+        # QT-001: optional last bar volume per symbol — feeds the volume-
+        # participation impact term in _apply_slippage when set.
+        self._last_volumes: dict[str, Decimal] = {}
 
         self._log = self._log.bind(
             engine="paper",
             slippage_bps=slippage_bps,
+            impact_coefficient_bps=impact_coefficient_bps,
             fill_latency_ms=fill_latency_ms,
         )
 
@@ -140,6 +156,19 @@ class PaperExecutionEngine(BaseExecutionEngine):
         """
         self._last_prices[symbol] = price
 
+    def set_last_bar(self, symbol: str, price: Decimal, volume: Decimal) -> None:
+        """QT-001: update both last price and last bar volume.
+
+        Volume is consumed by the volume-participation impact term in
+        :meth:`_apply_slippage` when ``impact_coefficient_bps > 0``.
+        Callers can keep using :meth:`set_last_price` when they have no
+        volume data; the impact term is skipped in that case.
+        """
+        if volume < Decimal("0"):
+            raise ValueError(f"volume must be >= 0, got {volume}")
+        self._last_prices[symbol] = price
+        self._last_volumes[symbol] = volume
+
     def _get_last_price(self, symbol: str) -> Decimal:
         """
         Get the last known price for a symbol.
@@ -161,26 +190,60 @@ class PaperExecutionEngine(BaseExecutionEngine):
     # Slippage model
     # ------------------------------------------------------------------
 
-    def _apply_slippage(self, price: Decimal, side: OrderSide) -> Decimal:
+    def _apply_slippage(
+        self,
+        price: Decimal,
+        side: OrderSide,
+        *,
+        symbol: str | None = None,
+        quantity: Decimal | None = None,
+    ) -> Decimal:
         """
         Apply slippage to a market-order execution price.
 
-        For BUY: price increases (we pay more).
-        For SELL: price decreases (we receive less).
+        Base slippage (Sprint 29 default 5 bps) is always applied; an
+        additional volume-participation impact term (QT-001 Sprint 42)
+        is layered on top when ALL of these are present:
 
-        Parameters
-        ----------
-        price:
-            Raw market price before slippage.
-        side:
-            Order side (BUY or SELL).
+        * ``impact_coefficient_bps > 0`` on the engine
+        * ``symbol`` and ``quantity`` supplied by the caller
+        * ``self._last_volumes[symbol]`` was recorded via ``set_last_bar``
+        * the recorded volume is strictly positive
 
-        Returns
-        -------
-        Decimal:
-            Slippage-adjusted execution price.
+        Impact follows the canonical square-root market impact law
+        (Almgren et al.):
+            ``impact_bps = impact_coefficient_bps * sqrt(quantity / bar_volume)``
+
+        Quieter symbols (small bar_volume) or larger orders therefore pay
+        a larger impact penalty, matching observed live behaviour where
+        market orders walk the order book.  Direction:
+
+        * BUY  → price * (1 + total_bps/10000)
+        * SELL → price * (1 - total_bps/10000)
         """
-        slippage_factor = Decimal(self._slippage_bps) / Decimal("10000")
+        total_bps = Decimal(self._slippage_bps)
+
+        if (
+            self._impact_coefficient_bps > 0
+            and symbol is not None
+            and quantity is not None
+            and quantity > Decimal("0")
+        ):
+            bar_volume = self._last_volumes.get(symbol)
+            if bar_volume is not None and bar_volume > Decimal("0"):
+                # sqrt(quantity / bar_volume) — Decimal lacks a native sqrt
+                # so we evaluate as float and cast back.  Participation rate
+                # is dimensionless; the impact in bps is then
+                # ``coefficient * sqrt(rate)``.
+                from math import sqrt as _sqrt
+
+                ratio = float(quantity / bar_volume)
+                impact_bps = Decimal(
+                    str(self._impact_coefficient_bps * _sqrt(ratio))
+                )
+                total_bps += impact_bps
+
+        slippage_factor = total_bps / Decimal("10000")
         if side == OrderSide.BUY:
             adjusted = price * (Decimal("1") + slippage_factor)
         else:
@@ -443,8 +506,15 @@ class PaperExecutionEngine(BaseExecutionEngine):
             # Apply slippage for market orders.  Capture the pre-slippage
             # price so the resulting Fill carries QT-009 telemetry showing
             # exactly how much we paid above (BUY) or received below (SELL)
-            # the indicated mid-market reference.
-            fill_price = self._apply_slippage(last_price, order.side)
+            # the indicated mid-market reference.  symbol+quantity allow
+            # the QT-001 volume-participation impact term to kick in when
+            # impact_coefficient_bps>0 and a bar volume is known.
+            fill_price = self._apply_slippage(
+                last_price,
+                order.side,
+                symbol=order.symbol,
+                quantity=order.quantity,
+            )
             is_maker = False
 
             fill = self._simulate_fill(

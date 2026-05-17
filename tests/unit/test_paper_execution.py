@@ -1131,3 +1131,136 @@ class TestQT009ExecutionTelemetry:
         fill = fills[0]
         assert fill.expected_price == _LAST_PRICE + Decimal("5")
         assert fill.slippage_bps_realized == Decimal("0.0000")
+
+
+# ===================================================================
+# TestQT001VolumeParticipationSlippage — Sprint 42 QT-001
+# ===================================================================
+
+
+class TestQT001VolumeParticipationSlippage:
+    """QT-001: opt-in volume-participation impact term layered onto the
+    base slippage_bps.  Default ``impact_coefficient_bps=0`` preserves
+    the fixed-slippage behaviour bit-for-bit.  When enabled, larger
+    orders against smaller bar volume incur progressively more slippage
+    via the square-root market impact law."""
+
+    def test_default_engine_has_no_impact_term(self) -> None:
+        """Backwards compat: engines without impact_coefficient_bps emit
+        the exact same slippage as Sprint 29 / pre-QT-001."""
+        engine, _ = _make_engine(slippage_bps=5)
+        out = engine._apply_slippage(
+            Decimal("100"), OrderSide.BUY, symbol=_SYMBOL, quantity=Decimal("1")
+        )
+        # 100 * (1 + 5/10000) = 100.05
+        assert out == Decimal("100.05000000")
+
+    def test_impact_term_skipped_without_bar_volume(self) -> None:
+        """impact_coefficient_bps > 0 but no last_volume known → engine
+        falls back to base-slippage only (no Decimal-arithmetic surprises
+        for callers that have not migrated to set_last_bar)."""
+        engine = PaperExecutionEngine(
+            run_id=_RUN_ID,
+            risk_manager=_make_risk_manager_mock(),
+            slippage_bps=5,
+            impact_coefficient_bps=20,
+        )
+        # set_last_price (no volume) → impact term skipped
+        engine.set_last_price(_SYMBOL, Decimal("100"))
+        out = engine._apply_slippage(
+            Decimal("100"), OrderSide.BUY, symbol=_SYMBOL, quantity=Decimal("1")
+        )
+        assert out == Decimal("100.05000000")
+
+    def test_impact_term_widens_buy_price(self) -> None:
+        """Active impact term must push BUY price ABOVE the
+        base-slippage-only fill price (we pay more)."""
+        engine = PaperExecutionEngine(
+            run_id=_RUN_ID,
+            risk_manager=_make_risk_manager_mock(),
+            slippage_bps=5,
+            impact_coefficient_bps=100,
+        )
+        engine.set_last_bar(_SYMBOL, Decimal("100"), Decimal("100"))
+
+        # quantity=10 vs bar_volume=100 → participation rate 0.1
+        # impact = 100 * sqrt(0.1) ≈ 31.62 bps; total ≈ 36.62 bps
+        # BUY price = 100 * (1 + 0.003662) ≈ 100.3662
+        out = engine._apply_slippage(
+            Decimal("100"), OrderSide.BUY, symbol=_SYMBOL, quantity=Decimal("10")
+        )
+        # Sanity: above base-slippage-only fill (100.05), below 1% impact
+        assert out > Decimal("100.05")
+        assert out < Decimal("101.00")
+
+    def test_impact_term_narrows_sell_price(self) -> None:
+        """SELL with impact term must give us LESS than base-slippage."""
+        engine = PaperExecutionEngine(
+            run_id=_RUN_ID,
+            risk_manager=_make_risk_manager_mock(),
+            slippage_bps=5,
+            impact_coefficient_bps=100,
+        )
+        engine.set_last_bar(_SYMBOL, Decimal("100"), Decimal("100"))
+
+        out = engine._apply_slippage(
+            Decimal("100"), OrderSide.SELL, symbol=_SYMBOL, quantity=Decimal("10")
+        )
+        # Symmetric: below base-slippage-only (99.95)
+        assert out < Decimal("99.95")
+        assert out > Decimal("99.00")
+
+    def test_larger_order_incurs_more_slippage(self) -> None:
+        """Sqrt impact is monotonic in participation rate — a 10x larger
+        order must pay strictly more BUY slippage (square-root impact
+        means the increase is ~3.16x not 10x, but still strictly more)."""
+        engine = PaperExecutionEngine(
+            run_id=_RUN_ID,
+            risk_manager=_make_risk_manager_mock(),
+            slippage_bps=5,
+            impact_coefficient_bps=100,
+        )
+        engine.set_last_bar(_SYMBOL, Decimal("100"), Decimal("100"))
+
+        small_fill = engine._apply_slippage(
+            Decimal("100"), OrderSide.BUY, symbol=_SYMBOL, quantity=Decimal("1")
+        )
+        big_fill = engine._apply_slippage(
+            Decimal("100"), OrderSide.BUY, symbol=_SYMBOL, quantity=Decimal("10")
+        )
+        assert big_fill > small_fill
+
+    def test_quieter_bar_incurs_more_slippage(self) -> None:
+        """Same order but on a quieter bar (smaller volume) → more impact."""
+        engine = PaperExecutionEngine(
+            run_id=_RUN_ID,
+            risk_manager=_make_risk_manager_mock(),
+            slippage_bps=5,
+            impact_coefficient_bps=100,
+        )
+
+        # Liquid bar
+        engine.set_last_bar(_SYMBOL, Decimal("100"), Decimal("1000"))
+        liquid_fill = engine._apply_slippage(
+            Decimal("100"), OrderSide.BUY, symbol=_SYMBOL, quantity=Decimal("10")
+        )
+
+        # Same order on a quieter bar (10x less volume)
+        engine.set_last_bar(_SYMBOL, Decimal("100"), Decimal("100"))
+        quiet_fill = engine._apply_slippage(
+            Decimal("100"), OrderSide.BUY, symbol=_SYMBOL, quantity=Decimal("10")
+        )
+        assert quiet_fill > liquid_fill
+
+    def test_negative_impact_coefficient_rejected(self) -> None:
+        with pytest.raises(ValueError, match="impact_coefficient_bps must be >= 0"):
+            PaperExecutionEngine(
+                run_id=_RUN_ID,
+                risk_manager=_make_risk_manager_mock(),
+                impact_coefficient_bps=-1,
+            )
+
+    def test_set_last_bar_rejects_negative_volume(self) -> None:
+        engine, _ = _make_engine()
+        with pytest.raises(ValueError, match="volume must be >= 0"):
+            engine.set_last_bar(_SYMBOL, Decimal("100"), Decimal("-1"))
