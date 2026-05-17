@@ -1287,3 +1287,140 @@ class TestSellOrderConcentrationBypass:
             f"Expected notional-cap blocking reason for SELL, "
             f"got: {result.rejection_reasons}"
         )
+
+
+# ===================================================================
+# TestATRPositionSizing — Sprint 42 QT-002
+# ===================================================================
+
+
+class TestATRPositionSizing:
+    """QT-002: ATR-scaled position sizing.  ``sizing_mode="atr"`` derives
+    the stop distance from ATR * multiplier so quieter symbols get
+    larger positions and more volatile ones get smaller.  Default
+    behaviour (``sizing_mode="fixed"``) is preserved bit-for-bit."""
+
+    def test_fixed_mode_unchanged_when_no_atr(self) -> None:
+        """Existing callers (atr_value omitted) get identical sizing."""
+        params = RiskParameters(per_trade_risk_pct=0.02)
+        rm = DefaultRiskManager(run_id="r-fixed", params=params)
+
+        qty = rm.calculate_position_size(
+            equity=Decimal("10000"),
+            entry_price=Decimal("100"),
+            stop_loss_price=Decimal("98"),  # 2% stop distance
+            confidence=1.0,
+        )
+        # risk_amount = 10000 * 0.02 * 1.0 = 200
+        # distance = 0.02; size = 200 / (100 * 0.02) = 100 base units
+        # max_concentration_cap = 0.15 * 10000 / 100 = 15
+        # final = min(100, 15) = 15
+        assert qty == Decimal("15.00000000")
+
+    def test_atr_mode_scales_distance_by_volatility(self) -> None:
+        """Higher ATR → wider stop → SMALLER position size."""
+        params = RiskParameters(
+            per_trade_risk_pct=0.02,
+            sizing_mode="atr",
+            atr_risk_multiplier=Decimal("1.5"),
+            max_position_size_pct=0.99,   # disable concentration cap
+            max_order_size_quote=Decimal("1000000"),
+        )
+        rm = DefaultRiskManager(run_id="r-atr", params=params)
+
+        # ATR = $3 on $100 entry → distance = 1.5 * 3 / 100 = 0.045 (4.5%)
+        # risk_amount = 10000 * 0.02 * 1.0 = 200
+        # size = 200 / (100 * 0.045) = 44.44... base units
+        qty_high_vol = rm.calculate_position_size(
+            equity=Decimal("10000"),
+            entry_price=Decimal("100"),
+            stop_loss_price=None,
+            confidence=1.0,
+            atr_value=Decimal("3"),
+        )
+
+        # ATR = $1 → distance = 0.015 → size = 200 / 1.5 = 133.33...
+        qty_low_vol = rm.calculate_position_size(
+            equity=Decimal("10000"),
+            entry_price=Decimal("100"),
+            stop_loss_price=None,
+            confidence=1.0,
+            atr_value=Decimal("1"),
+        )
+
+        assert qty_low_vol > qty_high_vol, (
+            "Lower volatility (smaller ATR) MUST yield larger position size"
+        )
+
+    def test_atr_mode_falls_back_to_fixed_when_atr_missing(self) -> None:
+        """sizing_mode=atr without atr_value uses the legacy fixed path."""
+        params = RiskParameters(
+            sizing_mode="atr",
+            atr_risk_multiplier=Decimal("1.5"),
+        )
+        rm = DefaultRiskManager(run_id="r-atr-fallback", params=params)
+
+        qty_fallback = rm.calculate_position_size(
+            equity=Decimal("10000"),
+            entry_price=Decimal("100"),
+            stop_loss_price=Decimal("98"),
+            confidence=1.0,
+            atr_value=None,
+        )
+        # Same as the fixed-mode test above — fallback to stop_loss_price.
+        assert qty_fallback == Decimal("15.00000000")
+
+    def test_atr_mode_clamps_zero_atr(self) -> None:
+        """ATR=0 (degenerate, e.g. warmup period) must not blow up sizing."""
+        params = RiskParameters(
+            sizing_mode="atr",
+            atr_risk_multiplier=Decimal("1.5"),
+        )
+        rm = DefaultRiskManager(run_id="r-atr-zero", params=params)
+        qty = rm.calculate_position_size(
+            equity=Decimal("10000"),
+            entry_price=Decimal("100"),
+            stop_loss_price=Decimal("98"),
+            confidence=1.0,
+            atr_value=Decimal("0"),
+        )
+        # ATR=0 → falls back to stop_loss_price path
+        assert qty == Decimal("15.00000000")
+
+    def test_atr_distance_floor_protects_against_near_zero_atr(self) -> None:
+        """Tiny ATR (illiquid symbol) is clamped to the 0.1% floor so
+        position size cannot be inflated to absurd levels."""
+        params = RiskParameters(
+            sizing_mode="atr",
+            atr_risk_multiplier=Decimal("1.5"),
+            max_position_size_pct=0.99,
+            max_order_size_quote=Decimal("1000000"),
+        )
+        rm = DefaultRiskManager(run_id="r-atr-floor", params=params)
+        # ATR=0.001 on $100 → raw distance = 1.5 * 0.001 / 100 = 1.5e-5
+        # → clamped to 0.001 (0.1%)
+        qty = rm.calculate_position_size(
+            equity=Decimal("10000"),
+            entry_price=Decimal("100"),
+            stop_loss_price=None,
+            confidence=1.0,
+            atr_value=Decimal("0.001"),
+        )
+        # With distance clamped to 0.001:
+        # size_from_risk = 200 / (100 * 0.001) = 2000
+        # max_concentration_cap = 0.99 * 10000 / 100 = 99
+        # final = min(2000, 99) = 99 — concentration cap saves the day
+        # even when the ATR floor itself is permissive.
+        assert qty == Decimal("99.00000000")
+
+    def test_invalid_sizing_mode_rejected(self) -> None:
+        with pytest.raises(ValueError, match="sizing_mode must be"):
+            RiskParameters(sizing_mode="kelly")
+
+    def test_invalid_atr_multiplier_rejected(self) -> None:
+        with pytest.raises(ValueError, match="atr_risk_multiplier must be > 0"):
+            RiskParameters(atr_risk_multiplier=Decimal("0"))
+
+    def test_unreasonable_atr_multiplier_rejected(self) -> None:
+        with pytest.raises(ValueError, match="unreasonably large"):
+            RiskParameters(atr_risk_multiplier=Decimal("10"))

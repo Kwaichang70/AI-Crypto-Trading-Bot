@@ -164,20 +164,76 @@ class DefaultRiskManager(BaseRiskManager):
     # calculate_position_size
     # ------------------------------------------------------------------
 
+    def _compute_stop_distance(
+        self,
+        *,
+        entry_price: Decimal,
+        stop_loss_price: Decimal | None,
+        atr_value: Decimal | None,
+    ) -> Decimal:
+        """QT-002: derive the fractional stop distance for sizing.
+
+        ATR mode (``sizing_mode == "atr"``) uses ``atr * multiplier /
+        entry_price`` when a positive ``atr_value`` is available; the
+        floor of 0.1 % protects against degenerate near-zero ATR readings
+        (early-bar warmup, illiquid pairs) that would otherwise blow up
+        position size.  Fixed mode preserves the legacy behaviour exactly.
+        """
+        if (
+            self._params.sizing_mode == "atr"
+            and atr_value is not None
+            and atr_value > Decimal(0)
+        ):
+            distance = (atr_value * self._params.atr_risk_multiplier) / entry_price
+            if distance < Decimal("0.001"):
+                self._log.warning(
+                    "risk.atr_distance_below_floor",
+                    raw_distance=str(distance),
+                    msg="ATR-derived distance < 0.1%; clamping to floor.",
+                )
+                distance = Decimal("0.001")
+            return distance
+
+        if self._params.sizing_mode == "atr" and atr_value is None:
+            self._log.warning(
+                "risk.atr_value_missing",
+                msg="sizing_mode='atr' but no atr_value provided; "
+                    "falling back to fixed-distance path.",
+            )
+
+        if stop_loss_price is not None and stop_loss_price > Decimal(0):
+            distance = abs(entry_price - stop_loss_price) / entry_price
+            # Guard against unrealistically tight stops that would inflate
+            # position size: floor at 0.1% distance.
+            if distance < Decimal("0.001"):
+                distance = Decimal("0.001")
+            return distance
+
+        return _DEFAULT_STOP_DISTANCE_PCT
+
     def calculate_position_size(
         self,
         equity: Decimal,
         entry_price: Decimal,
         stop_loss_price: Decimal | None,
         confidence: float,
+        atr_value: Decimal | None = None,
     ) -> Decimal:
         """
-        Fixed-fractional position sizing scaled by strategy confidence.
+        Position sizing scaled by strategy confidence.
 
-        Steps:
+        Two modes (see :class:`RiskParameters`):
+
+        * ``sizing_mode="fixed"`` (default) — fixed-fractional risk distance
+          from ``stop_loss_price`` (or 1 % default when missing).
+        * ``sizing_mode="atr"`` (QT-002) — distance = ``atr_value *
+          atr_risk_multiplier`` / ``entry_price``; falls back to fixed-mode
+          with a warning when ``atr_value`` is missing.
+
+        Steps (both modes):
             1. risk_amount = equity * per_trade_risk_pct * confidence
-            2. distance  = |entry - stop| / entry  (default 1% if no stop)
-            3. size_base = risk_amount / (entry_price * distance)
+            2. distance    = mode-dependent (see above)
+            3. size_base   = risk_amount / (entry_price * distance)
             4. Cap at max_order_size_quote / entry_price
             5. Cap at max_position_size_pct * equity / entry_price
             6. Return min of all values, rounded DOWN to 8 decimal places.
@@ -198,15 +254,12 @@ class DefaultRiskManager(BaseRiskManager):
         risk_pct = Decimal(str(self._params.per_trade_risk_pct))
         risk_amount = equity * risk_pct * confidence_d
 
-        # Determine stop-loss distance
-        if stop_loss_price is not None and stop_loss_price > Decimal(0):
-            distance = abs(entry_price - stop_loss_price) / entry_price
-            # Guard against unrealistically tight stops that would inflate
-            # position size: floor at 0.1% distance.
-            if distance < Decimal("0.001"):
-                distance = Decimal("0.001")
-        else:
-            distance = _DEFAULT_STOP_DISTANCE_PCT
+        # Determine stop-loss distance (mode-dependent — QT-002)
+        distance = self._compute_stop_distance(
+            entry_price=entry_price,
+            stop_loss_price=stop_loss_price,
+            atr_value=atr_value,
+        )
 
         # Core sizing
         size_from_risk = risk_amount / (entry_price * distance)

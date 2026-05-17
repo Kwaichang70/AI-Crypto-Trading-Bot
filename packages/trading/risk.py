@@ -68,6 +68,20 @@ class RiskParameters:
     cooldown_after_loss_streak: int = 3   # bars to pause after N consecutive losses
     loss_streak_count: int = 3            # number of losses that triggers cooldown
 
+    # QT-002 (Sprint 42): ATR-scaled position sizing
+    #
+    # ``sizing_mode="fixed"`` (default) preserves the legacy fixed-fractional
+    # behaviour: risk distance is taken from ``stop_loss_price`` or falls back
+    # to a hard-coded 1 % default.  ``sizing_mode="atr"`` derives the stop
+    # distance from ``atr_value * atr_risk_multiplier``, scaling position size
+    # inversely with volatility — quieter symbols get bigger positions, more
+    # volatile ones get smaller, so each trade puts roughly the same dollar
+    # amount of equity at risk.  Callers in ATR mode MUST supply an
+    # ``atr_value`` to ``calculate_position_size``; otherwise the manager
+    # falls back to the fixed-distance path with a warning.
+    sizing_mode: str = "fixed"
+    atr_risk_multiplier: Decimal = Decimal("1.5")
+
     def __post_init__(self) -> None:
         if not (0 < self.per_trade_risk_pct <= 0.05):
             raise ValueError(
@@ -85,6 +99,22 @@ class RiskParameters:
             raise ValueError(
                 f"max_portfolio_exposure_pct {self.max_portfolio_exposure_pct} "
                 f"out of safe range (0, 1.0]"
+            )
+        # QT-002: validate sizing-mode + ATR multiplier
+        if self.sizing_mode not in ("fixed", "atr"):
+            raise ValueError(
+                f"sizing_mode must be 'fixed' or 'atr', got {self.sizing_mode!r}"
+            )
+        if self.atr_risk_multiplier <= Decimal("0"):
+            raise ValueError(
+                f"atr_risk_multiplier must be > 0, got {self.atr_risk_multiplier}"
+            )
+        if self.atr_risk_multiplier > Decimal("5"):
+            # 5x ATR stop is already very wide; anything larger is almost
+            # certainly a misconfiguration.
+            raise ValueError(
+                f"atr_risk_multiplier {self.atr_risk_multiplier} is unreasonably "
+                f"large (>5); review configuration."
             )
 
 
@@ -238,13 +268,21 @@ class BaseRiskManager(abc.ABC):
         entry_price: Decimal,
         stop_loss_price: Decimal | None,
         confidence: float,
+        atr_value: Decimal | None = None,
     ) -> Decimal:
         """
         Compute the order size in base asset using fixed-fractional sizing.
 
-        If ``stop_loss_price`` is None, falls back to using
-        ``params.per_trade_risk_pct`` of equity as the risk amount and
-        assumes a default stop-loss distance of 1%.
+        Behaviour depends on ``params.sizing_mode``:
+
+        * ``"fixed"`` (default) — risk distance from ``stop_loss_price`` (or
+          a 1 % default when no stop is supplied).  Preserves the legacy
+          per-trade-risk-percent fixed-fractional behaviour.
+        * ``"atr"`` (QT-002, Sprint 42) — distance = ``atr_value *
+          params.atr_risk_multiplier`` divided by ``entry_price``.  Equivalent
+          to a target-vol sizing scheme — quieter symbols get bigger
+          positions, more volatile ones get smaller.  When ``atr_value`` is
+          missing the manager falls back to the fixed path with a warning.
 
         Parameters
         ----------
@@ -254,10 +292,14 @@ class BaseRiskManager(abc.ABC):
             Expected entry price for the trade.
         stop_loss_price:
             Price at which the stop-loss would trigger.
-            If None, a default distance is used.
+            If None and ``sizing_mode == "fixed"``, a default distance is used.
         confidence:
             Strategy confidence scalar in [0, 1]. Scales the position size
             proportionally.
+        atr_value:
+            Optional ATR (Average True Range) value in PRICE units (same
+            currency / scale as ``entry_price``).  Required when
+            ``params.sizing_mode == "atr"``; ignored otherwise.
 
         Returns
         -------
