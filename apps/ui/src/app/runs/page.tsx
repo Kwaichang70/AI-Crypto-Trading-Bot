@@ -3,7 +3,7 @@
  */
 "use client";
 
-import { useEffect, useState } from "react";
+import { Suspense, useEffect, useState } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { fetchRuns, formatPct } from "@/lib/api";
@@ -190,7 +190,7 @@ const RUNS_CSV_COLUMNS: CsvColumn<Run>[] = [
   { header: "Created At", value: (r) => r.createdAt },
 ];
 
-export default function RunsPage() {
+function RunsPageContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
 
@@ -562,5 +562,22 @@ export default function RunsPage() {
         </div>
       </div>
     </div>
+  );
+}
+
+/**
+ * Default export wraps RunsPageContent in a Suspense boundary.
+ *
+ * Next.js 14 requires any client component that calls useSearchParams() to
+ * sit inside a <Suspense> boundary at static-prerender time — without it
+ * ``next build`` fails the /runs route with a CSR-bailout error.  The
+ * fallback renders an empty grid skeleton matching the eventual layout
+ * so the layout shift is minimal once params resolve.
+ */
+export default function RunsPage() {
+  return (
+    <Suspense fallback={<div className="min-h-screen bg-slate-50 dark:bg-slate-950" />}>
+      <RunsPageContent />
+    </Suspense>
   );
 }
