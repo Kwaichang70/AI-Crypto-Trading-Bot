@@ -93,6 +93,16 @@ class MultiTimeframeContext:
         Net USD flow of large on-chain transactions in the last hour from
         Whale Alert.  Positive = inflow to exchanges (sell pressure).
         Negative = outflow from exchanges (accumulation).
+    fear_greed_index_7d_ago:
+        FGI value approximately 7 days prior to the current bar.
+        Populated by StrategyEngine._build_mtf_context() in Sprint 46+.
+        Falls back to None when historical data is unavailable; the v2
+        feature builder then sets fgi_delta_7d to 0.0.
+    btc_dominance_7d_ago:
+        BTC dominance percentage approximately 7 days prior (from
+        CoinGecko historical).  Falls back to None when the historical
+        endpoint is unavailable; the v2 feature builder then sets
+        btc_dom_delta_7d to 0.0.
     """
 
     htf_bars: dict[str, dict[str, list[OHLCVBar]]] = field(default_factory=dict)
@@ -117,3 +127,9 @@ class MultiTimeframeContext:
 
     # Whale Alert on-chain flow signals
     whale_net_flow: float | None = field(default=None)
+
+    # ----------------------------------------------------------------
+    # QT-007 (Sprint 46): 7-day-ago history snapshots for delta features
+    # ----------------------------------------------------------------
+    fear_greed_index_7d_ago: int | None = field(default=None)
+    btc_dominance_7d_ago: float | None = field(default=None)

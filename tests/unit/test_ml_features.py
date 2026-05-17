@@ -44,12 +44,18 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from common.models import OHLCVBar
+from common.models import MultiTimeframeContext, OHLCVBar
 from common.types import TimeFrame
 from data.ml_features import (
+    CURRENT_FEATURE_SCHEMA_VERSION,
     FEATURE_NAMES,
+    FEATURE_SCHEMA_VERSION_V1,
+    FEATURE_SCHEMA_VERSION_V2,
+    build_extended_feature_matrix,
+    build_extended_feature_vector_from_bars,
     build_feature_matrix,
     build_feature_vector_from_bars,
+    feature_names_for_schema,
 )
 
 # ---------------------------------------------------------------------------
@@ -458,3 +464,286 @@ class TestNumericalParity:
                     f"Parity failure for feature {name}: "
                     f"bars={vec_val}, df={mat_val}"
                 )
+
+
+# ===================================================================
+# QT-007 (Sprint 46) -- v2 extended feature schema
+# ===================================================================
+
+
+class TestQT007ExtendedFeatureBuilderBars:
+    """v2 schema = 10 v1 features + 4 context features (htf_trend,
+    fgi_level_norm, fgi_delta_7d, btc_dom_delta_7d).  Tests cover the
+    neutral-default fallbacks AND each context feature in isolation."""
+
+    def test_returns_14_elements(self) -> None:
+        v = build_extended_feature_vector_from_bars(_make_bars(30))
+        assert len(v) == 14
+
+    def test_first_ten_elements_match_v1(self) -> None:
+        bars = _make_bars(30)
+        v1 = build_feature_vector_from_bars(bars)
+        v2 = build_extended_feature_vector_from_bars(bars)
+        assert v2[:10] == v1, "v2 must preserve v1 features byte-for-byte"
+
+    def test_no_mtf_context_uses_neutral_defaults(self) -> None:
+        v = build_extended_feature_vector_from_bars(_make_bars(30), mtf_context=None)
+        # htf_trend, fgi_level_norm, fgi_delta_7d, btc_dom_delta_7d
+        assert v[10] == 0.0
+        assert v[11] == 0.5
+        assert v[12] == 0.0
+        assert v[13] == 0.0
+
+    def test_empty_htf_bars_dict_returns_zero_trend(self) -> None:
+        """A context with htf_bars={} (empty dict, not None) must still
+        produce a 0.0 htf_trend feature."""
+        ctx = MultiTimeframeContext(htf_bars={})
+        v = build_extended_feature_vector_from_bars(_make_bars(30), mtf_context=ctx)
+        assert v[10] == 0.0
+
+    def test_fgi_level_extracted_when_present(self) -> None:
+        ctx = MultiTimeframeContext(fear_greed_index=80)
+        v = build_extended_feature_vector_from_bars(_make_bars(30), mtf_context=ctx)
+        assert v[11] == 0.8     # 80 / 100
+        assert v[12] == 0.0     # no 7d-ago, delta defaults to 0
+
+    def test_fgi_level_clamped_above_100(self) -> None:
+        """alternative.me has historically returned slightly out-of-range
+        values; the clamp must protect the model input."""
+        ctx = MultiTimeframeContext(fear_greed_index=105)
+        v = build_extended_feature_vector_from_bars(_make_bars(30), mtf_context=ctx)
+        assert v[11] == 1.0
+
+    def test_fgi_delta_7d_computed_when_both_present(self) -> None:
+        # FGI went from 30 (extreme fear, 7d ago) to 80 (greed, now).
+        ctx = MultiTimeframeContext(
+            fear_greed_index=80,
+            fear_greed_index_7d_ago=30,
+        )
+        v = build_extended_feature_vector_from_bars(_make_bars(30), mtf_context=ctx)
+        assert v[12] == pytest.approx(0.5, abs=1e-9)   # (80-30)/100
+
+    def test_btc_dom_delta_7d_computed_when_both_present(self) -> None:
+        ctx = MultiTimeframeContext(
+            btc_dominance=55.0,
+            btc_dominance_7d_ago=50.0,
+        )
+        v = build_extended_feature_vector_from_bars(_make_bars(30), mtf_context=ctx)
+        assert v[13] == pytest.approx(0.1, abs=1e-9)   # (55-50)/50
+
+    def test_btc_dom_delta_missing_one_side_falls_back_to_zero(self) -> None:
+        ctx = MultiTimeframeContext(btc_dominance=55.0)   # no 7d-ago
+        v = build_extended_feature_vector_from_bars(_make_bars(30), mtf_context=ctx)
+        assert v[13] == 0.0
+
+    def test_htf_trend_positive_when_close_above_sma(self) -> None:
+        # _make_bars produces up-trending closes; SMA(20) over the last 20
+        # bars sits below the last close.
+        htf_4h = _make_bars(30)
+        ctx = MultiTimeframeContext(htf_bars={"4h": {"BTC/USDT": htf_4h}})
+        v = build_extended_feature_vector_from_bars(_make_bars(30), mtf_context=ctx)
+        assert v[10] == 1.0
+
+    def test_htf_trend_negative_when_close_below_sma(self) -> None:
+        # Build DOWN-trending HTF bars inline -- the module-level _make_bars
+        # only produces up-trending sequences.
+        base = datetime(2026, 1, 1, tzinfo=UTC)
+        htf_4h = [
+            OHLCVBar(
+                symbol="BTC/USDT",
+                timeframe=TimeFrame.FOUR_HOURS,
+                timestamp=base + timedelta(hours=4 * i),
+                open=Decimal(str(200 - i * 0.5 - 0.1)),
+                high=Decimal(str(200 - i * 0.5 + 1.0)),
+                low=Decimal(str(200 - i * 0.5 - 1.0)),
+                close=Decimal(str(200 - i * 0.5)),
+                volume=Decimal("100"),
+            )
+            for i in range(30)
+        ]
+        ctx = MultiTimeframeContext(htf_bars={"4h": {"BTC/USDT": htf_4h}})
+        v = build_extended_feature_vector_from_bars(_make_bars(30), mtf_context=ctx)
+        assert v[10] == -1.0
+
+    def test_htf_trend_skipped_when_insufficient_htf_bars(self) -> None:
+        # Only 10 HTF bars -- below the SMA(20) requirement.
+        ctx = MultiTimeframeContext(htf_bars={"4h": {"BTC/USDT": _make_bars(10)}})
+        v = build_extended_feature_vector_from_bars(_make_bars(30), mtf_context=ctx)
+        assert v[10] == 0.0
+
+    def test_htf_trend_fallback_tier_used_when_4h_missing(self) -> None:
+        # No 4h, only 1d -- fallback tier picks it up.
+        ctx = MultiTimeframeContext(htf_bars={"1d": {"BTC/USDT": _make_bars(30)}})
+        v = build_extended_feature_vector_from_bars(_make_bars(30), mtf_context=ctx)
+        assert v[10] == 1.0   # up-trending synthetic
+
+    def test_htf_trend_uses_symbol_kwarg_when_provided(self) -> None:
+        ctx = MultiTimeframeContext(htf_bars={"4h": {"ETH/USDT": _make_bars(30)}})
+        # Explicitly point to ETH/USDT even though primary bars are BTC/USDT.
+        v = build_extended_feature_vector_from_bars(
+            _make_bars(30), mtf_context=ctx, symbol="ETH/USDT",
+        )
+        assert v[10] == 1.0
+
+    def test_feature_names_for_schema(self) -> None:
+        v1_names = feature_names_for_schema(FEATURE_SCHEMA_VERSION_V1)
+        v2_names = feature_names_for_schema(FEATURE_SCHEMA_VERSION_V2)
+        assert v1_names == FEATURE_NAMES
+        assert v2_names[:10] == FEATURE_NAMES
+        assert v2_names[10:] == [
+            "htf_trend",
+            "fgi_level_norm",
+            "fgi_delta_7d",
+            "btc_dom_delta_7d",
+        ]
+
+    def test_feature_names_for_schema_rejects_unknown_version(self) -> None:
+        with pytest.raises(ValueError, match="Unknown feature schema version"):
+            feature_names_for_schema(99)
+
+    def test_current_schema_version_is_v2(self) -> None:
+        assert CURRENT_FEATURE_SCHEMA_VERSION == FEATURE_SCHEMA_VERSION_V2
+
+
+# ===================================================================
+# QT-007b (Sprint 46) -- v2 DataFrame-path builder (training)
+# ===================================================================
+
+
+class TestQT007ExtendedFeatureMatrixTraining:
+    """v2 training-path builder: 14-column DataFrame with optional
+    aligned FGI / BTC-dom / HTF inputs.  Tests cover the neutral-default
+    fallbacks AND each optional input in isolation."""
+
+    def _make_ohlcv_df(self, n: int = 200, freq: str = "1h") -> pd.DataFrame:
+        """Hourly OHLCV with a tz-aware UTC DatetimeIndex.
+
+        Closes increment by 0.5 per bar.  Volume linear.  Used as the
+        primary-timeframe DataFrame in every test below.
+        """
+        idx = pd.date_range("2024-01-01", periods=n, freq=freq, tz="UTC")
+        close = pd.Series(100.0 + np.arange(n) * 0.5, index=idx)
+        return pd.DataFrame(
+            {
+                "open": close - 0.1,
+                "high": close + 1.0,
+                "low": close - 1.0,
+                "close": close,
+                "volume": 1000.0 + np.arange(n) * 10.0,
+            },
+            index=idx,
+        )
+
+    # ----- 1. Shape + default-fallback paths --------------------------
+
+    def test_returns_14_columns_in_correct_order(self) -> None:
+        df = self._make_ohlcv_df()
+        out = build_extended_feature_matrix(df)
+        assert list(out.columns)[:10] == FEATURE_NAMES
+        assert list(out.columns)[10:] == [
+            "htf_trend", "fgi_level_norm", "fgi_delta_7d", "btc_dom_delta_7d",
+        ]
+
+    def test_first_ten_columns_match_v1(self) -> None:
+        df = self._make_ohlcv_df()
+        v1 = build_feature_matrix(df)
+        v2 = build_extended_feature_matrix(df)
+        pd.testing.assert_frame_equal(v2[v1.columns], v1)
+
+    def test_no_optional_inputs_uses_neutral_defaults(self) -> None:
+        df = self._make_ohlcv_df()
+        out = build_extended_feature_matrix(df)
+        assert (out["htf_trend"] == 0.0).all()
+        assert (out["fgi_level_norm"] == 0.5).all()
+        assert (out["fgi_delta_7d"] == 0.0).all()
+        assert (out["btc_dom_delta_7d"] == 0.0).all()
+
+    def test_no_optional_inputs_accepts_integer_index(self) -> None:
+        """v1 contract preserved: when no optional series is supplied,
+        any index type is accepted."""
+        df = self._make_ohlcv_df().reset_index(drop=True)   # plain RangeIndex
+        out = build_extended_feature_matrix(df)
+        assert len(out) == len(df)
+
+    def test_datetime_index_required_when_fgi_series_supplied(self) -> None:
+        df = self._make_ohlcv_df().reset_index(drop=True)
+        fgi = pd.Series(
+            [50, 60],
+            index=pd.date_range("2024-01-01", periods=2, tz="UTC"),
+        )
+        with pytest.raises(ValueError, match="DatetimeIndex"):
+            build_extended_feature_matrix(df, fgi_series=fgi)
+
+    def test_non_monotonic_index_rejected_when_optional_series_supplied(self) -> None:
+        df = self._make_ohlcv_df(n=20)
+        df = df.sample(frac=1.0, random_state=42)   # shuffle -> non-monotonic
+        fgi = pd.Series(
+            [50],
+            index=pd.date_range("2024-01-01", periods=1, tz="UTC"),
+        )
+        with pytest.raises(ValueError, match="monotonic"):
+            build_extended_feature_matrix(df, fgi_series=fgi)
+
+    # ----- 2. FGI level + delta ---------------------------------------
+
+    def test_fgi_level_clipped_and_aligned(self) -> None:
+        df = self._make_ohlcv_df(n=48)   # 2 days hourly
+        fgi = pd.Series(
+            [105, 75, 30],
+            index=pd.date_range("2024-01-01", periods=3, freq="D", tz="UTC"),
+        )
+        out = build_extended_feature_matrix(df, fgi_series=fgi)
+        # Day-1 hourly bars (first 24) carry FGI=105 (clamped to 1.0).
+        # Hour-0 of day 2 onwards picks up 75/100 = 0.75.
+        assert out["fgi_level_norm"].iloc[0] == 1.0
+        assert out["fgi_level_norm"].iloc[24] == pytest.approx(0.75, abs=1e-9)
+
+    def test_fgi_delta_7d_uses_history(self) -> None:
+        df = self._make_ohlcv_df(n=24 * 14)   # 14 days hourly
+        # FGI: 30 for days 0-6, 80 for days 7-13.  Delta at day-7 hour-0:
+        # current=80, 7d-ago=30 -> 0.5.
+        idx = pd.date_range("2024-01-01", periods=14, freq="D", tz="UTC")
+        values = [30] * 7 + [80] * 7
+        fgi = pd.Series(values, index=idx)
+        out = build_extended_feature_matrix(df, fgi_series=fgi)
+        # Row 168 = 168 hours from start = 2024-01-08 00:00 = day-7 hour-0.
+        assert out["fgi_delta_7d"].iloc[168] == pytest.approx(0.5, abs=1e-9)
+        # Row 0: no 7d-ago datum -> 0.0 default.
+        assert out["fgi_delta_7d"].iloc[0] == 0.0
+
+    # ----- 3. BTC dominance delta -------------------------------------
+
+    def test_btc_dom_delta_7d_uses_history(self) -> None:
+        df = self._make_ohlcv_df(n=24 * 14)
+        idx = pd.date_range("2024-01-01", periods=14, freq="D", tz="UTC")
+        values = [50.0] * 7 + [55.0] * 7
+        dom = pd.Series(values, index=idx)
+        out = build_extended_feature_matrix(df, btc_dom_series=dom)
+        # delta = (55 - 50) / 50 = 0.1 at day 7+.
+        assert out["btc_dom_delta_7d"].iloc[168] == pytest.approx(0.1, abs=1e-9)
+        assert out["btc_dom_delta_7d"].iloc[0] == 0.0
+
+    # ----- 4. HTF trend -----------------------------------------------
+
+    def test_htf_trend_positive_when_close_above_sma(self) -> None:
+        df = self._make_ohlcv_df(n=240)   # 10 days hourly
+        # HTF 4h closes -- up-trending, last close > SMA(20).
+        htf_idx = pd.date_range("2024-01-01", periods=60, freq="4h", tz="UTC")
+        htf = pd.Series(100.0 + np.arange(60) * 1.0, index=htf_idx)
+        out = build_extended_feature_matrix(df, htf_close=htf)
+        assert out["htf_trend"].iloc[-1] == 1.0
+
+    def test_htf_trend_negative_when_close_below_sma(self) -> None:
+        df = self._make_ohlcv_df(n=240)
+        htf_idx = pd.date_range("2024-01-01", periods=60, freq="4h", tz="UTC")
+        htf = pd.Series(200.0 - np.arange(60) * 1.0, index=htf_idx)
+        out = build_extended_feature_matrix(df, htf_close=htf)
+        assert out["htf_trend"].iloc[-1] == -1.0
+
+    def test_htf_trend_zero_during_warmup(self) -> None:
+        df = self._make_ohlcv_df(n=240)
+        htf_idx = pd.date_range("2024-01-01", periods=60, freq="4h", tz="UTC")
+        htf = pd.Series(100.0 + np.arange(60) * 1.0, index=htf_idx)
+        out = build_extended_feature_matrix(df, htf_close=htf)
+        # First row -- HTF SMA(20) hasn't warmed up yet.
+        assert out["htf_trend"].iloc[0] == 0.0

@@ -44,7 +44,7 @@ import pytest
 
 from common.types import OrderSide, OrderStatus, OrderType
 from trading.models import Order, Position
-from trading.risk import RiskParameters
+from trading.risk import RiskParameters, symbol_cluster
 from trading.risk_manager import DefaultRiskManager
 
 
@@ -68,6 +68,10 @@ def _make_params(**overrides) -> RiskParameters:
         "slippage_bps": 5,
         "cooldown_after_loss_streak": 3,
         "loss_streak_count": 3,
+        # QT-003 (Sprint 46): disable cluster cap by default so tests that
+        # don't explicitly configure it are not constrained by the new gate.
+        # Mirrors max_portfolio_exposure_pct=1.0 above.
+        "max_cluster_exposure_pct": 1.0,
     }
     defaults.update(overrides)
     return RiskParameters(**defaults)
@@ -323,10 +327,18 @@ class TestMaxPositions:
         assert any("max open positions" in r.lower() for r in result.rejection_reasons)
 
     def test_below_max_positions_allows_order(self) -> None:
-        """Orders are allowed when below max_open_positions."""
+        """Orders are allowed when below max_open_positions.
+
+        QT-003 (Sprint 46): position quantity reduced from 0.1 BTC to
+        0.001 BTC so the existing exposure (50 USDT) stays well below the
+        new cluster cap (40 % of equity); this test asserts
+        max_positions semantics, not exposure semantics.
+        """
         manager = _make_manager(max_open_positions=3)
-        open_positions = [_make_position(symbol="BTC/USDT")]
-        order = _make_limit_order(symbol="ETH/USDT")
+        open_positions = [
+            _make_position(symbol="BTC/USDT", quantity=Decimal("0.001"))
+        ]
+        order = _make_limit_order(symbol="ETH/USDT", quantity=Decimal("0.001"))
         result = manager.pre_trade_check(
             order=order,
             current_equity=Decimal("10000"),
@@ -1424,3 +1436,345 @@ class TestATRPositionSizing:
     def test_unreasonable_atr_multiplier_rejected(self) -> None:
         with pytest.raises(ValueError, match="unreasonably large"):
             RiskParameters(atr_risk_multiplier=Decimal("10"))
+
+
+# ===================================================================
+# QT-003 (Sprint 46) — Correlation-aware cluster exposure cap
+# ===================================================================
+
+
+class TestQT003ClusterExposureCap:
+    """QT-003: cluster-aware exposure cap.  A nominally "diversified"
+    portfolio of four crypto majors at rho>0.8 is effectively one beta
+    bet, so the cluster cap bites BEFORE the total portfolio cap when
+    one cluster fills up.  These tests cover:
+
+      1. symbol_cluster() lookup (direct unit test)
+      2. Same-cluster prospective exposure blocks the order
+      3. Same-cluster order exactly at cap is approved (strict >)
+      4. Cross-cluster order is approved (cluster cap doesn't bite)
+      5. SELL orders bypass the cluster check (matches total-cap behaviour)
+      6. Unknown base asset lands in the 'other' cluster
+      7. Order with no resolvable price skips the cluster check
+      8. Same-symbol current_price fallback for MARKET orders
+      9. RiskParameters validation: cluster cap range, cluster <= total cap
+    """
+
+    # Shared baseline: 10 000 equity, 60% total cap, 40% cluster cap,
+    # concentration + position-count caps disabled so the cluster
+    # check is the ONLY blocking gate.
+    _EQUITY = Decimal("10000")
+    _PEAK = Decimal("10000")
+
+    def _make_cluster_manager(self) -> DefaultRiskManager:
+        return _make_manager(
+            max_portfolio_exposure_pct=0.60,
+            max_cluster_exposure_pct=0.40,   # cluster cap = 4000 USDT
+            max_position_size_pct=0.99,      # disable concentration cap
+            max_order_size_quote=Decimal("1000000"),
+            max_open_positions=20,
+        )
+
+    # ----- 1. symbol_cluster() lookup --------------------------------
+
+    def test_symbol_cluster_btc_is_crypto_majors(self) -> None:
+        assert symbol_cluster("BTC/USDT") == "crypto_majors"
+        assert symbol_cluster("ETH/EUR") == "crypto_majors"
+        assert symbol_cluster("SOL/USD") == "crypto_majors"
+
+    def test_symbol_cluster_stablecoin(self) -> None:
+        assert symbol_cluster("USDT/USD") == "stablecoin"
+        assert symbol_cluster("USDC/EUR") == "stablecoin"
+
+    def test_symbol_cluster_unknown_falls_back_to_other(self) -> None:
+        assert symbol_cluster("SHIB/USDT") == "other"
+        assert symbol_cluster("PEPE/USD") == "other"
+
+    def test_symbol_cluster_is_case_insensitive(self) -> None:
+        assert symbol_cluster("btc/usdt") == "crypto_majors"
+        assert symbol_cluster("eth/eur") == "crypto_majors"
+
+    def test_symbol_cluster_without_slash(self) -> None:
+        """Defensive fallback for bare asset names (no slash) that CCXT would
+        never normally produce — not part of the documented public contract."""
+        assert symbol_cluster("BTC") == "crypto_majors"
+        assert symbol_cluster("UNKNOWN") == "other"
+
+    # ----- 2. Same-cluster prospective exposure blocks ----------------
+
+    def test_same_cluster_buy_blocked_when_prospective_exceeds_cap(self) -> None:
+        """BTC position at 2500 USDT + new ETH buy at 2000 USDT = 4500 USDT
+        crypto_majors exposure > 4000 cap -> BLOCKED."""
+        manager = self._make_cluster_manager()
+        existing_btc = _make_position(
+            symbol="BTC/EUR",
+            quantity=Decimal("0.05"),
+            current_price=Decimal("50000"),
+        )
+        order = _make_limit_order(
+            symbol="ETH/EUR",
+            side=OrderSide.BUY,
+            quantity=Decimal("0.04"),
+            price=Decimal("50000"),
+        )
+        result = manager.pre_trade_check(
+            order=order,
+            current_equity=self._EQUITY,
+            open_positions=[existing_btc],
+            daily_pnl=Decimal("0"),
+            peak_equity=self._PEAK,
+        )
+        assert result.approved is False
+        assert any(
+            "cluster" in r.lower() and "crypto_majors" in r
+            for r in result.rejection_reasons
+        ), (
+            f"Expected cluster rejection mentioning crypto_majors, "
+            f"got: {result.rejection_reasons}"
+        )
+
+    def test_same_cluster_buy_allowed_when_under_cap(self) -> None:
+        """BTC position at 2500 USDT + new ETH buy at 1000 USDT = 3500 USDT
+        crypto_majors exposure < 4000 cap -> APPROVED."""
+        manager = self._make_cluster_manager()
+        existing_btc = _make_position(
+            symbol="BTC/EUR",
+            quantity=Decimal("0.05"),
+            current_price=Decimal("50000"),
+        )
+        order = _make_limit_order(
+            symbol="ETH/EUR",
+            side=OrderSide.BUY,
+            quantity=Decimal("0.02"),
+            price=Decimal("50000"),
+        )
+        result = manager.pre_trade_check(
+            order=order,
+            current_equity=self._EQUITY,
+            open_positions=[existing_btc],
+            daily_pnl=Decimal("0"),
+            peak_equity=self._PEAK,
+        )
+        assert result.approved is True, (
+            f"crypto_majors at 3500 < 4000 cap should pass; "
+            f"rejection_reasons={result.rejection_reasons}"
+        )
+
+    # ----- 3. Boundary: prospective EXACTLY at cap (CR-004) -----------
+
+    def test_same_cluster_buy_allowed_when_prospective_exactly_at_cap(self) -> None:
+        """Cluster check uses strict ``>`` so prospective == cap is APPROVED.
+        Contrast with the total-portfolio check which uses ``>=`` (blocks at
+        equality).  Documents the asymmetry and guards against an accidental
+        change to ``>=`` going undetected."""
+        manager = self._make_cluster_manager()
+        # 0.05 BTC @ 50000 = 2500 existing.  Order: 0.03 ETH @ 50000 = 1500.
+        # Prospective = 2500 + 1500 = 4000 == cluster_cap (4000) -> APPROVED.
+        existing_btc = _make_position(
+            symbol="BTC/EUR",
+            quantity=Decimal("0.05"),
+            current_price=Decimal("50000"),
+        )
+        order = _make_limit_order(
+            symbol="ETH/EUR",
+            side=OrderSide.BUY,
+            quantity=Decimal("0.03"),
+            price=Decimal("50000"),
+        )
+        result = manager.pre_trade_check(
+            order=order,
+            current_equity=self._EQUITY,
+            open_positions=[existing_btc],
+            daily_pnl=Decimal("0"),
+            peak_equity=self._PEAK,
+        )
+        assert result.approved is True, (
+            f"Prospective == cluster_cap must be APPROVED (strict >); "
+            f"rejection_reasons={result.rejection_reasons}"
+        )
+
+    # ----- 4. Cross-cluster order is approved -------------------------
+
+    def test_cross_cluster_order_not_constrained(self) -> None:
+        """BTC at 2500 USDT (crypto_majors) + USDC buy at 1500 USDT
+        (stablecoin) -> each cluster well under cap, APPROVED."""
+        manager = self._make_cluster_manager()
+        existing_btc = _make_position(
+            symbol="BTC/EUR",
+            quantity=Decimal("0.05"),
+            current_price=Decimal("50000"),
+        )
+        order = _make_limit_order(
+            symbol="USDC/EUR",
+            side=OrderSide.BUY,
+            quantity=Decimal("1500"),
+            price=Decimal("1"),
+        )
+        result = manager.pre_trade_check(
+            order=order,
+            current_equity=self._EQUITY,
+            open_positions=[existing_btc],
+            daily_pnl=Decimal("0"),
+            peak_equity=self._PEAK,
+        )
+        assert result.approved is True, (
+            f"Cross-cluster buy must pass; rejection_reasons={result.rejection_reasons}"
+        )
+
+    # ----- 5. SELL bypasses cluster check -----------------------------
+
+    def test_sell_bypasses_cluster_cap_even_when_cluster_full(self) -> None:
+        """When crypto_majors cluster is over cap, a SELL must still be
+        approved (mirrors the SELL bypass on the total cap)."""
+        manager = self._make_cluster_manager()
+        # Cluster already saturated: 0.1 BTC @ 50000 = 5000 > 4000 cap.
+        existing = _make_position(
+            symbol="BTC/EUR",
+            quantity=Decimal("0.1"),
+            current_price=Decimal("50000"),
+        )
+        order = _make_limit_order(
+            symbol="BTC/EUR",
+            side=OrderSide.SELL,
+            quantity=Decimal("0.05"),
+            price=Decimal("50000"),
+        )
+        result = manager.pre_trade_check(
+            order=order,
+            current_equity=self._EQUITY,
+            open_positions=[existing],
+            daily_pnl=Decimal("0"),
+            peak_equity=self._PEAK,
+        )
+        assert result.approved is True, (
+            f"SELL must bypass cluster cap; rejection_reasons={result.rejection_reasons}"
+        )
+
+    # ----- 6. Unknown base asset -> 'other' cluster -------------------
+
+    def test_unknown_base_asset_uses_other_cluster_and_still_capped(self) -> None:
+        """SHIB -> 'other' cluster.  A 5000-USDT SHIB buy with no other
+        positions still trips the cluster cap (5000 > 4000)."""
+        manager = self._make_cluster_manager()
+        order = _make_limit_order(
+            symbol="SHIB/EUR",
+            side=OrderSide.BUY,
+            quantity=Decimal("100"),
+            price=Decimal("50"),
+        )
+        result = manager.pre_trade_check(
+            order=order,
+            current_equity=self._EQUITY,
+            open_positions=[],
+            daily_pnl=Decimal("0"),
+            peak_equity=self._PEAK,
+        )
+        assert result.approved is False
+        assert any(
+            "cluster" in r.lower() and "'other'" in r
+            for r in result.rejection_reasons
+        ), (
+            f"Expected cluster rejection mentioning 'other', "
+            f"got: {result.rejection_reasons}"
+        )
+
+    # ----- 7. Order with no resolvable price skips cluster check ------
+
+    def test_market_order_with_no_price_skips_cluster_check(self) -> None:
+        """When an order has no price AND no existing same-symbol position
+        provides a current_price, the cluster check skips this order rather
+        than guessing notional from quantity alone.  The downstream
+        concentration + notional caps still apply.
+
+        Here: MARKET BUY for ETH (no existing ETH position) -> cluster check
+        is skipped; the order is approved on the cluster axis.  ``market_price``
+        IS passed so the order_size / concentration check has a price to use."""
+        manager = self._make_cluster_manager()
+        # Existing BTC position at 2500 -- does NOT serve as fallback for ETH.
+        existing_btc = _make_position(
+            symbol="BTC/EUR",
+            quantity=Decimal("0.05"),
+            current_price=Decimal("50000"),
+        )
+        order = _make_market_order(
+            symbol="ETH/EUR",
+            side=OrderSide.BUY,
+            quantity=Decimal("0.001"),
+        )
+        result = manager.pre_trade_check(
+            order=order,
+            current_equity=self._EQUITY,
+            open_positions=[existing_btc],
+            daily_pnl=Decimal("0"),
+            peak_equity=self._PEAK,
+            market_price=Decimal("50000"),
+        )
+        assert result.approved is True, (
+            f"Cluster check must be skipped when order price + same-symbol "
+            f"current_price are both unavailable; "
+            f"rejection_reasons={result.rejection_reasons}"
+        )
+
+    # ----- 8. Same-symbol current_price fallback ----------------------
+
+    def test_market_order_uses_same_symbol_current_price_fallback(self) -> None:
+        """When order.price is None but an existing position in the SAME
+        symbol has a current_price, that price is used to value the
+        prospective notional for the cluster check."""
+        manager = self._make_cluster_manager()
+        # Existing BTC at 2500.  Same symbol -> its current_price is the
+        # fallback used to value a price-less MARKET BUY of BTC.
+        existing_btc = _make_position(
+            symbol="BTC/EUR",
+            quantity=Decimal("0.05"),
+            current_price=Decimal("50000"),
+        )
+        # MARKET BUY 0.04 BTC -> notional via fallback = 0.04 * 50000 = 2000.
+        # Prospective crypto_majors = 2500 + 2000 = 4500 > 4000 -> BLOCKED.
+        order = _make_market_order(
+            symbol="BTC/EUR",
+            side=OrderSide.BUY,
+            quantity=Decimal("0.04"),
+        )
+        result = manager.pre_trade_check(
+            order=order,
+            current_equity=self._EQUITY,
+            open_positions=[existing_btc],
+            daily_pnl=Decimal("0"),
+            peak_equity=self._PEAK,
+            market_price=Decimal("50000"),
+        )
+        assert result.approved is False
+        assert any(
+            "cluster" in r.lower() and "crypto_majors" in r
+            for r in result.rejection_reasons
+        ), (
+            f"Expected cluster rejection via same-symbol price fallback, "
+            f"got: {result.rejection_reasons}"
+        )
+
+    # ----- 9. RiskParameters validation -------------------------------
+
+    def test_cluster_cap_zero_raises(self) -> None:
+        with pytest.raises(ValueError, match="max_cluster_exposure_pct"):
+            RiskParameters(max_cluster_exposure_pct=0.0)
+
+    def test_cluster_cap_above_one_raises(self) -> None:
+        with pytest.raises(ValueError, match="max_cluster_exposure_pct"):
+            RiskParameters(max_cluster_exposure_pct=1.5)
+
+    def test_cluster_cap_above_total_cap_raises(self) -> None:
+        with pytest.raises(ValueError, match="must be <= max_portfolio_exposure_pct"):
+            RiskParameters(
+                max_portfolio_exposure_pct=0.40,
+                max_cluster_exposure_pct=0.50,
+            )
+
+    def test_cluster_cap_equal_to_total_cap_accepted(self) -> None:
+        """Boundary value: cluster == total cap is allowed (cluster cap
+        effectively bites at the same point as the total cap)."""
+        params = RiskParameters(
+            max_portfolio_exposure_pct=0.50,
+            max_cluster_exposure_pct=0.50,
+        )
+        assert params.max_cluster_exposure_pct == 0.50

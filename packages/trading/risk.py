@@ -32,7 +32,57 @@ __all__ = [
     "BaseRiskManager",
     "RiskParameters",
     "RiskViolation",
+    "symbol_cluster",
 ]
+
+
+# ---------------------------------------------------------------------------
+# QT-003 (Sprint 46): Asset-cluster mapping for correlation-aware exposure
+# ---------------------------------------------------------------------------
+#
+# Static base-asset → cluster lookup.  Major crypto assets are grouped under
+# ``crypto_majors`` because rolling 30-day return correlation between BTC,
+# ETH, SOL, XRP, ADA, DOGE, AVAX et al. routinely exceeds 0.8 in stress
+# periods — the "diversified portfolio" of four such names has an
+# effective N closer to 1.5 than to 4.
+#
+# Anything not in this map falls into the catch-all ``other`` cluster so
+# the cluster cap can still apply (defensive default).  A future iteration
+# could derive clusters dynamically from a rolling correlation matrix.
+_BASE_ASSET_CLUSTERS: dict[str, str] = {
+    # Bitcoin + correlated majors
+    "BTC": "crypto_majors",
+    "ETH": "crypto_majors",
+    "SOL": "crypto_majors",
+    "XRP": "crypto_majors",
+    "ADA": "crypto_majors",
+    "DOGE": "crypto_majors",
+    "AVAX": "crypto_majors",
+    "MATIC": "crypto_majors",
+    "DOT": "crypto_majors",
+    "LINK": "crypto_majors",
+    "BNB": "crypto_majors",
+    "LTC": "crypto_majors",
+    "BCH": "crypto_majors",
+    # Stablecoin reserve assets — kept separate so stablecoin-only
+    # strategies do not collide with the majors cluster cap.
+    "USDT": "stablecoin",
+    "USDC": "stablecoin",
+    "DAI": "stablecoin",
+}
+
+
+def symbol_cluster(symbol: str) -> str:
+    """Return the cluster name for a CCXT-style symbol like ``BTC/EUR``.
+
+    Resolves by base asset (the part before the first slash).  Unknown
+    base assets land in the ``other`` cluster so the cluster-exposure
+    cap still applies — defensive default avoids accidental
+    cluster-bypass for newly-listed tokens that have not been
+    classified yet.
+    """
+    base = symbol.split("/", 1)[0].strip().upper() if "/" in symbol else symbol.upper()
+    return _BASE_ASSET_CLUSTERS.get(base, "other")
 
 logger = structlog.get_logger(__name__)
 
@@ -82,6 +132,16 @@ class RiskParameters:
     sizing_mode: str = "fixed"
     atr_risk_multiplier: Decimal = Decimal("1.5")
 
+    # QT-003 (Sprint 46): correlation-aware cluster exposure cap.
+    #
+    # In addition to the flat ``max_portfolio_exposure_pct`` cap, every
+    # asset cluster (see ``symbol_cluster``) gets its own ceiling.  Four
+    # majors at ρ>0.8 are effectively one bet; capping the whole cluster
+    # at 40 % prevents an apparent "diversified" portfolio from being
+    # 60 %-exposed to the same beta.  Set to 1.0 to disable the cluster
+    # gate while keeping the legacy total cap.
+    max_cluster_exposure_pct: float = 0.40
+
     def __post_init__(self) -> None:
         if not (0 < self.per_trade_risk_pct <= 0.05):
             raise ValueError(
@@ -115,6 +175,20 @@ class RiskParameters:
             raise ValueError(
                 f"atr_risk_multiplier {self.atr_risk_multiplier} is unreasonably "
                 f"large (>5); review configuration."
+            )
+        # QT-003: validate cluster cap
+        if not (0 < self.max_cluster_exposure_pct <= 1.0):
+            raise ValueError(
+                f"max_cluster_exposure_pct {self.max_cluster_exposure_pct} "
+                f"out of safe range (0, 1.0]"
+            )
+        if self.max_cluster_exposure_pct > self.max_portfolio_exposure_pct:
+            # Cluster cap must be <= total cap; otherwise the cluster
+            # check can never bite before the total cap does.
+            raise ValueError(
+                f"max_cluster_exposure_pct ({self.max_cluster_exposure_pct}) "
+                f"must be <= max_portfolio_exposure_pct "
+                f"({self.max_portfolio_exposure_pct})"
             )
 
 
@@ -434,24 +508,79 @@ class BaseRiskManager(abc.ABC):
         current_equity: Decimal,
         open_positions: list[Position],
     ) -> RiskViolation | None:
-        """Block BUY orders if total portfolio exposure exceeds cap."""
+        """Block BUY orders when total OR cluster exposure exceeds cap.
+
+        QT-003 (Sprint 46): a portfolio nominally diversified across four
+        major crypto names is in reality one beta bet because the names
+        co-move at ρ>0.8.  The cluster cap therefore also bites BEFORE
+        the total cap when one cluster (e.g. crypto_majors) approaches
+        ``max_cluster_exposure_pct`` of equity.  The order's intended
+        cluster is computed against the prospective exposure (= current
+        cluster exposure + this order's notional) so the gate stops
+        cluster-stacking ahead of fill.
+        """
         if order.side != OrderSide.BUY or current_equity <= Decimal(0):
             return None
-        total_exposure = sum(
-            (p.notional_value for p in open_positions if not p.is_flat),
-            Decimal(0),
+
+        open_only = [p for p in open_positions if not p.is_flat]
+        total_exposure = sum((p.notional_value for p in open_only), Decimal(0))
+        total_cap = (
+            Decimal(str(self._params.max_portfolio_exposure_pct)) * current_equity
         )
-        cap = Decimal(str(self._params.max_portfolio_exposure_pct)) * current_equity
-        if total_exposure >= cap:
+        if total_exposure >= total_cap:
             return RiskViolation(
                 rule="max_portfolio_exposure",
                 message=(
                     f"Total portfolio exposure {total_exposure:.2f} "
-                    f"already at or above cap {cap:.2f} "
+                    f"already at or above cap {total_cap:.2f} "
                     f"({self._params.max_portfolio_exposure_pct:.0%} of equity)"
                 ),
                 blocking=True,
             )
+
+        # QT-003 cluster check.  Build per-cluster running totals and
+        # add the prospective order notional to its target cluster.  The
+        # order's notional uses ``order.quantity * price`` where price is
+        # ``order.price`` for LIMIT or the current market price for
+        # MARKET — we use ``order.price`` when set, falling back to the
+        # most-recent ``current_price`` of any existing position in the
+        # same symbol.  When neither is available the order's quantity
+        # alone is non-informative for notional, so the cluster check
+        # skips it (the regular max_position_size + concentration caps
+        # still apply downstream).
+        cluster_exposure: dict[str, Decimal] = {}
+        for p in open_only:
+            cluster_exposure.setdefault(symbol_cluster(p.symbol), Decimal(0))
+            cluster_exposure[symbol_cluster(p.symbol)] += p.notional_value
+
+        target_cluster = symbol_cluster(order.symbol)
+        order_price: Decimal | None = order.price
+        if order_price is None:
+            for p in open_only:
+                if p.symbol == order.symbol and p.current_price > Decimal(0):
+                    order_price = p.current_price
+                    break
+        if order_price is not None and order_price > Decimal(0):
+            prospective = (
+                cluster_exposure.get(target_cluster, Decimal(0))
+                + order.quantity * order_price
+            )
+            cluster_cap = (
+                Decimal(str(self._params.max_cluster_exposure_pct)) * current_equity
+            )
+            if prospective > cluster_cap:
+                return RiskViolation(
+                    rule="max_cluster_exposure",
+                    message=(
+                        f"Cluster '{target_cluster}' prospective exposure "
+                        f"{prospective:.2f} would exceed cap {cluster_cap:.2f} "
+                        f"({self._params.max_cluster_exposure_pct:.0%} of equity); "
+                        f"current cluster exposure is "
+                        f"{cluster_exposure.get(target_cluster, Decimal(0)):.2f}."
+                    ),
+                    blocking=True,
+                )
+
         return None
 
     def __repr__(self) -> str:

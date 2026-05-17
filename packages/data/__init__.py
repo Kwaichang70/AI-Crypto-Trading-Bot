@@ -53,15 +53,27 @@ __all__ = [
 # ML features  -- guarded import (scikit-learn may not be installed)
 try:
     from data.ml_features import (
+        CURRENT_FEATURE_SCHEMA_VERSION,
         FEATURE_NAMES,
+        FEATURE_SCHEMA_VERSION_V1,
+        FEATURE_SCHEMA_VERSION_V2,
+        build_extended_feature_matrix,
+        build_extended_feature_vector_from_bars,
         build_feature_matrix,
         build_feature_vector_from_bars,
+        feature_names_for_schema,
     )
 
     __all__ += [
+        "CURRENT_FEATURE_SCHEMA_VERSION",
         "FEATURE_NAMES",
+        "FEATURE_SCHEMA_VERSION_V1",
+        "FEATURE_SCHEMA_VERSION_V2",
+        "build_extended_feature_matrix",
+        "build_extended_feature_vector_from_bars",
         "build_feature_matrix",
         "build_feature_vector_from_bars",
+        "feature_names_for_schema",
     ]
 except ImportError:
     pass
