@@ -44,6 +44,11 @@ env:
   NODE_VERSION:   "20"
   # uv version — pin for reproducible installs; bump deliberately
   UV_VERSION:     "0.5.18"
+  # TO-004 (Sprint 43): pin Python's hash randomisation seed so any test
+  # that iterates over dict / set ordering produces byte-for-byte
+  # deterministic results across CI runs.  Random seed (default) is the
+  # #1 source of "passes locally, fails in CI" flakes.
+  PYTHONHASHSEED: "0"
 
 # =============================================================================
 # Job: lint — Python linting via ruff (fail fast, no compute wasted downstream)

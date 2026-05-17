@@ -172,6 +172,30 @@ class Settings(BaseSettings):
                 f"postgresql+asyncpg://{user}:{pw}@{host}:{port}/{db}"
             )
         return values
+
+    @model_validator(mode="after")
+    def _validate_cors_when_auth_enabled(self) -> "Settings":
+        """SEC-007 (Sprint 43): refuse wildcard origins under production
+        auth posture.
+
+        ``allow_credentials=True`` is incompatible with ``allow_origins=["*"]``
+        per the CORS spec — browsers will refuse the response — but a
+        wildcard prefix/suffix or a literal ``"*"`` is a classic operator
+        footgun that bypasses every layer of auth in dev mode reflections.
+        When ``require_api_auth`` is on, reject the misconfiguration at
+        startup so the API never boots into a vulnerable state.
+        """
+        if not self.require_api_auth:
+            return self
+        for origin in self.allowed_origins:
+            stripped = origin.strip()
+            if stripped == "*" or stripped.startswith("*") or stripped.endswith("*"):
+                raise ValueError(
+                    f"allowed_origins contains wildcard {origin!r} but "
+                    f"require_api_auth=True — wildcards are forbidden under "
+                    f"production auth posture (SEC-007)."
+                )
+        return self
     db_pool_size: int = Field(default=10, ge=1, le=50, description="SQLAlchemy connection pool size")
     db_max_overflow: int = Field(
         default=20, ge=0, le=100, description="SQLAlchemy max overflow connections"
@@ -328,7 +352,11 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     # External market signal API keys (Sprint 37)
     # ------------------------------------------------------------------
-    fred_api_key: str | None = Field(
+    # SEC-001 (Sprint 43): both keys use SecretStr so they don't leak into
+    # settings.model_dump(), debug repr, or accidental logging — same
+    # treatment as the other secrets in this Settings class (api_key_hash,
+    # database_url, exchange_api_*).  Call-sites must use .get_secret_value().
+    fred_api_key: SecretStr | None = Field(
         default=None,
         description=(
             "FRED (Federal Reserve Economic Data) API key. "
@@ -337,7 +365,7 @@ class Settings(BaseSettings):
             "When None (default), FRED signals are disabled."
         ),
     )
-    whale_alert_api_key: str | None = Field(
+    whale_alert_api_key: SecretStr | None = Field(
         default=None,
         description=(
             "Whale Alert API key for on-chain large transaction monitoring. "

@@ -121,6 +121,15 @@ services:
         PYTHON_VERSION: "3.11"
     image: crypto-trading-bot/api:local
     restart: unless-stopped
+    # SEC-011 (Sprint 43): disable core dumps.  The API process holds
+    # exchange API credentials in memory (CCXT requires raw keys for
+    # request signing) — a crash dump would write those secrets to disk
+    # in cleartext.  Hard-zero on the core RLIMIT prevents that exfil
+    # vector at the kernel level.
+    ulimits:
+      core:
+        soft: 0
+        hard: 0
     networks:
       - backend
       - frontend

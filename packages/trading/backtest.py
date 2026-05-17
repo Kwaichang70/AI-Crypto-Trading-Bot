@@ -620,63 +620,30 @@ class BacktestRunner:
         equity_curve: list[EquityCurvePoint],
         portfolio: PortfolioAccounting,
     ) -> int:
+        """QT-011 (Sprint 43): count bars where ANY position is open.
+
+        Earlier implementation iterated trades × curve and double-counted
+        bars that fell inside overlapping trade spans (multiple symbols
+        traded concurrently produced ``bars_count > len(curve)`` which was
+        then clamped at the curve length — biased both ways).
+
+        Corrected algorithm: walk the curve once and ask "is at least one
+        trade open at this timestamp?".  This collapses overlapping spans
+        to a single bar count, matching the natural interpretation of
+        ``exposure_pct = fraction of time the strategy had risk on``.
         """
-        Estimate the number of bars where the portfolio had open positions.
-
-        This is an approximation based on the equity curve.  A bar is
-        considered "in market" if the equity differs from what it would
-        be with cash only (i.e., there is unrealised position value).
-
-        For a more precise calculation, the StrategyEngine would need to
-        track position state per bar.  This heuristic is sufficient for
-        reporting purposes.
-
-        Parameters
-        ----------
-        equity_curve : list[EquityCurvePoint]
-            The annotated equity curve.
-        portfolio : PortfolioAccounting
-            The portfolio accounting instance.
-
-        Returns
-        -------
-        int
-            Estimated number of bars with open positions.
-        """
-        # Use the trade history to estimate exposure.
-        # Each trade spans from entry_at to exit_at.
-        # We count equity curve points that fall within any trade span.
         trades = portfolio.get_trade_history()
         if not trades or not equity_curve:
             return 0
 
-        # Simple heuristic: count equity curve points where equity
-        # is not equal to cash.  Since equity = cash + position_value,
-        # if equity != cash, there is an open position.
-        #
-        # However, we do not have direct access to cash at each point.
-        # Instead, we count the number of non-zero drawdown points as
-        # a rough lower bound on exposure.  A better approach:
-        # count points where equity deviates from a linear interpolation.
-        #
-        # The most accurate approach available without additional tracking:
-        # count the number of total bars, and estimate from trade count
-        # and average trade duration.
-        if not trades:
-            return 0
-
-        # Count bars between each trade's entry and exit
-        curve_timestamps = [p.timestamp for p in equity_curve]
-        bars_count = 0
-        for trade in trades:
-            for ts in curve_timestamps:
+        bars_in_market = 0
+        for point in equity_curve:
+            ts = point.timestamp
+            for trade in trades:
                 if trade.entry_at <= ts <= trade.exit_at:
-                    bars_count += 1
-
-        # Deduplicate (a bar can be "in market" for multiple trades)
-        # This is a simplification; in practice overlapping trades on
-        # different symbols would cause overcounting. Cap at curve length.
-        return min(bars_count, len(equity_curve))
+                    bars_in_market += 1
+                    break  # at least one open trade — count this bar once
+        return bars_in_market
 
 
 # ---------------------------------------------------------------------------

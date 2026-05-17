@@ -384,11 +384,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # ------------------------------------------------------------------
     # 9. FRED macro client — requires FRED_API_KEY (Sprint 37)
     # ------------------------------------------------------------------
-    if settings.fred_api_key:
+    if settings.fred_api_key is not None:
         try:
             from data.macro_data import FREDClient, set_global_client as _set_fred
 
-            _fred_instance = FREDClient(api_key=settings.fred_api_key)
+            _fred_instance = FREDClient(api_key=settings.fred_api_key.get_secret_value())
             _set_fred(_fred_instance)
             # Warm up cache on startup (best-effort; FRED data rarely changes)
             try:
@@ -410,11 +410,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # ------------------------------------------------------------------
     # 10. Whale Alert client — requires WHALE_ALERT_API_KEY (Sprint 37)
     # ------------------------------------------------------------------
-    if settings.whale_alert_api_key:
+    if settings.whale_alert_api_key is not None:
         try:
             from data.whale_tracker import WhaleAlertClient, set_global_client as _set_whale
 
-            _whale_instance = WhaleAlertClient(api_key=settings.whale_alert_api_key)
+            _whale_instance = WhaleAlertClient(api_key=settings.whale_alert_api_key.get_secret_value())
             _set_whale(_whale_instance)
             # Warm up cache on startup (best-effort)
             try:
@@ -456,7 +456,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Cancel all active paper/live trading engine tasks
     import asyncio
 
-    from api.routers.runs import _RUN_TASKS
+    # _RUN_TASKS moved to api.services.run_orchestrator in Sprint 40 Stap 2b;
+    # routers/runs.py re-exports the dict, but mypy strict requires an explicit
+    # export (it does not see aliased re-exports as such).
+    from api.services.run_orchestrator import _RUN_TASKS
 
     active_tasks = [t for t in _RUN_TASKS.values() if not t.done()]
     if active_tasks:
