@@ -342,10 +342,16 @@ class TestProposeAdjustments:
         assert adj.actionable is False
 
     def test_rsi_oversold_adjustment(self) -> None:
-        """Good RSI buy buckets produce an oversold parameter change."""
+        """Good RSI buy buckets produce an oversold parameter change.
+
+        QT-010 (Sprint 42): bucket counts must satisfy both the
+        ``min_trades_per_bucket`` floor (default 20) and the t-stat gate
+        (|sharpe|·√n >= 2.0).  Counts of 10/8 from earlier sprints are
+        below the gate; bumped here so the path is still exercised.
+        """
         buckets = [
-            _make_bucket(low=25.0, high=30.0, count=10, sharpe=1.5),
-            _make_bucket(low=30.0, high=35.0, count=8, sharpe=0.8),
+            _make_bucket(low=25.0, high=30.0, count=25, sharpe=1.5),
+            _make_bucket(low=30.0, high=35.0, count=22, sharpe=0.8),
         ]
         report = _make_report(rsi_buckets=buckets, param_confidence=0.80)
         optimizer = AdaptiveOptimizer()
@@ -362,8 +368,10 @@ class TestProposeAdjustments:
         """
         A bucket whose bucket_high would produce RSI < 15 is clamped to 15.
         We create a bucket at [5, 10] with high sharpe.
+
+        QT-010: count bumped from 10 to 25 to clear the t-stat gate.
         """
-        buckets = [_make_bucket(low=5.0, high=10.0, count=10, sharpe=2.0)]
+        buckets = [_make_bucket(low=5.0, high=10.0, count=25, sharpe=2.0)]
         report = _make_report(rsi_buckets=buckets, param_confidence=0.90)
         optimizer = AdaptiveOptimizer()
         adj = optimizer.propose_adjustments(
@@ -852,3 +860,79 @@ class TestOptimizerState:
         assert state.cooldown_until > datetime.now(tz=UTC)
         assert state.last_adjustment is None
         assert state.previous_params is None
+
+
+# ===================================================================
+# TestTStatGate — Sprint 42 QT-010
+# ===================================================================
+
+
+class TestTStatGate:
+    """QT-010: bucket-Sharpe significance gate replaces the legacy
+    ``trade_count >= 5`` heuristic with a t-statistic + minimum-trades
+    floor.  The gate is direction-agnostic and configurable via
+    ``min_trades_per_bucket`` and ``t_stat_threshold`` safeguards."""
+
+    def test_rejects_below_minimum_trades(self) -> None:
+        """trade_count < min_trades_per_bucket → rejected even at high t-stat."""
+        opt = AdaptiveOptimizer()
+        # 10 trades, Sharpe 3.0 → |t| = 3.0 * sqrt(10) ≈ 9.49 (well above 2.0)
+        # but count=10 < default min=20 → must still be rejected.
+        assert opt._is_bucket_significant(sharpe=3.0, trade_count=10) is False
+
+    def test_rejects_low_t_stat_even_with_enough_trades(self) -> None:
+        """High trade count but Sharpe near zero → rejected."""
+        opt = AdaptiveOptimizer()
+        # 100 trades, Sharpe 0.05 → |t| = 0.05 * 10 = 0.5 (< 2.0) → reject
+        assert opt._is_bucket_significant(sharpe=0.05, trade_count=100) is False
+
+    def test_accepts_when_both_conditions_pass(self) -> None:
+        opt = AdaptiveOptimizer()
+        # 25 trades, Sharpe 0.5 → |t| = 0.5 * sqrt(25) = 2.5 (>= 2.0) → accept
+        assert opt._is_bucket_significant(sharpe=0.5, trade_count=25) is True
+
+    def test_gate_is_direction_agnostic(self) -> None:
+        """Negative Sharpe with large magnitude is also significant."""
+        opt = AdaptiveOptimizer()
+        # 25 trades, Sharpe -0.5 → |t| = 2.5 (>= 2.0) → accept
+        assert opt._is_bucket_significant(sharpe=-0.5, trade_count=25) is True
+
+    def test_safeguard_override_lowers_threshold(self) -> None:
+        """Lower the t-stat threshold so a previously-rejected bucket passes."""
+        opt = AdaptiveOptimizer(safeguards={"t_stat_threshold": 1.0})
+        # 25 trades, Sharpe 0.25 → |t| = 0.25 * 5 = 1.25 (>= 1.0) → accept
+        assert opt._is_bucket_significant(sharpe=0.25, trade_count=25) is True
+
+    def test_safeguard_override_raises_threshold(self) -> None:
+        opt = AdaptiveOptimizer(safeguards={"t_stat_threshold": 3.0})
+        # Same bucket as the previous test but stricter threshold rejects it
+        assert opt._is_bucket_significant(sharpe=0.25, trade_count=25) is False
+
+    def test_low_significance_rsi_bucket_does_not_propose_change(self) -> None:
+        """Integration: a bucket that fails the gate must not drive an
+        oversold adjustment even if Sharpe is positive."""
+        # 8 trades, Sharpe 1.5 → |t| ≈ 4.24 (above 2.0) BUT count < 20 → reject
+        buckets = [_make_bucket(low=20.0, high=25.0, count=8, sharpe=1.5)]
+        report = _make_report(rsi_buckets=buckets, param_confidence=0.85)
+        opt = AdaptiveOptimizer()
+        adj = opt.propose_adjustments(
+            report, {"oversold": 30.0, "overbought": 70.0}
+        )
+        oversold_changes = [c for c in adj.changes if c.param_name == "oversold"]
+        assert oversold_changes == []
+
+    def test_significant_rsi_bucket_drives_change(self) -> None:
+        """High-significance bucket far enough from current oversold value
+        must produce a proposal."""
+        # 30 trades, Sharpe 1.2 → |t| ≈ 6.57; count ≥ 20 → accept
+        buckets = [_make_bucket(low=18.0, high=22.0, count=30, sharpe=1.2)]
+        report = _make_report(rsi_buckets=buckets, param_confidence=0.85)
+        opt = AdaptiveOptimizer()
+        adj = opt.propose_adjustments(
+            report, {"oversold": 35.0, "overbought": 70.0}
+        )
+        oversold_changes = [c for c in adj.changes if c.param_name == "oversold"]
+        # bucket_high=22 vs current=35 → delta well above the 0.01 noise floor
+        assert len(oversold_changes) == 1
+        # And the proposal should move oversold DOWN toward the significant bucket
+        assert oversold_changes[0].new_value < 35.0

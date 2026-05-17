@@ -30,6 +30,7 @@ bar-loop or a dedicated AdaptiveLearningTask.
 
 from __future__ import annotations
 
+import math
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
@@ -68,6 +69,13 @@ SAFEGUARDS: dict[str, Any] = {
     "rollback_cooldown_hours": 72,
     "max_rollbacks_30d": 3,
     "confidence_threshold": 0.65,
+    # QT-010 (Sprint 42): t-statistic gating for per-bucket Sharpe analysis.
+    # Replaces the legacy ``trade_count >= 5`` heuristic that was noise-
+    # dominated (Sharpe SE ≈ 0.45 at n=5).  A bucket's Sharpe is "real"
+    # when ``|sharpe| * sqrt(n) >= t_stat_threshold`` AND ``n >=
+    # min_trades_per_bucket``.  Default 2.0 ≈ 95% confidence for moderate n.
+    "min_trades_per_bucket": 20,
+    "t_stat_threshold": 2.0,
 }
 
 # Absolute bounds — no caller-supplied override may exceed these limits.
@@ -84,6 +92,10 @@ _ABSOLUTE_BOUNDS: dict[str, tuple[float, float]] = {
     "rollback_cooldown_hours": (24.0, 168.0),
     "max_rollbacks_30d": (1.0, 10.0),
     "confidence_threshold": (0.50, 0.90),
+    # QT-010 absolute bounds: t-stat in [1.0, 4.0] (1.0 ≈ 68% conf;
+    # 4.0 effectively disables adaptation), min_trades_per_bucket in [5, 100].
+    "min_trades_per_bucket": (5.0, 100.0),
+    "t_stat_threshold": (1.0, 4.0),
 }
 
 # CR-002: Validate RSI range tuples
@@ -593,6 +605,35 @@ class AdaptiveOptimizer:
     # Private optimization methods
     # ------------------------------------------------------------------
 
+    def _is_bucket_significant(
+        self, sharpe: float, trade_count: int
+    ) -> bool:
+        """QT-010 (Sprint 42): t-statistic gate for per-bucket Sharpe.
+
+        A bucket's Sharpe is treated as a real signal (rather than noise)
+        when BOTH conditions hold:
+
+        1. ``trade_count >= min_trades_per_bucket`` — the legacy ``>= 5``
+           heuristic was Sharpe-SE-dominated (≈ 0.45 at n=5); 20 trades is
+           the floor below which any t-statistic is structurally unreliable.
+        2. ``|sharpe| * sqrt(trade_count) >= t_stat_threshold`` —
+           equivalent to the per-trade Sharpe being statistically distinct
+           from zero at the configured confidence level (2.0 ≈ 95 %).
+
+        Both safeguards are mutable via ``SAFEGUARDS`` overrides so an
+        operator can dial sensitivity per deployment.
+        """
+        min_trades = int(self._safeguards["min_trades_per_bucket"])
+        if trade_count < min_trades:
+            return False
+        t_threshold = float(self._safeguards["t_stat_threshold"])
+        # t-stat magnitude — negative Sharpe with a large magnitude is also
+        # statistically significant (consistent loser); the surrounding
+        # algorithm only acts on ``sharpe > 0`` buckets but the gating
+        # itself is direction-agnostic so downstream callers can reuse it.
+        t_stat = abs(sharpe) * math.sqrt(float(trade_count))
+        return t_stat >= t_threshold
+
     def _optimize_rsi(
         self,
         report: PerformanceReport,
@@ -621,10 +662,12 @@ class AdaptiveOptimizer:
         current_overbought = float(current_params.get("overbought", 70.0))
 
         # --- Oversold (BUY entry) ---
+        # QT-010: t-stat gate replaces ``trade_count >= 5`` heuristic.
         buy_buckets = [
             b
             for b in pa.rsi_buckets
-            if b.bucket_high <= 50 and b.trade_count >= 5
+            if b.bucket_high <= 50
+            and self._is_bucket_significant(b.sharpe, b.trade_count)
         ]
         if buy_buckets:
             # Highest Sharpe in the oversold zone
@@ -666,10 +709,12 @@ class AdaptiveOptimizer:
                     )
 
         # --- Overbought (SELL exit) ---
+        # QT-010: t-stat gate replaces ``trade_count >= 5`` heuristic.
         sell_buckets = [
             b
             for b in pa.rsi_buckets
-            if b.bucket_low >= 50 and b.trade_count >= 5
+            if b.bucket_low >= 50
+            and self._is_bucket_significant(b.sharpe, b.trade_count)
         ]
         if sell_buckets:
             best_sell = max(
