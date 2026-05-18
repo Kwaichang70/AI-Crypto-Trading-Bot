@@ -35,7 +35,10 @@ from __future__ import annotations
 
 import time
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 import structlog
 from pydantic import BaseModel, Field
@@ -50,6 +53,7 @@ __all__ = [
 logger = structlog.get_logger(__name__)
 
 _ENDPOINT = "https://api.coingecko.com/api/v3/global"
+_MARKET_CAP_CHART_ENDPOINT = "https://api.coingecko.com/api/v3/global/market_cap_chart"
 _CACHE_TTL_SECONDS = 1800  # 30 minutes
 
 # ---------------------------------------------------------------------------
@@ -148,6 +152,15 @@ class CoinGeckoClient:
         # Cache: (snapshot, fetched_at_monotonic)
         self._latest_cache: tuple[CoinGeckoSnapshot, float] | None = None
 
+        # QT-007e (Sprint 46): Historical BTC dominance series state.
+        # ``_btc_dom_history_is_manual = True`` means the series was injected
+        # via ``set_btc_dominance_history`` and is sticky (no TTL expiry,
+        # no overwrite by failed network fetch).  A successful network
+        # fetch via the PRO endpoint clears the flag and replaces the data.
+        self._btc_dom_history: pd.Series | None = None
+        self._btc_dom_history_fetched_at: float | None = None
+        self._btc_dom_history_is_manual: bool = False
+
         self._log = structlog.get_logger(__name__).bind(
             component="coingecko_client"
         )
@@ -191,6 +204,55 @@ class CoinGeckoClient:
         if self._latest_cache is not None:
             return self._latest_cache[0]
         return None
+
+    def set_btc_dominance_history(self, series: pd.Series) -> None:
+        """Inject a manually-curated historical BTC dominance series.
+
+        Free-tier CoinGecko does not expose ``/global/market_cap_chart``
+        (PRO subscription only).  Operators who want the v2
+        ``btc_dom_delta_7d`` feature without upgrading can load a CSV
+        snapshot (e.g. from CoinMarketCap, Glassnode, or a manual export)
+        and inject it here.
+
+        Manual overrides are STICKY: they survive TTL expiry and are
+        only replaced by another call to ``set_btc_dominance_history``
+        OR a successful network fetch via ``fetch_btc_dominance_history``
+        on a PRO-enabled account.
+
+        Expected series shape:
+          - Index: UTC-aware DatetimeIndex (daily granularity typical).
+          - Values: float dominance percentage in [0, 100].
+          - Sorted ascending; monotonic.
+
+        Parameters
+        ----------
+        series:
+            Pre-prepared dominance series.  Stored by reference; callers
+            should not mutate it after handing off.
+
+        Raises
+        ------
+        ValueError:
+            If the index is not a tz-aware monotonically-increasing
+            DatetimeIndex.
+        """
+        import pandas as pd
+
+        if not isinstance(series.index, pd.DatetimeIndex):
+            raise ValueError("series.index must be a DatetimeIndex")
+        if series.index.tz is None:
+            raise ValueError("series.index must be tz-aware (UTC)")
+        if not series.index.is_monotonic_increasing:
+            raise ValueError("series.index must be monotonically increasing")
+
+        self._btc_dom_history = series
+        self._btc_dom_history_fetched_at = time.monotonic()
+        self._btc_dom_history_is_manual = True
+        self._log.info(
+            "coingecko_client.btc_dom_history_set",
+            n_points=len(series),
+            source="manual",
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -238,6 +300,215 @@ class CoinGeckoClient:
                 self._log.debug("coingecko_client.stale_cache_used")
                 return self._latest_cache[0]
             return None
+
+    async def fetch_btc_dominance_history(
+        self,
+        days: int = 30,
+    ) -> pd.Series:
+        """Fetch the BTC dominance percentage time-series for the last
+        ``days`` days.
+
+        Resolution order
+        ----------------
+        1. If a manual series was injected via
+           ``set_btc_dominance_history``, return it WITHOUT TTL expiry --
+           manual overrides are sticky until a subsequent call to
+           ``set_btc_dominance_history`` or a successful network fetch
+           replaces them.
+        2. If a previous network fetch is within the 30-minute TTL,
+           return the cached series.
+        3. Try the PRO endpoint ``/global/market_cap_chart``.  Returns a
+           ``pd.Series`` indexed by UTC timestamp.  On success the
+           manual-override flag (if any) is cleared.
+        4. Free tier: the PRO endpoint returns HTTP 401 / 403 / 404 / 422.
+           Log a WARNING and return an empty Series so the v2 feature
+           pipeline gracefully falls back to the neutral default
+           (``btc_dom_delta_7d = 0.0``).
+
+        Rate-limit handling: HTTP 429 is NOT degraded silently -- it
+        raises through ``raise_for_status`` and is caught by the broad
+        exception handler, which returns stale cache (if any) or empty.
+
+        Parameters
+        ----------
+        days:
+            Number of days of history to fetch.  CoinGecko PRO supports
+            up to 365 days on the free Demo plan, longer on paid plans.
+
+        Returns
+        -------
+        pd.Series:
+            Empty Series with ``dtype=float64`` and UTC-aware
+            ``DatetimeIndex`` when the endpoint is unreachable.
+        """
+        import pandas as pd  # noqa: F401  # used by type checker via TYPE_CHECKING
+
+        # 1. Manual override -- sticky, no TTL.
+        if self._btc_dom_history is not None and self._btc_dom_history_is_manual:
+            self._log.debug(
+                "coingecko_client.btc_dom_history_cache_hit",
+                source="manual",
+            )
+            return self._btc_dom_history
+
+        # 2. Network cache hit -- TTL applies.
+        if (
+            self._btc_dom_history is not None
+            and self._btc_dom_history_fetched_at is not None
+            and self._is_cache_valid(self._btc_dom_history_fetched_at)
+        ):
+            self._log.debug(
+                "coingecko_client.btc_dom_history_cache_hit",
+                source="network_cached",
+            )
+            return self._btc_dom_history
+
+        # 3. PRO endpoint
+        try:
+            session = await self._get_session()
+            async with session.get(
+                _MARKET_CAP_CHART_ENDPOINT,
+                params={"vs_currency": "usd", "days": str(days)},
+            ) as response:
+                if response.status in (401, 403, 404, 422):
+                    self._log.warning(
+                        "coingecko_client.btc_dom_history_pro_only",
+                        status=response.status,
+                        endpoint=_MARKET_CAP_CHART_ENDPOINT,
+                        msg=(
+                            "Historical BTC dominance requires CoinGecko PRO. "
+                            "Use set_btc_dominance_history(series) to inject "
+                            "a manual CSV, or accept the v2 btc_dom_delta_7d "
+                            "feature defaulting to 0.0."
+                        ),
+                    )
+                    return self._empty_dom_series()
+                response.raise_for_status()
+                payload = await response.json(content_type=None)
+
+            series = self._parse_dom_history(payload, log=self._log)
+            # Log if we are replacing a manual override with network data.
+            if self._btc_dom_history_is_manual:
+                self._log.info(
+                    "coingecko_client.btc_dom_history_replaced_manual_override",
+                    n_points=len(series),
+                    days_requested=days,
+                )
+            self._btc_dom_history = series
+            self._btc_dom_history_fetched_at = time.monotonic()
+            self._btc_dom_history_is_manual = False
+            self._log.info(
+                "coingecko_client.btc_dom_history_fetched",
+                n_points=len(series),
+                days_requested=days,
+            )
+            return series
+
+        except Exception as exc:
+            self._log.warning(
+                "coingecko_client.btc_dom_history_fetch_failed",
+                error=str(exc),
+            )
+            if self._btc_dom_history is not None:
+                self._log.debug("coingecko_client.btc_dom_history_stale_cache_used")
+                return self._btc_dom_history
+            return self._empty_dom_series()
+
+    @staticmethod
+    def _empty_dom_series() -> pd.Series:
+        """Return an empty UTC-indexed float64 Series."""
+        import pandas as pd
+        return pd.Series(
+            dtype="float64",
+            index=pd.DatetimeIndex([], tz="UTC", name="timestamp"),
+            name="btc_dominance",
+        )
+
+    @staticmethod
+    def _parse_dom_history(
+        payload: dict[str, Any],
+        *,
+        log: Any | None = None,
+    ) -> pd.Series:
+        """Parse CoinGecko ``/global/market_cap_chart`` response into a
+        dominance percentage time-series.
+
+        Response schema (PRO endpoint)::
+
+            {
+              "market_cap_chart": {
+                "market_cap": [[ts_ms, total_usd], ...],
+                "btc_dominance": [[ts_ms, percentage], ...]
+              }
+            }
+
+        Falls back to deriving dominance from raw BTC market cap and
+        total market cap when ``btc_dominance`` is absent (some PRO
+        tiers omit this convenience field).  Misaligned timestamps are
+        dropped via ``dropna`` -- the count is logged when a logger is
+        supplied so production debugging can spot data-quality issues.
+        """
+        import pandas as pd
+
+        chart: dict[str, Any] = payload.get("market_cap_chart") or payload
+
+        # Path A: btc_dominance series present (preferred).
+        dom_rows = chart.get("btc_dominance")
+        if isinstance(dom_rows, list) and dom_rows:
+            timestamps = pd.to_datetime(
+                [int(row[0]) for row in dom_rows],
+                unit="ms",
+                utc=True,
+            )
+            values = [float(row[1]) for row in dom_rows]
+            return pd.Series(
+                values,
+                index=pd.DatetimeIndex(timestamps, name="timestamp"),
+                dtype="float64",
+                name="btc_dominance",
+            ).sort_index()
+
+        # Path B: derive from BTC market cap / total market cap.
+        market_cap_rows = chart.get("market_cap") or []
+        btc_market_cap_rows = chart.get("btc_market_cap") or []
+        if not market_cap_rows or not btc_market_cap_rows:
+            return pd.Series(
+                dtype="float64",
+                index=pd.DatetimeIndex([], tz="UTC", name="timestamp"),
+                name="btc_dominance",
+            )
+
+        total = pd.Series(
+            [float(row[1]) for row in market_cap_rows],
+            index=pd.to_datetime(
+                [int(row[0]) for row in market_cap_rows],
+                unit="ms", utc=True,
+            ),
+            dtype="float64",
+        )
+        btc = pd.Series(
+            [float(row[1]) for row in btc_market_cap_rows],
+            index=pd.to_datetime(
+                [int(row[0]) for row in btc_market_cap_rows],
+                unit="ms", utc=True,
+            ),
+            dtype="float64",
+        )
+        joined = pd.concat([btc.rename("btc"), total.rename("total")], axis=1)
+        rows_before = len(joined)
+        joined = joined.dropna()
+        rows_after = len(joined)
+        if log is not None and rows_after < rows_before:
+            log.warning(
+                "coingecko_client.btc_dom_history_path_b_rows_dropped",
+                dropped=rows_before - rows_after,
+                total_before=rows_before,
+            )
+        joined["dominance"] = (joined["btc"] / joined["total"]) * 100.0
+        result = joined["dominance"].sort_index()
+        result.index = pd.DatetimeIndex(result.index, name="timestamp")
+        result.name = "btc_dominance"
+        return result
 
     # ------------------------------------------------------------------
     # Internal parsing

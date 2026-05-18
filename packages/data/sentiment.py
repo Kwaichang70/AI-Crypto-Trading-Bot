@@ -33,8 +33,11 @@ Alternative.me Fear & Greed Index: https://api.alternative.me/fng/?limit=30
 from __future__ import annotations
 
 import time
-from datetime import UTC, datetime
-from typing import Any
+from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 import structlog
 from pydantic import BaseModel, Field, field_validator
@@ -320,6 +323,153 @@ class FearGreedClient:
             if self._history_cache is not None:
                 return self._history_cache[0]
             return []
+
+    async def get_history_as_series(
+        self, limit: int = 30,
+    ) -> "pd.Series":
+        """Return the historical FGI values as a pandas Series indexed by
+        timestamp.
+
+        Thin adapter over :meth:`get_history` -- no new I/O, no new caching.
+        The returned Series uses ``int64`` values and a UTC-aware
+        ``DatetimeIndex`` sorted ascending so it can be passed directly
+        to :func:`build_extended_feature_matrix(fgi_series=...)`.
+
+        Parameters
+        ----------
+        limit:
+            Number of historical points to fetch (capped at 30 by the
+            underlying API).  The ``limit`` parameter only takes effect
+            on a cache miss; a cached response with more points than
+            ``limit`` will return all cached points (see ``get_history``
+            cache contract).
+
+        Returns
+        -------
+        pd.Series:
+            Empty Series with ``dtype=int64`` and UTC-aware index when the
+            API is unreachable.  Callers must NOT rely on the result being
+            non-empty; the feature matrix builder gracefully handles an
+            empty series by falling back to neutral defaults.
+        """
+        # Lazy pandas import keeps sentiment.py free of the ~150ms / 60MB
+        # startup cost in processes that never call this method.
+        import pandas as pd
+
+        snapshots = await self.get_history(limit=limit)
+        if not snapshots:
+            return pd.Series(
+                dtype="int64",
+                index=pd.DatetimeIndex([], tz="UTC", name="timestamp"),
+                name="fear_greed_index",
+            )
+
+        # API returns newest-first; sort ascending so shift(freq=...) in
+        # the feature builder operates on a monotonically increasing index.
+        ordered = sorted(snapshots, key=lambda s: s.timestamp)
+        index = pd.DatetimeIndex(
+            [s.timestamp for s in ordered],
+            tz="UTC",
+            name="timestamp",
+        )
+        return pd.Series(
+            [int(s.value) for s in ordered],
+            index=index,
+            dtype="int64",
+            name="fear_greed_index",
+        )
+
+    async def get_value_at_offset(self, days_ago: int) -> int | None:
+        """Return the FGI value approximately ``days_ago`` days before
+        ``utcnow()``, or None when no usable history is available.
+
+        Used by :meth:`StrategyEngine._build_mtf_context` to populate
+        ``MultiTimeframeContext.fear_greed_index_7d_ago`` for the v2
+        feature builder (see QT-007 Sprint 46).
+
+        Selection rule
+        --------------
+        The method picks the snapshot whose timestamp is closest to
+        ``utcnow() - days_ago`` (in absolute seconds).  This handles
+        alternative.me's sometimes-irregular daily publishing schedule
+        (skipped days / different posting times) without falsely
+        returning None when an exact match is absent.
+
+        API ceiling
+        -----------
+        The Alternative.me API returns at most 30 data points (roughly
+        the last 30 days).  Values of ``days_ago`` greater than ~28 may
+        return ``None`` not due to a data gap but due to the hard API
+        limit; a WARNING is logged in that case so the caller can
+        distinguish capability limits from real gaps.
+
+        Cache caveat
+        ------------
+        ``get_history``'s cache is not keyed by ``limit``.  If a prior
+        call populated the cache with a smaller ``limit`` than required
+        here, the closest-match search may miss and return ``None`` --
+        a DEBUG log records the cache shortfall when this happens.
+
+        Parameters
+        ----------
+        days_ago:
+            Non-negative number of days back from now.  Must be >= 1
+            (calling with 0 should use :attr:`cached_value` instead).
+
+        Returns
+        -------
+        int | None:
+            FGI value in [0, 100], or None when history is empty,
+            unreachable, or the closest match is more than 2 days off
+            (suggesting a data gap that the caller should treat as
+            "missing" rather than substitute a stale value).
+        """
+        if days_ago < 1:
+            raise ValueError(f"days_ago must be >= 1, got {days_ago}")
+
+        # API ceiling guard: warn the caller when the request exceeds
+        # what the upstream service can ever return.
+        if days_ago + 2 > 30:
+            self._log.warning(
+                "fear_greed_client.value_at_offset_beyond_api_limit",
+                days_ago=days_ago,
+                api_max_days=30,
+            )
+
+        # Fetch one more than days_ago so we have headroom for the closest-
+        # match search even if recent days were skipped.  Capped at 30.
+        fetch_limit = min(30, days_ago + 2)
+        snapshots = await self.get_history(limit=fetch_limit)
+        if not snapshots:
+            return None
+
+        # Cache-length diagnostic: a prior get_history(limit=K) populated
+        # the global cache with K points; if K < days_ago we may silently
+        # miss the match -- emit a DEBUG log so operators can spot this
+        # in incident postmortems.
+        if len(snapshots) < days_ago:
+            self._log.debug(
+                "fear_greed_client.value_at_offset_insufficient_cache",
+                cache_len=len(snapshots),
+                days_ago=days_ago,
+            )
+
+        target = datetime.now(tz=UTC) - timedelta(days=days_ago)
+        best = min(
+            snapshots,
+            key=lambda s: abs((s.timestamp - target).total_seconds()),
+        )
+        delta_days = abs((best.timestamp - target).total_seconds()) / 86400.0
+        # 2-day tolerance: alternative.me occasionally skips a publish day.
+        # Returning a value that is 3+ days off would mask a real data gap.
+        if delta_days > 2.0:
+            self._log.debug(
+                "fear_greed_client.value_at_offset_no_match",
+                days_ago=days_ago,
+                closest_delta_days=round(delta_days, 2),
+            )
+            return None
+        return int(best.value)
 
     # ------------------------------------------------------------------
     # Internal parsing
