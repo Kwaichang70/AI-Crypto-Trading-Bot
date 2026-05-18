@@ -1105,3 +1105,141 @@ class TestModelStrategyLifecycle:
         schema = ModelStrategy.parameter_schema()
         properties = schema.get("properties", {})
         assert "feature_window" in properties
+
+
+# ===================================================================
+# QT-007c-2 (Sprint 46) -- Schema dispatch + n_features_in_ fallback
+# ===================================================================
+
+
+class _MockShapedModel:
+    """Bare model-like object exposing only ``n_features_in_``."""
+
+    def __init__(self, n: int) -> None:
+        self.n_features_in_ = n
+
+
+class TestQT007c2SchemaDispatch:
+    """ModelStrategy must detect the active schema version from the
+    sidecar (preferred) or fall back to ``model.n_features_in_`` when
+    the sidecar lacks the ``schema_version`` field (QT-007c-1 race window)."""
+
+    def _make_qt_strategy(self, tmp_path, model_path: str = "") -> ModelStrategy:
+        """Wrapper around _make_strategy that sets model_dir to a tmp_path."""
+        return _make_strategy(
+            model_path=model_path,
+            model_dir=str(tmp_path),
+            feature_window=100,
+            prediction_threshold=0.5,
+            position_size=1000.0,
+        )
+
+    # ----- _detect_schema_version --------------------------------------
+
+    def test_detect_schema_prefers_sidecar_field(self, tmp_path) -> None:
+        s = self._make_qt_strategy(tmp_path)
+        sidecar = {"schema_version": 2, "version_id": "v-1"}
+        model = _MockShapedModel(n=10)   # contradicts sidecar
+        assert s._detect_schema_version(model=model, sidecar_data=sidecar) == 2
+
+    def test_detect_schema_rejects_bool_schema_version(self, tmp_path) -> None:
+        """Defensive: a sidecar with ``schema_version=True`` must not
+        resolve to v1 via the True == 1 trap; n_features_in_ wins."""
+        s = self._make_qt_strategy(tmp_path)
+        sidecar = {"schema_version": True}
+        model = _MockShapedModel(n=14)
+        assert s._detect_schema_version(model=model, sidecar_data=sidecar) == 2
+
+    def test_detect_schema_falls_back_to_n_features_in_10(self, tmp_path) -> None:
+        s = self._make_qt_strategy(tmp_path)
+        model = _MockShapedModel(n=10)
+        assert s._detect_schema_version(model=model, sidecar_data=None) == 1
+
+    def test_detect_schema_falls_back_to_n_features_in_14(self, tmp_path) -> None:
+        s = self._make_qt_strategy(tmp_path)
+        model = _MockShapedModel(n=14)
+        assert s._detect_schema_version(model=model, sidecar_data=None) == 2
+
+    def test_detect_schema_falls_back_to_v1_when_unknown(self, tmp_path) -> None:
+        """No n_features_in_ AND no sidecar -> v1 + structured warning log.
+        We mock the bound logger directly because structlog is not routed
+        through stdlib ``logging`` in the project's test harness."""
+        from unittest.mock import MagicMock
+        s = self._make_qt_strategy(tmp_path)
+        warn_spy = MagicMock()
+        s._log.warning = warn_spy   # type: ignore[method-assign]
+        model = object()             # has no n_features_in_
+        version = s._detect_schema_version(model=model, sidecar_data=None)
+        assert version == 1
+        warn_spy.assert_called_once()
+        args, kwargs = warn_spy.call_args
+        assert args[0] == "model_strategy.unknown_schema_falling_back_to_v1"
+
+    def test_detect_schema_ignores_invalid_sidecar_field(self, tmp_path) -> None:
+        s = self._make_qt_strategy(tmp_path)
+        model = _MockShapedModel(n=14)
+        assert (
+            s._detect_schema_version(
+                model=model, sidecar_data={"schema_version": 99},
+            )
+            == 2
+        )
+
+    def test_detect_schema_handles_v1_format_sidecar(self, tmp_path) -> None:
+        """Sidecars written by RetrainingService pre-Sprint-47 omit
+        schema_version entirely -- the v1-format sidecar contract still
+        works through the n_features_in_ fallback."""
+        s = self._make_qt_strategy(tmp_path)
+        v1_format = {
+            "version_id": "v-old",
+            "model_path": "/tmp/m.joblib",
+            "accuracy": 0.6,
+            "trained_at": "2026-04-01T00:00:00+00:00",
+        }
+        model = _MockShapedModel(n=14)
+        assert s._detect_schema_version(
+            model=model, sidecar_data=v1_format,
+        ) == 2
+
+    # ----- _build_feature_vector dispatch ------------------------------
+
+    def test_build_feature_vector_dispatches_to_v1(self, tmp_path) -> None:
+        s = self._make_qt_strategy(tmp_path)
+        s._active_schema_version = 1
+        bars = _bars_n(n=120)
+        v = s._build_feature_vector(bars)
+        assert len(v) == 10
+
+    def test_build_feature_vector_dispatches_to_v2(self, tmp_path) -> None:
+        from common.models import MultiTimeframeContext
+        s = self._make_qt_strategy(tmp_path)
+        s._active_schema_version = 2
+        bars = _bars_n(n=120)
+        ctx = MultiTimeframeContext(fear_greed_index=80)
+        v = s._build_feature_vector(bars, mtf_context=ctx)
+        assert len(v) == 14
+        # fgi_level_norm is at v2 index 11 = 80/100.
+        assert v[11] == pytest.approx(0.8, abs=1e-9)
+
+    def test_build_feature_vector_v1_ignores_mtf_context(self, tmp_path) -> None:
+        """Forward compat: callers always pass mtf_context in Sprint 46+,
+        but v1 must keep the legacy 10-element shape."""
+        from common.models import MultiTimeframeContext
+        s = self._make_qt_strategy(tmp_path)
+        s._active_schema_version = 1
+        bars = _bars_n(n=120)
+        v = s._build_feature_vector(
+            bars, mtf_context=MultiTimeframeContext(fear_greed_index=80),
+        )
+        assert len(v) == 10
+
+    # ----- on_stop resets the schema -----------------------------------
+
+    def test_on_stop_resets_active_schema_version(self, tmp_path) -> None:
+        """A recycled strategy instance must not inherit v2 dispatch state
+        from a previous run."""
+        s = self._make_qt_strategy(tmp_path)
+        s.on_start(run_id="test-run")
+        s._active_schema_version = 2   # simulate a v2 model having been loaded
+        s.on_stop()
+        assert s._active_schema_version == 1

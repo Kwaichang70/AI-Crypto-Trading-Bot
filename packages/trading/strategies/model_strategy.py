@@ -17,6 +17,26 @@ This enables RetrainingService to swap in retrained models without restarting
 the strategy. If the sidecar does not exist, the strategy continues with the
 originally loaded model (backward compatible).
 
+Sprint 46 -- Feature schema versioning (QT-007c-2)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ModelStrategy now supports BOTH the v1 (10-feature) and v2 (14-feature)
+schemas.  The active schema is determined at model-load time using two
+sources of truth (in order):
+
+  1. Sidecar field ``schema_version`` (written by ModelTrainer.save_sidecar).
+  2. ``model.n_features_in_`` attribute (set by scikit-learn during fit):
+     10 -> v1, 14 -> v2, anything else -> v1 fallback + warning log.
+
+The dual-source approach makes the strategy robust against
+``RetrainingService`` writing v1-format sidecars over v2 sidecars during
+the QT-007c -> QT-007f migration window.  The model itself carries
+authoritative shape information that cannot drift.
+
+v2 inference receives the active ``MultiTimeframeContext`` so the four
+extra features (htf_trend, fgi_level_norm, fgi_delta_7d, btc_dom_delta_7d)
+are populated from live market signals.  v1 inference ignores
+``mtf_context`` (unchanged behaviour for backward-compatible models).
+
 Feature schema (built by ``_build_feature_vector``)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 The feature vector for each bar tick contains:
@@ -78,6 +98,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from common.models import MultiTimeframeContext, OHLCVBar
 from common.types import SignalDirection
+from data.ml_features import feature_names_for_schema
 from trading.models import Signal
 from trading.strategy import BaseStrategy, StrategyMetadata
 
@@ -204,6 +225,10 @@ class ModelStrategy(BaseStrategy):
         # Initialized here so _check_model_version() never raises AttributeError
         # if called before on_start() (e.g., in unit tests or atypical lifecycle).
         self._model_dir_path: Path = Path("models/")
+        # Sprint 46 (QT-007c-2): active schema version, determined at model
+        # load time via sidecar.schema_version then model.n_features_in_.
+        # Defaults to v1 for backward compatibility with pre-Sprint-46 models.
+        self._active_schema_version: int = 1
 
     # ------------------------------------------------------------------ #
     # Parameter validation
@@ -266,10 +291,16 @@ class ModelStrategy(BaseStrategy):
 
             self._model = joblib.load(model_path)
             self._model_loaded = True
+            # Sprint 46 (QT-007c-2): determine schema version from sidecar+model.
+            # No sidecar yet at on_start time; fall back to n_features_in_.
+            self._active_schema_version = self._detect_schema_version(
+                model=self._model, sidecar_data=None,
+            )
             self._log.info(
                 "model_strategy.model_loaded",
                 model_path=str(model_path),
                 model_type=type(self._model).__name__,
+                schema_version=self._active_schema_version,
             )
         except ImportError:
             self._log.error(
@@ -306,6 +337,60 @@ class ModelStrategy(BaseStrategy):
         finally:
             executor.shutdown(wait=False)
 
+    def _detect_schema_version(
+        self,
+        model: Any,
+        sidecar_data: dict[str, Any] | None,
+    ) -> int:
+        """Determine the active feature-schema version for the loaded model.
+
+        Resolution order:
+
+          1. ``sidecar_data["schema_version"]`` if present and a non-bool int in {1, 2}.
+          2. ``model.n_features_in_``: 10 -> v1, 14 -> v2.
+          3. Fallback to v1 with a WARNING log (treats unknown shapes as v1
+             so backward-compatible models continue working).
+
+        The dual-source approach handles the temporary QT-007c-1 race window
+        where ``RetrainingService`` may overwrite a v2 sidecar with a v1-format
+        sidecar that lacks ``schema_version``.  The model object itself carries
+        authoritative shape information.
+
+        ``isinstance(sv, bool)`` is excluded because Python's ``bool`` is a
+        subclass of ``int`` and ``True`` would otherwise resolve to v1 via
+        ``True == 1`` -- a defensive guard against machine-serialised JSON
+        that accidentally emits booleans.
+        """
+        if sidecar_data is not None:
+            sv = sidecar_data.get("schema_version")
+            if (
+                isinstance(sv, int)
+                and not isinstance(sv, bool)
+                and sv in (1, 2)
+            ):
+                return sv
+
+        n_features = getattr(model, "n_features_in_", None)
+        if isinstance(n_features, int) and not isinstance(n_features, bool):
+            if n_features == 10:
+                return 1
+            if n_features == 14:
+                return 2
+
+        self._log.warning(
+            "model_strategy.unknown_schema_falling_back_to_v1",
+            n_features_in=n_features,
+            sidecar_keys=(
+                sorted(sidecar_data.keys()) if isinstance(sidecar_data, dict) else None
+            ),
+            msg=(
+                "Schema version could not be determined from sidecar OR model; "
+                "defaulting to v1 (10 features). Predictions may fail if the "
+                "model actually expects more features."
+            ),
+        )
+        return 1
+
     def _check_model_version(self, symbol: str) -> None:
         """Check sidecar JSON for a new model version and hot-swap if changed.
 
@@ -336,17 +421,22 @@ class ModelStrategy(BaseStrategy):
                 return
 
             # Version changed — reload model
-            new_model_path: str = data["model_path"]
+            new_model_path = data["model_path"]
             new_model = self._load_model_with_timeout(new_model_path)
             self._model = new_model
             self._model_loaded = True
             self._active_version_id = sidecar_version_id
+            # Re-detect schema -- a hot-swap may move us between v1 and v2.
+            self._active_schema_version = self._detect_schema_version(
+                model=new_model, sidecar_data=data,
+            )
 
             self._log.info(
                 "model_strategy.hot_swap",
                 version_id=sidecar_version_id,
                 model_path=new_model_path,
                 model_type=type(new_model).__name__,
+                schema_version=self._active_schema_version,
             )
         except Exception as exc:
             self._log.warning(
@@ -359,15 +449,30 @@ class ModelStrategy(BaseStrategy):
     # Feature extraction
     # ------------------------------------------------------------------ #
 
-    def _build_feature_vector(self, bars: Sequence[OHLCVBar]) -> list[float]:
-        """Build a 10-element feature vector from OHLCV bars.
+    def _build_feature_vector(
+        self,
+        bars: Sequence[OHLCVBar],
+        *,
+        mtf_context: MultiTimeframeContext | None = None,
+    ) -> list[float]:
+        """Build the feature vector for the active schema version.
 
-        Delegates to data.ml_features.build_feature_vector_from_bars for
-        single-source feature schema consistency between training and inference.
-        See that module for the canonical feature schema documentation.
+        For ``_active_schema_version == 1`` returns the legacy 10-element
+        vector (``mtf_context`` is ignored, matching the v1 builder).
+        For ``_active_schema_version == 2`` returns the extended 14-element
+        vector with the four context-aware features populated from
+        ``mtf_context``.  ``symbol`` is intentionally not passed -- the
+        builder resolves it to ``bars[-1].symbol`` which is always the
+        correct primary symbol in this call site.
         """
-        from data.ml_features import build_feature_vector_from_bars
+        if self._active_schema_version == 2:
+            from data.ml_features import build_extended_feature_vector_from_bars
+            return build_extended_feature_vector_from_bars(
+                bars,
+                mtf_context=mtf_context,
+            )
 
+        from data.ml_features import build_feature_vector_from_bars
         return build_feature_vector_from_bars(bars)
 
     # ------------------------------------------------------------------ #
@@ -421,8 +526,8 @@ class ModelStrategy(BaseStrategy):
             )
             return []
 
-        # Build feature vector
-        feature_vector = self._build_feature_vector(bars)
+        # Build feature vector (dispatches on the active schema version).
+        feature_vector = self._build_feature_vector(bars, mtf_context=mtf_context)
 
         # Predict — wrap in 2D array for scikit-learn API
         try:
@@ -487,16 +592,10 @@ class ModelStrategy(BaseStrategy):
                 "prediction_threshold": prediction_threshold,
                 "active_version_id": self._active_version_id,
                 "features": {
-                    "log_return_1": round(feature_vector[0], 6),
-                    "log_return_5": round(feature_vector[1], 6),
-                    "log_return_10": round(feature_vector[2], 6),
-                    "volatility_10": round(feature_vector[3], 6),
-                    "volatility_20": round(feature_vector[4], 6),
-                    "rsi_14": round(feature_vector[5], 6),
-                    "sma_ratio_10_50": round(feature_vector[6], 6),
-                    "sma_ratio_20_100": round(feature_vector[7], 6),
-                    "volume_ratio_10": round(feature_vector[8], 6),
-                    "high_low_range": round(feature_vector[9], 6),
+                    name: round(feature_vector[i], 6)
+                    for i, name in enumerate(
+                        feature_names_for_schema(self._active_schema_version)
+                    )
                 },
                 "close": str(current_bar.close),
             },
@@ -525,4 +624,7 @@ class ModelStrategy(BaseStrategy):
         self._model_loaded = False
         self._active_version_id = None
         self._sidecar_path = None
+        # Sprint 46 (QT-007c-2): reset to v1 default so a recycled instance
+        # cannot inherit v2 dispatch state into a fresh on_start cycle.
+        self._active_schema_version = 1
         super().on_stop()

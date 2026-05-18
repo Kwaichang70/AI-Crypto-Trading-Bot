@@ -39,11 +39,13 @@ Design notes
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
 import pytest
 
+from data.ml_features import feature_names_for_schema
 from data.ml_training import LABEL_BUY, LABEL_HOLD, LABEL_SELL, ModelTrainer
 
 # ---------------------------------------------------------------------------
@@ -82,8 +84,13 @@ def _make_ohlcv_df(n: int = 500) -> pd.DataFrame:
 
 
 def _make_trainer(model_dir: str | Path = "models/") -> ModelTrainer:
-    """Construct a ModelTrainer with the given model directory."""
-    return ModelTrainer(model_dir=str(model_dir))
+    """Construct a ModelTrainer with the given model directory.
+
+    Uses feature_schema_version=1 (legacy 10-element schema) so that
+    pre-existing tests remain stable after QT-007c-1 changed the default
+    to v2.  New v2-specific tests live in TestQT007cModelTrainerSchemaVersioning.
+    """
+    return ModelTrainer(model_dir=str(model_dir), feature_schema_version=1)
 
 
 def _prepare_and_train(trainer: ModelTrainer, n: int = 500) -> dict:  # type: ignore[type-arg]
@@ -451,3 +458,214 @@ class TestModelTrainerInit:
         assert trainer._model is None, (
             f"_model must be None before train(), got {trainer._model!r}"
         )
+
+
+# ===================================================================
+# Helper for QT-007c-1 v2 tests (tz-aware UTC index required)
+# ===================================================================
+#
+# NOTE: this helper is tz-aware UTC.  Existing v1 tests use the
+# (tz-naive) factories elsewhere in this file.  v2 paths that take
+# fgi_series / btc_dom_series / htf_close REQUIRE matching tz on the
+# DataFrame index; mismatching tz raises TypeError in pandas reindex.
+
+
+def _make_synth_ohlcv_utc(n: int) -> pd.DataFrame:
+    """Synthetic up-trending OHLCV with a tz-aware UTC DatetimeIndex.
+
+    Used by ``TestQT007cModelTrainerSchemaVersioning`` v2 tests.
+    """
+    idx = pd.date_range("2024-01-01", periods=n, freq="h", tz="UTC")
+    close = pd.Series(100.0 + np.arange(n) * 0.1, index=idx)
+    return pd.DataFrame(
+        {
+            "open": close - 0.1,
+            "high": close + 1.0,
+            "low": close - 1.0,
+            "close": close,
+            "volume": 1000.0 + np.arange(n) * 1.0,
+        },
+        index=idx,
+    )
+
+
+# ===================================================================
+# QT-007c-1 (Sprint 46) -- ModelTrainer schema versioning
+# ===================================================================
+
+
+class TestQT007cModelTrainerSchemaVersioning:
+    """Cover the v1/v2 dispatch + sidecar writer surface on ModelTrainer."""
+
+    def test_default_schema_is_v2(self) -> None:
+        from data.ml_training import ModelTrainer
+        t = ModelTrainer()
+        assert t.feature_schema_version == 2
+
+    def test_explicit_v1_uses_legacy_columns(self) -> None:
+        from data.ml_training import ModelTrainer
+        t = ModelTrainer(feature_schema_version=1)
+        assert t.feature_schema_version == 1
+        assert len(t.feature_names) == 10
+        assert "htf_trend" not in t.feature_names
+
+    def test_explicit_v2_uses_extended_columns(self) -> None:
+        from data.ml_training import ModelTrainer
+        t = ModelTrainer(feature_schema_version=2)
+        assert t.feature_schema_version == 2
+        assert len(t.feature_names) == 14
+        assert "htf_trend" in t.feature_names
+        assert "fgi_level_norm" in t.feature_names
+
+    def test_feature_names_returns_copy(self) -> None:
+        """Mutating the returned list must NOT alter the trainer's state."""
+        from data.ml_training import ModelTrainer
+        t = ModelTrainer(feature_schema_version=2)
+        names = t.feature_names
+        names.clear()
+        assert len(t.feature_names) == 14   # internal state intact
+
+    def test_invalid_schema_rejected(self) -> None:
+        """Validation is delegated to feature_names_for_schema."""
+        from data.ml_training import ModelTrainer
+        with pytest.raises(ValueError, match="Unknown feature schema version"):
+            ModelTrainer(feature_schema_version=99)
+
+    def test_v1_prepare_dataset_yields_10_columns(self, tmp_path: Path) -> None:
+        from data.ml_training import ModelTrainer
+        df = _make_synth_ohlcv_utc(n=500)
+        t = ModelTrainer(model_dir=str(tmp_path), feature_schema_version=1)
+        X, y = t.prepare_dataset(df, horizon=5, threshold=0.01)
+        assert X.shape[1] == 10
+
+    def test_v2_prepare_dataset_yields_14_columns(self, tmp_path: Path) -> None:
+        from data.ml_training import ModelTrainer
+        df = _make_synth_ohlcv_utc(n=500)
+        t = ModelTrainer(model_dir=str(tmp_path), feature_schema_version=2)
+        X, y = t.prepare_dataset(df, horizon=5, threshold=0.01)
+        assert X.shape[1] == 14
+
+    def test_v2_optional_inputs_threaded_to_extended_builder(self, tmp_path: Path) -> None:
+        from data.ml_training import ModelTrainer
+        df = _make_synth_ohlcv_utc(n=24 * 14)
+        fgi = pd.Series(
+            [30] * 7 + [80] * 7,
+            index=pd.date_range("2024-01-01", periods=14, freq="D", tz="UTC"),
+        )
+        t = ModelTrainer(model_dir=str(tmp_path), feature_schema_version=2)
+        X, y = t.prepare_dataset(df, horizon=5, threshold=0.01, fgi_series=fgi)
+        # fgi_level_norm is at v2 column index 11 inside X.
+        fgi_level_col = X[:, 11]
+        assert (fgi_level_col >= 0.3).all()
+        assert (fgi_level_col <= 1.0).all()
+        assert (fgi_level_col > 0.5).any()   # at least one greed day
+
+    def test_v1_logs_warning_when_v2_kwargs_provided(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """v1 trainer must NOT silently drop context data; a structured
+        warning is emitted that operators can grep for.
+
+        structlog writes to stdout (not the stdlib logging module), so we
+        use capsys rather than caplog to capture the output.
+        """
+        from data.ml_training import ModelTrainer
+        df = _make_synth_ohlcv_utc(n=500)
+        fgi = pd.Series(
+            [50],
+            index=pd.date_range("2024-01-01", periods=1, tz="UTC"),
+        )
+        t = ModelTrainer(model_dir=str(tmp_path), feature_schema_version=1)
+        X, y = t.prepare_dataset(df, fgi_series=fgi)
+        assert X.shape[1] == 10   # still v1 shape
+        # structlog writes to stdout; accept either the bare event key or
+        # the fully-qualified "training." prefix form.
+        captured = capsys.readouterr()
+        warning_text = captured.out + captured.err
+        assert (
+            "v2_kwargs_ignored_for_v1_schema" in warning_text
+            or "training.v2_kwargs_ignored_for_v1_schema" in warning_text
+        ), f"Expected warning about v2 kwargs ignored; got: {warning_text!r}"
+
+    def test_v2_prepare_dataset_from_trades_uses_extended_builder(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The v2 dispatch path in prepare_dataset_from_trades produces a
+        14-feature dataset."""
+        from datetime import datetime, timezone
+        from decimal import Decimal
+        from data.ml_training import ModelTrainer
+
+        df = _make_synth_ohlcv_utc(n=500)
+        # Build a handful of synthetic trade dicts spaced across the series.
+        trades: list[dict[str, Any]] = [
+            {
+                "side": "buy",
+                "realised_pnl": Decimal("5.0"),
+                "entry_price": Decimal("110.0"),
+                "quantity": Decimal("0.5"),
+                "entry_at": datetime(
+                    2024, 1, 1, 0, tzinfo=timezone.utc,
+                ) + pd.Timedelta(hours=int(150 + i * 5)),
+            }
+            for i in range(80)
+        ]
+        t = ModelTrainer(model_dir=str(tmp_path), feature_schema_version=2)
+        X, y = t.prepare_dataset_from_trades(
+            trades=trades,
+            ohlcv_df=df,
+            timeframe="1h",
+            context_bars=120,
+        )
+        assert X.shape[1] == 14
+
+    def test_train_metrics_include_schema_metadata(self, tmp_path: Path) -> None:
+        from data.ml_training import ModelTrainer
+        df = _make_synth_ohlcv_utc(n=500)
+        t = ModelTrainer(model_dir=str(tmp_path), feature_schema_version=2)
+        X, y = t.prepare_dataset(df)
+        metrics = t.train(X, y, n_estimators=10, random_state=42)
+        assert metrics["feature_schema_version"] == 2
+        assert len(metrics["feature_names"]) == 14
+        assert "htf_trend" in metrics["feature_importances"]
+
+    def test_save_sidecar_writes_v2_fields(self, tmp_path: Path) -> None:
+        import json
+        from datetime import datetime, timezone
+        from data.ml_features import feature_names_for_schema
+        from data.ml_training import ModelTrainer
+
+        t = ModelTrainer(model_dir=str(tmp_path), feature_schema_version=2)
+        path = t.save_sidecar(
+            symbol="BTC/USDT",
+            version_id="v-abc-123",
+            model_path=str(tmp_path / "btc_usdt_model.joblib"),
+            accuracy=0.62,
+            trained_at=datetime(2026, 5, 17, 12, 0, tzinfo=timezone.utc),
+        )
+        assert path.exists()
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert data["schema_version"] == 2
+        assert data["feature_names"][:10] == feature_names_for_schema(1)
+        assert data["feature_names"][10:] == [
+            "htf_trend", "fgi_level_norm", "fgi_delta_7d", "btc_dom_delta_7d",
+        ]
+        assert data["version_id"] == "v-abc-123"
+        assert data["accuracy"] == 0.62
+        assert data["trained_at"] == "2026-05-17T12:00:00+00:00"
+
+    def test_save_sidecar_atomic_replace(self, tmp_path: Path) -> None:
+        """Calling twice replaces the file cleanly; no .tmp files remain."""
+        import json
+        from data.ml_training import ModelTrainer
+        t = ModelTrainer(model_dir=str(tmp_path))
+        for v in ("v-1", "v-2"):
+            t.save_sidecar(
+                symbol="BTC/USDT",
+                version_id=v,
+                model_path="/tmp/m.joblib",
+                accuracy=0.5,
+            )
+        files = list(tmp_path.glob("*.json.tmp"))
+        assert files == [], f"Stale .tmp files: {files}"
+        active = tmp_path / "btc_usdt_active.json"
+        assert json.loads(active.read_text())["version_id"] == "v-2"

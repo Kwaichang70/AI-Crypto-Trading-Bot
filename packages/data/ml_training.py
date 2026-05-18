@@ -3,7 +3,9 @@ packages/data/ml_training.py
 ------------------------------
 ML model training pipeline for ModelStrategy.
 
-Trains a RandomForestClassifier using the canonical 10-element feature schema.
+Trains a RandomForestClassifier using either the v1 (10-element) or v2
+(14-element) feature schema.  Schema is selected at construction time
+via the ``feature_schema_version`` keyword argument; default is v2.
 Label encoding: SELL=0, HOLD=1, BUY=2 (matches ModelStrategy._LABEL_* constants).
 
 Requires scikit-learn>=1.5 and joblib>=1.4, imported lazily inside methods.
@@ -17,6 +19,29 @@ New in Sprint 23
 - prepare_dataset_from_trades()  Builds X, y from closed TradeORM dicts + OHLCV DataFrame.
 - save_model() gains optional version_suffix parameter for versioned filenames.
 - load_model() gains optional model_path parameter to load from an explicit path.
+
+New in Sprint 46 (QT-007)
+-------------------------
+- ModelTrainer accepts ``feature_schema_version`` (1 or 2; default = v2).
+- v2 schema uses the 14-element extended feature builder; v1 keeps the
+  legacy 10-element behaviour for backward-compatible retraining.
+- ``prepare_dataset`` and ``prepare_dataset_from_trades`` accept optional
+  aligned ``htf_close`` / ``fgi_series`` / ``btc_dom_series`` for v2 context
+  features.  On v1 trainers those kwargs are ignored with a WARNING log
+  (silent data-loss would be unacceptable in a training pipeline).
+- ``feature_names`` and ``feature_schema_version`` properties expose
+  the active schema for callers.
+- ``save_sidecar()`` writes the active-model JSON with schema_version +
+  feature_names.  WARNING: ``RetrainingService._write_active_sidecar``
+  currently writes a 4-key sidecar without schema fields; until Sprint 47
+  updates ``RetrainingService`` (QT-007f), automatic retraining will
+  overwrite sidecars written by this method with v1-format sidecars.
+  ``ModelStrategy`` (QT-007c-2) infers schema from ``model.n_features_in_``
+  when the sidecar field is missing, so this is operationally safe but
+  callers should be aware of the temporary inconsistency.
+- ``_FEATURE_COLS`` renamed to ``_V1_FEATURE_COLS`` to scope the constant
+  to the v1 schema.  No external production caller imported the old name
+  (verified by grep).
 """
 
 from __future__ import annotations
@@ -30,6 +55,13 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import structlog
+
+from data.ml_features import (
+    CURRENT_FEATURE_SCHEMA_VERSION,
+    FEATURE_SCHEMA_VERSION_V1,
+    FEATURE_SCHEMA_VERSION_V2,
+    feature_names_for_schema,
+)
 
 __all__ = [
     "ModelTrainer",
@@ -54,7 +86,10 @@ LABEL_BUY: int = 2
 PNL_THRESHOLD_PCT: float = 0.0015   # 0.15% — covers Coinbase round-trip fees
 BREAKEVEN_BAND_PCT: float = 0.0005  # 0.05% — fee-dominated noise band
 
-_FEATURE_COLS: list[str] = [
+# v1 feature column list — kept for clarity / external references.
+# ModelTrainer resolves the active list via
+# ``feature_names_for_schema(self._feature_schema_version)``.
+_V1_FEATURE_COLS: list[str] = [
     "log_return_1",
     "log_return_5",
     "log_return_10",
@@ -203,18 +238,62 @@ class ModelTrainer:
         Directory where models are saved/loaded. Created on save_model().
     """
 
-    def __init__(self, model_dir: str = "models/") -> None:
+    def __init__(
+        self,
+        model_dir: str = "models/",
+        *,
+        feature_schema_version: int = CURRENT_FEATURE_SCHEMA_VERSION,
+    ) -> None:
+        """Construct a trainer with a fixed feature-schema version.
+
+        Parameters
+        ----------
+        model_dir:
+            Directory where models + sidecar metadata are saved/loaded.
+        feature_schema_version:
+            1 = legacy 10-element schema (v1); 2 = extended 14-element schema (v2).
+            Defaults to the current schema (v2) -- pass 1 explicitly when
+            retraining a v1 model for backward compatibility.  Validation is
+            delegated to ``feature_names_for_schema`` so the supported-version
+            set lives in exactly one place.
+        """
         self._model_dir = Path(model_dir)
         self._model: Any = None
+        self._feature_schema_version = feature_schema_version
+        # feature_names_for_schema raises ValueError for unknown versions --
+        # single source of truth for the supported set.
+        self._feature_cols: list[str] = feature_names_for_schema(feature_schema_version)
         self._log = logger.bind(component="model_trainer")
+
+    @property
+    def feature_schema_version(self) -> int:
+        """Active feature schema version (1 = legacy 10, 2 = extended 14)."""
+        return self._feature_schema_version
+
+    @property
+    def feature_names(self) -> list[str]:
+        """Feature column names for the active schema (returns a copy so
+        callers cannot mutate the trainer's internal state)."""
+        return list(self._feature_cols)
 
     def prepare_dataset(
         self,
         df: pd.DataFrame,
         horizon: int = 5,
         threshold: float = 0.01,
+        *,
+        htf_close: pd.Series | None = None,
+        fgi_series: pd.Series | None = None,
+        btc_dom_series: pd.Series | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Build feature matrix X and label vector y from OHLCV data.
+
+        For ``feature_schema_version=1`` this is byte-identical to the legacy
+        behaviour (10 columns); the v2 context kwargs are ignored with a
+        WARNING log (silent data-loss in a training pipeline is unacceptable).
+        For ``feature_schema_version=2`` the extended 14-column matrix is
+        built and the optional ``htf_close`` / ``fgi_series`` / ``btc_dom_series``
+        arguments are passed through to :func:`build_extended_feature_matrix`.
 
         Parameters
         ----------
@@ -224,11 +303,16 @@ class ModelTrainer:
             Number of bars to look ahead for labeling.
         threshold : float
             Minimum absolute return for BUY/SELL labels.
+        htf_close, fgi_series, btc_dom_series:
+            Optional v2 context series (see :func:`build_extended_feature_matrix`).
+            Silently logged-and-ignored on v1 trainers.
 
         Returns
         -------
         tuple[np.ndarray, np.ndarray]
-            (X, y) where X has shape (n_samples, 10) and y has shape (n_samples,).
+            (X, y) where X has shape (n_samples, n_features) with
+            ``n_features = len(self.feature_names)`` and y has shape
+            (n_samples,).
         """
         if horizon < 1:
             raise ValueError(f"horizon must be >= 1, got {horizon}")
@@ -240,9 +324,12 @@ class ModelTrainer:
         if missing:
             raise ValueError(f"DataFrame missing required columns: {missing}")
 
-        from data.ml_features import build_feature_matrix
-
-        features_df: pd.DataFrame = build_feature_matrix(df)
+        features_df = self._build_features_for_schema(
+            df,
+            htf_close=htf_close,
+            fgi_series=fgi_series,
+            btc_dom_series=btc_dom_series,
+        )
 
         future_close: pd.Series = df["close"].shift(-horizon)
         future_return: pd.Series = (future_close - df["close"]) / df["close"]
@@ -252,15 +339,16 @@ class ModelTrainer:
         labels.loc[future_return < -threshold] = LABEL_SELL
 
         valid_mask: pd.Series = (
-            features_df[_FEATURE_COLS].notna().all(axis=1)
+            features_df[self._feature_cols].notna().all(axis=1)
             & future_return.notna()
         )
 
-        X: np.ndarray = features_df.loc[valid_mask, _FEATURE_COLS].values
+        X: np.ndarray = features_df.loc[valid_mask, self._feature_cols].values
         y: np.ndarray = labels[valid_mask].values
 
         self._log.info(
             "training.dataset_prepared",
+            schema_version=self._feature_schema_version,
             total_bars=len(df),
             valid_samples=len(X),
             buy_count=int((y == LABEL_BUY).sum()),
@@ -276,12 +364,57 @@ class ModelTrainer:
 
         return X, y
 
+    def _build_features_for_schema(
+        self,
+        df: pd.DataFrame,
+        *,
+        htf_close: pd.Series | None,
+        fgi_series: pd.Series | None,
+        btc_dom_series: pd.Series | None,
+    ) -> pd.DataFrame:
+        """Dispatch to v1 or v2 feature builder based on the trainer's schema.
+
+        Emits a WARNING log when v1 schema is active but v2 context kwargs
+        were supplied -- silent data-loss in a training pipeline would be
+        unacceptable.
+        """
+        if self._feature_schema_version == FEATURE_SCHEMA_VERSION_V2:
+            from data.ml_features import build_extended_feature_matrix
+            return build_extended_feature_matrix(
+                df,
+                htf_close=htf_close,
+                fgi_series=fgi_series,
+                btc_dom_series=btc_dom_series,
+            )
+
+        # v1 path: warn when context kwargs were provided but will be ignored.
+        ignored = [
+            k for k, v in (
+                ("htf_close", htf_close),
+                ("fgi_series", fgi_series),
+                ("btc_dom_series", btc_dom_series),
+            )
+            if v is not None
+        ]
+        if ignored:
+            self._log.warning(
+                "training.v2_kwargs_ignored_for_v1_schema",
+                schema_version=self._feature_schema_version,
+                ignored_kwargs=ignored,
+            )
+        from data.ml_features import build_feature_matrix
+        return build_feature_matrix(df)
+
     def prepare_dataset_from_trades(
         self,
         trades: list[dict[str, Any]],
         ohlcv_df: pd.DataFrame,
         timeframe: str = "1h",
         context_bars: int = 120,
+        *,
+        htf_close: pd.Series | None = None,
+        fgi_series: pd.Series | None = None,
+        btc_dom_series: pd.Series | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Build feature matrix X and label vector y from closed trade records.
 
@@ -306,11 +439,14 @@ class ModelTrainer:
         context_bars : int
             Minimum bars of look-back required before a signal bar (default 120).
             Must be >= 100 to cover SMA-100 feature warmup.
+        htf_close, fgi_series, btc_dom_series : pd.Series | None
+            Optional v2 context series for the v2 feature builder.  Silently
+            logged-and-ignored on v1 trainers.
 
         Returns
         -------
         tuple[np.ndarray, np.ndarray]
-            (X, y) where X has shape (n_valid_samples, 10) and
+            (X, y) where X has shape (n_valid_samples, n_features) and
             y has shape (n_valid_samples,).
 
         Raises
@@ -319,8 +455,6 @@ class ModelTrainer:
             If fewer than 50 valid samples survive alignment + NaN filtering,
             or if the OHLCV DataFrame is missing required columns.
         """
-        from data.ml_features import build_feature_matrix
-
         required_cols = {"open", "high", "low", "close", "volume"}
         missing = required_cols - set(ohlcv_df.columns)
         if missing:
@@ -330,8 +464,13 @@ class ModelTrainer:
         if not trades:
             raise ValueError("trades list must not be empty")
 
-        # Build feature matrix once over the full OHLCV DataFrame
-        features_df: pd.DataFrame = build_feature_matrix(ohlcv_df)
+        # Build feature matrix once over the full OHLCV DataFrame (dispatch on schema).
+        features_df: pd.DataFrame = self._build_features_for_schema(
+            ohlcv_df,
+            htf_close=htf_close,
+            fgi_series=fgi_series,
+            btc_dom_series=btc_dom_series,
+        )
 
         # Ensure the index is UTC-aware for alignment
         idx = features_df.index
@@ -406,7 +545,7 @@ class ModelTrainer:
 
             # Extract feature row at the signal bar
             bar_label = features_df.index[found_pos]
-            feature_row: pd.Series = features_df.loc[bar_label, _FEATURE_COLS]
+            feature_row: pd.Series = features_df.loc[bar_label, self._feature_cols]
 
             if feature_row.isna().any():
                 dropped_nan += 1
@@ -493,7 +632,7 @@ class ModelTrainer:
         accuracy = float(accuracy_score(y_test, y_pred))
 
         importances: dict[str, float] = dict(
-            zip(_FEATURE_COLS, [float(v) for v in self._model.feature_importances_])
+            zip(self._feature_cols, [float(v) for v in self._model.feature_importances_])
         )
 
         report: dict[str, Any] = classification_report(
@@ -507,6 +646,8 @@ class ModelTrainer:
             "test_samples": len(X_test),
             "feature_importances": importances,
             "classification_report": report,
+            "feature_schema_version": self._feature_schema_version,
+            "feature_names": list(self._feature_cols),
         }
 
         self._log.info(
@@ -589,3 +730,101 @@ class ModelTrainer:
         self._model = joblib.load(resolved_path)
         self._log.info("training.model_loaded", path=str(resolved_path))
         return self._model
+
+    def save_sidecar(
+        self,
+        symbol: str,
+        version_id: str,
+        *,
+        model_path: str | Path,
+        accuracy: float,
+        trained_at: datetime | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> Path:
+        """Write the active-model sidecar JSON for the given symbol.
+
+        Sidecar schema (Sprint 46 QT-007c-1 v2 fields):
+            - version_id:      str   (caller-supplied)
+            - model_path:      str   (path to .joblib file)
+            - accuracy:        float
+            - trained_at:      str   (ISO-8601 UTC)
+            - schema_version:  int   (1 or 2)
+            - feature_names:   list[str] (column order)
+            - extra:           dict (optional)
+
+        Atomic-write semantics: the JSON is written to a randomly-named tmp
+        file via ``tempfile.mkstemp`` and renamed onto the target path so
+        ``ModelStrategy`` never reads a partial file.  Cross-platform safe:
+        ``os.replace`` is atomic within a single filesystem and both tmp +
+        final paths live in ``_model_dir``.
+
+        WARNING (Sprint 46): ``RetrainingService._write_active_sidecar``
+        currently writes a 4-key sidecar without schema fields.  Until
+        Sprint 47 (QT-007f) updates it, automatic retraining will overwrite
+        sidecars written by this method.  ``ModelStrategy`` (QT-007c-2)
+        infers schema from ``model.n_features_in_`` as a fallback so this
+        is operationally safe.
+
+        Parameters
+        ----------
+        symbol:
+            Trading pair (e.g. ``"BTC/USDT"``).  Used to build the sidecar
+            filename ``{safe_symbol}_active.json``.
+        version_id:
+            Caller-supplied version identifier (typically a UUID).
+        model_path:
+            Path to the trained ``.joblib`` file.  Stored as a string in the
+            sidecar payload.
+        accuracy:
+            Test-set accuracy from :meth:`train`.
+        trained_at:
+            UTC timestamp.  Defaults to ``now()`` when None.
+        extra:
+            Optional additional metadata (e.g. n_samples, fold, parameters).
+            Stored under the ``extra`` key in the payload.
+        """
+        import json
+        import os
+        import tempfile
+
+        if trained_at is None:
+            trained_at = datetime.now(tz=timezone.utc)
+
+        self._model_dir.mkdir(parents=True, exist_ok=True)
+        safe_symbol = symbol.replace("/", "_").replace(" ", "_").lower()
+        sidecar_path = self._model_dir / f"{safe_symbol}_active.json"
+
+        payload: dict[str, Any] = {
+            "version_id": version_id,
+            "model_path": str(model_path),
+            "accuracy": float(accuracy),
+            "trained_at": trained_at.isoformat(),
+            "schema_version": self._feature_schema_version,
+            "feature_names": list(self._feature_cols),
+        }
+        if extra:
+            payload["extra"] = extra
+
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=f"{safe_symbol}_active.",
+            suffix=".json.tmp",
+            dir=str(self._model_dir),
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+            os.replace(tmp_path, sidecar_path)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
+        self._log.info(
+            "training.sidecar_saved",
+            path=str(sidecar_path),
+            schema_version=self._feature_schema_version,
+            version_id=version_id,
+        )
+        return sidecar_path
