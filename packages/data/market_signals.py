@@ -34,7 +34,7 @@ CoinGecko Global Market Data: https://api.coingecko.com/api/v3/global
 from __future__ import annotations
 
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -509,6 +509,49 @@ class CoinGeckoClient:
         result.index = pd.DatetimeIndex(result.index, name="timestamp")
         result.name = "btc_dominance"
         return result
+
+    def btc_dominance_at_offset_from_cache(self, days_ago: int) -> float | None:
+        """Synchronous accessor: return the BTC dominance percentage
+        approximately ``days_ago`` days before now, reading ONLY from
+        ``_btc_dom_history``.  Never performs I/O.
+
+        Used by :meth:`StrategyEngine._build_mtf_context` for the
+        ``btc_dominance_7d_ago`` field of :class:`MultiTimeframeContext`.
+
+        Returns ``None`` when no history is cached or when the closest
+        cached datum is more than 2 days off the target.
+
+        Parameters
+        ----------
+        days_ago:
+            Non-negative number of days back from now.  Must be >= 1.
+
+        Returns
+        -------
+        float | None:
+            Dominance percentage [0, 100], or None.
+        """
+        if days_ago < 1:
+            raise ValueError(f"days_ago must be >= 1, got {days_ago}")
+        if self._btc_dom_history is None or self._btc_dom_history.empty:
+            return None
+        # pandas is a heavy import; sys.modules cache amortises repeated
+        # lookups on this hot path (called once per bar from StrategyEngine).
+        import pandas as pd
+
+        target = datetime.now(tz=UTC) - timedelta(days=days_ago)
+        target_ts = pd.Timestamp(target)
+
+        idx = self._btc_dom_history.index
+        deltas = pd.Series(
+            (idx - target_ts).total_seconds(), index=idx,
+        ).abs()
+        closest_pos = int(deltas.argmin())
+        closest_ts = idx[closest_pos]
+        delta_days = abs((closest_ts - target_ts).total_seconds()) / 86400.0
+        if delta_days > 2.0:
+            return None
+        return float(self._btc_dom_history.iloc[closest_pos])
 
     # ------------------------------------------------------------------
     # Internal parsing

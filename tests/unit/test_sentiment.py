@@ -471,3 +471,59 @@ class TestQT007dFearGreedHistory:
         assert result is None     # no match found
         events = [c.args[0] for c in debug_spy.call_args_list if c.args]
         assert "fear_greed_client.value_at_offset_insufficient_cache" in events
+
+
+# ===================================================================
+# QT-007f-1 (Sprint 46) -- value_at_offset_from_cache sync accessor
+# ===================================================================
+
+
+class TestQT007f1ValueAtOffsetFromCache:
+    """Synchronous cache-only accessor for the 7d-ago MTF context field."""
+
+    def _snapshot(self, value: int, days_ago: int) -> FearGreedSnapshot:
+        ts = datetime.now(tz=UTC) - timedelta(days=days_ago)
+        return FearGreedSnapshot(
+            value=value, classification="neutral", timestamp=ts,
+        )
+
+    def test_returns_none_when_history_cache_is_unset(self) -> None:
+        client = FearGreedClient()
+        assert client.value_at_offset_from_cache(days_ago=7) is None
+
+    def test_returns_none_when_history_cache_is_empty(self) -> None:
+        client = FearGreedClient()
+        client._history_cache = ([], time.monotonic())
+        assert client.value_at_offset_from_cache(days_ago=7) is None
+
+    def test_returns_value_when_cache_has_matching_snapshot(self) -> None:
+        client = FearGreedClient()
+        client._history_cache = (
+            [self._snapshot(value=30, days_ago=7)],
+            time.monotonic(),
+        )
+        assert client.value_at_offset_from_cache(days_ago=7) == 30
+
+    def test_returns_closest_match_within_tolerance(self) -> None:
+        client = FearGreedClient()
+        client._history_cache = (
+            [
+                self._snapshot(value=40, days_ago=6),
+                self._snapshot(value=20, days_ago=9),
+            ],
+            time.monotonic(),
+        )
+        assert client.value_at_offset_from_cache(days_ago=7) == 40
+
+    def test_returns_none_beyond_2_day_tolerance(self) -> None:
+        client = FearGreedClient()
+        client._history_cache = (
+            [self._snapshot(value=99, days_ago=14)],
+            time.monotonic(),
+        )
+        assert client.value_at_offset_from_cache(days_ago=7) is None
+
+    def test_rejects_zero_days_ago(self) -> None:
+        client = FearGreedClient()
+        with pytest.raises(ValueError, match="days_ago must be >= 1"):
+            client.value_at_offset_from_cache(days_ago=0)

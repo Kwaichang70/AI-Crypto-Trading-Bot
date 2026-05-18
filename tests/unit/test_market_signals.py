@@ -12,7 +12,7 @@ Covers:
 from __future__ import annotations
 
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -365,3 +365,53 @@ class TestQT007eBTCDominanceHistory:
         assert s.dtype == "float64"
         assert s.index.tz is not None
         assert s.name == "btc_dominance"
+
+
+# ===================================================================
+# QT-007f-1 (Sprint 46) -- btc_dominance_at_offset_from_cache
+# ===================================================================
+
+
+class TestQT007f1BTCDominanceAtOffsetFromCache:
+    """Synchronous cache-only accessor for the 7d-ago BTC dominance
+    field of MultiTimeframeContext."""
+
+    @staticmethod
+    def _build_series_with_value_at_days_ago(value: float, days_ago: int):
+        import pandas as pd
+        ts = datetime.now(tz=UTC) - timedelta(days=days_ago)
+        idx = pd.DatetimeIndex(
+            [ts - timedelta(hours=12), ts, ts + timedelta(hours=12)],
+            tz="UTC",
+            name="timestamp",
+        )
+        return pd.Series([0.0, value, 0.0], index=idx, dtype="float64",
+                         name="btc_dominance")
+
+    def test_returns_none_when_history_unset(self) -> None:
+        client = CoinGeckoClient()
+        assert client.btc_dominance_at_offset_from_cache(days_ago=7) is None
+
+    def test_returns_none_when_history_empty(self) -> None:
+        client = CoinGeckoClient()
+        client._btc_dom_history = CoinGeckoClient._empty_dom_series()
+        assert client.btc_dominance_at_offset_from_cache(days_ago=7) is None
+
+    def test_returns_value_when_history_has_matching_point(self) -> None:
+        client = CoinGeckoClient()
+        client._btc_dom_history = self._build_series_with_value_at_days_ago(
+            value=55.0, days_ago=7,
+        )
+        assert client.btc_dominance_at_offset_from_cache(days_ago=7) == 55.0
+
+    def test_returns_none_beyond_2_day_tolerance(self) -> None:
+        client = CoinGeckoClient()
+        client._btc_dom_history = self._build_series_with_value_at_days_ago(
+            value=99.0, days_ago=14,
+        )
+        assert client.btc_dominance_at_offset_from_cache(days_ago=7) is None
+
+    def test_rejects_zero_days_ago(self) -> None:
+        client = CoinGeckoClient()
+        with pytest.raises(ValueError, match="days_ago must be >= 1"):
+            client.btc_dominance_at_offset_from_cache(days_ago=0)

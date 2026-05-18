@@ -1000,16 +1000,25 @@ class StrategyEngine:
         # Read cached FGI value (best-effort; never crash bar processing
         # if the client is unavailable or has not populated its cache yet).
         fgi_value: int | None = None
+        fgi_value_7d_ago: int | None = None
         try:
             from data.sentiment import get_global_client as _get_fgi_client
             _fgi_client = _get_fgi_client()
             if _fgi_client is not None:
                 fgi_value = _fgi_client.cached_value
+                # QT-007 v2 feature pipeline: cache-only sync read (no I/O).
+                # Returns None when history has not been populated yet by the
+                # background refresh task; v2 feature builder treats None as
+                # "no observed change".
+                fgi_value_7d_ago = _fgi_client.value_at_offset_from_cache(
+                    days_ago=7,
+                )
         except Exception:
             pass  # FGI is best-effort; never crash bar processing
 
         # CoinGecko market structure signals (best-effort)
         btc_dominance: float | None = None
+        btc_dominance_7d_ago: float | None = None
         market_cap_change_24h: float | None = None
         total_volume_change_24h: float | None = None
         try:
@@ -1021,6 +1030,10 @@ class StrategyEngine:
                     btc_dominance = _cg_snap.btc_dominance
                     market_cap_change_24h = _cg_snap.market_cap_change_24h
                     total_volume_change_24h = _cg_snap.total_volume_change_24h
+                # QT-007 v2 feature pipeline: cache-only sync read (no I/O).
+                btc_dominance_7d_ago = (
+                    _cg_client.btc_dominance_at_offset_from_cache(days_ago=7)
+                )
         except Exception:
             pass  # CoinGecko is best-effort; never crash bar processing
 
@@ -1068,6 +1081,10 @@ class StrategyEngine:
             ctx_kwargs["yield_curve_spread"] = yield_curve_spread
         if whale_net_flow is not None:
             ctx_kwargs["whale_net_flow"] = whale_net_flow
+        if fgi_value_7d_ago is not None:
+            ctx_kwargs["fear_greed_index_7d_ago"] = fgi_value_7d_ago
+        if btc_dominance_7d_ago is not None:
+            ctx_kwargs["btc_dominance_7d_ago"] = btc_dominance_7d_ago
 
         # Always return a context carrying the signal fields (fgi/btc_dom/...)
         # even when no HTF bars exist — strategies may condition on sentiment

@@ -486,6 +486,45 @@ class FearGreedClient:
     # Internal parsing
     # ------------------------------------------------------------------
 
+    def value_at_offset_from_cache(self, days_ago: int) -> int | None:
+        """Synchronous accessor: return the FGI value approximately
+        ``days_ago`` days before now, reading ONLY from the in-memory
+        ``_history_cache``.  Never performs I/O.
+
+        Used by :meth:`StrategyEngine._build_mtf_context` for the
+        ``fear_greed_index_7d_ago`` field of :class:`MultiTimeframeContext`.
+
+        Returns ``None`` when no history is cached or when the closest
+        cached snapshot is more than 2 days off the target (same
+        tolerance as :meth:`get_value_at_offset`).
+
+        Parameters
+        ----------
+        days_ago:
+            Non-negative number of days back from now.  Must be >= 1.
+
+        Returns
+        -------
+        int | None:
+            FGI value [0, 100], or None.
+        """
+        if days_ago < 1:
+            raise ValueError(f"days_ago must be >= 1, got {days_ago}")
+        if self._history_cache is None:
+            return None
+        snapshots, _fetched_at = self._history_cache
+        if not snapshots:
+            return None
+        target = datetime.now(tz=UTC) - timedelta(days=days_ago)
+        best = min(
+            snapshots,
+            key=lambda s: abs((s.timestamp - target).total_seconds()),
+        )
+        delta_days = abs((best.timestamp - target).total_seconds()) / 86400.0
+        if delta_days > 2.0:
+            return None
+        return int(best.value)
+
     def _parse_snapshot(self, item: dict[str, Any]) -> FearGreedSnapshot:
         """
         Parse one Alternative.me API response dict into a FearGreedSnapshot.

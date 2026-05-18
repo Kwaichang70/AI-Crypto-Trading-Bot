@@ -65,6 +65,8 @@ class RetrainingService:
         min_accuracy_threshold: float = 0.38,
         max_model_versions: int = 5,
         exchange_id: str = "binance",
+        *,
+        feature_schema_version: int = 2,
     ) -> None:
         self._db_session_factory = db_session_factory
         self._model_dir = Path(model_dir)
@@ -73,6 +75,10 @@ class RetrainingService:
         self._min_accuracy = min_accuracy_threshold
         self._max_versions = max_model_versions
         self._exchange_id = exchange_id
+        # QT-007 (Sprint 46): schema version for ModelTrainer construction;
+        # default v2 (14 features).  Set to 1 to keep the legacy 10-feature
+        # behaviour for backward compatibility.
+        self._feature_schema_version = feature_schema_version
         self._log = logger.bind(component="retraining_service")
         self._task: asyncio.Task[None] | None = None
         # In-memory watermark: keyed by "{symbol}::{timeframe}"
@@ -255,6 +261,41 @@ class RetrainingService:
             )
             return
 
+        # 3a. (QT-007f-2 Sprint 46) Fetch optional historical context series
+        # for the v2 feature schema.  All fetches are BEST-EFFORT -- a failure
+        # logs and degrades to None, which the v2 feature builder treats as
+        # "no observed change" via neutral defaults.  Only runs when
+        # feature_schema_version == 2 (skip the I/O on v1 trainers).
+        fgi_series: Any | None = None
+        btc_dom_series: Any | None = None
+        if self._feature_schema_version == 2:
+            try:
+                from data.sentiment import (
+                    get_global_client as _get_fgi_client,
+                )
+                _fgi_client = _get_fgi_client()
+                if _fgi_client is not None:
+                    fgi_series = await _fgi_client.get_history_as_series(limit=30)
+            except Exception as exc:
+                self._log.warning(
+                    "retraining_service.fgi_history_fetch_failed",
+                    error=str(exc),
+                )
+            try:
+                from data.market_signals import (
+                    get_global_client as _get_cg_client,
+                )
+                _cg_client = _get_cg_client()
+                if _cg_client is not None:
+                    btc_dom_series = await _cg_client.fetch_btc_dominance_history(
+                        days=30,
+                    )
+            except Exception as exc:
+                self._log.warning(
+                    "retraining_service.btc_dom_history_fetch_failed",
+                    error=str(exc),
+                )
+
         # 3. Train in thread (scikit-learn is CPU-bound + synchronous)
         version_id = uuid.uuid4()
         version_suffix = version_id.hex[:8]
@@ -267,6 +308,8 @@ class RetrainingService:
                 timeframe=timeframe,
                 symbol=symbol,
                 version_suffix=version_suffix,
+                fgi_series=fgi_series,
+                btc_dom_series=btc_dom_series,
             )
         except ValueError as exc:
             self._log.warning(
@@ -317,8 +360,16 @@ class RetrainingService:
         # 6. Prune old versions
         await self._prune_old_versions(symbol=symbol, timeframe=timeframe)
 
-        # 7. Write sidecar JSON atomically
-        self._write_active_sidecar(
+        # 7. Write sidecar JSON atomically.
+        # QT-007 (Sprint 46): use ModelTrainer.save_sidecar so the sidecar
+        # includes ``schema_version`` and ``feature_names``.  ModelStrategy
+        # reads both fields to dispatch to the correct feature builder.
+        from data.ml_training import ModelTrainer
+        _sidecar_trainer = ModelTrainer(
+            model_dir=str(self._model_dir),
+            feature_schema_version=self._feature_schema_version,
+        )
+        _sidecar_trainer.save_sidecar(
             symbol=symbol,
             version_id=str(mv.id),
             model_path=model_path,
@@ -390,15 +441,30 @@ class RetrainingService:
         timeframe: str,
         symbol: str,
         version_suffix: str,
+        fgi_series: Any | None = None,
+        btc_dom_series: Any | None = None,
     ) -> dict[str, Any]:
-        """Synchronous training pipeline. Runs in asyncio.to_thread."""
+        """Synchronous training pipeline. Runs in asyncio.to_thread.
+
+        QT-007 (Sprint 46): now constructs ``ModelTrainer`` with the
+        retraining service's configured ``feature_schema_version`` and
+        passes ``fgi_series`` + ``btc_dom_series`` through to the
+        prepare-dataset call so v2 trainers populate the new context
+        features.  v1 trainers ignore the optional kwargs with a
+        structured WARNING log (see ModelTrainer._build_features_for_schema).
+        """
         from data.ml_training import ModelTrainer
 
-        trainer = ModelTrainer(model_dir=str(self._model_dir))
+        trainer = ModelTrainer(
+            model_dir=str(self._model_dir),
+            feature_schema_version=self._feature_schema_version,
+        )
         X, y = trainer.prepare_dataset_from_trades(
             trades=trade_dicts,
             ohlcv_df=ohlcv_df,
             timeframe=timeframe,
+            fgi_series=fgi_series,
+            btc_dom_series=btc_dom_series,
         )
         metrics = trainer.train(X, y)
         model_path = trainer.save_model(symbol=symbol, version_suffix=version_suffix)
@@ -413,6 +479,8 @@ class RetrainingService:
                 "classification_report": metrics.get("classification_report", {}),
                 "train_samples": metrics.get("train_samples"),
                 "test_samples": metrics.get("test_samples"),
+                "feature_schema_version": metrics.get("feature_schema_version"),
+                "feature_names": metrics.get("feature_names"),
             },
         }
 
@@ -574,8 +642,12 @@ class RetrainingService:
     ) -> None:
         """Atomically write the active model sidecar JSON file.
 
-        ModelStrategy reads this file on each on_bar() call. Atomic write
-        (tmp file + os.replace) prevents a partial-read race condition.
+        .. deprecated:: Sprint 46 (QT-007f-2)
+           Use :meth:`ModelTrainer.save_sidecar` instead, which writes the
+           v2 sidecar schema including ``schema_version`` and
+           ``feature_names``.  This method is retained only for
+           backward compatibility with any external caller; the main
+           retraining flow now uses ``trainer.save_sidecar`` directly.
 
         File: models/{safe_symbol}_active.json
         """
