@@ -677,6 +677,7 @@ def _register_routes(application: FastAPI) -> None:
         }
 
     from api.routers import circuit_breaker, learning, ml, optimize, orders, portfolio, runs, signals, strategies
+    from api.routers import health as health_router_mod  # alias avoids shadowing the local `/health` handler
 
     _V1 = "/api/v1"
 
@@ -738,6 +739,14 @@ def _register_routes(application: FastAPI) -> None:
     application.include_router(
         learning.router,
         tags=["learning"],
+        dependencies=[Depends(require_api_key)],
+    )
+
+    # S47-6 (Sprint 47): background-task health diagnostics.
+    application.include_router(
+        health_router_mod.router,
+        prefix=_V1,
+        tags=["health"],
         dependencies=[Depends(require_api_key)],
     )
 

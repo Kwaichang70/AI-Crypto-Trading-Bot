@@ -84,6 +84,26 @@ class RetrainingService:
         # In-memory watermark: keyed by "{symbol}::{timeframe}"
         self._last_retrain_at: dict[str, datetime] = {}
 
+    # ------------------------------------------------------------------
+    # S47-6 (Sprint 47): Public diagnostics surface for the
+    # /api/v1/health/background endpoint.
+    # ------------------------------------------------------------------
+
+    @property
+    def running(self) -> bool:
+        """True iff the polling task is alive (not None and not done)."""
+        return self._task is not None and not self._task.done()
+
+    @property
+    def min_trades_for_retrain(self) -> int:
+        """Minimum trades threshold that triggers automatic retraining."""
+        return self._min_trades
+
+    @property
+    def check_interval_seconds(self) -> int:
+        """Poll interval in seconds."""
+        return self._check_interval_seconds
+
     # ------------------------------------------------------------------ #
     # Lifecycle
     # ------------------------------------------------------------------ #

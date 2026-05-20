@@ -73,7 +73,9 @@ class HistoryCacheWarmer:
         self._btc_dom_history_days = btc_dom_history_days
         self._task: asyncio.Task[None] | None = None
         self._log = logger.bind(component="history_cache_warmer")
-        # Diagnostics surface for S47-6 health endpoint.
+        # Diagnostics surface for S47-6 health endpoint.  Wall-clock
+        # Unix epoch float (time.time()), comparable across process
+        # restarts, or None until the first tick completes.
         self.last_run_at: float | None = None
         self.last_fgi_points: int = 0
         self.last_btc_dom_points: int = 0
@@ -170,7 +172,10 @@ class HistoryCacheWarmer:
                     exc_info=True,
                 )
 
-        self.last_run_at = time.monotonic()
+        # CR-005: wall-clock Unix epoch -- monotonic resets on restart and
+        # would mislead operators ("4.2" post-restart looks recent when it
+        # actually means "4.2s after process start").
+        self.last_run_at = time.time()
         self.last_fgi_points = fgi_points
         self.last_btc_dom_points = cg_points
         self._log.info(
