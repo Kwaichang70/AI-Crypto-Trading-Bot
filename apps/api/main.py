@@ -104,6 +104,10 @@ _whale_alert_client: Any = None
 # ---------------------------------------------------------------------------
 _equity_prune_task: Any = None
 
+# S47-1: history cache warmer — keeps FGI + BTC-dom history caches warm
+# for the v2 feature pipeline's synchronous accessors.
+_history_cache_warmer: Any = None
+
 # ---------------------------------------------------------------------------
 # Module-level TelegramNotifier instance — DEPRECATED: mirror of
 # container.services.telegram_notifier — sunset by Sprint 41
@@ -159,7 +163,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """
     global _retraining_service, _telegram_notifier
     global _coingecko_client, _fred_client, _whale_alert_client
-    global _fgi_client, _equity_prune_task
+    global _fgi_client, _equity_prune_task, _history_cache_warmer
 
     settings = get_settings()
 
@@ -380,6 +384,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log.info("coingecko_client.skipped", reason="aiohttp not installed")
     except Exception:
         log.warning("coingecko_client.startup_error", exc_info=True)
+
+    # ------------------------------------------------------------------
+    # 11. History cache warmer (S47-1) — periodic FGI + BTC dom history.
+    # Without this, the v2 feature pipeline's 7d-ago lookups always
+    # return None and the model receives neutral defaults for
+    # fgi_delta_7d / btc_dom_delta_7d, silently nullifying half of QT-007.
+    # ------------------------------------------------------------------
+    try:
+        from api.services.history_cache_warmer import HistoryCacheWarmer
+
+        _history_cache_warmer = HistoryCacheWarmer(
+            fgi_client=_fgi_client,
+            coingecko_client=_coingecko_client,
+        )
+        await _history_cache_warmer.start()
+        container.background_tasks.history_cache_warmer = _history_cache_warmer  # LS-003
+        log.info("history_cache_warmer.wired")
+    except Exception:
+        log.warning("history_cache_warmer.startup_error", exc_info=True)
 
     # ------------------------------------------------------------------
     # 9. FRED macro client — requires FRED_API_KEY (Sprint 37)

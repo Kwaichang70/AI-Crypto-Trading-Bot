@@ -74,6 +74,9 @@ class BackgroundTaskRegistry:
     """
 
     equity_prune_task: asyncio.Task[Any] | None = None
+    # S47-1: HistoryCacheWarmer instance (not a raw Task -- the object
+    # owns its own asyncio.Task internally and has a stop() coroutine).
+    history_cache_warmer: Any | None = None
     # Reserved for future named long-lived tasks.
 
     async def cancel_all(self, timeout: float = 5.0) -> None:
@@ -85,6 +88,18 @@ class BackgroundTaskRegistry:
         if self.equity_prune_task is not None and not self.equity_prune_task.done():
             self.equity_prune_task.cancel()
             tasks.append(self.equity_prune_task)
+
+        # S47-1: HistoryCacheWarmer owns its own task and has its own
+        # cancel coroutine.  Drive it via stop() so the warmer logs its
+        # own clean-shutdown event, then continue with the bulk wait.
+        if self.history_cache_warmer is not None:
+            try:
+                await self.history_cache_warmer.stop()
+            except Exception:
+                logger.warning(
+                    "background_tasks.cancel_all: history_cache_warmer.stop raised",
+                    exc_info=True,
+                )
 
         if tasks:
             done, pending = await asyncio.wait(tasks, timeout=timeout)
@@ -228,7 +243,8 @@ class AppContainer:
         Each key is True when the component has been populated (non-None).
 
         Keys: db_engine, telegram_notifier, retraining_service, fgi_client,
-        coingecko_client, fred_client, whale_alert_client, equity_prune_task.
+        coingecko_client, fred_client, whale_alert_client, equity_prune_task,
+        history_cache_warmer.
         """
         return {
             "db_engine": self.db_engine is not None,
@@ -239,4 +255,8 @@ class AppContainer:
             "fred_client": self.services.fred_client is not None,
             "whale_alert_client": self.services.whale_alert_client is not None,
             "equity_prune_task": self.background_tasks.equity_prune_task is not None,
+            "history_cache_warmer": (
+                self.background_tasks.history_cache_warmer is not None
+                and self.background_tasks.history_cache_warmer.running
+            ),
         }

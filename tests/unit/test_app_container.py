@@ -152,6 +152,7 @@ class TestHealthAllFalse:
             "fred_client",
             "whale_alert_client",
             "equity_prune_task",
+            "history_cache_warmer",   # S47-1 (Sprint 47)
         }
         assert set(snapshot.keys()) == expected_keys
         assert all(v is False for v in snapshot.values())
