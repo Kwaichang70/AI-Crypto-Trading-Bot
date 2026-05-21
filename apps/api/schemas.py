@@ -330,6 +330,10 @@ class BacktestMetricsResponse(BaseModel):
     total_bars: int
     bars_in_market: int
     exposure_pct: float
+    exposure_pct_per_symbol: dict[str, float] = Field(
+        default_factory=dict,
+        description="Per-symbol exposure fraction in [0.0, 1.0]",
+    )
 
     # Date range
     start_date: datetime

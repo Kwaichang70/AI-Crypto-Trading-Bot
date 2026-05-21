@@ -198,6 +198,11 @@ class StrategyEngine:
         self._total_signals: int = 0
         self._total_orders: int = 0
         self._total_fills: int = 0
+        # M2 (Sprint 49): authoritative per-bar exposure counters for backtest mode.
+        # Populated by run_backtest() and read by BacktestRunner.run() via the return dict.
+        # Reset to zero at the start of each run_backtest() call.
+        self._exposure_bars_total: int = 0
+        self._exposure_bars_per_symbol: dict[str, int] = {}
         self._stop_event: asyncio.Event = asyncio.Event()
 
         # Adaptive learning - excursion and skip tracking (Sprint 32)
@@ -507,6 +512,10 @@ class StrategyEngine:
         # Store HTF bars for multi-timeframe context building
         self._htf_bars = htf_bars
 
+        # Reset exposure counters for this backtest run
+        self._exposure_bars_total = 0
+        self._exposure_bars_per_symbol = {s: 0 for s in self._symbols}
+
         self._log.info(
             "engine.backtest_starting",
             total_bars=num_bars,
@@ -549,6 +558,19 @@ class StrategyEngine:
             # Process this bar
             await self._process_bar(current_bars, history_by_symbol)
 
+            # M2 (Sprint 49): after _process_bar has applied fills, query live
+            # portfolio positions to count this bar authoritatively.
+            # Using get_position() per symbol is O(n_symbols) dict lookups — cheap
+            # compared to the O(bars × trades) post-hoc estimate it replaces.
+            _any_open = False
+            for _sym in self._symbols:
+                _pos = self._portfolio.get_position(_sym)
+                if _pos is not None and not _pos.is_flat:
+                    self._exposure_bars_per_symbol[_sym] += 1
+                    _any_open = True
+            if _any_open:
+                self._exposure_bars_total += 1
+
         self._log.info(
             "engine.backtest_complete",
             bars_processed=self._bar_count,
@@ -556,7 +578,12 @@ class StrategyEngine:
             total_orders=self._total_orders,
         )
 
-        return self._portfolio.get_summary()
+        summary = self._portfolio.get_summary()
+        # Include M2 exposure counters so BacktestRunner.run() can use them
+        # directly instead of the post-hoc _estimate_bars_in_market heuristic.
+        summary["exposure_bars_total"] = self._exposure_bars_total
+        summary["exposure_bars_per_symbol"] = dict(self._exposure_bars_per_symbol)
+        return summary
 
     # ------------------------------------------------------------------
     # Paper / Live loop entry point

@@ -967,10 +967,13 @@ class TestRunBacktestExecution:
 
     async def test_returns_portfolio_get_summary_result(self) -> None:
         """
-        run_backtest() must return the dict produced by portfolio.get_summary().
+        run_backtest() must return the dict produced by portfolio.get_summary(),
+        augmented with the M2 exposure counters.
 
-        This is the primary result the BacktestRunner uses to populate the
-        run record in the database.
+        After M2 the engine mutates the summary dict to add two keys before
+        returning it, so we assert the original fields plus the new keys
+        explicitly rather than using dict equality (which would pass by
+        accidental aliasing since both sides reference the same object).
         """
         expected = {"current_equity": "12500", "total_trades": 3}
         engine, mocks = _make_engine(config={"warmup_bars": 0})
@@ -983,7 +986,10 @@ class TestRunBacktestExecution:
         bar = _make_bar()
         result = await engine.run_backtest(bars_by_symbol={"BTC/USDT": [bar]})
 
-        assert result == expected
+        assert result["current_equity"] == "12500"
+        assert result["total_trades"] == 3
+        assert "exposure_bars_total" in result
+        assert "exposure_bars_per_symbol" in result
 
     async def test_early_termination_via_stop_event(self) -> None:
         """

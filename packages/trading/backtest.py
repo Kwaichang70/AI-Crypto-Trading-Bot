@@ -260,7 +260,6 @@ class BacktestRunner:
 
         # 5. Track bar-level state for exposure calculation
         total_bars_processed = 0
-        bars_in_market = 0
 
         # We need to track per-bar equity for accurate curve construction.
         # The portfolio records equity on every update_market_prices and
@@ -269,7 +268,7 @@ class BacktestRunner:
 
         try:
             # 6. Run backtest through the strategy engine
-            await engine.run_backtest(bars_by_symbol, htf_bars=htf_bars)
+            engine_summary = await engine.run_backtest(bars_by_symbol, htf_bars=htf_bars)
         finally:
             # 7. Stop engine (always, even on error)
             await engine.stop()
@@ -300,14 +299,19 @@ class BacktestRunner:
         )
         total_bars_processed = max(0, num_bars_per_symbol - self._warmup_bars)
 
-        # 11. Compute exposure: count bars where portfolio had open positions
-        # We approximate this from the equity curve: if equity differs from
-        # cash-only (initial_capital + realised_pnl), a position is open.
-        # A more precise approach: count bars where position_snapshots had
-        # non-flat positions.  We use the equity curve as a proxy.
-        bars_in_market = self._estimate_bars_in_market(
-            equity_curve, portfolio
-        )
+        # 11. M2 (Sprint 49): read authoritative exposure counters from the engine
+        # summary dict.  These were populated by run_backtest()'s per-bar tracker
+        # (O(n_symbols) dict lookups per bar) and correctly capture bars where
+        # positions were open at end-of-bar — including runs that finish with
+        # positions still open (the failure mode of the old _estimate_bars_in_market
+        # which only counted closed TradeResult records).
+        bars_in_market: int = engine_summary.get("exposure_bars_total", 0)
+        exposure_bars_per_symbol: dict[str, float] = {
+            sym: min(1.0, cnt / total_bars_processed) if total_bars_processed > 0 else 0.0
+            for sym, cnt in engine_summary.get(
+                "exposure_bars_per_symbol", {}
+            ).items()
+        }
 
         # 12. Compute final equity
         final_equity = portfolio.current_equity
@@ -375,6 +379,7 @@ class BacktestRunner:
             total_bars=total_bars_processed,
             bars_in_market=bars_in_market,
             exposure_pct=exposure,
+            exposure_pct_per_symbol=exposure_bars_per_symbol,
             # Curve & trades
             equity_curve=equity_curve,
             trades=trade_history,
@@ -628,17 +633,20 @@ class BacktestRunner:
         equity_curve: list[EquityCurvePoint],
         portfolio: PortfolioAccounting,
     ) -> int:
-        """QT-011 (Sprint 43): count bars where ANY position is open.
+        """QT-011 (Sprint 43) / M2 (Sprint 49): count bars where ANY position is open.
 
-        Earlier implementation iterated trades × curve and double-counted
-        bars that fell inside overlapping trade spans (multiple symbols
-        traded concurrently produced ``bars_count > len(curve)`` which was
-        then clamped at the curve length — biased both ways).
+        **Retained for backward compatibility and direct unit-test coverage.**
+        As of M2 (Sprint 49) this method is NO LONGER CALLED by
+        ``BacktestRunner.run()`` — the authoritative source is now the per-bar
+        tracker inside ``StrategyEngine.run_backtest()`` which observes live
+        portfolio positions after each bar, including positions that remain open
+        at run-end (the failure mode of this method: ``get_trade_history()``
+        only returns *closed* trades, so a run that ends fully invested returns
+        ``bars_in_market = 0``).
 
-        Corrected algorithm: walk the curve once and ask "is at least one
-        trade open at this timestamp?".  This collapses overlapping spans
-        to a single bar count, matching the natural interpretation of
-        ``exposure_pct = fraction of time the strategy had risk on``.
+        The >100% failure mode is impossible by construction: the early ``break``
+        in the inner trade loop guarantees ``bars_in_market <= len(equity_curve)``.
+        The ``min(1.0, ...)`` clamp in ``compute_exposure`` is belt-and-suspenders.
         """
         trades = portfolio.get_trade_history()
         if not trades or not equity_curve:

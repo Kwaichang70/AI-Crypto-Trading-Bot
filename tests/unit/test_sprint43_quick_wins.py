@@ -142,10 +142,13 @@ def _make_trade_stub(*, entry_at: datetime, exit_at: datetime) -> Any:
 
 
 class TestQT011ExposureBarCount:
-    """QT-011: overlapping trades on different symbols must NOT inflate
-    the bars-in-market count.  Earlier implementation iterated
-    trades × curve and summed without de-duplication; corrected
-    implementation asks "any trade open?" per bar."""
+    """QT-011 (Sprint 43) / M2 (Sprint 49): overlapping trades on different symbols
+    must NOT inflate the bars-in-market count.
+
+    As of M2 the authoritative source is ``StrategyEngine.run_backtest()``'s
+    per-bar tracker (live portfolio positions), not this post-hoc estimate.
+    ``_estimate_bars_in_market`` is retained for backward compatibility and
+    these tests continue to verify its standalone contract."""
 
     def test_single_trade_counts_each_bar_once(self) -> None:
         from trading.backtest import BacktestRunner

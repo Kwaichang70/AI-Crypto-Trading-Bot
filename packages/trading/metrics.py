@@ -216,6 +216,15 @@ class BacktestResult(BaseModel):
         le=1.0,
         description="Fraction of bars with an open position",
     )
+    exposure_pct_per_symbol: dict[str, float] = Field(
+        default_factory=dict,
+        description=(
+            "Per-symbol fraction of post-warmup bars where that symbol had an "
+            "open position. Values in [0.0, 1.0]. Empty dict for runs with no "
+            "positions or when the authoritative tracker was not available "
+            "(e.g. BacktestResult constructed directly in tests)."
+        ),
+    )
 
     # Equity curve
     equity_curve: list[EquityCurvePoint] = Field(

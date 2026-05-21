@@ -156,6 +156,7 @@ def build_backtest_metrics(result: Any) -> BacktestMetricsResponse:
         total_bars=result.total_bars,
         bars_in_market=result.bars_in_market,
         exposure_pct=result.exposure_pct,
+        exposure_pct_per_symbol=result.exposure_pct_per_symbol,
         start_date=result.start_date,
         end_date=result.end_date,
         duration_days=result.duration_days,

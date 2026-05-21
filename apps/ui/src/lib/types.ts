@@ -79,6 +79,7 @@ export interface BacktestMetrics {
   totalBars: number;
   barsInMarket: number;
   exposurePct: number;
+  exposurePctPerSymbol?: Record<string, number>;
   startDate: string;
   endDate: string;
   durationDays: number;

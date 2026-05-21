@@ -55,6 +55,7 @@ class TestBuildBacktestMetricsProfitFactor:
             total_bars=100,
             bars_in_market=60,
             exposure_pct=0.6,
+            exposure_pct_per_symbol={},
             start_date=datetime(2024, 1, 1, tzinfo=UTC),
             end_date=datetime(2024, 2, 1, tzinfo=UTC),
             duration_days=31,
