@@ -341,8 +341,9 @@ class TestInverseVolCombination:
                 "BTC/USDT", SignalDirection.BUY, 100 if i % 2 == 0 else 500, 0.5,
             )
             e.on_bar([_bar()])
-        std_a = statistics.pstdev(e._magnitude_history[0])
-        std_b = statistics.pstdev(e._magnitude_history[1])
+        # S47-4: per-symbol history keyed by symbol.
+        std_a = statistics.pstdev(e._magnitude_history["BTC/USDT"][0])
+        std_b = statistics.pstdev(e._magnitude_history["BTC/USDT"][1])
         assert std_b > std_a
 
     def test_silent_sub_gets_zero_weight(self) -> None:
@@ -360,7 +361,8 @@ class TestInverseVolCombination:
         for _ in range(4):
             e.on_bar([_bar()])
         # Internal weight inspection.
-        weights = e._compute_weights()
+        # S47-4: _compute_weights now takes a symbol argument.
+        weights = e._compute_weights("BTC/USDT")
         # Sub B should have weight 0; sub A should hold all the weight.
         assert weights[1] == 0.0
         assert weights[0] == pytest.approx(1.0, abs=1e-9)
@@ -504,3 +506,101 @@ class TestMultiSymbolHandling:
         out = e.on_bar([_bar("BTC/USDT")])
         symbols = sorted(s.symbol for s in out)
         assert symbols == ["BTC/USDT", "ETH/USDT"]
+
+
+# ===================================================================
+# S47-4 (Sprint 47) -- per-symbol magnitude history fairness
+# ===================================================================
+
+
+class TestPerSymbolMagnitudeHistory:
+    """S47-4: a sub trading multiple symbols must not be penalised in
+    inverse-vol weighting just because its summed magnitude is higher."""
+
+    def test_multi_symbol_sub_has_separate_history_per_symbol(self) -> None:
+        sigs = [
+            _signal("BTC/USDT", SignalDirection.BUY, 100, 0.5),
+            _signal("ETH/USDT", SignalDirection.BUY, 100, 0.5),
+        ]
+        e = EnsembleStrategy(
+            strategy_id="e",
+            sub_strategies=[_StubStrategy("a", sigs)],
+            combination_method="inverse_vol",
+            vol_lookback=3,
+        )
+        e.on_bar([_bar()])
+        # Both symbols have their own history; each records 100, not 200.
+        assert len(e._magnitude_history) == 2
+        assert list(e._magnitude_history["BTC/USDT"][0])[-1] == 100.0
+        assert list(e._magnitude_history["ETH/USDT"][0])[-1] == 100.0
+        # CR-005 regression guard: no cross-symbol sum.
+        assert list(e._magnitude_history["BTC/USDT"][0])[-1] != 200.0
+
+    def test_sub_silent_on_one_symbol_zero_weight_only_there(self) -> None:
+        """Sub A trades BTC only; Sub B trades ETH only.  Each gets full
+        weight on the symbol it trades and zero on the other.
+
+        NOTE: ``_StubStrategy`` ignores bar content and emits its
+        configured signal regardless of which symbol bars arrive, so
+        both subs see both BTC + ETH in ``per_sub_signals`` every bar
+        (the cross-symbol 0.0 padding logic depends on this).
+        """
+        sub_a = _StubStrategy(
+            "a", _signal("BTC/USDT", SignalDirection.BUY, 100, 0.5),
+        )
+        sub_b = _StubStrategy(
+            "b", _signal("ETH/USDT", SignalDirection.BUY, 100, 0.5),
+        )
+        e = EnsembleStrategy(
+            strategy_id="e",
+            sub_strategies=[sub_a, sub_b],
+            combination_method="inverse_vol",
+            vol_lookback=3,
+        )
+        # Warm up: 4 bars where each sub emits its own symbol.
+        for _ in range(4):
+            e.on_bar([_bar()])
+
+        # On BTC: sub A has all-100 history (constant), sub B all-zero.
+        w_btc = e._compute_weights("BTC/USDT")
+        assert w_btc[0] == pytest.approx(1.0, abs=1e-9)
+        assert w_btc[1] == 0.0
+
+        # On ETH: sub A all-zero, sub B all-100.
+        w_eth = e._compute_weights("ETH/USDT")
+        assert w_eth[0] == 0.0
+        assert w_eth[1] == pytest.approx(1.0, abs=1e-9)
+
+    def test_unseen_symbol_falls_back_to_uniform_weights(self) -> None:
+        e = EnsembleStrategy(
+            strategy_id="e",
+            sub_strategies=[_StubStrategy("a"), _StubStrategy("b")],
+            combination_method="inverse_vol",
+            vol_lookback=3,
+        )
+        # Never call on_bar -- so no history at all.
+        weights = e._compute_weights("BTC/USDT")
+        assert weights == [0.5, 0.5]
+
+    def test_on_stop_clears_per_symbol_history(self) -> None:
+        sigs = [_signal("BTC/USDT", SignalDirection.BUY, 100, 0.5)]
+        e = EnsembleStrategy(
+            strategy_id="e",
+            sub_strategies=[_StubStrategy("a", sigs)],
+            combination_method="inverse_vol",
+        )
+        e.on_bar([_bar()])
+        assert "BTC/USDT" in e._magnitude_history
+        e.on_stop()
+        assert e._magnitude_history == {}
+
+    def test_equal_weight_unaffected_by_per_symbol_change(self) -> None:
+        """equal_weight method should never consult histories -- a quick
+        regression guard that the dispatch still works."""
+        e = EnsembleStrategy(
+            strategy_id="e",
+            sub_strategies=[_StubStrategy("a"), _StubStrategy("b")],
+            combination_method="equal_weight",
+        )
+        weights = e._compute_weights("BTC/USDT")
+        assert weights == [0.5, 0.5]

@@ -34,12 +34,10 @@ warms up enough history for every wrapped strategy.
 MVP scope (Sprint 46 QT-008): class + unit tests only.  Registry +
 API/UI integration deferred to Sprint 47.
 
-Multi-symbol caveat (CR-005 documented limitation): the inverse-vol
-magnitude history sums |target_position| across all symbols emitted
-on the same bar.  A sub-strategy trading more symbols therefore has
-proportionally larger magnitudes than a single-symbol sub, biasing
-its inverse-vol weight downward.  Per-symbol histories are a
-Sprint 47 enhancement.
+Multi-symbol fairness (S47-4 Sprint 47):
+the inverse-vol magnitude history is keyed PER SYMBOL.  A sub trading
+4 symbols therefore has the same per-symbol weight as a single-symbol
+sub of equivalent consistency, fixing the QT-008 CR-005 limitation.
 """
 
 from __future__ import annotations
@@ -139,10 +137,22 @@ class EnsembleStrategy(BaseStrategy):
         self._combination_method = combination_method
         self._vol_lookback = vol_lookback
         self._min_agreement = min_agreement
-        # Rolling magnitude history per sub-strategy index.
-        self._magnitude_history: list[deque[float]] = [
-            deque(maxlen=vol_lookback) for _ in self._sub_strategies
-        ]
+        # S47-4 (Sprint 47): symbol-keyed magnitude history.  Each symbol
+        # tracks one deque per sub-strategy of the most recent
+        # ``|target_position|`` values for THAT symbol -- 0.0 when the sub
+        # did not emit for the symbol on a bar where some other sub did.
+        # A sub that never trades a given symbol therefore accumulates an
+        # all-zero history for it and is excluded (weight 0) from that
+        # symbol's combination, matching the CR-002 silent-sub semantic
+        # without falsely penalising multi-symbol subs.
+        self._magnitude_history: dict[str, list[deque[float]]] = {}
+
+    def _ensure_history_for_symbol(self, symbol: str) -> None:
+        """Lazily allocate the per-sub deque list for a newly-seen symbol."""
+        if symbol not in self._magnitude_history:
+            self._magnitude_history[symbol] = [
+                deque(maxlen=self._vol_lookback) for _ in self._sub_strategies
+            ]
 
     # ------------------------------------------------------------------
     # Public properties
@@ -190,8 +200,10 @@ class EnsembleStrategy(BaseStrategy):
                     "ensemble_strategy.sub_on_stop_failed",
                     sub_id=sub.strategy_id,
                 )
-        for d in self._magnitude_history:
-            d.clear()
+        for deques in self._magnitude_history.values():
+            for d in deques:
+                d.clear()
+        self._magnitude_history.clear()
         super().on_stop()
 
     # ------------------------------------------------------------------
@@ -218,18 +230,26 @@ class EnsembleStrategy(BaseStrategy):
                 sigs = []
             per_sub_signals.append(list(sigs))
 
-        # Update magnitude history per sub.  See CR-005 caveat in module
-        # docstring: this sums across symbols.
-        for i, sigs in enumerate(per_sub_signals):
-            mag = float(sum((abs(s.target_position) for s in sigs), Decimal(0)))
-            self._magnitude_history[i].append(mag)
-
+        # Determine the set of symbols any sub emitted for this bar.
         symbols: set[str] = set()
         for sigs in per_sub_signals:
             for s in sigs:
                 symbols.add(s.symbol)
+        # CR-001 (S47-4): early-return BEFORE the history-update loop so
+        # silent bars (no sub emitted anything) skip both the loop and
+        # the combination phase, leaving history untouched.
         if not symbols:
             return []
+
+        # S47-4: update magnitude history per (symbol, sub).  For every
+        # symbol any sub emitted for, record each sub's |target_position|
+        # for THAT symbol (0.0 when the sub did not emit for it).
+        for symbol in symbols:
+            self._ensure_history_for_symbol(symbol)
+            for i, sigs in enumerate(per_sub_signals):
+                sig = self._first_signal_for_symbol(sigs, symbol)
+                mag = float(abs(sig.target_position)) if sig is not None else 0.0
+                self._magnitude_history[symbol][i].append(mag)
 
         combined: list[Signal] = []
         for symbol in sorted(symbols):
@@ -251,7 +271,7 @@ class EnsembleStrategy(BaseStrategy):
         sub_signals_for_symbol: list[Signal | None] = [
             self._first_signal_for_symbol(sigs, symbol) for sigs in per_sub_signals
         ]
-        weights = self._compute_weights()
+        weights = self._compute_weights(symbol)
 
         if self._combination_method == "majority_vote":
             return self._combine_majority(symbol, sub_signals_for_symbol, weights)
@@ -267,17 +287,22 @@ class EnsembleStrategy(BaseStrategy):
                 return s
         return None
 
-    def _compute_weights(self) -> list[float]:
-        """Compute per-sub weights for combination.
+    def _compute_weights(self, symbol: str) -> list[float]:
+        """Compute per-sub weights for combination of the given symbol.
 
-        - Equal-weight: 1/N for every sub.
-        - Inverse-vol / majority-vote base:
-            * Warmup (< _MIN_VOL_LOOKBACK history samples): uniform weight 1.0.
-            * Constantly-silent sub (all history magnitudes == 0): weight 0.0
-              (CR-002 remediation -- silent subs do NOT receive 1/eps weight).
+        Both ``inverse_vol`` and ``majority_vote`` combination methods
+        receive PER-SYMBOL weights since S47-4 (Sprint 47).
+
+        - Equal-weight: 1/N for every sub regardless of symbol.
+        - Inverse-vol / majority-vote base (per-symbol since S47-4):
+            * Symbol not yet seen (no history): uniform weight 1.0/N.
+            * Warmup (< _MIN_VOL_LOOKBACK history samples for this symbol):
+              uniform weight 1.0 per sub.
+            * Sub silent for this symbol (all history magnitudes == 0):
+              weight 0.0 (CR-002 -- silent sub does NOT receive 1/eps).
             * Otherwise: 1 / max(pstdev, 1e-9).
           All weights are normalised to sum to 1.0.  If the total collapses
-          to zero (e.g. ALL subs are constantly-silent) the function falls
+          to zero (e.g. ALL subs silent for this symbol) the function falls
           back to uniform weights to avoid a divide-by-zero downstream.
         """
         n = len(self._sub_strategies)
@@ -287,15 +312,20 @@ class EnsembleStrategy(BaseStrategy):
         if self._combination_method == "equal_weight":
             return [1.0 / n] * n
 
+        # ``None`` return from .get() means the symbol has never been seen
+        # by on_bar -- the uniform-weight fallback is the deliberate
+        # warmup semantic (CR-004 informational).
+        histories = self._magnitude_history.get(symbol)
+        if histories is None:
+            return [1.0 / n] * n
+
         weights: list[float] = []
-        for hist in self._magnitude_history:
+        for hist in histories:
             if len(hist) < _MIN_VOL_LOOKBACK:
                 weights.append(1.0)
                 continue
             hist_list = list(hist)
             if all(v == 0.0 for v in hist_list):
-                # CR-002: a constantly-silent sub is unreliable, not "low
-                # variance"; exclude it from the inverse-vol weighting.
                 weights.append(0.0)
                 continue
             try:
