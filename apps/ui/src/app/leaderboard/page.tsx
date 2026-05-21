@@ -47,7 +47,16 @@ function getMetrics(run: Run): {
   totalTrades: number;
   profitFactor: number;
 } | null {
-  if (run.backtestMetrics) return run.backtestMetrics;
+  if (run.backtestMetrics) {
+    const bm = run.backtestMetrics;
+    return {
+      totalReturnPct: bm.totalReturnPct,
+      sharpeRatio: bm.sharpeRatio,
+      winRate: bm.winRate,
+      totalTrades: bm.totalTrades,
+      profitFactor: bm.profitFactor ?? 0,  // null-coalesce: treat no-trades as 0 for avg computation
+    };
+  }
   const cfgBm = (run.config as unknown as Record<string, unknown>)?.backtest_metrics as Record<string, unknown> | undefined;
   if (!cfgBm) return null;
   return {

@@ -106,7 +106,7 @@ class OptimizeEntryResponse(BaseModel):
 
     rank: int
     params: dict[str, Any]
-    metrics: dict[str, float]
+    metrics: dict[str, float | None]
 
 
 class OptimizationRunSummary(BaseModel):
@@ -424,7 +424,7 @@ async def get_optimization_run(
         OptimizeEntryResponse(
             rank=e.rank,
             params=e.params,
-            metrics={k: float(v) for k, v in e.metrics.items()},
+            metrics={k: (float(v) if v is not None else None) for k, v in e.metrics.items()},
         )
         for e in row.entries
     ]

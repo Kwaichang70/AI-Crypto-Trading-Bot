@@ -71,7 +71,7 @@ class OptimizationEntry:
 
     rank: int
     params: dict[str, Any]
-    metrics: dict[str, float]
+    metrics: dict[str, float | None]
 
 
 @dataclass(frozen=True)
@@ -256,7 +256,7 @@ class ParameterOptimizer:
         bars_by_symbol: dict[str, list[OHLCVBar]],
         start_time: float,
     ) -> OptimizationResult:
-        results: list[tuple[dict[str, Any], dict[str, float]]] = []
+        results: list[tuple[dict[str, Any], dict[str, float | None]]] = []
         failed = 0
 
         for idx, combo_values in enumerate(self._combinations):
@@ -288,10 +288,12 @@ class ParameterOptimizer:
                 failed += 1
 
         reverse = self._rank_by not in _ASCENDING_METRICS
-        results.sort(
-            key=lambda r: r[1].get(self._rank_by, float("-inf")),
-            reverse=reverse,
-        )
+
+        def _in_sample_sort_key(r: tuple[dict[str, Any], dict[str, float | None]]) -> float:
+            v = r[1].get(self._rank_by)
+            return float(v) if v is not None else float("-inf")
+
+        results.sort(key=_in_sample_sort_key, reverse=reverse)
 
         entries = [
             OptimizationEntry(rank=i + 1, params=params, metrics=metrics)
@@ -342,7 +344,7 @@ class ParameterOptimizer:
         # For each combination run every fold's TEST window and aggregate
         # the resulting metrics.  The in-sample pass uses the full dataset
         # so callers can contrast overfit vs OOS Sharpe directly.
-        results: list[tuple[dict[str, Any], dict[str, float]]] = []
+        results: list[tuple[dict[str, Any], dict[str, float | None]]] = []
         failed = 0
 
         for idx, combo_values in enumerate(self._combinations):
@@ -406,13 +408,15 @@ class ParameterOptimizer:
         # the OOS alias is missing, e.g. rank_by metrics not yet mirrored).
         oos_rank_key = f"oos_{self._rank_by}"
         reverse = self._rank_by not in _ASCENDING_METRICS
-        results.sort(
-            key=lambda r: r[1].get(
-                oos_rank_key,
-                r[1].get(self._rank_by, float("-inf")),
-            ),
-            reverse=reverse,
-        )
+
+        def _walk_forward_sort_key(r: tuple[dict[str, Any], dict[str, float | None]]) -> float:
+            oos_v = r[1].get(oos_rank_key)
+            if oos_v is not None:
+                return float(oos_v)
+            is_v = r[1].get(self._rank_by)
+            return float(is_v) if is_v is not None else float("-inf")
+
+        results.sort(key=_walk_forward_sort_key, reverse=reverse)
 
         entries = [
             OptimizationEntry(rank=i + 1, params=params, metrics=metrics)
@@ -422,7 +426,10 @@ class ParameterOptimizer:
         # Deflated Sharpe across all completed trials (based on OOS medians)
         dsr: float | None = None
         if results:
-            trial_sharpes = [m.get("oos_sharpe_ratio", 0.0) for _, m in results]
+            # oos_sharpe_ratio is always a real float (set from statistics.median
+            # of fold_sharpes:list[float]); default 0.0 handles absent key only.
+            trial_sharpes_raw = [m.get("oos_sharpe_ratio", 0.0) for _, m in results]
+            trial_sharpes = [float(v) if v is not None else 0.0 for v in trial_sharpes_raw]
             if len(trial_sharpes) >= 2:
                 sharpe_std = statistics.stdev(trial_sharpes)
                 best_sharpe = max(trial_sharpes)
@@ -478,7 +485,7 @@ class ParameterOptimizer:
         )
         return await runner.run(bars_by_symbol)
 
-    def _extract_metrics(self, result: BacktestResult) -> dict[str, float]:
+    def _extract_metrics(self, result: BacktestResult) -> dict[str, float | None]:
         """Extract the standard metric dict from a BacktestResult.
 
         Rankable metrics (present in SUPPORTED_METRICS): sharpe_ratio, sortino_ratio,

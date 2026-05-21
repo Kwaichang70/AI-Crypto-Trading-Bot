@@ -685,11 +685,33 @@ export default function RunDetailPage() {
                         value={run.backtestMetrics.calmarRatio.toFixed(3)}
                         trend={run.backtestMetrics.calmarRatio >= 1.0 ? "up" : "neutral"}
                       />
-                      <StatCard
-                        label="Profit Factor"
-                        value={run.backtestMetrics.profitFactor.toFixed(2)}
-                        trend={run.backtestMetrics.profitFactor >= 1.5 ? "up" : run.backtestMetrics.profitFactor < 1.0 ? "down" : "neutral"}
-                      />
+                      {(() => {
+                        const pf = run.backtestMetrics.profitFactor;
+                        const pfInf = run.backtestMetrics.profitFactorIsInfinite;
+                        const pfDisplay =
+                          pf === null
+                            ? pfInf
+                              ? "∞"   // ∞ — all winners, zero losses
+                              : "—"   // — — no trades executed
+                            : pf.toFixed(2);
+                        const pfTrend: "up" | "down" | "neutral" =
+                          pf === null
+                            ? pfInf
+                              ? "up"       // pure-winner run is unambiguously positive
+                              : "neutral"  // no-trade run has no directional signal
+                            : pf >= 1.5
+                              ? "up"
+                              : pf < 1.0
+                                ? "down"
+                                : "neutral";
+                        return (
+                          <StatCard
+                            label="Profit Factor"
+                            value={pfDisplay}
+                            trend={pfTrend}
+                          />
+                        );
+                      })()}
                       <StatCard
                         label="Exposure"
                         value={formatPct(run.backtestMetrics.exposurePct)}

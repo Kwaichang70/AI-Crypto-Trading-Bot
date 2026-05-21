@@ -43,6 +43,7 @@ __all__ = [
     "compute_sortino",
     "compute_calmar",
     "compute_profit_factor",
+    "is_profit_factor_infinite",
     "compute_max_drawdown",
     "compute_max_drawdown_duration",
     "compute_exposure",
@@ -116,7 +117,8 @@ class TradeStatistics(BaseModel):
     winning_trades: int = 0
     losing_trades: int = 0
     win_rate: float = 0.0
-    profit_factor: float = 0.0
+    profit_factor: float | None = None
+    profit_factor_is_infinite: bool = False
     average_trade_pnl: Decimal = Decimal("0")
     average_win: Decimal = Decimal("0")
     average_loss: Decimal = Decimal("0")
@@ -188,9 +190,17 @@ class BacktestResult(BaseModel):
     winning_trades: int = Field(ge=0)
     losing_trades: int = Field(ge=0)
     win_rate: float = Field(ge=0.0, le=1.0)
-    profit_factor: float = Field(
-        ge=0.0,
-        description="Gross profit / gross loss; inf if no losses",
+    profit_factor: float | None = Field(
+        default=None,
+        description=(
+            "Gross profit / gross loss. None when no trades (indeterminate) or "
+            "when all trades are winners (infinite — see profit_factor_is_infinite). "
+            "0.0 when all trades are losers. Positive float in the normal mixed case."
+        ),
+    )
+    profit_factor_is_infinite: bool = Field(
+        default=False,
+        description="True iff there are winning trades but zero losing trades",
     )
     average_trade_pnl: Decimal
     average_win: Decimal
@@ -418,7 +428,7 @@ def compute_calmar(
 
 def compute_profit_factor(
     trades: Sequence[TradeResult],
-) -> float:
+) -> float | None:
     """
     Compute profit factor: gross profit / gross loss.
 
@@ -429,19 +439,24 @@ def compute_profit_factor(
 
     Returns
     -------
-    float
-        Profit factor >= 0.  Returns 0.0 if no trades.
-        Returns ``float('inf')`` if there are winning trades but zero
-        gross loss (no losing trades).
+    float | None
+        ``None`` if no trades (indeterminate — check :func:`is_profit_factor_infinite`
+        to distinguish from the infinite case).
+        ``None`` if gross_profit > 0 and gross_loss == 0 (infinite — use the
+        sibling helper :func:`is_profit_factor_infinite` to detect this state).
+        ``0.0`` if all trades are losers (no winners, well-defined sentinel).
+        Positive ``float`` in the normal mixed case.
 
     Notes
     -----
-    A profit factor > 1.0 indicates a profitable system on a gross
-    basis (before considering the return of capital).  Values above
-    2.0 are generally considered strong.
+    A profit factor > 1.0 indicates a profitable system on a gross basis
+    (before considering the return of capital).  Values above 2.0 are
+    generally considered strong.  The three-state encoding (None/0.0/float)
+    is wire-safe: JSON ``null`` signals indeterminate or infinite; the sibling
+    boolean ``is_profit_factor_infinite`` disambiguates.
     """
     if not trades:
-        return 0.0
+        return None
 
     gross_profit = Decimal("0")
     gross_loss = Decimal("0")
@@ -454,10 +469,42 @@ def compute_profit_factor(
 
     if gross_loss == Decimal("0"):
         if gross_profit > Decimal("0"):
-            return float("inf")
+            return None
         return 0.0
 
     return float(gross_profit / gross_loss)
+
+
+def is_profit_factor_infinite(trades: Sequence[TradeResult]) -> bool:
+    """Return True iff gross_profit > 0 AND gross_loss == 0.
+
+    This is the wire-safe companion to :func:`compute_profit_factor`.  When
+    ``compute_profit_factor`` returns ``None``, callers must check this helper
+    to distinguish the "infinite" state (winners exist, no losers) from the
+    "indeterminate" state (empty trade list).
+
+    Parameters
+    ----------
+    trades : Sequence[TradeResult]
+        Completed round-trip trades.
+
+    Returns
+    -------
+    bool
+        ``True`` iff the trade list is non-empty, gross_profit > 0, and
+        gross_loss == 0.  ``False`` for empty lists, all-loser lists, and
+        normal mixed lists.
+    """
+    if not trades:
+        return False
+    gross_profit = Decimal("0")
+    gross_loss = Decimal("0")
+    for trade in trades:
+        if trade.realised_pnl > Decimal("0"):
+            gross_profit += trade.realised_pnl
+        elif trade.realised_pnl < Decimal("0"):
+            gross_loss += abs(trade.realised_pnl)
+    return gross_profit > Decimal("0") and gross_loss == Decimal("0")
 
 
 def compute_max_drawdown(
@@ -659,6 +706,7 @@ def compute_trade_statistics(
 
     win_rate = winning_count / total if total > 0 else 0.0
     profit_factor = compute_profit_factor(trades)
+    pf_is_infinite = is_profit_factor_infinite(trades)
 
     return TradeStatistics(
         total_trades=total,
@@ -666,6 +714,7 @@ def compute_trade_statistics(
         losing_trades=losing_count,
         win_rate=win_rate,
         profit_factor=profit_factor,
+        profit_factor_is_infinite=pf_is_infinite,
         average_trade_pnl=average_pnl,
         average_win=average_win,
         average_loss=average_loss,

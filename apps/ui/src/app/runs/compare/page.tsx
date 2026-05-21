@@ -181,8 +181,10 @@ const METRIC_ROWS: MetricRow[] = [
     label: "Profit Factor",
     extract: (d) => pick(d.run.backtestMetrics, "profitFactor") as number | null,
     display: (d) => {
-      const v = d.run.backtestMetrics?.profitFactor;
-      return v != null ? v.toFixed(2) : "—";
+      const bm = d.run.backtestMetrics;
+      if (!bm) return "—";
+      if (bm.profitFactor === null) return bm.profitFactorIsInfinite ? "∞" : "—";
+      return bm.profitFactor.toFixed(2);
     },
     higherIsBetter: true,
   },

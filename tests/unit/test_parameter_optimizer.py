@@ -330,7 +330,9 @@ class TestParameterOptimizerMetrics:
         )
         result = await opt.run(_bars_by_symbol(200))
         for key, value in result.entries[0].metrics.items():
-            assert isinstance(value, float), f"{key} is {type(value)}, expected float"
+            assert value is None or isinstance(value, float), (
+                f"{key} is {type(value)}, expected float or None"
+            )
 
 
 # ===================================================================

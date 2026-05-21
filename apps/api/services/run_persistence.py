@@ -147,6 +147,7 @@ def build_backtest_metrics(result: Any) -> BacktestMetricsResponse:
         losing_trades=result.losing_trades,
         win_rate=result.win_rate,
         profit_factor=result.profit_factor,
+        profit_factor_is_infinite=result.profit_factor_is_infinite,
         average_trade_pnl=str(result.average_trade_pnl),
         average_win=str(result.average_win),
         average_loss=str(result.average_loss),

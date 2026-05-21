@@ -20,6 +20,7 @@ Design decisions
 
 from __future__ import annotations
 
+import math
 import uuid
 from datetime import datetime
 from decimal import Decimal
@@ -311,7 +312,14 @@ class BacktestMetricsResponse(BaseModel):
     winning_trades: int
     losing_trades: int
     win_rate: float
-    profit_factor: float
+    profit_factor: float | None = Field(
+        default=None,
+        description="Gross profit / gross loss. None when no trades or infinite. 0.0 when all losers.",
+    )
+    profit_factor_is_infinite: bool = Field(
+        default=False,
+        description="True iff winning trades exist but no losing trades",
+    )
     average_trade_pnl: str
     average_win: str
     average_loss: str
@@ -335,6 +343,13 @@ class BacktestMetricsResponse(BaseModel):
     )
     def serialise_decimal(self, v: Decimal | str) -> str:
         return str(v)
+
+    @field_serializer("profit_factor")
+    def serialise_profit_factor(self, v: float | None) -> float | None:
+        """Coerce legacy float('inf') to None; None and normal floats pass through."""
+        if v is not None and math.isinf(v):
+            return None
+        return v
 
 
 class RunDetailResponse(RunResponse):

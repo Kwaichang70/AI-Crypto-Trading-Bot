@@ -25,7 +25,9 @@ import pytest
 
 from common.types import OrderSide, TimeFrame
 from trading.metrics import (
+    BacktestResult,
     EquityCurvePoint,
+    TradeStatistics,
     compute_calmar,
     compute_cagr,
     compute_exposure,
@@ -36,6 +38,7 @@ from trading.metrics import (
     compute_sharpe,
     compute_sortino,
     compute_trade_statistics,
+    is_profit_factor_infinite,
 )
 from trading.models import TradeResult
 
@@ -325,16 +328,16 @@ class TestComputeCalmar:
 class TestComputeProfitFactor:
     """Tests for compute_profit_factor(trades)."""
 
-    def test_empty_trades_returns_zero(self) -> None:
-        """No trades returns 0.0 by convention."""
+    def test_empty_trades_returns_none(self) -> None:
+        """Zero trades -> None (indeterminate, not 0.0)."""
         result = compute_profit_factor([])
-        assert result == 0.0
+        assert result is None
 
-    def test_all_winning_trades_returns_inf(self) -> None:
-        """All winning trades with no losers returns float('inf')."""
+    def test_all_winning_trades_returns_none(self) -> None:
+        """All winning trades -> None (infinite semantics via sibling flag)."""
         trades = [_make_trade(100.0), _make_trade(200.0), _make_trade(50.0)]
         result = compute_profit_factor(trades)
-        assert math.isinf(result) and result > 0
+        assert result is None
 
     def test_all_losing_trades_returns_zero(self) -> None:
         """All losing trades with no winners returns 0.0."""
@@ -386,7 +389,92 @@ class TestComputeProfitFactor:
         """Profit factor = gross_profit / gross_loss across known inputs."""
         trades = [_make_trade(p) for p in wins + losses]
         result = compute_profit_factor(trades)
+        assert result is not None
         assert abs(result - expected) < 1e-9
+
+    # -----------------------------------------------------------------------
+    # Sprint 49 M1: three-state semantic tests
+    # -----------------------------------------------------------------------
+
+    def test_profit_factor_zero_trades_returns_none(self) -> None:
+        """Empty trade list -> (None, False) — indeterminate, not 'all losers'."""
+        pf = compute_profit_factor([])
+        flag = is_profit_factor_infinite([])
+        assert pf is None
+        assert flag is False
+
+    def test_profit_factor_only_winners_returns_none_with_inf_flag(self) -> None:
+        """3 wins, 0 losses -> profit_factor=None, is_infinite=True."""
+        trades = [_make_trade(100.0), _make_trade(75.0), _make_trade(25.0)]
+        pf = compute_profit_factor(trades)
+        flag = is_profit_factor_infinite(trades)
+        assert pf is None
+        assert flag is True
+
+    def test_profit_factor_only_losers_returns_zero_no_flag(self) -> None:
+        """0 wins, 3 losses -> profit_factor=0.0, is_infinite=False."""
+        trades = [_make_trade(-50.0), _make_trade(-30.0), _make_trade(-20.0)]
+        pf = compute_profit_factor(trades)
+        flag = is_profit_factor_infinite(trades)
+        assert pf == 0.0
+        assert flag is False
+
+    def test_profit_factor_mixed_returns_normal_value_no_flag(self) -> None:
+        """2 wins of $100 each + 1 loss of $50 -> profit_factor=4.0, is_infinite=False."""
+        trades = [_make_trade(100.0), _make_trade(100.0), _make_trade(-50.0)]
+        pf = compute_profit_factor(trades)
+        flag = is_profit_factor_infinite(trades)
+        assert pf is not None
+        assert abs(pf - 4.0) < 1e-9
+        assert flag is False
+
+    def test_trade_statistics_propagates_inf_flag(self) -> None:
+        """TradeStatistics built from winners-only has profit_factor=None, profit_factor_is_infinite=True."""
+        trades = [_make_trade(100.0), _make_trade(200.0)]
+        stats = compute_trade_statistics(trades)
+        assert stats.profit_factor is None
+        assert stats.profit_factor_is_infinite is True
+
+    def test_backtest_result_serializes_profit_factor_null_when_inf(self) -> None:
+        """BacktestResult.model_dump() returns profit_factor=None, profit_factor_is_infinite=True for all-winners."""
+        from datetime import UTC, datetime
+        from decimal import Decimal
+        from common.types import TimeFrame
+        result = BacktestResult(
+            run_id="test-bt",
+            strategy_ids=["test"],
+            symbols=["BTC/USDT"],
+            timeframe=TimeFrame.ONE_HOUR,
+            start_date=datetime(2024, 1, 1, tzinfo=UTC),
+            end_date=datetime(2024, 2, 1, tzinfo=UTC),
+            duration_days=31,
+            initial_capital=Decimal("10000"),
+            final_equity=Decimal("11000"),
+            total_return_pct=0.1,
+            cagr=0.1,
+            max_drawdown_pct=0.0,
+            max_drawdown_duration_bars=0,
+            sharpe_ratio=1.5,
+            sortino_ratio=2.0,
+            calmar_ratio=1.0,
+            total_trades=2,
+            winning_trades=2,
+            losing_trades=0,
+            win_rate=1.0,
+            profit_factor=None,
+            profit_factor_is_infinite=True,
+            average_trade_pnl=Decimal("500"),
+            average_win=Decimal("500"),
+            average_loss=Decimal("0"),
+            largest_win=Decimal("600"),
+            largest_loss=Decimal("0"),
+            total_bars=100,
+            bars_in_market=50,
+            exposure_pct=0.5,
+        )
+        dumped = result.model_dump()
+        assert dumped["profit_factor"] is None
+        assert dumped["profit_factor_is_infinite"] is True
 
 
 # ===========================================================================
@@ -657,7 +745,8 @@ class TestComputeTradeStatistics:
         stats = compute_trade_statistics([])
         assert stats.total_trades == 0
         assert stats.win_rate == 0.0
-        assert stats.profit_factor == 0.0
+        assert stats.profit_factor is None
+        assert stats.profit_factor_is_infinite is False
 
     def test_win_rate_calculation(self) -> None:
         """3 wins + 1 loss = 75% win rate."""

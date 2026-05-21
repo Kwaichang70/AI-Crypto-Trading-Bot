@@ -372,7 +372,7 @@ class TestBacktestRunNoSignals:
         assert isinstance(r.winning_trades, int) and r.winning_trades >= 0
         assert isinstance(r.losing_trades, int) and r.losing_trades >= 0
         assert isinstance(r.win_rate, float)
-        assert isinstance(r.profit_factor, float)
+        assert r.profit_factor is None or isinstance(r.profit_factor, float)
         assert isinstance(r.average_trade_pnl, Decimal)
         assert isinstance(r.average_win, Decimal)
         assert isinstance(r.average_loss, Decimal)

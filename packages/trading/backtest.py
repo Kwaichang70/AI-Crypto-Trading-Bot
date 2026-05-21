@@ -365,6 +365,7 @@ class BacktestRunner:
             losing_trades=trade_stats.losing_trades,
             win_rate=trade_stats.win_rate,
             profit_factor=trade_stats.profit_factor,
+            profit_factor_is_infinite=trade_stats.profit_factor_is_infinite,
             average_trade_pnl=trade_stats.average_trade_pnl,
             average_win=trade_stats.average_win,
             average_loss=trade_stats.average_loss,
@@ -392,7 +393,14 @@ class BacktestRunner:
             max_drawdown=f"{max_dd:.4%}",
             total_trades=trade_stats.total_trades,
             win_rate=f"{trade_stats.win_rate:.2%}",
-            profit_factor=f"{trade_stats.profit_factor:.2f}",
+            profit_factor=(
+                "n/a"
+                if trade_stats.profit_factor is None
+                and not trade_stats.profit_factor_is_infinite
+                else "inf"
+                if trade_stats.profit_factor_is_infinite
+                else f"{trade_stats.profit_factor:.2f}"
+            ),
             exposure=f"{exposure:.2%}",
             total_fees=str(portfolio.total_fees_paid),
         )

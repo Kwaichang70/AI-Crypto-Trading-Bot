@@ -63,7 +63,14 @@ export interface BacktestMetrics {
   winningTrades: number;
   losingTrades: number;
   winRate: number;
-  profitFactor: number;
+  /**
+   * Gross profit / gross loss.
+   * null  → no trades executed (profitFactorIsInfinite=false) OR all winners, zero losses (profitFactorIsInfinite=true).
+   * 0.0   → all trades were losers (well-defined; render normally).
+   * >0.0  → normal profitable/unprofitable ratio.
+   */
+  profitFactor: number | null;
+  profitFactorIsInfinite: boolean;
   averageTradePnl: string;
   averageWin: string;
   averageLoss: string;
