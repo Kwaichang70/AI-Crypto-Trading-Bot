@@ -24,7 +24,7 @@ import math
 import uuid
 from datetime import datetime
 from decimal import Decimal
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, Literal, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
 from pydantic.alias_generators import to_camel
@@ -372,6 +372,28 @@ class BacktestMetricsResponse(BaseModel):
         description=(
             "Positions still open when the backtest ended, marked to terminal "
             "bar close price. Excluded from trade-count statistics."
+        ),
+    )
+
+    # M4 (Sprint 49): PSR + statistical significance
+    psr: float | None = Field(
+        default=None,
+        description=(
+            "Probabilistic Sharpe Ratio per Bailey & López de Prado (2012). "
+            "Probability that the true Sharpe exceeds zero given observed sample. "
+            "None when fewer than 30 per-period return observations."
+        ),
+    )
+    n_observations: int = Field(
+        default=0,
+        description="Number of per-period return observations (equity curve length - 1).",
+    )
+    confidence_flag: Literal["high", "medium", "low"] | None = Field(
+        default=None,
+        description=(
+            "Statistical confidence tier: 'high' (PSR>=0.95, trades>=50), "
+            "'medium' (PSR>=0.80, trades>=30), 'low' (otherwise), "
+            "None (PSR not computable)."
         ),
     )
 

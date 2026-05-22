@@ -739,11 +739,34 @@ export default function RunDetailPage() {
                   <div className="card">
                     <h3 className="mb-3 text-sm font-semibold text-slate-700 dark:text-slate-300">Backtest Performance</h3>
                     <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
-                      <StatCard
-                        label="Sharpe Ratio"
-                        value={run.backtestMetrics.sharpeRatio.toFixed(3)}
-                        trend={run.backtestMetrics.sharpeRatio >= 1.0 ? "up" : run.backtestMetrics.sharpeRatio < 0 ? "down" : "neutral"}
-                      />
+                      {(() => {
+                        const m = run.backtestMetrics;
+                        const psr = m.psr ?? null;
+                        const flag = m.confidenceFlag ?? null;
+                        const psrText =
+                          psr === null
+                            ? "PSR: n/a"
+                            : `PSR: ${(psr * 100).toFixed(1)}% ${flag === "high" ? "✓ high" : flag === "medium" ? "medium" : "⚠ low"}`;
+                        // CR-002 INLINE FIX: use text-amber-500 for low (not text-slate-500)
+                        // This differentiates "low" from "null" visually; the ⚠ glyph carries the warning
+                        const psrClassName =
+                          psr === null
+                            ? "text-slate-500"
+                            : flag === "high"
+                            ? "text-profit"
+                            : flag === "medium"
+                            ? "text-amber-500"
+                            : "text-amber-500";  // low — was "text-slate-500" in producer; CR-002 changed to amber
+                        return (
+                          <StatCard
+                            label="Sharpe Ratio"
+                            value={m.sharpeRatio.toFixed(3)}
+                            subValue={psrText}
+                            subValueClassName={psrClassName}
+                            trend={m.sharpeRatio >= 1.0 ? "up" : m.sharpeRatio < 0 ? "down" : "neutral"}
+                          />
+                        );
+                      })()}
                       <StatCard
                         label="Sortino Ratio"
                         value={run.backtestMetrics.sortinoRatio.toFixed(3)}

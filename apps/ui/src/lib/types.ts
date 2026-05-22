@@ -109,6 +109,24 @@ export interface BacktestMetrics {
    * that lack the field deserialise without errors.
    */
   openPositionsMtm?: readonly OpenPositionMTM[];
+  /**
+   * Probabilistic Sharpe Ratio per Bailey & López de Prado (2012).
+   * Probability in [0, 1] that the true Sharpe exceeds zero.
+   * null when fewer than 30 return observations.
+   * Added by M4 backend (Sprint 49). Optional with `?` so pre-M4 run
+   * records that lack the field deserialise without errors.
+   */
+  psr?: number | null;
+  /**
+   * Number of per-period return observations used to compute PSR.
+   * Equals len(equity_curve) - 1.
+   */
+  nObservations?: number;
+  /**
+   * Three-tier confidence label derived from PSR and trade count.
+   * "high" | "medium" | "low" | null (when PSR not computable).
+   */
+  confidenceFlag?: "high" | "medium" | "low" | null;
 }
 
 export interface RunListResponse {

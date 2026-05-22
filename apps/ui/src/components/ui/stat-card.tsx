@@ -2,6 +2,7 @@ interface StatCardProps {
   label: string;
   value: string | number;
   subValue?: string | undefined;
+  subValueClassName?: string | undefined;
   trend?: "up" | "down" | "neutral";
   isLoading?: boolean;
 }
@@ -10,6 +11,7 @@ export function StatCard({
   label,
   value,
   subValue,
+  subValueClassName,
   trend,
   isLoading = false,
 }: StatCardProps) {
@@ -38,7 +40,7 @@ export function StatCard({
         {value}
       </p>
       {subValue && (
-        <p className="text-xs text-slate-500">{subValue}</p>
+        <p className={`text-xs ${subValueClassName ?? "text-slate-500"}`}>{subValue}</p>
       )}
     </div>
   );

@@ -103,4 +103,26 @@ describe("StatCard", () => {
     const valueEl = container.querySelector(".text-slate-400");
     expect(valueEl).toBeInTheDocument();
   });
+
+  // ---- subValueClassName override ------------------------------------------
+
+  it("applies a custom className to the subValue element when subValueClassName is provided", () => {
+    const { container } = render(
+      <StatCard label="Sharpe" value="1.42" subValue="PSR: 95.2% ✓ high" subValueClassName="text-profit" />,
+    );
+    const subEl = container.querySelector(".text-profit");
+    expect(subEl).toBeInTheDocument();
+    expect(subEl).toHaveTextContent("PSR:");
+  });
+
+  it("falls back to text-slate-500 on the subValue element when subValueClassName is omitted", () => {
+    render(
+      <StatCard label="Sharpe" value="1.42" subValue="annualised" />,
+    );
+    // Without subValueClassName, the subValue element must carry text-slate-500.
+    // We target via text content to avoid matching the label element which also uses text-slate-500.
+    const subEl = screen.getByText("annualised");
+    expect(subEl).toBeInTheDocument();
+    expect(subEl).toHaveClass("text-slate-500");
+  });
 });

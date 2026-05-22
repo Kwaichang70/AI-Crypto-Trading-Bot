@@ -27,18 +27,22 @@ from __future__ import annotations
 import math
 from datetime import datetime
 from decimal import Decimal
-from typing import Sequence
+from typing import Literal, Sequence
 
 import structlog
 from pydantic import BaseModel, Field
 
 from common.types import TimeFrame
 from trading.models import TradeResult
+from trading._statistics import _norm_cdf  # noqa: PLC2701 — shared statistics helper
+from trading.walk_forward import deflated_sharpe_ratio  # noqa: F401 — thin re-export for consumers
 
 __all__ = [
     "BacktestResult",
     "EquityCurvePoint",
     "OpenPositionMTM",
+    "compute_psr",
+    "deflated_sharpe_ratio",
     "compute_cagr",
     "compute_sharpe",
     "compute_sortino",
@@ -218,6 +222,36 @@ class BacktestResult(BaseModel):
     )
     calmar_ratio: float = Field(
         description="CAGR / max_drawdown",
+    )
+
+    # M4 (Sprint 49): PSR + statistical significance fields
+    psr: float | None = Field(
+        default=None,
+        description=(
+            "Probabilistic Sharpe Ratio per Bailey & López de Prado (2012). "
+            "Probability that the true Sharpe exceeds the benchmark (0) given "
+            "the observed sample Sharpe and its higher moments. "
+            "None when n_observations < _PSR_MIN_OBSERVATIONS (insufficient sample). "
+            "See _PSR_HIGH_THRESHOLD and _PSR_MEDIUM_THRESHOLD for confidence tiers."
+        ),
+    )
+    n_observations: int = Field(
+        default=0,
+        ge=0,
+        description="Number of per-period return observations (len(equity_curve) - 1).",
+    )
+    confidence_flag: Literal["high", "medium", "low"] | None = Field(
+        default=None,
+        description=(
+            "Statistical confidence tier derived from PSR and n_closed_trades. "
+            "'high': PSR >= _PSR_HIGH_THRESHOLD AND n_closed_trades >= _N_TRADES_HIGH_THRESHOLD. "
+            "'medium': PSR >= _PSR_MEDIUM_THRESHOLD AND n_closed_trades >= _N_TRADES_MEDIUM_THRESHOLD. "
+            "'low': otherwise (PSR computable but thresholds not met). "
+            "None: when PSR is None (insufficient observations). "
+            "Thresholds are stricter than textbook (_N_TRADES_HIGH_THRESHOLD=50 for 'high') "
+            "to align with the live-promotion gate (200-trade requirement, FASE 2). "
+            "Hard-coded per user decision 2026-05-21; see sprint49-quant-thresholds.md."
+        ),
     )
 
     # Trade statistics
@@ -777,6 +811,159 @@ def compute_trade_statistics(
         gross_profit=gross_profit,
         gross_loss=gross_loss,
     )
+
+
+# ---------------------------------------------------------------------------
+# M4 (Sprint 49): confidence-flag thresholds.
+# Hard-coded per user decision 2026-05-21 (sprint49-quant-thresholds.md):
+# NOT config-tunable — the looser textbook defaults would just get re-picked.
+# Stricter than Bailey & López de Prado defaults (n>=50 for 'high', not 30)
+# to align with the live-promotion gate (200-trade requirement, FASE 2).
+# ---------------------------------------------------------------------------
+_PSR_HIGH_THRESHOLD: float = 0.95
+_N_TRADES_HIGH_THRESHOLD: int = 50
+_PSR_MEDIUM_THRESHOLD: float = 0.80
+_N_TRADES_MEDIUM_THRESHOLD: int = 30
+# Minimum per-period observations for PSR to be statistically meaningful
+# (asymptotic CDF approximation reliability — Bailey & López de Prado 2012).
+_PSR_MIN_OBSERVATIONS: int = 30
+
+
+# ===================================================================
+# M4 (Sprint 49): Probabilistic Sharpe Ratio
+# ===================================================================
+
+
+def compute_psr(
+    observed_sharpe: float,
+    n_observations: int,
+    *,
+    sr_benchmark: float = 0.0,
+    skew: float = 0.0,
+    kurtosis: float = 3.0,
+) -> float | None:
+    """Probabilistic Sharpe Ratio per Bailey & López de Prado (2012), eq. 5.
+
+    Computes the probability that the true (population) Sharpe ratio exceeds
+    ``sr_benchmark`` given the observed sample Sharpe and its higher moments.
+
+    Formula
+    -------
+    ::
+
+        denominator = sqrt(
+            (1 - skew * SR_obs + (kurtosis - 1) / 4 * SR_obs^2) / (n - 1)
+        )
+        z = (SR_obs - SR_benchmark) / denominator
+        PSR = Φ(z)
+
+    where Φ is the standard normal CDF.
+
+    Parameters
+    ----------
+    observed_sharpe:
+        Per-period (NOT annualised) Sharpe ratio.  Callers must de-annualise
+        before passing: ``per_period_sharpe = annual_sharpe / sqrt(periods_per_year)``.
+    n_observations:
+        Number of per-period return observations (``len(equity_curve) - 1``).
+        Must be >= _PSR_MIN_OBSERVATIONS for the asymptotic CDF approximation
+        to be reliable.
+    sr_benchmark:
+        Benchmark Sharpe to test against.  Default 0 — tests if the strategy
+        has any positive expected Sharpe at all.
+    skew:
+        Sample skewness of per-period returns (population moment, divide by n).
+        Default 0.0 (symmetric, normal-like).
+    kurtosis:
+        Sample kurtosis of per-period returns — NOT excess kurtosis; normal
+        distribution has kurtosis = 3.  Default 3.0.
+
+    Returns
+    -------
+    float | None
+        Probability in [0, 1], or ``None`` when:
+        - ``n_observations < _PSR_MIN_OBSERVATIONS`` (insufficient sample for
+          asymptotic validity)
+        - Denominator underflows below ``1e-12`` (degenerate case)
+
+    Notes
+    -----
+    Bailey & López de Prado (2012) use population moments in their paper.
+    This function expects pre-computed population skewness and kurtosis.
+    For sample sizes >= _PSR_MIN_OBSERVATIONS the bias difference is negligible.
+
+    The original paper's formula uses the per-period Sharpe.  If you have an
+    annualised Sharpe from ``compute_sharpe()``, de-annualise it first::
+
+        per_period_sharpe = annual_sharpe / math.sqrt(periods_per_year)
+
+    References
+    ----------
+    Bailey, D. H., & López de Prado, M. (2012).
+    The Sharpe Ratio Efficient Frontier.
+    *Journal of Risk*, 15(2), 3-44.
+    """
+    if n_observations < _PSR_MIN_OBSERVATIONS:
+        return None
+
+    sr = observed_sharpe
+    n = n_observations
+
+    # Variance of the Sharpe estimator under the null
+    # Formula: Var(SR_hat) = (1 - skew*SR + (kurt-1)/4*SR^2) / (n-1)
+    var_numerator = 1.0 - skew * sr + (kurtosis - 1.0) / 4.0 * sr * sr
+    if var_numerator <= 0.0:
+        # Numerator can go negative for very large |SR| with strong skew/kurtosis.
+        # This signals a degenerate input; return None rather than a spurious result.
+        return None
+
+    denominator = math.sqrt(var_numerator / (n - 1))
+    if denominator < 1e-12:
+        return None
+
+    z = (sr - sr_benchmark) / denominator
+    return _norm_cdf(z)
+
+
+def _derive_confidence_flag(
+    psr: float | None,
+    n_closed_trades: int,
+) -> Literal["high", "medium", "low"] | None:
+    """Map PSR and trade count to a three-tier confidence label.
+
+    Thresholds (hard-coded per user decision 2026-05-21,
+    sprint49-quant-thresholds.md):
+
+    - ``"high"``:   PSR >= _PSR_HIGH_THRESHOLD AND n_closed_trades >= _N_TRADES_HIGH_THRESHOLD
+    - ``"medium"``: PSR >= _PSR_MEDIUM_THRESHOLD AND n_closed_trades >= _N_TRADES_MEDIUM_THRESHOLD
+    - ``"low"``:    PSR computable but neither threshold met
+
+    Thresholds are intentionally STRICTER than the Bailey & López de Prado
+    textbook defaults (which use n>=30 for 'high').  The _N_TRADES_HIGH_THRESHOLD-trade
+    floor aligns with the eventual live-promotion gate from ModelAnalyse FASE 2,
+    ensuring that backtests short-listed for live deployment have demonstrated
+    enough trade activity for the PSR to be operationally credible.
+
+    Parameters
+    ----------
+    psr:
+        Probabilistic Sharpe Ratio from ``compute_psr()``.
+        ``None`` when n_observations < _PSR_MIN_OBSERVATIONS.
+    n_closed_trades:
+        Number of completed round-trip trades in the backtest.
+
+    Returns
+    -------
+    Literal["high", "medium", "low"] | None
+        ``None`` when ``psr is None``.
+    """
+    if psr is None:
+        return None
+    if psr >= _PSR_HIGH_THRESHOLD and n_closed_trades >= _N_TRADES_HIGH_THRESHOLD:
+        return "high"
+    if psr >= _PSR_MEDIUM_THRESHOLD and n_closed_trades >= _N_TRADES_MEDIUM_THRESHOLD:
+        return "medium"
+    return "low"
 
 
 # ===================================================================

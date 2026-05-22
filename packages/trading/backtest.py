@@ -58,6 +58,8 @@ from trading.metrics import (
     BacktestResult,
     EquityCurvePoint,
     OpenPositionMTM,
+    _derive_confidence_flag,  # noqa: PLC2701 - private helper, same-package call
+    compute_psr,
     TIMEFRAME_PERIODS_PER_YEAR,
     compute_cagr,
     compute_calmar,
@@ -368,8 +370,41 @@ class BacktestRunner:
         sortino = compute_sortino(per_period_returns, periods_per_year)
         calmar = compute_calmar(cagr, max_dd)
 
+        # M4 (Sprint 49): PSR + statistical confidence fields
+        n_obs = len(per_period_returns)
+        # De-annualise Sharpe for PSR — Bailey's formula uses per-period Sharpe.
+        # per_period_sharpe = annual_sharpe / sqrt(periods_per_year)
+        per_period_sharpe = (
+            sharpe / math.sqrt(periods_per_year)
+            if periods_per_year > 0
+            else sharpe
+        )
+        # Compute population skewness and kurtosis from per-period returns
+        psr_skew = 0.0
+        psr_kurtosis = 3.0  # normal distribution default
+        if n_obs >= 4:
+            _mean = sum(per_period_returns) / n_obs
+            _var = sum((r - _mean) ** 2 for r in per_period_returns) / n_obs  # population
+            _std = math.sqrt(_var)
+            if _std > 0.0:
+                psr_skew = sum(
+                    (r - _mean) ** 3 for r in per_period_returns
+                ) / (n_obs * _std ** 3)
+                psr_kurtosis = sum(
+                    (r - _mean) ** 4 for r in per_period_returns
+                ) / (n_obs * _std ** 4)
+        psr = compute_psr(
+            per_period_sharpe,
+            n_obs,
+            skew=psr_skew,
+            kurtosis=psr_kurtosis,
+        )
+
         # 15. Compute trade statistics
         trade_stats = compute_trade_statistics(trade_history)
+
+        # confidence_flag depends on both PSR and trade count — computed after trade_stats
+        confidence_flag = _derive_confidence_flag(psr, trade_stats.total_trades)
 
         exposure = compute_exposure(bars_in_market, total_bars_processed)
 
@@ -419,6 +454,10 @@ class BacktestRunner:
             open_positions_mtm=open_positions_mtm,
             # Fees
             total_fees_paid=portfolio.total_fees_paid,
+            # M4 (Sprint 49): PSR + statistical significance
+            psr=psr,
+            n_observations=n_obs,
+            confidence_flag=confidence_flag,
         )
 
         self._log.info(
@@ -442,6 +481,8 @@ class BacktestRunner:
             ),
             exposure=f"{exposure:.2%}",
             total_fees=str(portfolio.total_fees_paid),
+            psr=f"{psr:.4f}" if psr is not None else "n/a",
+            confidence_flag=confidence_flag or "n/a",
         )
 
         self._last_execution_engine = exec_engine

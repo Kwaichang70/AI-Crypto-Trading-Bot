@@ -22,6 +22,7 @@ from trading.metrics import (
     EquityCurvePoint,
     OpenPositionMTM,
     TradeStatistics,
+    compute_psr,
     compute_cagr,
     compute_calmar,
     compute_exposure,
@@ -96,6 +97,7 @@ __all__ = [
     "OpenPositionMTM",
     "TradeStatistics",
     # Metric functions
+    "compute_psr",
     "compute_cagr",
     "compute_sharpe",
     "compute_sortino",

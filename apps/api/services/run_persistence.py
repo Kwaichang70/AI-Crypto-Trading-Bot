@@ -171,6 +171,10 @@ def build_backtest_metrics(result: Any) -> BacktestMetricsResponse:
             )
             for pos in getattr(result, "open_positions_mtm", [])
         ],
+        # M4 (Sprint 49): PSR + statistical significance
+        psr=getattr(result, "psr", None),
+        n_observations=getattr(result, "n_observations", 0),
+        confidence_flag=getattr(result, "confidence_flag", None),
     )
 
 
