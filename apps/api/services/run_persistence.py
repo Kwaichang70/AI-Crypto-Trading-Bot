@@ -45,7 +45,14 @@ from api.db.models import (
     RunORM,
     TradeORM,
 )
-from api.schemas import BacktestMetricsResponse, OpenPositionMTMResponse, RunDetailResponse, RunResponse
+from api.schemas import (
+    BacktestMetricsResponse,
+    LEADERBOARD_ELIGIBLE_FLAGS,
+    LEADERBOARD_MIN_CLOSED_TRADES,
+    OpenPositionMTMResponse,
+    RunDetailResponse,
+    RunResponse,
+)
 
 __all__ = [
     "build_backtest_metrics",
@@ -66,6 +73,11 @@ logger = structlog.get_logger(__name__)
 def run_orm_to_response(run: RunORM) -> RunResponse:
     """Convert a ``RunORM`` instance to a ``RunResponse`` Pydantic model.
 
+    M5 (Sprint 49): extracts confidence_flag and psr from JSONB after
+    model_validate; computes leaderboard_eligible at call site since
+    model_copy() in Pydantic v2 does not accept a validate= parameter
+    and does not re-trigger model_validator(mode="after").
+
     Parameters
     ----------
     run:
@@ -76,7 +88,44 @@ def run_orm_to_response(run: RunORM) -> RunResponse:
     RunResponse
         The API response model.
     """
-    return RunResponse.model_validate(run)
+    # Step 1: top-level columns via from_attributes.
+    # n_closed_trades maps automatically (top-level column, field default=None).
+    response = RunResponse.model_validate(run)
+
+    # Step 2: extract JSONB-resident leaderboard fields (confidence_flag, psr).
+    # These are NOT top-level SQL columns; they live in config["backtest_metrics"].
+    # Best-effort: a parse failure must not crash a list-runs GET.
+    raw_metrics: dict[str, Any] | None = (run.config or {}).get("backtest_metrics")
+    if not isinstance(raw_metrics, dict):
+        return response
+
+    updates: dict[str, Any] = {}
+
+    raw_flag = raw_metrics.get("confidence_flag")
+    if raw_flag in {"high", "medium", "low"}:
+        updates["confidence_flag"] = raw_flag
+
+    raw_psr = raw_metrics.get("psr")
+    if isinstance(raw_psr, (int, float)) and not (
+        isinstance(raw_psr, float) and (math.isinf(raw_psr) or math.isnan(raw_psr))
+    ):
+        updates["psr"] = float(raw_psr)
+
+    if not updates:
+        return response
+
+    # Compute leaderboard_eligible here rather than relying on model_validator
+    # re-firing after model_copy(). Pydantic v2's model_copy() does NOT accept
+    # a validate= parameter and does NOT re-trigger validators.
+    final_flag = updates.get("confidence_flag", response.confidence_flag)
+    final_n = response.n_closed_trades
+    updates["leaderboard_eligible"] = (
+        final_n is not None
+        and final_n >= LEADERBOARD_MIN_CLOSED_TRADES
+        and final_flag in LEADERBOARD_ELIGIBLE_FLAGS
+    )
+
+    return response.model_copy(update=updates)
 
 
 def run_orm_to_detail_response(run: RunORM) -> RunDetailResponse:

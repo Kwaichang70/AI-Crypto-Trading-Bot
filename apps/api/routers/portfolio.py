@@ -46,6 +46,8 @@ from api.schemas import (
     EquityCurveResponse,
     EquityPointResponse,
     ErrorResponse,
+    LEADERBOARD_ELIGIBLE_FLAGS,
+    LEADERBOARD_MIN_CLOSED_TRADES,
     PortfolioResponse,
     PositionListResponse,
     PositionResponse,
@@ -682,7 +684,8 @@ async def get_aggregate_portfolio(
     ]
 
     total_initial_capital = Decimal("0")
-    return_pcts: list[float] = []
+    eligible_runs_count: int = 0
+    return_pcts_eligible: list[float] = []
 
     for cfg in config_rows:
         # Sum initial capital (stored as string e.g. "10000.00")
@@ -693,18 +696,34 @@ async def get_aggregate_portfolio(
             except Exception:
                 pass
 
-        # Collect backtest return percentages (snake_case keys in JSONB)
+        # M5 (Sprint 49): gate best/worst on eligibility (INF-8 fix).
+        # Ineligible runs are not counted in eligible_runs_count and not
+        # appended to return_pcts_eligible.
+        # JSONB key "total_trades" == RunORM.n_closed_trades (same source:
+        # BacktestResult.total_trades written by persist_backtest_results).
         raw_metrics = cfg.get("backtest_metrics")
-        if isinstance(raw_metrics, dict):
-            ret_pct = raw_metrics.get("total_return_pct")
-            if ret_pct is not None:
-                try:
-                    return_pcts.append(float(ret_pct))
-                except (TypeError, ValueError):
-                    pass
+        if not isinstance(raw_metrics, dict):
+            continue
 
-    best_return: float | None = max(return_pcts) if return_pcts else None
-    worst_return: float | None = min(return_pcts) if return_pcts else None
+        n_trades = raw_metrics.get("total_trades")
+        flag = raw_metrics.get("confidence_flag")
+        if not (
+            isinstance(n_trades, int)
+            and n_trades >= LEADERBOARD_MIN_CLOSED_TRADES
+            and flag in LEADERBOARD_ELIGIBLE_FLAGS
+        ):
+            continue
+
+        eligible_runs_count += 1
+        ret_pct = raw_metrics.get("total_return_pct")
+        if ret_pct is not None:
+            try:
+                return_pcts_eligible.append(float(ret_pct))
+            except (TypeError, ValueError):
+                pass
+
+    best_return: float | None = max(return_pcts_eligible) if return_pcts_eligible else None
+    worst_return: float | None = min(return_pcts_eligible) if return_pcts_eligible else None
 
     log.info(
         "aggregate_portfolio.fetched",
@@ -726,4 +745,5 @@ async def get_aggregate_portfolio(
         best_run_return_pct=best_return,
         worst_run_return_pct=worst_return,
         total_initial_capital=str(total_initial_capital),
+        eligible_runs_count=eligible_runs_count,
     )

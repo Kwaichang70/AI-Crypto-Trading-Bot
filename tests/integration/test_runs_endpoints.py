@@ -83,10 +83,15 @@ def _make_run_orm(
     stopped_at: datetime | None = None,
     created_at: datetime = _FIXED_NOW,
     updated_at: datetime = _FIXED_NOW,
+    n_closed_trades: int | None = None,
 ) -> SimpleNamespace:
     """
     Construct a SimpleNamespace with the same attribute surface as RunORM,
     suitable for Pydantic from_attributes=True serialization.
+
+    n_closed_trades:
+        Added by M5 (Sprint 49).  Defaults to None so all pre-M5 tests
+        continue to work without changes.
     """
     return SimpleNamespace(
         id=run_id,
@@ -104,6 +109,7 @@ def _make_run_orm(
         stopped_at=stopped_at,
         created_at=created_at,
         updated_at=updated_at,
+        n_closed_trades=n_closed_trades,
     )
 
 

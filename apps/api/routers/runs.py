@@ -716,12 +716,24 @@ async def create_run(
 _VALID_MODES: frozenset[str] = frozenset({"backtest", "paper", "live"})
 _VALID_STATUSES: frozenset[str] = frozenset({"running", "stopped", "error", "archived"})
 
+# M5 (Sprint 49): allowed sort column names for GET /api/v1/runs.
+# Only top-level RunORM columns are permitted — JSONB-resident fields (psr,
+# sharpe_ratio) are excluded because they have no index and produce fragile
+# mypy types under strict mode.  Frontend sorts JSONB fields client-side
+# within the 50-row page.  See M5 producer report §3 for full rationale.
+_VALID_SORT_BY: frozenset[str] = frozenset({"created_at", "n_closed_trades"})
+_VALID_SORT_ORDERS: frozenset[str] = frozenset({"asc", "desc"})
+
 
 @router.get(
     "",
     response_model=RunListResponse,
     summary="List all trading runs",
-    description="Returns a paginated list of all runs, ordered by creation time descending.",
+    description=(
+        "Returns a paginated list of all runs with optional server-side filtering "
+        "and sorting.  Default order is creation time descending.  Sortable by "
+        "created_at or n_closed_trades (top-level columns only)."
+    ),
 )
 async def list_runs(
     db: Annotated[AsyncSession, Depends(get_db)],
@@ -755,6 +767,32 @@ async def list_runs(
         bool,
         Query(description="When true, include archived runs in results (default: false)"),
     ] = False,
+    min_closed_trades: Annotated[
+        int | None,
+        Query(
+            ge=0,
+            description=(
+                "Filter: only return runs with n_closed_trades >= this value. "
+                "NULL runs (paper/live/pre-M3 backtests) are excluded when this "
+                "param is supplied."
+            ),
+        ),
+    ] = None,
+    sort_by: Annotated[
+        str | None,
+        Query(
+            description=(
+                "Column to sort by. Allowed values: created_at, n_closed_trades. "
+                "Defaults to created_at. Values not in the allowed set return HTTP 422."
+            ),
+        ),
+    ] = None,
+    sort_order: Annotated[
+        str,
+        Query(
+            description="Sort direction: 'desc' (default) or 'asc'.",
+        ),
+    ] = "desc",
 ) -> RunListResponse:
     """
     List all trading runs with pagination and optional server-side filtering.
@@ -781,6 +819,14 @@ async def list_runs(
         Optional ISO-8601 lower bound on created_at (inclusive).
     created_before:
         Optional ISO-8601 upper bound on created_at (inclusive).
+    min_closed_trades:
+        Optional minimum n_closed_trades threshold. Runs with NULL
+        n_closed_trades (paper/live/pre-M3) are excluded when supplied.
+    sort_by:
+        Column to sort by. Allowed: created_at, n_closed_trades.
+        Invalid values raise HTTP 422.
+    sort_order:
+        Sort direction. Allowed: asc, desc. Invalid values raise HTTP 422.
 
     Returns
     -------
@@ -797,6 +843,9 @@ async def list_runs(
         symbol=symbol,
         created_after=created_after,
         created_before=created_before,
+        min_closed_trades=min_closed_trades,
+        sort_by=sort_by,
+        sort_order=sort_order,
     )
     log.info("runs.list_requested")
 
@@ -810,6 +859,19 @@ async def list_runs(
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"Invalid status '{run_status}'. Must be one of: {sorted(_VALID_STATUSES)}",
+        )
+    if sort_by is not None and sort_by not in _VALID_SORT_BY:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"Invalid sort_by '{sort_by}'. "
+                f"Must be one of: {sorted(_VALID_SORT_BY)}"
+            ),
+        )
+    if sort_order not in _VALID_SORT_ORDERS:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Invalid sort_order '{sort_order}'. Must be 'asc' or 'desc'.",
         )
 
     # Build filter conditions
@@ -830,6 +892,12 @@ async def list_runs(
     # Symbol filter — substring match against the JSON-serialised symbols array
     if symbol is not None:
         filters.append(cast(RunORM.config["symbols"], String).contains(symbol))
+
+    # min_closed_trades filter — NULL rows are excluded implicitly by >= comparison.
+    # Runs where n_closed_trades IS NULL (paper/live/pre-M3) will not satisfy
+    # n_closed_trades >= N and are therefore excluded when the param is set.
+    if min_closed_trades is not None:
+        filters.append(RunORM.n_closed_trades >= min_closed_trades)
 
     # Date range filters — parse ISO-8601, raise 422 for malformed input
     if created_after is not None:
@@ -874,7 +942,24 @@ async def list_runs(
     )
     if filters:
         page_stmt = page_stmt.where(*filters)
-    page_stmt = page_stmt.order_by(RunORM.created_at.desc()).offset(offset).limit(limit)
+
+    # Dynamic ORDER BY — default is created_at DESC (existing behaviour).
+    # n_closed_trades DESC puts NULL last in PostgreSQL (NULLs sort after all
+    # values in DESC order); we use NULLS LAST to be explicit and portable.
+    # Type-safe: order_by is applied inside each branch to avoid mypy strict
+    # complaints about reassigning a variable with incompatible column types.
+    effective_sort = sort_by or "created_at"
+    if effective_sort == "n_closed_trades":
+        if sort_order == "asc":
+            page_stmt = page_stmt.order_by(RunORM.n_closed_trades.asc().nulls_last())
+        else:
+            page_stmt = page_stmt.order_by(RunORM.n_closed_trades.desc().nulls_last())
+    else:  # created_at (default)
+        if sort_order == "asc":
+            page_stmt = page_stmt.order_by(RunORM.created_at.asc())
+        else:
+            page_stmt = page_stmt.order_by(RunORM.created_at.desc())
+    page_stmt = page_stmt.offset(offset).limit(limit)
     result = await db.execute(page_stmt)
     runs = list(result.scalars().all())
 

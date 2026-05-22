@@ -220,6 +220,9 @@ export async function fetchRuns(params?: {
   symbol?: string;
   createdAfter?: string;
   createdBefore?: string;
+  minClosedTrades?: number;
+  sortBy?: "created_at" | "n_closed_trades";
+  sortOrder?: "asc" | "desc";
 }): Promise<ApiResult<RunListResponse>> {
   const qs = new URLSearchParams();
   if (params?.offset !== undefined) qs.set("offset", String(params.offset));
@@ -230,6 +233,10 @@ export async function fetchRuns(params?: {
   if (params?.symbol) qs.set("symbol", params.symbol);
   if (params?.createdAfter) qs.set("created_after", params.createdAfter);
   if (params?.createdBefore) qs.set("created_before", params.createdBefore);
+  if (params?.minClosedTrades !== undefined)
+    qs.set("min_closed_trades", String(params.minClosedTrades));
+  if (params?.sortBy) qs.set("sort_by", params.sortBy);
+  if (params?.sortOrder) qs.set("sort_order", params.sortOrder);
   const query = qs.toString() ? `?${qs.toString()}` : "";
   return apiGet<RunListResponse>(`/api/v1/runs${query}`, {
     cache: "no-store",

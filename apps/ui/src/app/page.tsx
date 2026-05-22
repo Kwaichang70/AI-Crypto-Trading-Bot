@@ -123,7 +123,7 @@ export default async function DashboardPage() {
       />
 
       {/* Summary cards — 2 rows of 3 */}
-      <section aria-label="Summary metrics" className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+      <section aria-label="Summary metrics" className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
         <StatCard
           label="Total Runs"
           value={aggregate?.totalRuns ?? 0}
@@ -202,6 +202,29 @@ export default async function DashboardPage() {
                     ? "down"
                     : "neutral"
               }
+            />
+          );
+        })()}
+        {(() => {
+          const total = aggregate?.totalRuns ?? 0;
+          const eligible = aggregate?.eligibleRunsCount ?? 0;
+          const bestReturn = aggregate?.bestRunReturnPct ?? null;
+          const subtitle = total > 0 ? `${eligible} of ${total} runs eligible` : "no runs yet";
+          const value = bestReturn === null ? "—" : `${bestReturn >= 0 ? "+" : ""}${(bestReturn * 100).toFixed(2)}%`;
+          const bestTrend: "up" | "down" | "neutral" =
+            bestReturn === null
+              ? "neutral"
+              : bestReturn > 0
+                ? "up"
+                : bestReturn < 0
+                  ? "down"
+                  : "neutral";
+          return (
+            <StatCard
+              label="Best Return (eligible)"
+              value={value}
+              trend={bestTrend}
+              subValue={subtitle}
             />
           );
         })()}

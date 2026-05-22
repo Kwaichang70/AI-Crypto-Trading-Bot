@@ -40,6 +40,35 @@ export interface Run {
   createdAt: string;
   updatedAt: string;
   backtestMetrics?: BacktestMetrics | null;
+  /**
+   * Number of closed (round-trip) trades in this run.
+   * null for pre-M5 run records or when no trades executed yet.
+   * Added by M5 backend (Sprint 49). Optional with `?` so older records
+   * deserialise without errors.
+   */
+  nClosedTrades?: number | null;
+  /**
+   * Three-tier confidence label derived from PSR and trade count.
+   * "high" | "medium" | "low" | null (when PSR not computable).
+   * Duplicates BacktestMetrics.confidenceFlag so the runs-list page can
+   * render a badge without fetching full backtest metrics.
+   * Added by M5 backend (Sprint 49).
+   */
+  confidenceFlag?: "high" | "medium" | "low" | null;
+  /**
+   * Probabilistic Sharpe Ratio surface value exposed at the run level
+   * so it is sortable / filterable from the list endpoint.
+   * null when fewer than 30 return observations.
+   * Added by M5 backend (Sprint 49).
+   */
+  psr?: number | null;
+  /**
+   * True when this run meets the leaderboard eligibility criteria
+   * (n_closed_trades >= 10 AND confidence_flag IN ("high", "medium")).
+   * Defaults to false for pre-M5 records and runs with insufficient data.
+   * Added by M5 backend (Sprint 49).
+   */
+  leaderboardEligible?: boolean;
 }
 
 /**
@@ -276,6 +305,13 @@ export interface AggregatePortfolio {
   bestRunReturnPct: number | null;
   worstRunReturnPct: number | null;
   totalInitialCapital: string;
+  /**
+   * Number of runs that meet leaderboard eligibility criteria
+   * (n_closed_trades >= 10 AND confidence_flag IN ("high", "medium")).
+   * Used by the home-page "Best Return (eligible)" card subtitle.
+   * Added by M5 backend (Sprint 49). Optional with `?` for backward compat.
+   */
+  eligibleRunsCount?: number;
 }
 
 export interface EquityPoint {

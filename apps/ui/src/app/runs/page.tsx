@@ -3,7 +3,7 @@
  */
 "use client";
 
-import { Suspense, useEffect, useState } from "react";
+import { Suspense, useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { fetchRuns, formatPct } from "@/lib/api";
@@ -31,6 +31,48 @@ const STATUS_OPTIONS: { value: RunStatus | "all"; label: string }[] = [
 const PAGE_SIZE_OPTIONS = [10, 25, 50, 100] as const;
 
 const MAX_COMPARE = 5;
+
+// Valid server-side sort keys exposed by the M5 backend.
+type ServerSortBy = "created_at" | "n_closed_trades";
+type ServerSortOrder = "asc" | "desc";
+
+// ---------------------------------------------------------------------------
+// ConfidenceBadge — inline component; no separate file needed (single use).
+// Colour semantics mirror the M4 PSR/confidence StatCard (run-detail page):
+//   high   → green (badge-success)
+//   medium → amber (badge-warning)
+//   low    → muted amber with ⚠ prefix
+//   null   → slate (badge-neutral) with em dash
+// CR-004 fallback: NOT exported — Next.js page files allow only framework-
+// reserved export names (default, metadata, generateStaticParams, etc.);
+// an arbitrary named export violates the .next/types constraint and causes
+// a tsc error. Test file uses an inline copy with FIXME comment.
+// Future: extract to components/ui/confidence-badge.tsx.
+// ---------------------------------------------------------------------------
+
+function ConfidenceBadge({
+  flag,
+}: {
+  flag: "high" | "medium" | "low" | null | undefined;
+}) {
+  if (flag === "high") {
+    return <span className="badge-success">high</span>;
+  }
+  if (flag === "medium") {
+    return <span className="badge-warning">medium</span>;
+  }
+  if (flag === "low") {
+    return (
+      <span className="inline-flex items-center rounded-full bg-amber-50 px-2.5 py-0.5 text-xs font-medium text-amber-600 dark:bg-amber-900/20 dark:text-amber-500">
+        ⚠ low
+      </span>
+    );
+  }
+  // null / undefined — run has no metrics or insufficient observations
+  return (
+    <span className="badge-neutral">—</span>
+  );
+}
 
 /**
  * Build the column list. The checkbox column is first and captures the
@@ -146,6 +188,53 @@ function buildColumns(
       },
     },
     {
+      key: "closedTrades",
+      header: "Closed Trades",
+      sortable: true,
+      sortValue: (run) => run.nClosedTrades ?? 0,
+      render: (run) => {
+        const val = run.nClosedTrades;
+        if (val === undefined || val === null) {
+          return <span className="text-slate-400 dark:text-slate-600 text-xs">—</span>;
+        }
+        return (
+          <span className="font-mono text-xs text-slate-700 dark:text-slate-300">
+            {val}
+          </span>
+        );
+      },
+    },
+    {
+      key: "confidence",
+      header: "Confidence",
+      sortable: false,
+      render: (run) => <ConfidenceBadge flag={run.confidenceFlag} />,
+    },
+    {
+      key: "psr",
+      header: "PSR",
+      sortable: true,
+      sortValue: (run) => run.psr ?? 0,
+      render: (run) => {
+        const val = run.psr;
+        if (val === undefined || val === null) {
+          return <span className="text-slate-400 dark:text-slate-600 text-xs">—</span>;
+        }
+        // CR-003: dark variants on amber branches align with badge-warning dark behavior.
+        const colorClass =
+          (run.confidenceFlag === "high")
+            ? "text-profit"
+            : (run.confidenceFlag === "medium" || run.confidenceFlag === "low")
+              ? "text-amber-500 dark:text-amber-400"
+              : "text-slate-700 dark:text-slate-300";
+        return (
+          <span className={`font-mono text-xs font-medium ${colorClass}`}>
+            {(val * 100).toFixed(1)}%
+          </span>
+        );
+      },
+    },
+    {
       key: "symbols",
       header: "Symbols",
       render: (run) => (
@@ -205,6 +294,14 @@ function RunsPageContent() {
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
+  // Server-side sort state — synced to URL query params.
+  const [serverSortBy, setServerSortBy] = useState<ServerSortBy>(
+    (searchParams.get("sortBy") as ServerSortBy | null) ?? "created_at",
+  );
+  const [serverSortOrder, setServerSortOrder] = useState<ServerSortOrder>(
+    (searchParams.get("sortOrder") as ServerSortOrder | null) ?? "desc",
+  );
+
   // Pagination state — page is 0-indexed.
   const [page, setPage] = useState<number>(() => {
     const raw = searchParams.get("page");
@@ -260,9 +357,11 @@ function RunsPageContent() {
     if (symbolFilter) params.set("symbol", symbolFilter);
     if (dateAfter) params.set("dateAfter", dateAfter);
     if (dateBefore) params.set("dateBefore", dateBefore);
+    if (serverSortBy !== "created_at") params.set("sortBy", serverSortBy);
+    if (serverSortOrder !== "desc") params.set("sortOrder", serverSortOrder);
     const qs = params.toString();
     router.replace(qs ? `/runs?${qs}` : "/runs", { scroll: false });
-  }, [modeFilter, statusFilter, page, pageSize, strategyFilter, symbolFilter, dateAfter, dateBefore, router]);
+  }, [modeFilter, statusFilter, page, pageSize, strategyFilter, symbolFilter, dateAfter, dateBefore, serverSortBy, serverSortOrder, router]);
 
   useEffect(() => {
     async function load() {
@@ -277,6 +376,8 @@ function RunsPageContent() {
         ...(debouncedSymbol ? { symbol: debouncedSymbol } : {}),
         ...(dateAfter ? { createdAfter: new Date(dateAfter).toISOString() } : {}),
         ...(dateBefore ? { createdBefore: new Date(dateBefore).toISOString() } : {}),
+        sortBy: serverSortBy,
+        sortOrder: serverSortOrder,
       });
       if (result.ok) {
         setRuns(result.data.items);
@@ -287,7 +388,18 @@ function RunsPageContent() {
       setIsLoading(false);
     }
     void load();
-  }, [page, pageSize, modeFilter, statusFilter, debouncedStrategy, debouncedSymbol, dateAfter, dateBefore]);
+  }, [page, pageSize, modeFilter, statusFilter, debouncedStrategy, debouncedSymbol, dateAfter, dateBefore, serverSortBy, serverSortOrder]);
+
+  // Sort dropdown handlers — reset page to 0 on change (same pattern as handleModeFilter).
+  const handleServerSortBy = useCallback((value: ServerSortBy) => {
+    setServerSortBy(value);
+    setPage(0);
+  }, []);
+
+  const handleServerSortOrder = useCallback((value: ServerSortOrder) => {
+    setServerSortOrder(value);
+    setPage(0);
+  }, []);
 
   // Pagination derived values.
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
@@ -412,6 +524,37 @@ function RunsPageContent() {
           </svg>
           {showAdvanced ? "Hide" : "More"} Filters
         </button>
+
+        {/* Server-side sort controls */}
+        <div className="ml-auto flex items-center gap-2">
+          <label
+            htmlFor="sort-by"
+            className="text-xs text-slate-500 dark:text-slate-400"
+          >
+            Sort by
+          </label>
+          <select
+            id="sort-by"
+            value={serverSortBy}
+            onChange={(e) => handleServerSortBy(e.target.value as ServerSortBy)}
+            className="rounded bg-slate-100 dark:bg-slate-800 px-2 py-1 text-xs text-slate-800 dark:text-slate-200 focus:outline-none focus:ring-1 focus:ring-indigo-500 border border-slate-200 dark:border-slate-700"
+            aria-label="Sort field"
+          >
+            <option value="created_at">Created</option>
+            <option value="n_closed_trades">Closed Trades</option>
+          </select>
+          <select
+            value={serverSortOrder}
+            onChange={(e) =>
+              handleServerSortOrder(e.target.value as ServerSortOrder)
+            }
+            className="rounded bg-slate-100 dark:bg-slate-800 px-2 py-1 text-xs text-slate-800 dark:text-slate-200 focus:outline-none focus:ring-1 focus:ring-indigo-500 border border-slate-200 dark:border-slate-700"
+            aria-label="Sort order"
+          >
+            <option value="desc">Desc</option>
+            <option value="asc">Asc</option>
+          </select>
+        </div>
 
         {/* Selection hint */}
         {selectedIds.size > 0 && (

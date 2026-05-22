@@ -24,9 +24,9 @@ import math
 import uuid
 from datetime import datetime
 from decimal import Decimal
-from typing import Any, Generic, Literal, TypeVar
+from typing import Any, Generic, Literal, Self, TypeVar
 
-from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator, model_validator
 from pydantic.alias_generators import to_camel
 
 from common.types import OrderSide, OrderStatus, OrderType, RunMode, TimeFrame
@@ -67,6 +67,9 @@ __all__ = [
     "StrategyListResponse",
     # Error
     "ErrorResponse",
+    # M5 (Sprint 49): leaderboard eligibility constants
+    "LEADERBOARD_MIN_CLOSED_TRADES",
+    "LEADERBOARD_ELIGIBLE_FLAGS",
 ]
 
 # ---------------------------------------------------------------------------
@@ -259,6 +262,22 @@ class RunCreateRequest(BaseModel):
         return v
 
 
+# ---------------------------------------------------------------------------
+# M5 (Sprint 49) leaderboard eligibility constants.
+# Hard-coded per the user's M4 thresholds pattern; NOT config-tunable.
+# Change via code review only.
+#
+# LEADERBOARD_MIN_CLOSED_TRADES: minimum closed round-trip trades for a run
+#   to qualify for "best/worst" ranking.  10 trades balances statistical
+#   reliability against the practical reality of short backtests.
+# LEADERBOARD_ELIGIBLE_FLAGS: confidence tiers that qualify.  "low" is
+#   excluded because PSR < 0.80 or <30 trades means the Sharpe estimate is
+#   unreliable regardless of trade count.
+# ---------------------------------------------------------------------------
+LEADERBOARD_MIN_CLOSED_TRADES: int = 10
+LEADERBOARD_ELIGIBLE_FLAGS: frozenset[str] = frozenset({"high", "medium"})
+
+
 class RunResponse(BaseModel):
     """
     Response model for a single trading run.
@@ -266,6 +285,17 @@ class RunResponse(BaseModel):
     Monetary fields (``config`` may embed monetary values) are not extracted
     into top-level typed fields — the config JSONB blob is returned as-is
     since its shape varies by strategy.
+
+    M5 (Sprint 49) adds leaderboard transparency fields:
+
+    - ``n_closed_trades``: sourced from RunORM.n_closed_trades SQL column.
+      NULL for pre-M3 runs and for paper/live runs.
+    - ``confidence_flag``: extracted from config["backtest_metrics"] JSONB.
+      NULL when PSR was not computable (< 30 equity observations).
+    - ``psr``: extracted from config["backtest_metrics"] JSONB.
+      NULL when not computable.
+    - ``leaderboard_eligible``: computed field; True iff n_closed_trades >= 10
+      AND confidence_flag in {"high", "medium"}.
     """
 
     model_config = _API_MODEL_CONFIG
@@ -278,6 +308,54 @@ class RunResponse(BaseModel):
     stopped_at: datetime | None = Field(description="UTC timestamp when the run stopped")
     created_at: datetime = Field(description="Row creation timestamp")
     updated_at: datetime = Field(description="Row last-update timestamp")
+
+    # M5 (Sprint 49): leaderboard transparency fields
+    n_closed_trades: int | None = Field(
+        default=None,
+        description=(
+            "Closed round-trip trade count from RunORM.n_closed_trades column. "
+            "NULL for paper/live runs and pre-M3 backtest runs."
+        ),
+    )
+    confidence_flag: Literal["high", "medium", "low"] | None = Field(
+        default=None,
+        description=(
+            "Statistical confidence tier from backtest_metrics JSONB. "
+            "'high': PSR>=0.95 and trades>=50. "
+            "'medium': PSR>=0.80 and trades>=30. "
+            "'low': otherwise. None: PSR not computable."
+        ),
+    )
+    psr: float | None = Field(
+        default=None,
+        description=(
+            "Probabilistic Sharpe Ratio from backtest_metrics JSONB. "
+            "Probability in [0,1] that true Sharpe > 0. None when < 30 observations."
+        ),
+    )
+    leaderboard_eligible: bool = Field(
+        default=False,
+        description=(
+            "True iff n_closed_trades >= 10 AND confidence_flag in {'high', 'medium'}. "
+            "False when data is missing or below threshold."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _compute_leaderboard_eligible(self) -> Self:
+        """Compute leaderboard eligibility from n_closed_trades and confidence_flag.
+
+        Runs after all field population so both source fields are available.
+        This executes even when constructed via model_validate(orm_object).
+        """
+        n = self.n_closed_trades
+        flag = self.confidence_flag
+        self.leaderboard_eligible = (
+            n is not None
+            and n >= LEADERBOARD_MIN_CLOSED_TRADES
+            and flag in LEADERBOARD_ELIGIBLE_FLAGS
+        )
+        return self
 
 
 class RunListResponse(PaginatedResponse[RunResponse]):
@@ -632,13 +710,28 @@ class AggregatePortfolioResponse(BaseModel):
     total_realised_pnl: str = Field(description="Sum of realised PnL across all trades")
     total_fees_paid: str = Field(description="Sum of fees across all trades")
     best_run_return_pct: float | None = Field(
-        description="Highest total_return_pct from backtest metrics (None if no backtests)"
+        description=(
+            "Highest total_return_pct among leaderboard-eligible backtest runs "
+            "(n_closed_trades>=10 AND confidence_flag in {'high','medium'}). "
+            "None if no eligible backtests exist."
+        )
     )
     worst_run_return_pct: float | None = Field(
-        description="Lowest total_return_pct from backtest metrics (None if no backtests)"
+        description=(
+            "Lowest total_return_pct among leaderboard-eligible backtest runs. "
+            "None if no eligible backtests exist."
+        )
     )
     total_initial_capital: str = Field(
         description="Sum of initial_capital across all runs"
+    )
+    eligible_runs_count: int = Field(
+        default=0,
+        description=(
+            "Number of backtest runs that satisfy leaderboard eligibility criteria "
+            "(n_closed_trades>=10, confidence_flag in {'high','medium'}). "
+            "Shows as denominator: 'best return from N of M runs'."
+        ),
     )
 
     @field_serializer("total_realised_pnl", "total_fees_paid", "total_initial_capital")
