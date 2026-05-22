@@ -390,6 +390,9 @@ class TestBacktestRunNoSignals:
         assert isinstance(r.trades, list)
         assert isinstance(r.total_fees_paid, Decimal)
 
+        # M3 (Sprint 49): new field
+        assert isinstance(r.open_positions_mtm, list)
+
     @pytest.mark.asyncio
     async def test_equity_curve_length_matches_bar_count(
         self, no_signal_result: BacktestResult

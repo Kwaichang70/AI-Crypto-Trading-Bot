@@ -43,6 +43,25 @@ export interface Run {
 }
 
 /**
+ * A single open position at backtest end, mark-to-market at the final bar.
+ * Mirrors OpenPositionMTMResponse in apps/api/schemas.py.
+ * All price/PnL fields are strings (Decimal precision preserved from backend).
+ */
+export interface OpenPositionMTM {
+  symbol: string;
+  /** Decimal string — e.g. "0.01234567" */
+  quantity: string;
+  /** Entry price as a Decimal string — e.g. "29500.00" */
+  entryPrice: string;
+  /** Last bar close price as a Decimal string — e.g. "31200.00" */
+  lastPrice: string;
+  /** Unrealised PnL = (lastPrice − entryPrice) × quantity, as a Decimal string */
+  unrealisedPnl: string;
+  /** ISO-8601 datetime when the position was opened */
+  openedAt: string;
+}
+
+/**
  * Backtest performance metrics returned in RunDetailResponse.
  * Mirrors BacktestMetricsResponse in apps/api/schemas.py.
  * All percentage/ratio fields are decimal fractions (0.12 = 12%).
@@ -83,6 +102,13 @@ export interface BacktestMetrics {
   startDate: string;
   endDate: string;
   durationDays: number;
+  /**
+   * Positions still open at the end of the backtest, valued at the final bar's
+   * close price (mark-to-market). Empty list when all positions closed cleanly.
+   * Added by M3 backend (Sprint 49). Optional with `?` so pre-M3 run records
+   * that lack the field deserialise without errors.
+   */
+  openPositionsMtm?: readonly OpenPositionMTM[];
 }
 
 export interface RunListResponse {

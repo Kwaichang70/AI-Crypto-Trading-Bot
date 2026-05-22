@@ -150,6 +150,20 @@ class PortfolioAccounting:
         """
         return self.get_equity(list(self._position_snapshots.values()))
 
+    def get_open_positions(self) -> list[Position]:
+        """
+        Return positions with non-zero quantity (open positions only).
+
+        Mirrors the ``get_position`` / ``get_trade_history`` accessor style.
+        Returns a new list; mutations do not propagate to internal state.
+
+        Returns
+        -------
+        list[Position]:
+            All positions where ``is_flat`` is False (quantity > 0).
+        """
+        return [pos for pos in self._position_snapshots.values() if not pos.is_flat]
+
     def get_position(self, symbol: str) -> Position | None:
         """
         Return the current position snapshot for a symbol, or None if

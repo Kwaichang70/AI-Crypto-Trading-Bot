@@ -18,7 +18,7 @@ import {
   formatCurrency,
   formatPct,
 } from "@/lib/api";
-import type { Run, Portfolio, EquityPoint, Trade, Order, Fill, Position, LearningState } from "@/lib/types";
+import type { Run, Portfolio, EquityPoint, Trade, Order, Fill, Position, LearningState, OpenPositionMTM } from "@/lib/types";
 import type { CsvColumn } from "@/lib/csv-export";
 import { ExportCsvButton } from "@/components/ui/export-csv-button";
 import { Header } from "@/components/layout/header";
@@ -257,6 +257,62 @@ const POSITION_COLUMNS: Column<Position>[] = [
 ];
 
 // ---------------------------------------------------------------------------
+// Open-at-end MTM position columns (backtest only)
+// ---------------------------------------------------------------------------
+
+const OPEN_POSITION_MTM_COLUMNS: Column<OpenPositionMTM>[] = [
+  {
+    key: "symbol",
+    header: "Symbol",
+    render: (p) => <span className="font-mono text-xs text-slate-300">{p.symbol}</span>,
+  },
+  {
+    key: "quantity",
+    header: "Qty",
+    render: (p) => <span className="font-mono text-xs">{p.quantity}</span>,
+  },
+  {
+    key: "entryPrice",
+    header: "Entry Price",
+    sortable: true,
+    sortValue: (p) => parseFloat(p.entryPrice),
+    render: (p) => <span className="font-mono text-xs">{formatCurrency(p.entryPrice)}</span>,
+  },
+  {
+    key: "lastPrice",
+    header: "Last Price",
+    sortable: true,
+    sortValue: (p) => parseFloat(p.lastPrice),
+    render: (p) => <span className="font-mono text-xs">{formatCurrency(p.lastPrice)}</span>,
+  },
+  {
+    key: "unrealisedPnl",
+    header: "Unrealised PnL",
+    sortable: true,
+    sortValue: (p) => parseFloat(p.unrealisedPnl),
+    render: (p) => {
+      const pnl = parseFloat(p.unrealisedPnl);
+      return (
+        <span className={`font-mono text-xs font-medium ${pnl >= 0 ? "text-profit" : "text-loss"}`}>
+          {pnl >= 0 ? "+" : ""}{formatCurrency(p.unrealisedPnl)}
+        </span>
+      );
+    },
+  },
+  {
+    key: "openedAt",
+    header: "Opened At",
+    sortable: true,
+    sortValue: (p) => new Date(p.openedAt).getTime(),
+    render: (p) => (
+      <span className="font-mono text-xs text-slate-500">
+        {new Date(p.openedAt).toLocaleString()}
+      </span>
+    ),
+  },
+];
+
+// ---------------------------------------------------------------------------
 // CSV column specs — plain scalar values for export
 // ---------------------------------------------------------------------------
 
@@ -303,6 +359,15 @@ const POSITION_CSV_COLUMNS: CsvColumn<Position>[] = [
   { header: "Unrealised PnL", value: (p) => p.unrealisedPnl },
   { header: "Notional Value", value: (p) => p.notionalValue },
   { header: "Opened At", value: (p) => p.openedAt },
+];
+
+const OPEN_POSITION_MTM_CSV_COLUMNS: CsvColumn<OpenPositionMTM>[] = [
+  { header: "Symbol",         value: (p) => p.symbol },
+  { header: "Quantity",       value: (p) => p.quantity },
+  { header: "Entry Price",    value: (p) => p.entryPrice },
+  { header: "Last Price",     value: (p) => p.lastPrice },
+  { header: "Unrealised PnL", value: (p) => p.unrealisedPnl },
+  { header: "Opened At",      value: (p) => p.openedAt },
 ];
 
 const EQUITY_CSV_COLUMNS: CsvColumn<EquityPoint>[] = [
@@ -539,6 +604,10 @@ export default function RunDetailPage() {
           { id: "orders", label: `Orders (${orders.length})` },
           { id: "fills", label: `Fills (${fills.length})` },
           { id: "positions", label: `Positions (${positions.length})` },
+          ...(run.runMode === "backtest" && run.backtestMetrics
+            ? [{ id: "open-at-end", label: `Open at End (${run.backtestMetrics.openPositionsMtm?.length ?? 0})` }]
+            : []
+          ),
           ...(learning ? [{ id: "learning", label: "Learning" }] : []),
         ]}
       >
@@ -818,6 +887,32 @@ export default function RunDetailPage() {
                   keyExtractor={(p) => p.symbol}
                   emptyMessage="No open positions for this run."
                 />
+              </div>
+            )}
+
+            {activeTab === "open-at-end" && run.runMode === "backtest" && run.backtestMetrics && (
+              <div className="space-y-2">
+                {(run.backtestMetrics.openPositionsMtm ?? []).length === 0 ? (
+                  <div className="rounded-xl border border-slate-200 dark:border-slate-800 px-4 py-8 text-center text-sm text-slate-400 dark:text-slate-500">
+                    No open positions at end of backtest — all positions closed cleanly.
+                  </div>
+                ) : (
+                  <>
+                    <div className="flex justify-end">
+                      <ExportCsvButton
+                        filename={`run-${id.slice(0, 8)}-open-at-end.csv`}
+                        columns={OPEN_POSITION_MTM_CSV_COLUMNS}
+                        data={run.backtestMetrics.openPositionsMtm ?? []}
+                      />
+                    </div>
+                    <DataTable
+                      columns={OPEN_POSITION_MTM_COLUMNS}
+                      data={run.backtestMetrics.openPositionsMtm ?? []}
+                      keyExtractor={(p) => p.symbol}
+                      emptyMessage="No open positions at end of backtest."
+                    />
+                  </>
+                )}
               </div>
             )}
 

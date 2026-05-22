@@ -57,6 +57,8 @@ __all__ = [
     "EquityCurveResponse",
     "PositionResponse",
     "PositionListResponse",
+    # Open Position MTM
+    "OpenPositionMTMResponse",
     # ML Model Versions
     "ModelVersionResponse",
     "ModelVersionListResponse",
@@ -283,6 +285,30 @@ class RunListResponse(PaginatedResponse[RunResponse]):
     pass
 
 
+class OpenPositionMTMResponse(BaseModel):
+    """
+    API response for a single position still open at end-of-backtest.
+
+    Monetary fields (quantity, entry_price, last_price, unrealised_pnl) are
+    stored as Decimal internally and serialised as strings via ``field_serializer``
+    to preserve precision across the JSON boundary.  This mirrors the pattern
+    used by ``BacktestMetricsResponse.serialise_decimal``.
+    """
+
+    model_config = _API_MODEL_CONFIG
+
+    symbol: str
+    quantity: Decimal
+    entry_price: Decimal
+    last_price: Decimal
+    unrealised_pnl: Decimal
+    opened_at: datetime
+
+    @field_serializer("quantity", "entry_price", "last_price", "unrealised_pnl")
+    def serialise_decimal(self, v: Decimal) -> str:
+        return str(v)
+
+
 class BacktestMetricsResponse(BaseModel):
     """
     Backtest performance metrics included in RunDetailResponse.
@@ -339,6 +365,15 @@ class BacktestMetricsResponse(BaseModel):
     start_date: datetime
     end_date: datetime
     duration_days: int
+
+    # M3 (Sprint 49): open positions at end-of-backtest
+    open_positions_mtm: list[OpenPositionMTMResponse] = Field(
+        default_factory=list,
+        description=(
+            "Positions still open when the backtest ended, marked to terminal "
+            "bar close price. Excluded from trade-count statistics."
+        ),
+    )
 
     @field_serializer(
         "initial_capital", "final_equity", "total_fees_paid",

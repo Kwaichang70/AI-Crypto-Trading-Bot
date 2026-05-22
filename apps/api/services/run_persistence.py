@@ -45,7 +45,7 @@ from api.db.models import (
     RunORM,
     TradeORM,
 )
-from api.schemas import BacktestMetricsResponse, RunDetailResponse, RunResponse
+from api.schemas import BacktestMetricsResponse, OpenPositionMTMResponse, RunDetailResponse, RunResponse
 
 __all__ = [
     "build_backtest_metrics",
@@ -160,6 +160,17 @@ def build_backtest_metrics(result: Any) -> BacktestMetricsResponse:
         start_date=result.start_date,
         end_date=result.end_date,
         duration_days=result.duration_days,
+        open_positions_mtm=[
+            OpenPositionMTMResponse(
+                symbol=pos.symbol,
+                quantity=pos.quantity,
+                entry_price=pos.entry_price,
+                last_price=pos.last_price,
+                unrealised_pnl=pos.unrealised_pnl,
+                opened_at=pos.opened_at,
+            )
+            for pos in getattr(result, "open_positions_mtm", [])
+        ],
     )
 
 
@@ -499,6 +510,8 @@ async def persist_backtest_results(
         )
 
     # --- Persist position snapshots ---
+    # TODO: Sprint 50+ — refactor _position_snapshots private access via get_open_positions()
+    # (CR-006 deferred cleanup; pre-existing before M3, not introduced here).
     position_orms: list[PositionSnapshotORM] = []
     if portfolio is not None and hasattr(portfolio, '_position_snapshots'):
         now = datetime.now(tz=UTC)
@@ -535,6 +548,12 @@ async def persist_backtest_results(
     # Explicitly flag the JSONB column as modified so SQLAlchemy tracks the
     # in-place dict mutation through its change-detection mechanism.
     flag_modified(run_orm, "config")
+
+    # M3 (Sprint 49): populate RunORM.n_closed_trades for leaderboard queries (M5).
+    # Sourced directly from result.total_trades (closed round-trips only) — the
+    # single source of truth.  SQL column allows M5 leaderboard to filter/sort
+    # without parsing JSONB.
+    run_orm.n_closed_trades = result.total_trades
 
     log.info(
         "runs.backtest_results_persisted",

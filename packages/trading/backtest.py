@@ -57,6 +57,7 @@ from trading.engines.paper import PaperExecutionEngine
 from trading.metrics import (
     BacktestResult,
     EquityCurvePoint,
+    OpenPositionMTM,
     TIMEFRAME_PERIODS_PER_YEAR,
     compute_cagr,
     compute_calmar,
@@ -277,6 +278,37 @@ class BacktestRunner:
         raw_equity_curve = portfolio.get_equity_curve()
         trade_history = portfolio.get_trade_history()
 
+        # 8b. M3 (Sprint 49): build open-position MTM list using terminal bar prices.
+        # trade_history contains CLOSED round-trips only; positions that the backtest
+        # ended with still open are captured here for operator visibility without
+        # contaminating trade-count statistics.
+        terminal_bars: dict[str, OHLCVBar] = {
+            sym: bars_by_symbol[sym][-1]
+            for sym in self._symbols
+            if bars_by_symbol.get(sym)
+        }
+        open_positions_mtm: list[OpenPositionMTM] = []
+        for pos in portfolio.get_open_positions():
+            terminal = terminal_bars.get(pos.symbol)
+            if terminal is None:
+                self._log.warning(
+                    "backtest.open_position_no_terminal_bar",
+                    symbol=pos.symbol,
+                )
+                continue
+            last_price = Decimal(str(terminal.close))
+            unrealised = (last_price - pos.average_entry_price) * pos.quantity
+            open_positions_mtm.append(
+                OpenPositionMTM(
+                    symbol=pos.symbol,
+                    quantity=pos.quantity,
+                    entry_price=pos.average_entry_price,
+                    last_price=last_price,
+                    unrealised_pnl=unrealised,
+                    opened_at=pos.opened_at,
+                )
+            )
+
         # Determine date range from bars
         all_bars = []
         for sym in self._symbols:
@@ -383,6 +415,8 @@ class BacktestRunner:
             # Curve & trades
             equity_curve=equity_curve,
             trades=trade_history,
+            # M3 (Sprint 49): open positions at end of backtest
+            open_positions_mtm=open_positions_mtm,
             # Fees
             total_fees_paid=portfolio.total_fees_paid,
         )

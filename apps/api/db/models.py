@@ -175,6 +175,28 @@ class RunORM(Base):
         comment="If this run was auto-recovered, the ID of the original orphaned run",
     )
 
+    # M3 (Sprint 49): leaderboard SQL column -- closed trade count.
+    # Populated by persist_backtest_results() for backtest runs from Sprint 49 onward.
+    # NULL for pre-Sprint-49 runs and for paper/live runs.
+    # Backfill script (scripts/backfill_metrics_v2.py) populates historical rows.
+    n_closed_trades: Mapped[int | None] = mapped_column(
+        Integer(),
+        nullable=True,
+        default=None,
+        comment="Closed round-trip trade count. NULL for pre-M3 or non-backtest runs.",
+    )
+
+    # M3 (Sprint 49): one-shot idempotency flag for the backfill script.
+    # Set to True after backfill_metrics_v2.py has confirmed n_closed_trades
+    # is populated for this row.  Schedule a future migration to drop this
+    # column after 100% backfill coverage is confirmed on production.
+    metrics_v2_backfilled: Mapped[bool] = mapped_column(
+        Boolean(),
+        nullable=False,
+        server_default="false",
+        comment="True after backfill_metrics_v2.py has populated n_closed_trades for this row.",
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

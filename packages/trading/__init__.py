@@ -20,6 +20,7 @@ from trading.optimizer import OptimizationEntry, OptimizationResult, ParameterOp
 from trading.metrics import (
     BacktestResult,
     EquityCurvePoint,
+    OpenPositionMTM,
     TradeStatistics,
     compute_cagr,
     compute_calmar,
@@ -92,6 +93,7 @@ __all__ = [
     "BacktestRunner",
     "BacktestResult",
     "EquityCurvePoint",
+    "OpenPositionMTM",
     "TradeStatistics",
     # Metric functions
     "compute_cagr",

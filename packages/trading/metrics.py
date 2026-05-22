@@ -38,6 +38,7 @@ from trading.models import TradeResult
 __all__ = [
     "BacktestResult",
     "EquityCurvePoint",
+    "OpenPositionMTM",
     "compute_cagr",
     "compute_sharpe",
     "compute_sortino",
@@ -102,6 +103,40 @@ class EquityCurvePoint(BaseModel):
         ge=0.0,
         description="Current drawdown from peak as decimal fraction",
     )
+
+
+# ---------------------------------------------------------------------------
+# Open position mark-to-market record
+# ---------------------------------------------------------------------------
+
+class OpenPositionMTM(BaseModel):
+    """
+    A position still open at end-of-backtest with mark-to-market PnL.
+
+    Trade statistics (``total_trades``, ``win_rate``, ``profit_factor``)
+    in ``BacktestResult`` count CLOSED round-trips only.  Positions that
+    the backtest ended with open are reported here so operators can see
+    their unrealised exposure without confusing it with completed trades.
+
+    ``unrealised_pnl`` is computed as::
+
+        (last_price - entry_price) * quantity
+
+    This matches the formula in ``PortfolioAccounting.update_market_prices()``.
+    ``entry_price`` (``average_entry_price`` on the Position) includes the
+    entry-side fee in its cost basis, consistent with the equity curve
+    treatment.  This means ``unrealised_pnl`` may differ slightly from the
+    exchange-reported mark-to-market if the exchange does not capitalise fees.
+    """
+
+    model_config = {"frozen": True}
+
+    symbol: str
+    quantity: Decimal
+    entry_price: Decimal
+    last_price: Decimal
+    unrealised_pnl: Decimal
+    opened_at: datetime
 
 
 # ---------------------------------------------------------------------------
@@ -236,6 +271,16 @@ class BacktestResult(BaseModel):
     trades: list[TradeResult] = Field(
         default_factory=list,
         description="All completed round-trip trades",
+    )
+
+    # M3 (Sprint 49): open positions at end-of-backtest
+    open_positions_mtm: list[OpenPositionMTM] = Field(
+        default_factory=list,
+        description=(
+            "Positions open at backtest end, valued at the terminal bar close. "
+            "Excluded from trade-count statistics (total_trades, win_rate, etc.), "
+            "which count CLOSED round-trips only."
+        ),
     )
 
     # Fee summary
