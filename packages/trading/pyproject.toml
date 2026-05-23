@@ -12,6 +12,7 @@ dependencies = [
     "pydantic>=2.9",
     "structlog>=24.4",
     "ccxt>=4.4",
+    "numpy>=1.26",
     "common",
 ]
 

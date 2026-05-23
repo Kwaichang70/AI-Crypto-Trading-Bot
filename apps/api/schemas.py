@@ -234,6 +234,17 @@ class RunCreateRequest(BaseModel):
             "and mode=paper. Always forced to False for live mode."
         ),
     )
+    seed: int | None = Field(
+        default=None,
+        ge=0,
+        le=2**31 - 1,
+        description=(
+            "Random seed for deterministic reproducibility of backtest runs. "
+            "Auto-generated (and logged) when not provided. "
+            "Range: 0 to 2147483647 (inclusive). "
+            "Ignored for paper and live modes."
+        ),
+    )
 
     @field_validator("initial_capital")
     @classmethod
@@ -488,6 +499,16 @@ class BacktestMetricsResponse(BaseModel):
         description=(
             "None = PnL in detected quote currency (no FX applied). "
             "M6b will set 'USD' for MIXED runs after conversion."
+        ),
+    )
+
+    # M7 (Sprint 49): seed for operator replay
+    seed: int | None = Field(
+        default=None,
+        description=(
+            "Random seed used for this backtest. Re-submit the same run config "
+            "with this seed value to reproduce identical results. "
+            "None for pre-M7 records."
         ),
     )
 

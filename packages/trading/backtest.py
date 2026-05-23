@@ -48,6 +48,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
+import numpy as np
 import structlog
 
 from common.models import OHLCVBar
@@ -205,7 +206,12 @@ class BacktestRunner:
         self._slippage_bps = slippage_bps
         self._maker_fee_bps = maker_fee_bps
         self._taker_fee_bps = taker_fee_bps
-        self._seed = seed
+        # M7 (Sprint 49 INF-9): auto-generate a reproducible seed when caller
+        # omits one so every backtest can be replayed.  Use OS-seeded random
+        # to produce a 32-bit integer (safe range for both Python and numpy).
+        if seed is None:
+            seed = random.randint(0, 2**31 - 1)
+        self._seed: int = seed
         self._trailing_stop_pct = trailing_stop_pct
 
         # Build risk parameters with explicit fee overrides
@@ -253,6 +259,16 @@ class BacktestRunner:
     # Public API
     # ------------------------------------------------------------------
 
+    @property
+    def seed(self) -> int:
+        """Resolved RNG seed for this run (auto-generated if not provided).
+
+        Always a non-None int after construction (M7 guarantees this).
+        Note: seed isolation assumes sequential backtest execution. Concurrent
+        backtests sharing the process-global RNG state (M7b) are not supported.
+        """
+        return self._seed
+
     async def run(
         self,
         bars_by_symbol: dict[str, list[OHLCVBar]],
@@ -282,10 +298,12 @@ class BacktestRunner:
             If bar data fails validation (unsorted, misaligned, or
             insufficient for warm-up).
         """
-        # 0. Deterministic seed
-        if self._seed is not None:
-            random.seed(self._seed)
-            self._log.info("backtest.seed_set", seed=self._seed)
+        # 0. Deterministic seed — always non-None after M7 __init__ guard.
+        # Seeds both Python random and numpy.random so sklearn PRNG (used by
+        # ModelStrategy) and any future stochastic elements are reproducible.
+        random.seed(self._seed)
+        np.random.seed(self._seed)
+        self._log.info("backtest.seed_set", seed=self._seed)
 
         # 1. Validate input bars
         self._validate_bars(bars_by_symbol)
@@ -523,6 +541,8 @@ class BacktestRunner:
             # M6 (Sprint 49): currency labeling
             quote_currency=quote_currency,
             reporting_currency=None,
+            # M7 (Sprint 49 INF-9): seed pinning for reproducibility
+            seed=self._seed,
         )
 
         self._log.info(

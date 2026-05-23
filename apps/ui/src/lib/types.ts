@@ -168,6 +168,12 @@ export interface BacktestMetrics {
    * M6b will populate "USD" for mixed runs after conversion.
    */
   reportingCurrency?: string | null;
+  /**
+   * Resolved RNG seed used for this backtest run.
+   * Re-submit the run config with this seed to reproduce identical results.
+   * null for pre-M7 records. Added by M7 backend (Sprint 49).
+   */
+  seed?: number | null;
 }
 
 export interface RunListResponse {

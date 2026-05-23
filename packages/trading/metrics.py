@@ -341,6 +341,17 @@ class BacktestResult(BaseModel):
         ),
     )
 
+    # M7 (Sprint 49): seed pinning for reproducibility
+    seed: int | None = Field(
+        default=None,
+        description=(
+            "Random seed used for this backtest run (both Python random and numpy.random). "
+            "Auto-generated when not provided by the caller; stored in RunORM.config['seed'] "
+            "so the run can be replayed with identical conditions. "
+            "None for pre-M7 BacktestResult objects constructed directly in tests."
+        ),
+    )
+
 
 # ===================================================================
 # Standalone metric functions

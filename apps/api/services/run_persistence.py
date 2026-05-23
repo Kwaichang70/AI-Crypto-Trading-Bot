@@ -227,6 +227,8 @@ def build_backtest_metrics(result: Any) -> BacktestMetricsResponse:
         # M6 (Sprint 49): currency labeling — getattr guards for pre-M6 BacktestResult objects
         quote_currency=getattr(result, "quote_currency", None),
         reporting_currency=getattr(result, "reporting_currency", None),
+        # M7 (Sprint 49): seed for operator replay — getattr guard for pre-M7 BacktestResult objects
+        seed=getattr(result, "seed", None),
     )
 
 

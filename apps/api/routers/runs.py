@@ -550,6 +550,15 @@ async def create_run(
         strategy=strategy_name,
     )
 
+    # CR-007 (M7): warn if caller supplied a seed for paper/live — it is silently
+    # ignored because BacktestRunner is only constructed for backtest mode.
+    if body.seed is not None and not is_backtest:
+        log.warning(
+            "runs.seed_ignored_for_non_backtest_mode",
+            seed=body.seed,
+            mode=mode_value,
+        )
+
     # ------------------------------------------------------------------
     # BACKTEST MODE  -- execute synchronously, persist results, finish run
     # ------------------------------------------------------------------
@@ -579,7 +588,14 @@ async def create_run(
                 timeframe=timeframe,
                 initial_capital=Decimal(body.initial_capital),
                 trailing_stop_pct=_trailing_stop_pct,
+                seed=body.seed,
             )
+            # M7 (Sprint 49 INF-9): persist the resolved seed (auto-generated or
+            # caller-supplied) into the config dict.  Seed mutation here is captured
+            # by _persist_backtest_results() below, which rebuilds config from
+            # run_orm.config (including this mutation) and writes the complete
+            # merged block back to the DB.
+            config_snapshot["seed"] = runner.seed
 
             log.info("runs.backtest_execution_starting", run_id=str(run_id))
             result = await runner.run(bars_by_symbol)
