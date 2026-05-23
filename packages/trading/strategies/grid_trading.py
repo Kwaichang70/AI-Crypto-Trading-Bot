@@ -69,6 +69,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from common.models import MultiTimeframeContext, OHLCVBar
 from common.types import SignalDirection
+from trading._schema_utils import normalise_nullable_json_schema
 from trading.models import Signal
 from trading.strategy import BaseStrategy, StrategyMetadata
 from trading.strategies.rsi_mean_reversion import _compute_rsi
@@ -202,7 +203,7 @@ class GridTradingStrategy(BaseStrategy):
     @classmethod
     def parameter_schema(cls) -> dict[str, Any]:
         """Return JSON Schema for accepted parameters."""
-        return _GridParams.model_json_schema()
+        return normalise_nullable_json_schema(_GridParams.model_json_schema())
 
     @property
     def min_bars_required(self) -> int:

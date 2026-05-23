@@ -99,6 +99,7 @@ from pydantic import BaseModel, Field, field_validator
 from common.models import MultiTimeframeContext, OHLCVBar
 from common.types import SignalDirection
 from data.ml_features import feature_names_for_schema
+from trading._schema_utils import normalise_nullable_json_schema
 from trading.models import Signal
 from trading.strategy import BaseStrategy, StrategyMetadata
 
@@ -242,7 +243,7 @@ class ModelStrategy(BaseStrategy):
     @classmethod
     def parameter_schema(cls) -> dict[str, Any]:
         """Return JSON Schema for accepted parameters."""
-        return _ModelStrategyParams.model_json_schema()
+        return normalise_nullable_json_schema(_ModelStrategyParams.model_json_schema())
 
     @property
     def min_bars_required(self) -> int:

@@ -26,8 +26,10 @@ function ParamInput({
   onChange: (v: unknown) => void;
 }) {
   const label = name.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+  const effectiveType: string | undefined =
+    schema.type ?? schema.anyOf?.find((s) => s.type !== "null")?.type;
 
-  if (schema.type === "boolean") {
+  if (effectiveType === "boolean") {
     return (
       <div className="flex items-center justify-between">
         <label className="text-sm text-slate-700 dark:text-slate-300">
@@ -55,15 +57,15 @@ function ParamInput({
         )}
       </label>
       <input
-        type={schema.type === "integer" || schema.type === "number" ? "number" : "text"}
+        type={effectiveType === "integer" || effectiveType === "number" ? "number" : "text"}
         value={String(value ?? schema.default ?? "")}
         min={schema.minimum}
         max={schema.maximum}
-        step={schema.type === "integer" ? 1 : "any"}
+        step={effectiveType === "integer" ? 1 : "any"}
         onChange={(e) => {
           const raw = e.target.value;
-          if (schema.type === "integer") onChange(parseInt(raw, 10));
-          else if (schema.type === "number") onChange(parseFloat(raw));
+          if (effectiveType === "integer") onChange(parseInt(raw, 10));
+          else if (effectiveType === "number") onChange(parseFloat(raw));
           else onChange(raw);
         }}
         className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 placeholder-slate-400 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200 dark:placeholder-slate-500"

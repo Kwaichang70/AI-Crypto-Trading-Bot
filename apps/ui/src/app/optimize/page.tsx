@@ -237,7 +237,11 @@ export default function OptimizePage() {
     for (const row of paramGridRows) {
       if (!row.paramName || !row.valuesRaw.trim()) continue;
       const schema = paramTypes[row.paramName];
-      const type = schema?.type ?? "string";
+      // Resolve effective type — see INF-5 comment in param-grid-editor.tsx
+      const type: string =
+        schema?.type
+        ?? schema?.anyOf?.find((s) => s.type !== "null")?.type
+        ?? "string";
       const values = row.valuesRaw
         .split(",")
         .map((v) => v.trim())

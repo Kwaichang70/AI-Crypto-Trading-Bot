@@ -367,7 +367,16 @@ export interface PositionListResponse {
 // ---------------------------------------------------------------------------
 
 export interface JsonSchemaProperty {
-  type: "string" | "integer" | "number" | "boolean";
+  /** Scalar type string (normalised backend form). */
+  type?: "string" | "integer" | "number" | "boolean";
+  /** Set by backend normaliser when the field is ``float | None``. */
+  nullable?: boolean;
+  /**
+   * Raw Pydantic v2 anyOf form — present on un-normalised schemas or if a
+   * future Pydantic version changes its emission shape.  Frontend resolvers
+   * must handle this as a fallback.
+   */
+  anyOf?: Array<{ type: string; minimum?: number; maximum?: number }>;
   description?: string;
   default?: unknown;
   minimum?: number;

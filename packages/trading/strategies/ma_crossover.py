@@ -49,6 +49,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from common.models import MultiTimeframeContext, OHLCVBar
 from common.types import SignalDirection
+from trading._schema_utils import normalise_nullable_json_schema
 from trading.models import Signal
 from trading.strategy import BaseStrategy, StrategyMetadata
 
@@ -179,7 +180,7 @@ class MACrossoverStrategy(BaseStrategy):
         dict[str, Any]
             JSON Schema derived from the Pydantic params model.
         """
-        return _MACrossoverParams.model_json_schema()
+        return normalise_nullable_json_schema(_MACrossoverParams.model_json_schema())
 
     @property
     def min_bars_required(self) -> int:

@@ -61,13 +61,17 @@ export function ParamGridEditor({
 
       {rows.map((row, idx) => {
         const schema = paramTypes[row.paramName];
-        const typeHint = schema
-          ? schema.type === "integer"
-            ? "integers"
-            : schema.type === "number"
-              ? "decimals"
-              : "values"
-          : "values";
+        // Resolve the effective scalar type from three possible schema shapes:
+        // 1. {type: "number", nullable: true}  — normalised backend form (INF-5)
+        // 2. {anyOf: [{type: "number",...}, {type: "null"}]}  — raw Pydantic v2 fallback
+        // 3. {type: "integer" | "string" | "boolean"}  — non-nullable fields (unchanged)
+        const effectiveType: string | undefined = schema?.type
+          ?? schema?.anyOf?.find((s) => s.type !== "null")?.type;
+        const typeHint = effectiveType === "integer"
+          ? "integers"
+          : effectiveType === "number"
+            ? "decimals"
+            : "values";
 
         return (
           <div key={row.id} className="flex items-start gap-2">
