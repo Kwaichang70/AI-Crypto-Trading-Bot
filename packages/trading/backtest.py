@@ -52,7 +52,7 @@ import structlog
 
 from common.models import OHLCVBar
 from data.market_data import BaseMarketDataService
-from common.types import RunMode, TimeFrame
+from common.types import QuoteCurrency, RunMode, TimeFrame
 from trading.engines.paper import PaperExecutionEngine
 from trading.metrics import (
     BacktestResult,
@@ -80,6 +80,53 @@ from trading.strategy_engine import StrategyEngine
 __all__ = ["BacktestRunner"]
 
 logger = structlog.get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# M6 (Sprint 49): quote currency detection helper
+# ---------------------------------------------------------------------------
+
+
+def _detect_quote_currency(symbols: list[str]) -> str | None:
+    """Detect quote currency from CCXT symbols.
+
+    Returns quote part if all symbols share the same quote, the
+    ``QuoteCurrency.MIXED`` sentinel string when heterogeneous, or
+    ``None`` if no symbol contains a '/' separator.
+
+    Parameters
+    ----------
+    symbols:
+        List of CCXT symbol strings, e.g. ``["BTC/USDT", "ETH/USDT"]``.
+
+    Returns
+    -------
+    str | None
+        Single detected quote string (e.g. ``"USDT"``), ``QuoteCurrency.MIXED``
+        (``"MIXED"``) if multiple distinct quotes detected, or ``None`` if no
+        symbol contains a ``"/"`` separator (e.g. ``["BTCUSD"]``).
+
+    Examples
+    --------
+    >>> _detect_quote_currency(["BTC/USDT", "ETH/USDT"])
+    'USDT'
+    >>> _detect_quote_currency(["BTC/USDT", "ETH/USD"])
+    'MIXED'
+    >>> _detect_quote_currency(["BTCUSD"])
+    None
+    >>> _detect_quote_currency([])
+    None
+    """
+    detected: set[str] = set()
+    for sym in symbols:
+        parts = sym.split("/", 1)
+        if len(parts) == 2 and parts[1]:
+            detected.add(parts[1].strip().upper())
+    if not detected:
+        return None
+    if len(detected) == 1:
+        return next(iter(detected))
+    return QuoteCurrency.MIXED
 
 
 # ---------------------------------------------------------------------------
@@ -408,6 +455,21 @@ class BacktestRunner:
 
         exposure = compute_exposure(bars_in_market, total_bars_processed)
 
+        # M6 (Sprint 49): detect quote currency from symbol strings.
+        # Parse "BASE/QUOTE" for every configured symbol; if all share the
+        # same quote part, record it.  Divergent quotes → MIXED + warning.
+        quote_currency = _detect_quote_currency(self._symbols)
+        if quote_currency == QuoteCurrency.MIXED:
+            self._log.warning(
+                "backtest.mixed_quote_currencies",
+                symbols=self._symbols,
+                message=(
+                    "Multi-symbol run has heterogeneous quote currencies. "
+                    "PnL figures are in native currencies and not directly "
+                    "comparable. FX conversion deferred to M6b."
+                ),
+            )
+
         # 16. Assemble result
         result = BacktestResult(
             # Metadata
@@ -458,6 +520,9 @@ class BacktestRunner:
             psr=psr,
             n_observations=n_obs,
             confidence_flag=confidence_flag,
+            # M6 (Sprint 49): currency labeling
+            quote_currency=quote_currency,
+            reporting_currency=None,
         )
 
         self._log.info(

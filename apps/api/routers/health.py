@@ -80,12 +80,28 @@ class ActiveRunsHealth(BaseModel):
     )
 
 
+class FxCacheWarmerHealth(BaseModel):
+    """Health snapshot for the FX rate cache warmer (M6 MVP stub)."""
+
+    configured: bool = Field(description="True if FxCacheWarmer was instantiated at startup")
+    running: bool = Field(description="True if the warmer's asyncio.Task is alive")
+    last_run_at_unix: float | None = Field(
+        default=None,
+        description="Wall-clock Unix epoch of the last tick, or None pre-first-tick.",
+    )
+    last_rates_cached: int = Field(
+        default=0,
+        description="Number of FX rate entries cached on the last tick (0 in M6 MVP stub).",
+    )
+
+
 class BackgroundHealthResponse(BaseModel):
     """Top-level response from GET /api/v1/health/background."""
 
     history_cache_warmer: HistoryCacheWarmerHealth
     retraining_service: RetrainingServiceHealth
     active_runs: ActiveRunsHealth
+    fx_cache_warmer: FxCacheWarmerHealth
 
 
 # ---------------------------------------------------------------------------
@@ -142,8 +158,25 @@ async def background_health(request: Request) -> BackgroundHealthResponse:
         run_ids = []
     active = ActiveRunsHealth(count=len(run_ids), run_ids=run_ids)
 
+    # FX cache warmer (M6 Sprint 49).
+    fx_warmer = (
+        container.background_tasks.fx_cache_warmer
+        if container is not None
+        else None
+    )
+    if fx_warmer is not None:
+        fx_warmer_health = FxCacheWarmerHealth(
+            configured=True,
+            running=bool(getattr(fx_warmer, "running", False)),
+            last_run_at_unix=getattr(fx_warmer, "last_run_at", None),
+            last_rates_cached=int(getattr(fx_warmer, "last_rates_cached", 0)),
+        )
+    else:
+        fx_warmer_health = FxCacheWarmerHealth(configured=False, running=False)
+
     return BackgroundHealthResponse(
         history_cache_warmer=warmer_health,
         retraining_service=rsvc_health,
         active_runs=active,
+        fx_cache_warmer=fx_warmer_health,
     )

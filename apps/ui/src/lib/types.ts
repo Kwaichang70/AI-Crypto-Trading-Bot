@@ -156,6 +156,18 @@ export interface BacktestMetrics {
    * "high" | "medium" | "low" | null (when PSR not computable).
    */
   confidenceFlag?: "high" | "medium" | "low" | null;
+  /**
+   * Quote currency detected from trade symbols ("USDT", "EUR", "MIXED" if heterogeneous, null pre-M6).
+   * "MIXED" indicates heterogeneous quote currencies — PnL figures are not
+   * directly comparable without FX conversion (M6b).
+   */
+  quoteCurrency?: string | null;
+  /**
+   * Reporting currency for displayed monetary values.
+   * null = native quote, no FX conversion applied (M6 default).
+   * M6b will populate "USD" for mixed runs after conversion.
+   */
+  reportingCurrency?: string | null;
 }
 
 export interface RunListResponse {

@@ -77,6 +77,8 @@ class BackgroundTaskRegistry:
     # S47-1: HistoryCacheWarmer instance (not a raw Task -- the object
     # owns its own asyncio.Task internally and has a stop() coroutine).
     history_cache_warmer: Any | None = None
+    # M6 (Sprint 49): FX rate cache warmer stub.  Real fetching in M6b.
+    fx_cache_warmer: Any | None = None
     # Reserved for future named long-lived tasks.
 
     async def cancel_all(self, timeout: float = 5.0) -> None:
@@ -98,6 +100,16 @@ class BackgroundTaskRegistry:
             except Exception:
                 logger.warning(
                     "background_tasks.cancel_all: history_cache_warmer.stop raised",
+                    exc_info=True,
+                )
+
+        # M6: FxCacheWarmer drives its own asyncio.Task; stop() is the clean path.
+        if self.fx_cache_warmer is not None:
+            try:
+                await self.fx_cache_warmer.stop()
+            except Exception:
+                logger.warning(
+                    "background_tasks.cancel_all: fx_cache_warmer.stop raised",
                     exc_info=True,
                 )
 
@@ -244,7 +256,7 @@ class AppContainer:
 
         Keys: db_engine, telegram_notifier, retraining_service, fgi_client,
         coingecko_client, fred_client, whale_alert_client, equity_prune_task,
-        history_cache_warmer.
+        history_cache_warmer, fx_cache_warmer.
         """
         return {
             "db_engine": self.db_engine is not None,
@@ -258,5 +270,9 @@ class AppContainer:
             "history_cache_warmer": (
                 self.background_tasks.history_cache_warmer is not None
                 and self.background_tasks.history_cache_warmer.running
+            ),
+            "fx_cache_warmer": (
+                self.background_tasks.fx_cache_warmer is not None
+                and self.background_tasks.fx_cache_warmer.running
             ),
         }

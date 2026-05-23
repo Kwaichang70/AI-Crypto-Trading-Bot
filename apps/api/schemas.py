@@ -475,6 +475,22 @@ class BacktestMetricsResponse(BaseModel):
         ),
     )
 
+    # M6 (Sprint 49): currency labeling
+    quote_currency: str | None = Field(
+        default=None,
+        description=(
+            "Detected quote currency, e.g. 'USDT', 'USD', or 'MIXED' for "
+            "heterogeneous multi-symbol runs.  None for pre-M6 records."
+        ),
+    )
+    reporting_currency: str | None = Field(
+        default=None,
+        description=(
+            "None = PnL in detected quote currency (no FX applied). "
+            "M6b will set 'USD' for MIXED runs after conversion."
+        ),
+    )
+
     @field_serializer(
         "initial_capital", "final_equity", "total_fees_paid",
         "average_trade_pnl", "average_win", "average_loss",

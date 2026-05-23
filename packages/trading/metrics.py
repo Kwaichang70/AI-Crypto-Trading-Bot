@@ -323,6 +323,24 @@ class BacktestResult(BaseModel):
         description="Total fees paid in quote currency",
     )
 
+    # M6 (Sprint 49): quote currency detection + reporting currency label
+    quote_currency: str | None = Field(
+        default=None,
+        description=(
+            "Detected quote currency from symbol strings (e.g. 'USDT', 'USD'). "
+            "'MIXED' when multi-symbol run has heterogeneous quote currencies. "
+            "None for pre-M6 records constructed without detection logic."
+        ),
+    )
+    reporting_currency: str | None = Field(
+        default=None,
+        description=(
+            "Currency in which PnL and equity figures are expressed. "
+            "None = same as quote_currency (no FX conversion applied). "
+            "M6b will set this to 'USD' for MIXED runs after conversion."
+        ),
+    )
+
 
 # ===================================================================
 # Standalone metric functions

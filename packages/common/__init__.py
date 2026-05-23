@@ -8,7 +8,7 @@ Public API
 ----------
 From ``common.types``:
     OrderSide, OrderType, OrderStatus, SignalDirection, RunMode, TimeFrame,
-    AssetClass, LogLevel
+    AssetClass, LogLevel, QuoteCurrency
 
 From ``common.models``:
     OHLCVBar
@@ -42,6 +42,7 @@ from common.types import (
     OrderSide,
     OrderStatus,
     OrderType,
+    QuoteCurrency,
     RunMode,
     SignalDirection,
     TimeFrame,
@@ -67,6 +68,7 @@ __all__ = [
     "TimeFrame",
     "AssetClass",
     "LogLevel",
+    "QuoteCurrency",
     # models
     "OHLCVBar",
     # config

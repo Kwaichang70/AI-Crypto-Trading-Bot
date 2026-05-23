@@ -114,6 +114,7 @@ class TestBackgroundHealthEndpoint:
         body = r.json()
         assert set(body.keys()) == {
             "history_cache_warmer", "retraining_service", "active_runs",
+            "fx_cache_warmer",  # M6 (Sprint 49)
         }
         assert set(body["history_cache_warmer"].keys()) == {
             "configured", "running", "last_run_at_unix",
@@ -124,3 +125,6 @@ class TestBackgroundHealthEndpoint:
             "min_trades_for_retrain", "check_interval_seconds",
         }
         assert set(body["active_runs"].keys()) == {"count", "run_ids"}
+        assert set(body["fx_cache_warmer"].keys()) == {  # M6 (Sprint 49)
+            "configured", "running", "last_run_at_unix", "last_rates_cached",
+        }

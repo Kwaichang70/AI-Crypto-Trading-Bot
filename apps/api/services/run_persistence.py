@@ -224,6 +224,9 @@ def build_backtest_metrics(result: Any) -> BacktestMetricsResponse:
         psr=getattr(result, "psr", None),
         n_observations=getattr(result, "n_observations", 0),
         confidence_flag=getattr(result, "confidence_flag", None),
+        # M6 (Sprint 49): currency labeling — getattr guards for pre-M6 BacktestResult objects
+        quote_currency=getattr(result, "quote_currency", None),
+        reporting_currency=getattr(result, "reporting_currency", None),
     )
 
 

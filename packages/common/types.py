@@ -18,6 +18,7 @@ __all__ = [
     "TimeFrame",
     "AssetClass",
     "LogLevel",
+    "QuoteCurrency",
 ]
 
 
@@ -110,3 +111,29 @@ class LogLevel(StrEnum):
     WARNING = auto()
     ERROR = auto()
     CRITICAL = auto()
+
+
+class QuoteCurrency(StrEnum):
+    """Quote currency codes (ISO-4217 + crypto stablecoins).
+
+    Values use explicit uppercase string literals (NOT ``auto()``) because
+    ISO-4217 currency codes and CCXT tickers are canonically uppercase.
+    Do NOT change to auto() — that would produce lowercase values and
+    break comparisons with CCXT symbol strings.
+
+    ``MIXED`` is set when a multi-symbol run contains heterogeneous quote
+    currencies (e.g. ["BTC/USDT", "ETH/USD"]).  In that case PnL figures
+    are not directly comparable without FX conversion (M6b).
+    """
+
+    # Values use explicit uppercase string literals (NOT ``auto()``) because
+    # ISO-4217 currency codes and CCXT tickers are canonically uppercase.
+    # Do NOT change to auto() — that would produce lowercase values and
+    # break comparisons with CCXT symbol strings.
+    USD = "USD"
+    USDT = "USDT"
+    USDC = "USDC"
+    EUR = "EUR"
+    GBP = "GBP"
+    JPY = "JPY"
+    MIXED = "MIXED"
