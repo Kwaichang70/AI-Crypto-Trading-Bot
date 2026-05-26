@@ -72,6 +72,17 @@ ENV NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
 ARG NEXTAUTH_SECRET
 ENV NEXTAUTH_SECRET=$NEXTAUTH_SECRET
 
+# Sprint 50 cycle 2 fix: Google OAuth credentials also needed at BUILD time
+# because lib/auth-options.ts validateAuthConfig() fires when Next.js collects
+# page data during `next build` for /api/auth/[...nextauth]/route.ts. Without
+# these as build args, `next build` fails with "GOOGLE_OAUTH_CLIENT_ID and
+# GOOGLE_OAUTH_CLIENT_SECRET must both be set". Runtime values come via
+# docker-compose environment: block (identical values, same .env source).
+ARG GOOGLE_OAUTH_CLIENT_ID
+ENV GOOGLE_OAUTH_CLIENT_ID=$GOOGLE_OAUTH_CLIENT_ID
+ARG GOOGLE_OAUTH_CLIENT_SECRET
+ENV GOOGLE_OAUTH_CLIENT_SECRET=$GOOGLE_OAUTH_CLIENT_SECRET
+
 # Copy installed modules from deps stage
 COPY --from=deps /app/node_modules ./node_modules
 

@@ -220,6 +220,12 @@ services:
         # vars — it uses only values present at `next build` time.
         # The same value is ALSO in environment: below so route handlers read it.
         NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:?NEXTAUTH_SECRET must be set in .env}
+        # Sprint 50 cycle 2 fix: Google OAuth credentials also needed at BUILD
+        # time because validateAuthConfig() fires when Next.js collects page data
+        # for /api/auth/[...nextauth]/route.ts. Runtime values come via
+        # environment: block below (same .env source guarantees identical values).
+        GOOGLE_OAUTH_CLIENT_ID: ${GOOGLE_OAUTH_CLIENT_ID:?GOOGLE_OAUTH_CLIENT_ID must be set in .env}
+        GOOGLE_OAUTH_CLIENT_SECRET: ${GOOGLE_OAUTH_CLIENT_SECRET:?GOOGLE_OAUTH_CLIENT_SECRET must be set in .env}
     image: crypto-trading-bot/ui:local
     restart: unless-stopped
     networks:
