@@ -1,0 +1,51 @@
+# =============================================================================
+# AI Crypto Trading Bot - Caddyfile
+#
+# Caddy v2 reverse proxy configuration.
+#
+# TLS strategy: built-in automatic Tailscale certificate handling
+#   Standard caddy:2-alpine (v2.5+) automatically fetches Let's Encrypt
+#   certificates for *.ts.net domains from the locally-running tailscaled
+#   daemon at handshake time. No explicit get_certificate directive needed.
+#   (get_certificate tailscale is a non-standard xcaddy module not in caddy:2-alpine.)
+#
+# PREREQUISITES (see CADDY-RUNBOOK.md STEP 0 + STEP 1):
+#   1. Hetzner firewall MUST restrict ports 443 and 3001 to 100.64.0.0/10 (Tailscale)
+#      BEFORE this stack is deployed.
+#   2. Tailscale HTTPS must be enabled in tailnet admin console (one-time toggle).
+#   3. TS_PERMIT_CERT_UID must be set in /etc/default/tailscaled on host (see STEP 1c).
+#   4. tailscaled.sock must be mounted into this container (see docker-compose.yml).
+#   5. Run caddy-config.sh to substitute {{TAILSCALE_FQDN}} before deploying.
+# =============================================================================
+
+{
+    # Global options
+    admin localhost:2019      # Admin API: container-internal only, never 0.0.0.0
+    skip_install_trust        # CR-002: suppress Alpine certutil warning (no system store)
+    # NOTE: do NOT set `auto_https off` here. That would suppress Caddy's built-in
+    # *.ts.net certificate path. ACME is not attempted for .ts.net domains by design,
+    # so `auto_https off` provides no benefit and breaks the Tailscale cert flow.
+}
+
+# ---------------------------------------------------------------------------
+# Primary site - UI + API proxy
+#
+# Replace {{TAILSCALE_FQDN}} before deploying via: bash infra/caddy-config.sh
+# ---------------------------------------------------------------------------
+{{TAILSCALE_FQDN}} {
+    # handle /api/* preserves the full /api/v1/... prefix (NOT handle_path).
+    handle /api/* {
+        reverse_proxy api:8000
+    }
+    handle {
+        reverse_proxy ui:3000
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Grafana - metrics dashboard on port 3001
+# (same FQDN, different port; Tailscale cert is hostname-scoped, port-agnostic)
+# ---------------------------------------------------------------------------
+{{TAILSCALE_FQDN}}:3001 {
+    reverse_proxy grafana:3000
+}

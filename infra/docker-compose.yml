@@ -24,6 +24,10 @@ volumes:
     driver: local
   grafana_data:
     driver: local
+  caddy_data:
+    driver: local
+  caddy_config:
+    driver: local
 
 # ---------------------------------------------------------------------------
 # Networks — services communicate on isolated bridge networks
@@ -168,6 +172,8 @@ services:
       # -- Authentication --
       REQUIRE_API_AUTH:    ${REQUIRE_API_AUTH:-false}
       API_KEY_HASH:        ${API_KEY_HASH:-}
+      # -- Reverse proxy: trust Caddy's X-Forwarded-For header (1 hop) --
+      TRUSTED_PROXY_COUNT: ${TRUSTED_PROXY_COUNT:-1}
       # -- ML Auto-Retraining --
       ML_AUTO_RETRAIN:              ${ML_AUTO_RETRAIN:-false}
       ML_MIN_TRADES_FOR_RETRAIN:    ${ML_MIN_TRADES_FOR_RETRAIN:-50}
@@ -182,8 +188,6 @@ services:
       # -- External signal APIs --
       FRED_API_KEY:                 ${FRED_API_KEY:-}
       WHALE_ALERT_API_KEY:          ${WHALE_ALERT_API_KEY:-}
-    ports:
-      - "${API_PORT:-8000}:8000"
     healthcheck:
       test: ["CMD-SHELL",
              "curl -f http://localhost:8000/health || exit 1"]
@@ -224,8 +228,6 @@ services:
       NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
       INTERNAL_API_URL:    http://api:8000
       PORT:                3000
-    ports:
-      - "${UI_PORT:-3000}:3000"
     healthcheck:
       test: ["CMD-SHELL",
              "wget -qO- http://localhost:3000/api/health 2>/dev/null || curl -f http://localhost:3000 || exit 1"]
@@ -293,12 +295,16 @@ services:
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
       GF_USERS_ALLOW_SIGN_UP: "false"
       # Serve behind a sub-path if needed: GF_SERVER_ROOT_URL=http://host/grafana/
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/api/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     volumes:
       - grafana_data:/var/lib/grafana
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
       - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
-    ports:
-      - "${GRAFANA_PORT:-3001}:3000"
     depends_on:
       - prometheus
     deploy:
@@ -308,3 +314,47 @@ services:
           cpus: "0.5"
         reservations:
           memory: 64m
+
+  # --------------------------------------------------------------------------
+  # Caddy — TLS-terminating reverse proxy via Tailscale certificate
+  #
+  # Owns host ports 443 (UI + API) and 3001 (Grafana).
+  # Certificate: built-in Tailscale *.ts.net automatic cert handling.
+  # Browser-trusted; no manual CA install.
+  #
+  # PREREQUISITES (see infra/CADDY-RUNBOOK.md):
+  #   STEP 0: Hetzner firewall restricts 443 + 3001 to Tailscale CIDR 100.64.0.0/10
+  #   STEP 1a: Tailscale HTTPS enabled in tailnet admin console
+  #   STEP 1b: TS_PERMIT_CERT_UID set in /etc/default/tailscaled on host
+  #   STEP 2: tailscaled.sock present on host (populated after `tailscale up`)
+  # --------------------------------------------------------------------------
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    networks:
+      - backend
+      - frontend
+    depends_on:
+      api:
+        condition: service_healthy
+      ui:
+        condition: service_healthy
+      grafana:
+        condition: service_healthy
+    ports:
+      - "443:443"
+      - "3001:3001"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+      # Tailscale socket: allows Caddy to call tailscaled cert API
+      # TS_PERMIT_CERT_UID must be set in /etc/default/tailscaled on host
+      - /var/run/tailscale/tailscaled.sock:/var/run/tailscale/tailscaled.sock:ro
+    deploy:
+      resources:
+        limits:
+          memory: 128m
+          cpus: "0.5"
+        reservations:
+          memory: 32m
