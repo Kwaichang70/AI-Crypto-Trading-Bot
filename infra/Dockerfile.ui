@@ -62,6 +62,16 @@ FROM base AS builder
 ARG NEXT_PUBLIC_API_URL=http://localhost:8000
 ENV NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
 
+# CR-001: NEXTAUTH_SECRET must be available at build time for the Next.js
+# Edge middleware bundle. The Edge runtime is a V8 isolate that runs the
+# compiled middleware.js — it cannot read docker-compose environment vars
+# injected at container start. Baking the value here via ARG/ENV ensures
+# next-auth/middleware can verify JWT session cookies in the Edge runtime.
+# The same value is injected at runtime via docker-compose environment: so
+# the Node.js route handlers see an identical value.
+ARG NEXTAUTH_SECRET
+ENV NEXTAUTH_SECRET=$NEXTAUTH_SECRET
+
 # Copy installed modules from deps stage
 COPY --from=deps /app/node_modules ./node_modules
 

@@ -1,7 +1,9 @@
 import type { Metadata, Viewport } from "next";
 import { Inter } from "next/font/google";
+import { Providers } from "./providers";
 import { Sidebar } from "@/components/layout/sidebar";
 import { MobileNav } from "@/components/layout/mobile-nav";
+import { NavUser } from "@/components/layout/nav-user";
 import { ThemeProvider } from "@/components/theme-provider";
 import { ThemeToggle } from "@/components/ui/theme-toggle";
 import { ToastProvider } from "@/components/ui/toast";
@@ -43,30 +45,33 @@ export default function RootLayout({
       suppressHydrationWarning
     >
       <body className="min-h-screen font-sans antialiased">
-        <ThemeProvider>
-          <ToastProvider>
-            {/* Top navigation bar */}
-            <header className="sticky top-0 z-40 border-b border-slate-200 bg-white/80 backdrop-blur-sm dark:border-slate-800 dark:bg-slate-950/80">
-              <div className="mx-auto flex h-14 max-w-screen-2xl items-center justify-between px-4 sm:px-6 lg:px-8">
-                <span className="text-sm font-semibold tracking-tight text-slate-900 dark:text-slate-100">
-                  Trading Bot
-                </span>
-                <div className="flex items-center gap-2">
-                  <MobileNav />
-                  <ThemeToggle />
+        <Providers>
+          <ThemeProvider>
+            <ToastProvider>
+              {/* Top navigation bar */}
+              <header className="sticky top-0 z-40 border-b border-slate-200 bg-white/80 backdrop-blur-sm dark:border-slate-800 dark:bg-slate-950/80">
+                <div className="mx-auto flex h-14 max-w-screen-2xl items-center justify-between px-4 sm:px-6 lg:px-8">
+                  <span className="text-sm font-semibold tracking-tight text-slate-900 dark:text-slate-100">
+                    Trading Bot
+                  </span>
+                  <div className="flex items-center gap-2">
+                    <MobileNav />
+                    <NavUser />
+                    <ThemeToggle />
+                  </div>
                 </div>
-              </div>
-            </header>
+              </header>
 
-            {/* Two-column shell: sidebar + main */}
-            <div className="mx-auto flex max-w-screen-2xl gap-8 px-4 sm:px-6 lg:px-8">
-              <Sidebar />
-              <main className="min-w-0 flex-1 py-6">
-                {children}
-              </main>
-            </div>
-          </ToastProvider>
-        </ThemeProvider>
+              {/* Two-column shell: sidebar + main */}
+              <div className="mx-auto flex max-w-screen-2xl gap-8 px-4 sm:px-6 lg:px-8">
+                <Sidebar />
+                <main className="min-w-0 flex-1 py-6">
+                  {children}
+                </main>
+              </div>
+            </ToastProvider>
+          </ThemeProvider>
+        </Providers>
       </body>
     </html>
   );

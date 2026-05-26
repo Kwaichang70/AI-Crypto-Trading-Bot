@@ -215,6 +215,11 @@ services:
       target: runner
       args:
         NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+        # CR-001: NEXTAUTH_SECRET must be baked into the Edge middleware bundle
+        # at build time. The Edge runtime cannot read docker-compose environment
+        # vars — it uses only values present at `next build` time.
+        # The same value is ALSO in environment: below so route handlers read it.
+        NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:?NEXTAUTH_SECRET must be set in .env}
     image: crypto-trading-bot/ui:local
     restart: unless-stopped
     networks:
@@ -228,6 +233,15 @@ services:
       NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
       INTERNAL_API_URL:    http://api:8000
       PORT:                3000
+      # NextAuth runtime configuration — MUST be environment (not only build args).
+      # NextAuth route handlers read these via process.env at request time.
+      NEXTAUTH_URL:              ${NEXTAUTH_URL:?NEXTAUTH_URL must be set in .env}
+      NEXTAUTH_SECRET:           ${NEXTAUTH_SECRET:?NEXTAUTH_SECRET must be set in .env}
+      GOOGLE_OAUTH_CLIENT_ID:    ${GOOGLE_OAUTH_CLIENT_ID:?GOOGLE_OAUTH_CLIENT_ID must be set in .env}
+      GOOGLE_OAUTH_CLIENT_SECRET: ${GOOGLE_OAUTH_CLIENT_SECRET:?GOOGLE_OAUTH_CLIENT_SECRET must be set in .env}
+      # SR-004: Fail-fast — ADMIN_EMAILS must be explicitly set.
+      # Use 'none@example.invalid' if you want zero admin accounts.
+      ADMIN_EMAILS: ${ADMIN_EMAILS:?ADMIN_EMAILS must be set in .env (use 'none@example.invalid' if you want zero admins)}
     healthcheck:
       test: ["CMD-SHELL",
              "wget -qO- http://localhost:3000/api/health 2>/dev/null || curl -f http://localhost:3000 || exit 1"]

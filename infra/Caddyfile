@@ -33,10 +33,20 @@
 # Replace {{TAILSCALE_FQDN}} before deploying via: bash infra/caddy-config.sh
 # ---------------------------------------------------------------------------
 {{TAILSCALE_FQDN}} {
+    # NextAuth OAuth callbacks MUST reach the UI container, not the FastAPI backend.
+    # This more-specific handle block MUST appear BEFORE handle /api/* because
+    # Caddy v2 evaluates handle blocks in source order and stops at the first match.
+    handle /api/auth/* {
+        reverse_proxy ui:3000
+    }
+
+    # All other /api/* routes go to the FastAPI backend.
     # handle /api/* preserves the full /api/v1/... prefix (NOT handle_path).
     handle /api/* {
         reverse_proxy api:8000
     }
+
+    # Catch-all: everything else goes to the Next.js frontend.
     handle {
         reverse_proxy ui:3000
     }
