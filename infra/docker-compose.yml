@@ -214,7 +214,10 @@ services:
       dockerfile: infra/Dockerfile.ui
       target: runner
       args:
-        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+        # Use `-` (not `:-`) so an explicit empty value passes through.
+        # Empty = browser uses same-origin relative URLs (Caddy proxies /api/v1/*).
+        # Set to "http://localhost:8000" for `npm run dev` outside Docker.
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL-}
         # CR-001: NEXTAUTH_SECRET must be baked into the Edge middleware bundle
         # at build time. The Edge runtime cannot read docker-compose environment
         # vars — it uses only values present at `next build` time.

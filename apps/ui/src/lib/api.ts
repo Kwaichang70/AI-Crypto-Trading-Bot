@@ -35,6 +35,12 @@ import type {
 // Configuration
 // ---------------------------------------------------------------------------
 
+// Sprint 50 cycle 2 fix: paths in this module all start with /api/v1/...
+// (already include the /api prefix). BASE_URL must therefore be EITHER:
+//   - a full URL like "http://api:8000" (server-side SSR, prepended to /api/v1/...)
+//   - empty string "" (browser, makes URLs same-origin relative; Caddy proxies /api/v1/*)
+// The previous fallback `|| "/api"` caused double-prefix /api/api/v1/... in browser
+// when NEXT_PUBLIC_API_URL was set to "/api" or empty.
 const BASE_URL =
   typeof window === "undefined"
     ? (
@@ -42,7 +48,7 @@ const BASE_URL =
         process.env.NEXT_PUBLIC_API_URL ??
         "http://api:8000"
       ).replace(/\/$/, "")
-    : (process.env.NEXT_PUBLIC_API_URL ?? "").replace(/\/$/, "") || "/api";
+    : (process.env.NEXT_PUBLIC_API_URL ?? "").replace(/\/$/, "");
 
 // ---------------------------------------------------------------------------
 // Shared response types
