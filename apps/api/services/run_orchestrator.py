@@ -44,6 +44,7 @@ from api.db.models import (
     PositionSnapshotORM,
     TradeORM,
 )
+from api.services.audit_log import record_audit_event
 from api.services.run_persistence import persist_paper_results as _persist_paper_results
 from common.types import TimeFrame
 
@@ -95,6 +96,10 @@ def _normalize_exchange_secret(secret: str) -> str:
 #: Tune to balance DB write pressure vs dashboard freshness — 30 s keeps
 #: Grafana panels current without hammering the connection pool.
 _PAPER_FLUSH_INTERVAL_SECONDS: float = 30.0
+
+# Mirrors trading.strategy_engine._HALT_AUTO_STOP_REASON — duplicated to
+# avoid an api→trading→api import cycle. Both must stay in sync.
+_HALT_AUTO_STOP_REASON_VALUE: str = "circuit_breaker_halt"
 
 
 # ---------------------------------------------------------------------------
@@ -821,6 +826,28 @@ async def run_paper_engine(
                 log=log,
             )
 
+        # Sprint 50 Cycle 4: if the engine set its own stop event due to a
+        # HALT circuit-breaker response, write an audit row BEFORE the status
+        # transition so the forensic trail is complete even if status write fails.
+        if engine is not None and getattr(engine, "auto_stop_reason", None) == _HALT_AUTO_STOP_REASON_VALUE:
+            try:
+                factory_audit = get_session_factory()
+                async with factory_audit() as db_audit:
+                    await record_audit_event(
+                        db_audit,
+                        event_type="circuit_breaker_halt_auto_stop",
+                        resource_type="run",
+                        resource_id=run_id_str,
+                        request=None,  # system-initiated; no operator request context
+                        payload={"trigger": "graduated_halt", "run_id": run_id_str},
+                    )
+                    await db_audit.commit()
+            except Exception:
+                log.warning(
+                    "runs.paper_engine_halt_audit_failed",
+                    run_id=run_id_str,
+                )
+
         # Update run status in DB using an isolated session
         try:
             factory = get_session_factory()
@@ -1084,6 +1111,27 @@ async def run_live_engine(
                 state=flush_state,
                 log=log,
             )
+
+        # Sprint 50 Cycle 4: audit HALT auto-stop before status transition
+        # (mirrors paper engine pattern; availability > perfect auditability).
+        if engine is not None and getattr(engine, "auto_stop_reason", None) == _HALT_AUTO_STOP_REASON_VALUE:
+            try:
+                factory_audit = get_session_factory()
+                async with factory_audit() as db_audit:
+                    await record_audit_event(
+                        db_audit,
+                        event_type="circuit_breaker_halt_auto_stop",
+                        resource_type="run",
+                        resource_id=run_id_str,
+                        request=None,
+                        payload={"trigger": "graduated_halt", "run_id": run_id_str},
+                    )
+                    await db_audit.commit()
+            except Exception:
+                log.warning(
+                    "runs.live_engine_halt_audit_failed",
+                    run_id=run_id_str,
+                )
 
         # Update run status in DB using an isolated session
         try:

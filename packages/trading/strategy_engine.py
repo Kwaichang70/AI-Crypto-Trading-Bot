@@ -67,6 +67,11 @@ _DEFAULT_WARMUP_MULTIPLIER: int = 2
 #: Floor for the auto-warmup window even when strategies request less.
 _MIN_WARMUP_BARS: int = 50
 
+# Sprint 50 Cycle 4: HALT auto-stop reason marker. Public, immutable. The
+# orchestrator reads engine.auto_stop_reason and compares to this value
+# before writing a 'circuit_breaker_halt_auto_stop' audit row.
+_HALT_AUTO_STOP_REASON: str = "circuit_breaker_halt"
+
 
 # ---------------------------------------------------------------------------
 # Engine state enum
@@ -205,6 +210,12 @@ class StrategyEngine:
         self._exposure_bars_per_symbol: dict[str, int] = {}
         self._stop_event: asyncio.Event = asyncio.Event()
 
+        # Sprint 50 Cycle 4: auto-stop reason set by the engine when it
+        # initiates its own shutdown (e.g. graduated circuit breaker HALT).
+        # The orchestrator reads this via auto_stop_reason property to decide
+        # whether to write a targeted audit event.  None = operator/timeout stop.
+        self._auto_stop_reason: str | None = None
+
         # Adaptive learning - excursion and skip tracking (Sprint 32)
         self._excursion_tracker = TradeExcursionTracker()
         self._skip_logger = TradeSkipLogger()
@@ -275,6 +286,22 @@ class StrategyEngine:
     def circuit_breaker(self) -> Any:
         """The circuit breaker instance, or None if not configured."""
         return self._circuit_breaker
+
+    @property
+    def auto_stop_reason(self) -> str | None:
+        """Reason string when the engine initiated its own shutdown, else None.
+
+        Set by :meth:`_process_bar` when the graduated circuit breaker returns
+        ``HALT``.  The orchestrator reads this in the ``finally`` block to write
+        a targeted audit event so the operator has a clear stop-cause trail.
+        Callers MUST NOT write to this attribute — it is set only by the engine.
+
+        Set in live and paper modes only.  In backtest mode the engine continues
+        iterating bars and never reaches the orchestrator ``finally`` block that
+        consumes this attribute; backtest callers MAY observe a non-None value
+        but no audit row is written.
+        """
+        return self._auto_stop_reason
 
     # ------------------------------------------------------------------
     # Lifecycle: start
@@ -742,6 +769,39 @@ class StrategyEngine:
         _suppress_new_signals = (
             _cb_response in (CircuitBreakerResponse.HALT, CircuitBreakerResponse.DAILY_LIMIT)
         )
+
+        # Sprint 50 Cycle 4: HALT is now auto-stop.  Setting _stop_event
+        # causes run_live_loop() to exit after this bar completes, which
+        # triggers the orchestrator's finally block (status transition +
+        # audit row).  DAILY_LIMIT is excluded — it may resume the next UTC day.
+        # The not-is_set() guard prevents repeated log spam on a hard-tripped
+        # breaker that is never reset between bars.
+        if _cb_response == CircuitBreakerResponse.HALT and not self._stop_event.is_set():
+            open_position_count = 0
+            try:
+                if self._portfolio is not None:
+                    _halt_summary = self._portfolio.get_summary()
+                    open_position_count = int(_halt_summary.get("open_positions", 0))
+            except Exception:
+                pass  # defensive — log enrichment must never crash the stop path
+            logger.warning(
+                "circuit_breaker.halt_auto_stop_requested",
+                run_id=self._run_id,
+                symbol=list(current_bars.keys())[0] if current_bars else None,
+                reason="graduated_circuit_breaker_halt",
+                open_position_count=open_position_count,
+            )
+            # NOTE: HALT auto-stop deliberately does NOT close open positions.
+            # Forced liquidation at HALT-trigger prices (typically post-flash-crash,
+            # post-drawdown) historically executes at worst-decile prices. Operator
+            # decides liquidation strategy after reviewing the audit row and dashboard.
+            # No-position-close policy: HALT stops trading but does NOT liquidate
+            # open positions.  Operator decides via the runbook
+            # (docs/runbooks/circuit-breaker-halt-auto-stop.md) whether to liquidate,
+            # hold, or reset+resume.  Rationale: a forced sell at a stressed moment
+            # could realise the very loss the breaker is trying to contain.
+            self._auto_stop_reason = _HALT_AUTO_STOP_REASON
+            self._stop_event.set()
 
         for strategy in self._strategies:
             try:

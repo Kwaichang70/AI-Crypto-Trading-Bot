@@ -58,6 +58,11 @@ _VALID_EVENT_TYPES: frozenset[str] = frozenset(
         # so post-incident audit can isolate global interventions from
         # targeted single-run stops.
         "kill_switch",
+        # Sprint 50 Cycle 4: system-initiated stop caused by the graduated
+        # circuit breaker reaching HALT level.  Distinct from operator-
+        # triggered emergency_stop/kill_switch so post-incident queries can
+        # isolate autonomous risk-management stops from manual interventions.
+        "circuit_breaker_halt_auto_stop",
     }
 )
 
