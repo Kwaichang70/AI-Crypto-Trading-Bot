@@ -29,6 +29,8 @@ export const config = {
      *   - /_next/static/* and /_next/image/* (Next.js internals)
      *   - /favicon.ico, /*.svg, /*.png, /*.jpg, /*.webp (static assets)
      */
+    // MUST continue to match /api/admin/* — see Sprint 50 cycle 3 SEC-001 (frontend security audit).
+    // Removing this coverage would silently bypass NextAuth on /api/admin/kill-switch.
     "/((?!api/auth|_next/static|_next/image|favicon\\.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp)).*)",
   ],
 };

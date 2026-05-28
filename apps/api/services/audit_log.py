@@ -53,6 +53,11 @@ _VALID_EVENT_TYPES: frozenset[str] = frozenset(
         # endpoint.  Distinct from regular DELETE /runs/{id} so the
         # post-incident audit can isolate emergency interventions.
         "emergency_stop",
+        # Sprint 50 Cycle 3: aggregate kill-switch that stops ALL running
+        # engines in one operator call.  Distinct from per-run emergency_stop
+        # so post-incident audit can isolate global interventions from
+        # targeted single-run stops.
+        "kill_switch",
     }
 )
 
@@ -112,6 +117,7 @@ async def record_audit_event(
     resource_id: str,
     request: Request | None = None,
     payload: dict[str, Any] | None = None,
+    actor_override: str | None = None,
 ) -> None:
     """Persist a single audit event.
 
@@ -135,6 +141,11 @@ async def record_audit_event(
         Pass ``None`` for system-initiated events (lifespan recovery etc).
     payload:
         Optional JSONB payload.  MUST NOT include secret material.
+    actor_override:
+        When provided, use this string directly as the actor identifier
+        instead of resolving from the X-API-Key header.  Used by the
+        kill-switch endpoint to record a deterministic admin key prefix
+        (e.g. ``"admin_key_<hex12>"``).
     """
     if event_type not in _VALID_EVENT_TYPES:
         logger.warning(
@@ -144,7 +155,10 @@ async def record_audit_event(
         )
         return
 
-    actor = _resolve_actor(request)
+    if actor_override is not None:
+        actor = actor_override
+    else:
+        actor = _resolve_actor(request)
     ip, user_agent = _resolve_transport(request)
 
     event = AuditEventORM(

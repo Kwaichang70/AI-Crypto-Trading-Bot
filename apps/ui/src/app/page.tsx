@@ -15,6 +15,7 @@ import { RunStatusBadge } from "@/components/ui/status-badge";
 import { Header } from "@/components/layout/header";
 import { EquityOverview } from "@/components/dashboard/equity-overview";
 import { MarketSignals } from "@/components/dashboard/market-signals";
+import { KillSwitchButton } from "@/components/kill-switch-button";
 
 export const metadata: Metadata = { title: "Dashboard" };
 export const dynamic = "force-dynamic";
@@ -113,12 +114,15 @@ export default async function DashboardPage() {
         title="Trading Bot Dashboard"
         subtitle="Monitor live runs, review backtest results, and manage strategy configuration."
         actions={
-          <Link
-            href="/runs/new"
-            className="rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-indigo-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500"
-          >
-            New Backtest
-          </Link>
+          <div className="flex items-center gap-3">
+            <Link
+              href="/runs/new"
+              className="rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-indigo-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500"
+            >
+              New Backtest
+            </Link>
+            <KillSwitchButton />
+          </div>
         }
       />
 

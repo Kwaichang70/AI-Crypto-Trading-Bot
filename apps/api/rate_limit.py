@@ -373,6 +373,14 @@ async def _rate_limit_middleware(request: Request, call_next: Any) -> Response:
     if path.endswith("/emergency-stop"):
         return cast(Response, await call_next(request))
 
+    # Sprint 50 Cycle 3: exempt the global kill-switch from rate limits.
+    # Same rationale as /emergency-stop above — availability of the kill
+    # switch is a security property; the audit_events row records every
+    # invocation so abuse is detectable post-incident.
+    # Exact match (not endswith) to prevent unintended path inheritance.
+    if path == "/api/v1/emergency/kill-switch":
+        return cast(Response, await call_next(request))
+
     # Determine the appropriate limit tier
     method = request.method.upper()
     if method == "GET":

@@ -268,6 +268,60 @@ class Settings(BaseSettings):
     )
 
     # ------------------------------------------------------------------
+    # Admin operations (Sprint 50 Cycle 3)
+    # ------------------------------------------------------------------
+    admin_api_key: SecretStr = Field(
+        default=SecretStr(""),
+        description=(
+            "Plaintext admin key for privileged operations (global kill-switch).  "
+            "Validated directly via hmac.compare_digest — NOT hashed like api_key_hash.  "
+            "Generate with: openssl rand -hex 32.  "
+            "When empty, all admin endpoints return 401 (indistinguishable from absent header).  "
+            "Rotate independently of X-API-Key — rotation only affects kill-switch."
+        ),
+    )
+
+    @field_validator("admin_api_key")
+    @classmethod
+    def _validate_admin_api_key(cls, v: SecretStr) -> SecretStr:
+        """Reject placeholder and weak values at settings load time.
+
+        Rules (empty string = "not configured" sentinel, always allowed):
+        1. Value starting with 'REPLACE_ME' (any case) → rejected (placeholder)
+        2. Non-empty value shorter than 32 characters → rejected (too short)
+        3. Non-empty value that is entirely alphabetic → rejected (no entropy)
+        4. Non-empty value that is entirely numeric → rejected (no entropy)
+
+        Pattern mirrors `validate_api_key_hash` (config.py) + extends it
+        with entropy checks analogous to password complexity requirements.
+        """
+        raw = v.get_secret_value()
+        if not raw:
+            # Empty = "admin key not configured" sentinel; 401 returned at runtime
+            return v
+        if raw.upper().startswith("REPLACE_ME"):
+            raise ValueError(
+                "admin_api_key appears to be a placeholder (starts with 'REPLACE_ME'). "
+                "Generate a real key with: openssl rand -hex 32"
+            )
+        if len(raw) < 32:
+            raise ValueError(
+                f"admin_api_key must be at least 32 characters (got {len(raw)}). "
+                "Generate a real key with: openssl rand -hex 32"
+            )
+        if raw.isalpha():
+            raise ValueError(
+                "admin_api_key must not be entirely alphabetic (no entropy). "
+                "Generate a real key with: openssl rand -hex 32"
+            )
+        if raw.isdigit():
+            raise ValueError(
+                "admin_api_key must not be entirely numeric (no entropy). "
+                "Generate a real key with: openssl rand -hex 32"
+            )
+        return v
+
+    # ------------------------------------------------------------------
     # Risk defaults (overridable per-run)
     # ------------------------------------------------------------------
     default_max_open_positions: int = Field(default=3, ge=1, le=20)

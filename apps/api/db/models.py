@@ -1448,7 +1448,7 @@ class AuditEventORM(Base):
         CheckConstraint(
             "event_type IN ("
             "'live_trading_enabled', 'model_activated', "
-            "'circuit_breaker_reset', 'emergency_stop'"
+            "'circuit_breaker_reset', 'emergency_stop', 'kill_switch'"
             ")",
             name="ck_audit_events_event_type",
         ),

@@ -678,8 +678,17 @@ def _register_routes(application: FastAPI) -> None:
 
     from api.routers import circuit_breaker, learning, ml, optimize, orders, portfolio, runs, signals, strategies
     from api.routers import health as health_router_mod  # alias avoids shadowing the local `/health` handler
+    from api.routers import emergency
 
     _V1 = "/api/v1"
+
+    application.include_router(
+        emergency.router,
+        prefix=_V1,
+        tags=["emergency"],
+        # require_admin dependency is declared on the endpoint itself (not here)
+        # so the router remains importable without settings configured.
+    )
 
     application.include_router(
         runs.router,
