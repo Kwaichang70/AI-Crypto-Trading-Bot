@@ -49,8 +49,13 @@ def client_with_token(monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient, 
 
 
 def _live_payload(*, confirm_token: str | None = None) -> dict[str, Any]:
+    # Sprint 51 C2 lockdown: use the ACTIVE, live-eligible ``grid_trading`` so
+    # the request reaches the LiveTradingGate (the focus of these SEC-004
+    # confirm-token tests).  ma_crossover is now DEMOTED -> backtest-only and
+    # would be rejected with 422 BEFORE the gate, which is unrelated to the
+    # confirm-token behaviour under test here.
     body: dict[str, Any] = {
-        "strategyName": "ma_crossover",
+        "strategyName": "grid_trading",
         "strategyParams": {},
         "symbols": ["BTC/USDT"],
         "timeframe": "1h",

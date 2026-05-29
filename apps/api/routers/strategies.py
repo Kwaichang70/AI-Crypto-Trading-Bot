@@ -32,6 +32,7 @@ from api.schemas import (
     StrategyInfoResponse,
     StrategyListResponse,
 )
+from trading.strategy_availability import get_availability
 
 __all__ = ["router"]
 
@@ -82,6 +83,7 @@ def _build_registry() -> dict[str, dict[str, Any]]:
 
     for name, cls in entries:
         meta = cls.metadata
+        av = get_availability(name)
         strategies[name] = {
             "name": name,
             "display_name": meta.name,
@@ -89,6 +91,11 @@ def _build_registry() -> dict[str, dict[str, Any]]:
             "description": meta.description,
             "tags": list(meta.tags),
             "parameter_schema": cls.parameter_schema(),
+            # Sprint 51 Cycle 2: availability metadata
+            "allowed_modes": sorted(m.value for m in av.allowed_modes),
+            "status": av.status.value,
+            "demotion_reason": av.demotion_reason or None,
+            "promotion_requirements": list(av.promotion_requirements),
         }
 
     return strategies
@@ -138,6 +145,10 @@ def _to_strategy_info(entry: dict[str, Any]) -> StrategyInfoResponse:
         description=entry["description"],
         tags=entry["tags"],
         parameter_schema=entry["parameter_schema"],
+        allowed_modes=entry["allowed_modes"],
+        status=entry["status"],
+        demotion_reason=entry["demotion_reason"],
+        promotion_requirements=entry["promotion_requirements"],
     )
 
 

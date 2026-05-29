@@ -23,6 +23,15 @@ Test strategy
 - Each test is independent: the mock_db_session fixture resets all call
   history and return values between tests.
 
+Sprint 51 Cycle 2 note
+----------------------
+ma_crossover, breakout and model_strategy are now DEMOTED -> backtest-only.
+Paper/live run-creation and orphan recovery for those strategies is rejected
+by the strategy-availability lockdown.  Tests that exercise paper-mode wiring
+(strategy-agnostic intent) were re-targeted to the ACTIVE strategy
+``grid_trading`` so they keep testing their ORIGINAL behaviour.  A dedicated
+``TestStrategyAvailabilityLockdown`` class asserts the new lockdown behaviour.
+
 Mock wiring summary
 -------------------
   list_runs:  db.execute() is called twice (count then page).
@@ -59,9 +68,13 @@ _FIXED_UUID = uuid.UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
 _FIXED_UUID_2 = uuid.UUID("11111111-2222-3333-4444-555555555555")
 _FIXED_NOW = datetime(2026, 1, 15, 12, 0, 0, tzinfo=UTC)
 
+# Sprint 51 C2 lockdown: paper-mode fixtures use an ACTIVE strategy
+# (grid_trading) because ma_crossover is now DEMOTED -> backtest-only and the
+# create_run/recovery guards correctly reject it in paper/live.  Empty params
+# rely on the strategy's schema defaults so the payload stays strategy-agnostic.
 _PAPER_RUN_CONFIG = {
-    "strategy_name": "ma_crossover",
-    "strategy_params": {"fast_period": 10, "slow_period": 50},
+    "strategy_name": "grid_trading",
+    "strategy_params": {},
     "symbols": ["BTC/USDT"],
     "timeframe": "1h",
     "mode": "paper",
@@ -98,7 +111,9 @@ def _make_run_orm(
         run_mode=run_mode,
         status=status,
         config=config or {
-            "strategy_name": "ma_crossover",
+            # Sprint 51 C2: read-back fixtures use an ACTIVE strategy so they
+            # are coherent with what the lockdown allows in paper/live.
+            "strategy_name": "grid_trading",
             "strategy_params": {},
             "symbols": ["BTC/USDT"],
             "timeframe": "1h",
@@ -165,8 +180,10 @@ class TestCreateRun:
 
         The strategy registry validation in the handler converts the name to
         snake_case and checks it against the registry dict.  Any name not in
-        {ma_crossover, rsi_mean_reversion, breakout} must be rejected before
-        any DB I/O occurs.
+        the registry must be rejected (400) before any DB I/O occurs.  Note
+        this is the *unknown-strategy* guard (400), distinct from the
+        availability lockdown guard (422) tested in
+        TestStrategyAvailabilityLockdown.
         """
         payload = {
             "strategyName": "no_such_strategy",
@@ -193,7 +210,7 @@ class TestCreateRun:
         HTTP 422 Unprocessable Entity response (Pydantic validation error).
         """
         # Only strategy_name is provided — everything else is missing
-        payload = {"strategyName": "ma_crossover"}
+        payload = {"strategyName": "grid_trading"}
         resp = client_dev_with_db.post("/api/v1/runs", json=payload)
 
         assert resp.status_code == 422
@@ -208,7 +225,7 @@ class TestCreateRun:
         ValueError which FastAPI converts to 422 before reaching the handler.
         """
         payload = {
-            "strategyName": "ma_crossover",
+            "strategyName": "grid_trading",
             "strategyParams": {},
             "symbols": ["BTCUSDT"],  # Missing slash — invalid CCXT format
             "timeframe": "1h",
@@ -225,6 +242,10 @@ class TestCreateRun:
         """
         A valid paper-mode run creation must return HTTP 201 with RunDetailResponse.
 
+        Sprint 51 C2: re-targeted from the now-demoted ``ma_crossover`` to the
+        ACTIVE ``grid_trading`` so the original paper-creation wiring intent is
+        preserved on a strategy the lockdown allows in paper mode.
+
         The handler calls db.add() then db.flush() and returns the ORM object
         converted to RunDetailResponse.  We verify:
         - HTTP 201 status code
@@ -233,8 +254,8 @@ class TestCreateRun:
         - db.flush() was called once (inside the paper mode branch)
         """
         payload = {
-            "strategyName": "ma_crossover",
-            "strategyParams": {"fast_period": 10, "slow_period": 50},
+            "strategyName": "grid_trading",
+            "strategyParams": {},
             "symbols": ["BTC/USDT"],
             "timeframe": "1h",
             "mode": "paper",
@@ -247,13 +268,135 @@ class TestCreateRun:
         body = resp.json()
         assert body["runMode"] == "paper"
         assert body["status"] == "running"
-        assert body["config"]["strategy_name"] == "ma_crossover"
+        assert body["config"]["strategy_name"] == "grid_trading"
         assert body["config"]["symbols"] == ["BTC/USDT"]
         assert body["backtestMetrics"] is None
 
         # Verify DB interactions
         mock_db_session.add.assert_called_once()
         mock_db_session.flush.assert_called()
+
+
+# ---------------------------------------------------------------------------
+# Strategy-availability lockdown tests (Sprint 51 Cycle 2)
+# ---------------------------------------------------------------------------
+
+# The three strategies demoted to backtest-only by Sprint 48 ModelAnalyse.
+_DEMOTED_STRATEGIES = ["ma_crossover", "breakout", "model_strategy"]
+
+
+@pytest.mark.integration
+class TestStrategyAvailabilityLockdown:
+    """
+    POST /api/v1/runs must enforce strategy-availability lockdown.
+
+    A DEMOTED strategy (ma_crossover / breakout / model_strategy) may only be
+    created in backtest mode.  Paper and live creation is rejected with HTTP
+    422 *after* the unknown-strategy (400) guard and *before* any DB I/O for
+    the run row.  An ACTIVE strategy is accepted in paper mode.
+    """
+
+    @pytest.mark.parametrize("strategy", _DEMOTED_STRATEGIES)
+    @pytest.mark.parametrize("mode", ["paper", "live"])
+    def test_demoted_strategy_rejected_in_paper_and_live(
+        self, client_dev_with_db: TestClient, strategy: str, mode: str
+    ) -> None:
+        """TEST-S51C2-100: each demoted strategy returns 422 in paper AND live.
+
+        The 422 detail must mention the offending mode and/or availability so
+        the operator understands why the run was blocked.
+        """
+        payload = {
+            "strategyName": strategy,
+            "strategyParams": {},
+            "symbols": ["BTC/USDT"],
+            "timeframe": "1h",
+            "mode": mode,
+            "initialCapital": "10000.00",
+            # Live-mode would normally also require the safety gate, but the
+            # availability guard fires before the gate, so no token is needed.
+        }
+        resp = client_dev_with_db.post("/api/v1/runs", json=payload)
+
+        assert resp.status_code == 422, (
+            f"{strategy} in {mode} mode must be rejected with 422, "
+            f"got {resp.status_code}: {resp.text}"
+        )
+        detail = resp.json()["detail"]
+        assert isinstance(detail, str), "detail must be a plain string"
+        # The message references the mode AND the demoted status / availability.
+        assert mode in detail
+        assert "available" in detail.lower()
+        assert "demoted" in detail.lower()
+
+    @pytest.mark.parametrize("strategy", _DEMOTED_STRATEGIES)
+    def test_demoted_strategy_allowed_in_backtest(
+        self, client_dev_with_db: TestClient, mock_db_session: AsyncMock, strategy: str
+    ) -> None:
+        """TEST-S51C2-101: each demoted strategy is STILL allowed in backtest (201).
+
+        Backtest runs execute synchronously and persist a stopped run; we only
+        assert the availability guard does NOT block backtest (status != 422).
+        """
+        payload = {
+            "strategyName": strategy,
+            "strategyParams": {},
+            "symbols": ["BTC/USDT"],
+            "timeframe": "1h",
+            "mode": "backtest",
+            "initialCapital": "10000.00",
+            "backtestStart": "2024-01-01T00:00:00+00:00",
+            "backtestEnd": "2024-01-10T00:00:00+00:00",
+        }
+
+        # The availability guard runs at the top of create_run, well before the
+        # backtest OHLCV fetch.  We patch _fetch_bars_for_backtest to raise a
+        # deterministic HTTPException so no network I/O occurs; if the lockdown
+        # had blocked the run we would have seen 422 BEFORE reaching the fetch.
+        # The essential assertion is simply "the lockdown did not return 422".
+        from fastapi import HTTPException, status as http_status
+
+        with patch(
+            "api.routers.runs._fetch_bars_for_backtest",
+            side_effect=HTTPException(
+                status_code=http_status.HTTP_502_BAD_GATEWAY,
+                detail="patched: no network in tests",
+            ),
+        ):
+            resp = client_dev_with_db.post("/api/v1/runs", json=payload)
+
+        assert resp.status_code != 422, (
+            f"{strategy} backtest must NOT be blocked by the availability "
+            f"lockdown; got {resp.status_code}: {resp.text}"
+        )
+        # Sanity: we reached the (patched) fetch path, proving the lockdown let
+        # the demoted strategy through in backtest mode.
+        assert resp.status_code == 502, (
+            f"Expected to reach the patched fetch (502), got {resp.status_code}: "
+            f"{resp.text}"
+        )
+
+    def test_active_strategy_allowed_in_paper(
+        self, client_dev_with_db: TestClient, mock_db_session: AsyncMock
+    ) -> None:
+        """TEST-S51C2-102: an ACTIVE strategy (grid_trading) is accepted in paper (201)."""
+        payload = {
+            "strategyName": "grid_trading",
+            "strategyParams": {},
+            "symbols": ["BTC/USDT"],
+            "timeframe": "1h",
+            "mode": "paper",
+            "initialCapital": "10000.00",
+        }
+        resp = client_dev_with_db.post("/api/v1/runs", json=payload)
+
+        assert resp.status_code == 201, (
+            f"grid_trading paper run must be accepted; got {resp.status_code}: "
+            f"{resp.text}"
+        )
+        body = resp.json()
+        assert body["runMode"] == "paper"
+        assert body["config"]["strategy_name"] == "grid_trading"
 
 
 # ---------------------------------------------------------------------------
@@ -439,7 +582,7 @@ class TestGetRun:
             "durationDays": 151,
         }
         config_with_metrics = {
-            "strategy_name": "ma_crossover",
+            "strategy_name": "grid_trading",
             "strategy_params": {},
             "symbols": ["BTC/USDT"],
             "timeframe": "1h",
@@ -570,7 +713,7 @@ class TestRunsEndpointAuth:
         DB access or strategy validation happens.
         """
         payload = {
-            "strategyName": "ma_crossover",
+            "strategyName": "grid_trading",
             "strategyParams": {},
             "symbols": ["BTC/USDT"],
             "timeframe": "1h",
@@ -627,9 +770,15 @@ class TestRunsEndpointAuth:
 # ---------------------------------------------------------------------------
 
 # Standard payload reused across task-wiring tests.
+#
+# Sprint 51 C2 lockdown: re-targeted from the now-demoted ``ma_crossover`` to
+# the ACTIVE ``grid_trading`` so these strategy-agnostic task-wiring tests keep
+# exercising the paper-engine background-task lifecycle on a strategy that the
+# lockdown permits in paper mode.  Empty params use the strategy's schema
+# defaults.
 _PAPER_PAYLOAD = {
-    "strategyName": "ma_crossover",
-    "strategyParams": {"fast_period": 10, "slow_period": 50},
+    "strategyName": "grid_trading",
+    "strategyParams": {},
     "symbols": ["BTC/USDT"],
     "timeframe": "1h",
     "mode": "paper",
@@ -707,6 +856,10 @@ class TestPaperEngineTaskWiring:
         POST /api/v1/runs in paper mode must add an entry to _RUN_TASKS keyed
         by the returned run_id string before the HTTP response is returned.
 
+        Sprint 51 C2: payload uses the ACTIVE ``grid_trading`` (was the
+        now-demoted ma_crossover); the background-task wiring being verified is
+        strategy-agnostic.
+
         The patched coroutine sleeps indefinitely so the task stays alive
         (and therefore present in _RUN_TASKS) when we inspect the dict
         after the synchronous TestClient call returns.
@@ -738,6 +891,8 @@ class TestPaperEngineTaskWiring:
         The asyncio.Task created for a paper run must carry the name
         ``paper-engine-{run_id}`` so it is identifiable in event-loop
         introspection and log messages.
+
+        Sprint 51 C2: payload uses the ACTIVE ``grid_trading``.
         """
         from api.routers.runs import _RUN_TASKS
 
@@ -790,7 +945,7 @@ class TestPaperEngineTaskWiring:
             run_mode="paper",
             status="running",
             config={
-                "strategy_name": "ma_crossover",
+                "strategy_name": "grid_trading",
                 "strategy_params": {},
                 "symbols": ["BTC/USDT"],
                 "timeframe": "1h",
@@ -843,7 +998,7 @@ class TestPaperEngineTaskWiring:
             run_mode="paper",
             status="running",
             config={
-                "strategy_name": "ma_crossover",
+                "strategy_name": "grid_trading",
                 "strategy_params": {},
                 "symbols": ["BTC/USDT"],
                 "timeframe": "1h",
@@ -871,6 +1026,8 @@ class TestPaperEngineTaskWiring:
         """
         When the paper engine coroutine completes (or returns early), its
         finally block must remove the run_id entry from _RUN_TASKS.
+
+        Sprint 51 C2: payload uses the ACTIVE ``grid_trading``.
 
         The patched coroutine returns immediately after performing the same
         _RUN_TASKS.pop() that the real finally block performs.  After giving
@@ -909,6 +1066,8 @@ class TestPaperEngineTaskWiring:
         """
         Each POST /api/v1/runs (paper mode) must create an independent Task
         registered under a unique run_id in _RUN_TASKS.
+
+        Sprint 51 C2: payload uses the ACTIVE ``grid_trading``.
 
         Two sequential paper-mode POSTs must produce two distinct _RUN_TASKS
         entries with different keys.  This verifies that the task registry

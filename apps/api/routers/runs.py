@@ -75,7 +75,8 @@ from api.services.run_persistence import (
     run_orm_to_detail_response as _run_orm_to_detail_response,
     run_orm_to_response as _run_orm_to_response,
 )
-from common.types import TimeFrame
+from common.types import RunMode, TimeFrame
+from trading.strategy_availability import get_availability, is_mode_allowed
 
 __all__ = ["router", "recover_orphaned_runs"]
 
@@ -361,6 +362,38 @@ async def create_run(
         )
 
     strategy_cls = registry[strategy_name]
+
+    # ------------------------------------------------------------------
+    # Strategy-availability lockdown (Sprint 51 Cycle 2, IMPL-S51C2-101).
+    # A demoted strategy may only run in backtest mode.  Single source of
+    # truth: trading.strategy_availability.is_mode_allowed.  Fail-closed for
+    # unlisted strategies (backtest-only).  strategy_name is already
+    # normalized (lower + "-"->"_") above, matching the availability keyspace.
+    # ------------------------------------------------------------------
+    if not is_mode_allowed(strategy_name, body.mode):
+        availability = get_availability(strategy_name)
+        sorted_modes = sorted(m.value for m in availability.allowed_modes)
+        status_value = availability.status.value
+        demotion_reason = availability.demotion_reason
+        log.warning(
+            "runs.strategy_mode_not_allowed",
+            strategy_name=strategy_name,
+            mode=str(body.mode),
+            status=status_value,
+            allowed_modes=sorted_modes,
+        )
+        # detail is a plain STRING (not a dict) to avoid the UI
+        # "[object Object]" envelope risk.  All context is embedded inline.
+        # str(body.mode) is runtime-safe: body.mode is a plain str at runtime
+        # (use_enum_values=True) but typed RunMode for mypy; .value would crash.
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"Strategy {strategy_name!r} is not available in "
+                f"{str(body.mode)!r} mode (status={status_value}). "
+                f"Allowed: {sorted_modes}. {demotion_reason}".strip()
+            ),
+        )
 
     # Extract trailing_stop_pct from strategy params BEFORE schema validation.
     # The UI may submit trailing_stop_pct as an empty string when the field is
@@ -1398,6 +1431,7 @@ async def get_promotion_eligibility(
         400: {"description": "Paper run not eligible (gate criteria not met)"},
         403: {"description": "Live trading safety gate failed"},
         404: {"description": "Source paper run not found"},
+        422: {"description": "Strategy not available for live trading (demoted)"},
     },
 )
 async def promote_to_live(
@@ -1448,6 +1482,32 @@ async def promote_to_live(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Paper run {run_id} not found.",
+        )
+
+    # Strategy-availability lockdown (Sprint 51 Cycle 2, IMPL-S51C2-103).
+    # OUTER guard, orthogonal to the per-run evidence gate: a demoted strategy
+    # must never reach live via the promotion path even if its paper-run
+    # evidence would otherwise satisfy evaluate_paper_run_eligibility.
+    # strategy_name is read from the source run's immutable config snapshot and
+    # normalized (SEC-001) to match create_run's availability keyspace.
+    promotion_strategy_name = (
+        str(source_run.config.get("strategy_name", "")) if source_run.config else ""
+    ).lower().replace("-", "_")
+    if not is_mode_allowed(promotion_strategy_name, RunMode.LIVE):
+        availability = get_availability(promotion_strategy_name)
+        log.warning(
+            "runs.promotion_strategy_mode_not_allowed",
+            source_run_id=str(run_id),
+            strategy_name=promotion_strategy_name,
+            status=availability.status.value,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"Strategy {promotion_strategy_name!r} is not available for "
+                f"live trading (status={availability.status.value}) and cannot "
+                f"be promoted to live. {availability.demotion_reason}".strip()
+            ),
         )
 
     # Step 2: Promotion gate (data-volume only)
@@ -1911,6 +1971,38 @@ async def recover_orphaned_runs() -> int:
                     timeframe = TimeFrame(timeframe_str)
                 except ValueError:
                     log.warning("recovery.orphan_skipped", run_id=orphan_id, reason="invalid_timeframe", timeframe=timeframe_str)
+                    await _mark_orphan_error(factory, orphan.id, log)
+                    continue
+
+                # Strategy-availability lockdown (Sprint 51 Cycle 2, IMPL-S51C2-102).
+                # FAIL-CLOSED: a demoted strategy must NOT be auto-restarted in
+                # paper/live.  Mark the orphan as error and skip (do not recreate).
+                # Single source of truth shared with create_run.  Normalize the
+                # strategy name (SEC-001) so the availability key matches
+                # create_run's keyspace regardless of how it was stored.
+                normalized_strategy_name = strategy_name.lower().replace("-", "_")
+                # Validate orphan_mode before constructing RunMode (C1/SEC-007):
+                # a corrupt run_mode column would otherwise raise an uncaught
+                # ValueError; mirror the timeframe-validation skip pattern.
+                try:
+                    orphan_run_mode = RunMode(orphan_mode)
+                except ValueError:
+                    log.warning(
+                        "recovery.orphan_skipped",
+                        reason="invalid_run_mode",
+                        run_id=orphan_id,
+                        mode=orphan_mode,
+                    )
+                    await _mark_orphan_error(factory, orphan.id, log)
+                    continue
+                if not is_mode_allowed(normalized_strategy_name, orphan_run_mode):
+                    log.warning(
+                        "recovery.orphan_skipped",
+                        run_id=orphan_id,
+                        reason="strategy_mode_not_allowed",
+                        strategy_name=normalized_strategy_name,
+                        mode=orphan_mode,
+                    )
                     await _mark_orphan_error(factory, orphan.id, log)
                     continue
 

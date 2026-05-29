@@ -16,6 +16,18 @@ Test classes
 5. TestRecoverValidationSkips   (~5 tests) -- missing strategy_name, unknown strategy, empty symbols,
                                               invalid timeframe, recovery-chain prevention
 6. TestRecoverPerOrphanIsolation (~2 tests) -- one bad orphan does not block valid neighbour
+7. TestRecoverStrategyAvailabilityLockdown (Sprint 51 C2) -- demoted orphan marked error + not restarted;
+                                              active orphan still recovers.
+
+Sprint 51 Cycle 2 note
+----------------------
+ma_crossover, breakout and model_strategy are now DEMOTED -> backtest-only.
+The orphan-recovery path applies the same strategy-availability lockdown as
+create_run: a demoted paper/live orphan is marked error and NOT auto-restarted.
+The happy-path recovery/wiring tests (strategy-agnostic intent: orphan
+recovery + task registration) were re-targeted from the now-demoted
+``ma_crossover`` to the ACTIVE ``grid_trading`` so they keep verifying their
+ORIGINAL behaviour on a strategy the lockdown permits in paper/live.
 
 Design notes
 ------------
@@ -73,11 +85,17 @@ def _make_orphan(
     run_mode: str = "paper",
     config: dict | None = None,
     recovered_from_run_id: uuid.UUID | None = None,
+    strategy_name: str = "grid_trading",
 ) -> SimpleNamespace:
     """Build a SimpleNamespace that mimics a RunORM orphan row.
 
     Only attributes consumed by recover_orphaned_runs() are set; the rest are
     left absent so any accidental access raises AttributeError immediately.
+
+    Sprint 51 C2: the default strategy is the ACTIVE ``grid_trading`` (was the
+    now-demoted ``ma_crossover``) so the strategy-agnostic happy-path recovery
+    tests exercise their original intent on a strategy the lockdown permits in
+    paper/live.  Tests that supply an explicit ``config`` override this.
     """
     return SimpleNamespace(
         id=uuid.uuid4(),
@@ -85,7 +103,7 @@ def _make_orphan(
         status="running",
         config=config
         or {
-            "strategy_name": "ma_crossover",
+            "strategy_name": strategy_name,
             "symbols": ["BTC/USD"],
             "timeframe": "1h",
             "initial_capital": "10000",
@@ -287,7 +305,7 @@ class TestRecoverNoOrphans:
         with (
             patch("api.db.session.get_session_factory", return_value=factory),
             patch("api.config.get_settings", return_value=_make_settings()),
-            patch("api.routers.runs._get_strategy_registry", return_value={"ma_crossover": MagicMock()}),
+            patch("api.routers.runs._get_strategy_registry", return_value={"grid_trading": MagicMock()}),
         ):
             result = await recover_orphaned_runs()
 
@@ -316,12 +334,18 @@ class TestRecoverNoOrphans:
 
 
 class TestRecoverPaperOrphan:
-    """Verify the full recovery flow for a single paper-mode orphan."""
+    """Verify the full recovery flow for a single paper-mode orphan.
+
+    Sprint 51 C2: re-targeted to the ACTIVE ``grid_trading`` (was the
+    now-demoted ``ma_crossover``).  The recovery + task-registration behaviour
+    being verified is strategy-agnostic; ``grid_trading`` is permitted in
+    paper/live by the lockdown so the original happy-path is preserved.
+    """
 
     @pytest.mark.asyncio
     async def test_paper_orphan_returns_one(self) -> None:
         """A single valid paper orphan must result in a return value of 1."""
-        orphan = _make_orphan(run_mode="paper")
+        orphan = _make_orphan(run_mode="paper")  # default strategy: grid_trading
         select_session = _make_session_for_select([orphan])
         write_session = _make_session_for_write(orphan)
         factory = _build_factory(select_session, write_session, write_session)
@@ -331,7 +355,7 @@ class TestRecoverPaperOrphan:
         with (
             patch("api.db.session.get_session_factory", return_value=factory),
             patch("api.config.get_settings", return_value=_make_settings()),
-            patch("api.routers.runs._get_strategy_registry", return_value={"ma_crossover": MagicMock()}),
+            patch("api.routers.runs._get_strategy_registry", return_value={"grid_trading": MagicMock()}),
             patch("api.routers.runs._run_paper_engine", dummy_coro),
             patch("api.routers.runs._run_live_engine", AsyncMock()),
         ):
@@ -356,7 +380,7 @@ class TestRecoverPaperOrphan:
         with (
             patch("api.db.session.get_session_factory", return_value=factory),
             patch("api.config.get_settings", return_value=_make_settings()),
-            patch("api.routers.runs._get_strategy_registry", return_value={"ma_crossover": MagicMock()}),
+            patch("api.routers.runs._get_strategy_registry", return_value={"grid_trading": MagicMock()}),
             patch("api.routers.runs._run_paper_engine", AsyncMock()),
             patch("api.routers.runs._run_live_engine", AsyncMock()),
         ):
@@ -382,7 +406,7 @@ class TestRecoverPaperOrphan:
         with (
             patch("api.db.session.get_session_factory", return_value=factory),
             patch("api.config.get_settings", return_value=_make_settings()),
-            patch("api.routers.runs._get_strategy_registry", return_value={"ma_crossover": MagicMock()}),
+            patch("api.routers.runs._get_strategy_registry", return_value={"grid_trading": MagicMock()}),
             patch("api.routers.runs._run_paper_engine", AsyncMock()),
             patch("api.routers.runs._run_live_engine", AsyncMock()),
         ):
@@ -413,7 +437,7 @@ class TestRecoverPaperOrphan:
         with (
             patch("api.db.session.get_session_factory", return_value=factory),
             patch("api.config.get_settings", return_value=_make_settings()),
-            patch("api.routers.runs._get_strategy_registry", return_value={"ma_crossover": MagicMock()}),
+            patch("api.routers.runs._get_strategy_registry", return_value={"grid_trading": MagicMock()}),
             patch("api.routers.runs._run_paper_engine", AsyncMock()),
             patch("api.routers.runs._run_live_engine", AsyncMock()),
         ):
@@ -440,10 +464,13 @@ class TestRecoverLiveOrphan:
     async def test_live_orphan_gate_pass_recovered(self) -> None:
         """Live orphan with enable_live_trading=True and valid keys must be recovered.
 
+        Sprint 51 C2: re-targeted to the ACTIVE ``grid_trading`` (live-eligible)
+        so the strategy-agnostic gate-pass recovery intent is preserved.
+
         Expected outcome: return value 1, one entry in _RUN_TASKS, _run_live_engine
         coroutine was started (not _run_paper_engine).
         """
-        orphan = _make_orphan(run_mode="live")
+        orphan = _make_orphan(run_mode="live")  # default strategy: grid_trading
         select_session = _make_session_for_select([orphan])
         write_session = _make_session_for_write(orphan)
         factory = _build_factory(select_session, write_session, write_session)
@@ -458,7 +485,7 @@ class TestRecoverLiveOrphan:
         with (
             patch("api.db.session.get_session_factory", return_value=factory),
             patch("api.config.get_settings", return_value=settings),
-            patch("api.routers.runs._get_strategy_registry", return_value={"ma_crossover": MagicMock()}),
+            patch("api.routers.runs._get_strategy_registry", return_value={"grid_trading": MagicMock()}),
             patch("api.routers.runs._run_paper_engine", AsyncMock()),
             patch("api.routers.runs._run_live_engine", live_coro),
         ):
@@ -486,7 +513,7 @@ class TestRecoverLiveOrphan:
         with (
             patch("api.db.session.get_session_factory", return_value=factory),
             patch("api.config.get_settings", return_value=settings),
-            patch("api.routers.runs._get_strategy_registry", return_value={"ma_crossover": MagicMock()}),
+            patch("api.routers.runs._get_strategy_registry", return_value={"grid_trading": MagicMock()}),
             patch("api.routers.runs._run_paper_engine", AsyncMock()),
             patch("api.routers.runs._run_live_engine", AsyncMock()),
         ):
@@ -518,7 +545,7 @@ class TestRecoverLiveOrphan:
         with (
             patch("api.db.session.get_session_factory", return_value=factory),
             patch("api.config.get_settings", return_value=settings),
-            patch("api.routers.runs._get_strategy_registry", return_value={"ma_crossover": MagicMock()}),
+            patch("api.routers.runs._get_strategy_registry", return_value={"grid_trading": MagicMock()}),
             patch("api.routers.runs._run_paper_engine", AsyncMock()),
             patch("api.routers.runs._run_live_engine", AsyncMock()),
         ):
@@ -535,7 +562,13 @@ class TestRecoverLiveOrphan:
 
 
 class TestRecoverValidationSkips:
-    """Verify each config-validation guard marks the orphan error and continues."""
+    """Verify each config-validation guard marks the orphan error and continues.
+
+    Note: these guards (missing_strategy_name / unknown_strategy / empty_symbols /
+    invalid_timeframe) fire BEFORE the Sprint 51 C2 availability lockdown, so the
+    legacy ``ma_crossover`` references here remain valid — the orphan never
+    reaches the availability check.
+    """
 
     @pytest.mark.asyncio
     async def test_missing_strategy_name_marks_error_and_skips(self) -> None:
@@ -562,7 +595,7 @@ class TestRecoverValidationSkips:
         with (
             patch("api.db.session.get_session_factory", return_value=factory),
             patch("api.config.get_settings", return_value=_make_settings()),
-            patch("api.routers.runs._get_strategy_registry", return_value={"ma_crossover": MagicMock()}),
+            patch("api.routers.runs._get_strategy_registry", return_value={"grid_trading": MagicMock()}),
         ):
             result = await recover_orphaned_runs()
 
@@ -592,7 +625,7 @@ class TestRecoverValidationSkips:
         with (
             patch("api.db.session.get_session_factory", return_value=factory),
             patch("api.config.get_settings", return_value=_make_settings()),
-            patch("api.routers.runs._get_strategy_registry", return_value={"ma_crossover": MagicMock()}),
+            patch("api.routers.runs._get_strategy_registry", return_value={"grid_trading": MagicMock()}),
         ):
             result = await recover_orphaned_runs()
 
@@ -605,7 +638,7 @@ class TestRecoverValidationSkips:
         """An orphan with an empty 'symbols' list must be skipped."""
         orphan = _make_orphan(
             config={
-                "strategy_name": "ma_crossover",
+                "strategy_name": "grid_trading",
                 "symbols": [],
                 "timeframe": "1h",
                 "initial_capital": "10000",
@@ -622,7 +655,7 @@ class TestRecoverValidationSkips:
         with (
             patch("api.db.session.get_session_factory", return_value=factory),
             patch("api.config.get_settings", return_value=_make_settings()),
-            patch("api.routers.runs._get_strategy_registry", return_value={"ma_crossover": MagicMock()}),
+            patch("api.routers.runs._get_strategy_registry", return_value={"grid_trading": MagicMock()}),
         ):
             result = await recover_orphaned_runs()
 
@@ -639,7 +672,7 @@ class TestRecoverValidationSkips:
         """
         orphan = _make_orphan(
             config={
-                "strategy_name": "ma_crossover",
+                "strategy_name": "grid_trading",
                 "symbols": ["BTC/USD"],
                 "timeframe": "3h",  # not a valid TimeFrame value
                 "initial_capital": "10000",
@@ -656,7 +689,7 @@ class TestRecoverValidationSkips:
         with (
             patch("api.db.session.get_session_factory", return_value=factory),
             patch("api.config.get_settings", return_value=_make_settings()),
-            patch("api.routers.runs._get_strategy_registry", return_value={"ma_crossover": MagicMock()}),
+            patch("api.routers.runs._get_strategy_registry", return_value={"grid_trading": MagicMock()}),
         ):
             result = await recover_orphaned_runs()
 
@@ -699,6 +732,10 @@ class TestRecoverPerOrphanIsolation:
     """Verify that per-orphan exception isolation works correctly.
 
     One bad orphan in a batch must not prevent the valid one from recovering.
+
+    Sprint 51 C2: the valid neighbour uses the ACTIVE ``grid_trading`` (was the
+    now-demoted ``ma_crossover``) so the strategy-agnostic isolation intent is
+    preserved.
     """
 
     @pytest.mark.asyncio
@@ -719,7 +756,7 @@ class TestRecoverPerOrphanIsolation:
                 "mode": "paper",
             }
         )
-        good_orphan = _make_orphan(run_mode="paper")
+        good_orphan = _make_orphan(run_mode="paper")  # default strategy: grid_trading
 
         # SELECT returns both orphans
         select_session = _make_session_for_select([bad_orphan, good_orphan])
@@ -732,7 +769,7 @@ class TestRecoverPerOrphanIsolation:
         with (
             patch("api.db.session.get_session_factory", return_value=factory),
             patch("api.config.get_settings", return_value=_make_settings()),
-            patch("api.routers.runs._get_strategy_registry", return_value={"ma_crossover": MagicMock()}),
+            patch("api.routers.runs._get_strategy_registry", return_value={"grid_trading": MagicMock()}),
             patch("api.routers.runs._run_paper_engine", AsyncMock()),
             patch("api.routers.runs._run_live_engine", AsyncMock()),
         ):
@@ -751,7 +788,7 @@ class TestRecoverPerOrphanIsolation:
         write session to simulate an unexpected DB error mid-recovery.  The second
         valid orphan must still be recovered.
         """
-        orphan_fail = _make_orphan(run_mode="paper")
+        orphan_fail = _make_orphan(run_mode="paper")  # default strategy: grid_trading
         orphan_ok = _make_orphan(run_mode="paper")
 
         select_session = _make_session_for_select([orphan_fail, orphan_ok])
@@ -766,7 +803,7 @@ class TestRecoverPerOrphanIsolation:
         with (
             patch("api.db.session.get_session_factory", return_value=factory),
             patch("api.config.get_settings", return_value=_make_settings()),
-            patch("api.routers.runs._get_strategy_registry", return_value={"ma_crossover": MagicMock()}),
+            patch("api.routers.runs._get_strategy_registry", return_value={"grid_trading": MagicMock()}),
             patch("api.routers.runs._run_paper_engine", AsyncMock()),
             patch("api.routers.runs._run_live_engine", AsyncMock()),
         ):
@@ -776,3 +813,125 @@ class TestRecoverPerOrphanIsolation:
         assert result == 1, (
             f"Valid second orphan must still be recovered despite first error, got {result}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Class 7: TestRecoverStrategyAvailabilityLockdown (Sprint 51 Cycle 2)
+# ---------------------------------------------------------------------------
+
+
+class TestRecoverStrategyAvailabilityLockdown:
+    """Verify the strategy-availability lockdown on the orphan-recovery path.
+
+    A DEMOTED strategy's paper/live orphan must be marked error and NOT
+    auto-restarted (no task registered).  An ACTIVE strategy's orphan still
+    recovers normally.  The demoted orphan must be REGISTERED in the strategy
+    registry (so this is NOT the unknown_strategy guard) — the lockdown is the
+    reason it is skipped.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("strategy", ["ma_crossover", "breakout", "model_strategy"])
+    @pytest.mark.parametrize("mode", ["paper", "live"])
+    async def test_demoted_orphan_marked_error_and_not_restarted(
+        self, strategy: str, mode: str
+    ) -> None:
+        """TEST-S51C2-200: a demoted paper/live orphan is marked error, no task started."""
+        orphan = _make_orphan(run_mode=mode, strategy_name=strategy)
+        orphan.status = "running"
+
+        select_session = _make_session_for_select([orphan])
+        write_session = _make_session_for_write(orphan)
+        # Only a SELECT + one _mark_orphan_error write are expected (no INSERT).
+        factory = _build_factory(select_session, write_session)
+
+        # The demoted strategy IS registered, so the unknown_strategy guard does
+        # NOT fire — the availability lockdown is the reason it is skipped.
+        # Live gate is configured to PASS so we prove the lockdown (not the
+        # gate) is what blocks the restart.
+        settings = _make_settings(
+            enable_live_trading=True,
+            api_key="live_key",
+            api_secret="live_secret",
+        )
+
+        with (
+            patch("api.db.session.get_session_factory", return_value=factory),
+            patch("api.config.get_settings", return_value=settings),
+            patch(
+                "api.routers.runs._get_strategy_registry",
+                return_value={strategy: MagicMock()},
+            ),
+            patch("api.routers.runs._run_paper_engine", AsyncMock()),
+            patch("api.routers.runs._run_live_engine", AsyncMock()),
+        ):
+            result = await recover_orphaned_runs()
+
+        assert result == 0, (
+            f"Demoted {strategy} {mode} orphan must NOT be recovered, got {result}"
+        )
+        assert runs_module._RUN_TASKS == {}, (
+            "No task may be registered for a demoted-strategy orphan"
+        )
+        assert orphan.status == "error", (
+            f"Demoted {strategy} {mode} orphan must be marked error, "
+            f"got {orphan.status!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_active_orphan_still_recovers_under_lockdown(self) -> None:
+        """TEST-S51C2-201: an ACTIVE strategy orphan still recovers (control case)."""
+        orphan = _make_orphan(run_mode="paper", strategy_name="grid_trading")
+        select_session = _make_session_for_select([orphan])
+        write_session = _make_session_for_write(orphan)
+        factory = _build_factory(select_session, write_session, write_session)
+
+        with (
+            patch("api.db.session.get_session_factory", return_value=factory),
+            patch("api.config.get_settings", return_value=_make_settings()),
+            patch(
+                "api.routers.runs._get_strategy_registry",
+                return_value={"grid_trading": MagicMock()},
+            ),
+            patch("api.routers.runs._run_paper_engine", AsyncMock()),
+            patch("api.routers.runs._run_live_engine", AsyncMock()),
+        ):
+            result = await recover_orphaned_runs()
+
+        assert result == 1, f"Active grid_trading orphan must recover, got {result}"
+        assert len(runs_module._RUN_TASKS) == 1
+
+    @pytest.mark.asyncio
+    async def test_demoted_orphan_among_active_neighbour_isolation(self) -> None:
+        """TEST-S51C2-202: a demoted orphan is skipped but an active neighbour recovers."""
+        demoted = _make_orphan(run_mode="paper", strategy_name="ma_crossover")
+        demoted.status = "running"
+        active = _make_orphan(run_mode="paper", strategy_name="grid_trading")
+
+        select_session = _make_session_for_select([demoted, active])
+        demoted_write = _make_session_for_write(demoted)
+        active_write = _make_session_for_write(active)
+        factory = _build_factory(
+            select_session, demoted_write, active_write, active_write
+        )
+
+        with (
+            patch("api.db.session.get_session_factory", return_value=factory),
+            patch("api.config.get_settings", return_value=_make_settings()),
+            patch(
+                "api.routers.runs._get_strategy_registry",
+                return_value={
+                    "ma_crossover": MagicMock(),
+                    "grid_trading": MagicMock(),
+                },
+            ),
+            patch("api.routers.runs._run_paper_engine", AsyncMock()),
+            patch("api.routers.runs._run_live_engine", AsyncMock()),
+        ):
+            result = await recover_orphaned_runs()
+
+        assert result == 1, (
+            f"Only the active neighbour must be recovered, got {result}"
+        )
+        assert len(runs_module._RUN_TASKS) == 1
+        assert demoted.status == "error", "Demoted orphan must be marked error"

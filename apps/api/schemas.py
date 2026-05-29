@@ -924,6 +924,23 @@ class StrategyInfoResponse(BaseModel):
     parameter_schema: dict[str, Any] = Field(
         description="JSON Schema for strategy parameters"
     )
+    # Sprint 51 Cycle 2: availability metadata (camelCase wire names via to_camel)
+    allowed_modes: list[str] = Field(
+        default=["backtest", "paper", "live"],
+        description="RunModes this strategy may run in (sorted string values).",
+    )
+    status: str = Field(
+        default="active",
+        description="Strategy lifecycle status: active | demoted | experimental.",
+    )
+    demotion_reason: str | None = Field(
+        default=None,
+        description="Concise reason a strategy is restricted; null for active strategies.",
+    )
+    promotion_requirements: list[str] = Field(
+        default_factory=list,
+        description="Symbolic requirement codes to re-promote a demoted strategy.",
+    )
 
 
 class StrategyListResponse(BaseModel):

@@ -13,6 +13,7 @@ import { useToast } from "@/components/ui/toast";
 
 const TIMEFRAMES = ["1m", "5m", "15m", "1h", "4h", "1d"];
 const COMMON_SYMBOLS = ["BTC/EUR", "ETH/EUR", "SOL/EUR", "XRP/EUR", "ADA/EUR"];
+const ALL_MODES: readonly RunMode[] = ["backtest", "paper", "live"];
 
 function ParamInput({
   name,
@@ -155,6 +156,23 @@ function NewRunInner() {
     setStrategyParams(defaults);
   }
 
+  // Modes the currently-selected strategy may run in. Missing field (older
+  // API) → all three modes allowed (graceful degrade).
+  const allowedModes: readonly RunMode[] = selectedStrategy?.allowedModes ?? ALL_MODES;
+
+  // Auto-correct: if the selected strategy changes (or loads) and the current
+  // mode is no longer permitted, fall back to "backtest" (always allowed).
+  // Covers both the initial-load path and handleStrategyChange because both
+  // funnel through setSelectedStrategy. Prevents a stuck-on-paper state when
+  // switching to a demoted strategy.
+  useEffect(() => {
+    if (selectedStrategy && !allowedModes.includes(mode)) {
+      setMode("backtest");
+    }
+    // mode intentionally omitted: we only react to strategy/allowed changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedStrategy, allowedModes]);
+
   async function handleStrategyChange(name: string) {
     const result = await fetchStrategySchema(name);
     if (result.ok) {
@@ -187,6 +205,18 @@ function NewRunInner() {
     }
     if (!selectedStrategy) {
       setSubmitError("Select a strategy.");
+      return;
+    }
+
+    // Defense-in-depth: block disallowed mode before the network round-trip.
+    // The backend returns 422 as the authority, but a client-side guard gives
+    // an immediate, specific message.
+    const allowed = selectedStrategy.allowedModes ?? ALL_MODES;
+    if (!allowed.includes(mode)) {
+      setSubmitError(
+        `"${selectedStrategy.displayName}" is not available for ${mode} mode. ` +
+          `Allowed: ${allowed.join(", ")}.`,
+      );
       return;
     }
 
@@ -235,27 +265,37 @@ function NewRunInner() {
         <div className="card space-y-3">
           <h2 className="text-sm font-semibold text-slate-800 dark:text-slate-200">Run Mode</h2>
           <div className="flex gap-3">
-            {(["backtest", "paper", "live"] as const).map((m) => (
-              <label
-                key={m}
-                className={[
-                  "flex flex-1 cursor-pointer items-center justify-center rounded-lg border py-3 text-sm font-medium transition-colors",
-                  mode === m
-                    ? "border-indigo-500 bg-indigo-600/20 text-indigo-600 dark:text-indigo-400"
-                    : "border-slate-300 dark:border-slate-700 text-slate-500 dark:text-slate-400 hover:border-slate-400 dark:hover:border-slate-600 hover:text-slate-700 dark:hover:text-slate-300",
-                ].join(" ")}
-              >
-                <input
-                  type="radio"
-                  name="mode"
-                  value={m}
-                  checked={mode === m}
-                  onChange={() => setMode(m)}
-                  className="sr-only"
-                />
-                <span className="capitalize">{m}</span>
-              </label>
-            ))}
+            {ALL_MODES.map((m) => {
+              const isAllowed = allowedModes.includes(m);
+              return (
+                <label
+                  key={m}
+                  aria-disabled={!isAllowed}
+                  title={!isAllowed ? "This strategy is restricted to backtest only." : undefined}
+                  className={[
+                    "flex flex-1 items-center justify-center rounded-lg border py-3 text-sm font-medium transition-colors",
+                    !isAllowed
+                      ? "cursor-not-allowed border-slate-200 text-slate-400 opacity-50 dark:border-slate-800 dark:text-slate-600"
+                      : mode === m
+                      ? "cursor-pointer border-indigo-500 bg-indigo-600/20 text-indigo-600 dark:text-indigo-400"
+                      : "cursor-pointer border-slate-300 dark:border-slate-700 text-slate-500 dark:text-slate-400 hover:border-slate-400 dark:hover:border-slate-600 hover:text-slate-700 dark:hover:text-slate-300",
+                  ].join(" ")}
+                >
+                  <input
+                    type="radio"
+                    name="mode"
+                    value={m}
+                    checked={mode === m}
+                    disabled={!isAllowed}
+                    onChange={() => {
+                      if (isAllowed) setMode(m);
+                    }}
+                    className="sr-only"
+                  />
+                  <span className="capitalize">{m}</span>
+                </label>
+              );
+            })}
           </div>
           <p className="text-xs text-slate-500">
             {mode === "backtest"
@@ -304,6 +344,15 @@ function NewRunInner() {
 
           {selectedStrategy && (
             <p className="text-xs text-slate-500">{selectedStrategy.description}</p>
+          )}
+
+          {selectedStrategy?.status === "demoted" && (
+            <div className="rounded-lg border border-amber-300 bg-amber-50 px-4 py-2 text-xs text-amber-700 dark:border-amber-800 dark:bg-amber-900/20 dark:text-amber-400">
+              {selectedStrategy.demotionReason
+                ? `${selectedStrategy.demotionReason} `
+                : "This strategy has been demoted. "}
+              Available for backtest only.
+            </div>
           )}
 
           {/* Dynamic strategy parameters */}

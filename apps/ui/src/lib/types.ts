@@ -399,6 +399,14 @@ export interface JsonSchema {
   additionalProperties?: boolean;
 }
 
+/**
+ * Promotion lifecycle status of a strategy (Sprint 51 Cycle 2).
+ * - "active": cleared for all run modes (backtest, paper, live).
+ * - "demoted": restricted to backtest only pending re-promotion.
+ * - "experimental": newly added / under evaluation.
+ */
+export type StrategyStatus = "active" | "demoted" | "experimental";
+
 export interface Strategy {
   name: string;
   displayName: string;
@@ -406,6 +414,18 @@ export interface Strategy {
   description: string;
   tags: readonly string[];
   parameterSchema: JsonSchema;
+  /**
+   * Run modes this strategy may be launched in. Subset of RunMode.
+   * OPTIONAL for back-compat with older API responses — when absent the UI
+   * treats the strategy as allowing all three modes.
+   */
+  allowedModes?: readonly RunMode[];
+  /** Promotion lifecycle status. Absent → treat as "active". */
+  status?: StrategyStatus;
+  /** Human-readable reason a strategy was demoted; null/absent when not demoted. */
+  demotionReason?: string | null;
+  /** Criteria that must be met before the strategy can be re-promoted. */
+  promotionRequirements?: readonly string[];
 }
 
 export interface StrategyListResponse {

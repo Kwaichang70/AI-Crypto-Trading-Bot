@@ -7,6 +7,7 @@ import type { Metadata } from "next";
 import { fetchStrategies } from "@/lib/api";
 import type { Strategy } from "@/lib/types";
 import { Header } from "@/components/layout/header";
+import { StrategyStatusBadge } from "@/components/ui/strategy-status-badge";
 
 export const metadata: Metadata = { title: "Strategies" };
 export const dynamic = "force-dynamic";
@@ -61,7 +62,7 @@ function ParameterSchemaTable({ strategy }: { strategy: Strategy }) {
 // Strategy card
 // ---------------------------------------------------------------------------
 
-function StrategyCard({ strategy }: { strategy: Strategy }) {
+export function StrategyCard({ strategy }: { strategy: Strategy }) {
   return (
     <div className="card space-y-3">
       <div className="flex items-start justify-between gap-2">
@@ -73,9 +74,27 @@ function StrategyCard({ strategy }: { strategy: Strategy }) {
             {strategy.name} · v{strategy.version}
           </p>
         </div>
+        <StrategyStatusBadge status={strategy.status} />
       </div>
 
       <p className="text-sm text-slate-500 dark:text-slate-400">{strategy.description}</p>
+
+      {strategy.status === "demoted" && strategy.demotionReason && (
+        <p className="text-xs text-amber-700 dark:text-amber-400">{strategy.demotionReason}</p>
+      )}
+
+      {strategy.status === "demoted" &&
+        strategy.promotionRequirements &&
+        strategy.promotionRequirements.length > 0 && (
+          <div className="space-y-1">
+            <p className="text-xs font-medium text-slate-500">To re-promote:</p>
+            <div className="flex flex-wrap gap-1">
+              {strategy.promotionRequirements.map((req) => (
+                <TagPill key={req} tag={req} />
+              ))}
+            </div>
+          </div>
+        )}
 
       {strategy.tags.length > 0 && (
         <div className="flex flex-wrap gap-1">

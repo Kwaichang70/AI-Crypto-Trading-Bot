@@ -72,6 +72,12 @@ from trading.trade_journal import (
 )
 from trading.strategy import BaseStrategy, StrategyMetadata
 from trading.strategy_engine import EngineState, StrategyEngine
+from trading.strategy_availability import (
+    StrategyAvailability,
+    StrategyStatus,
+    get_availability,
+    is_mode_allowed,
+)
 
 __all__ = [
     # Orchestrator
@@ -145,6 +151,11 @@ __all__ = [
     "AlertType",
     "DailyReport",
     "WeeklyReport",
+    # Strategy availability (Sprint 51 Cycle 2)
+    "StrategyAvailability",
+    "StrategyStatus",
+    "get_availability",
+    "is_mode_allowed",
     # Portfolio
     "PortfolioAccounting",
     # Models
