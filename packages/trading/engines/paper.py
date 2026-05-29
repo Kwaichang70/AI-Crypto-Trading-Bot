@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -695,12 +695,22 @@ class PaperExecutionEngine(BaseExecutionEngine):
         symbol = signal.symbol
         last_price = self._get_last_price(symbol)
 
-        # Calculate position size via risk manager
-        quantity = self._risk_manager.calculate_position_size(
-            equity=self._get_current_equity(),
-            entry_price=last_price,
-            stop_loss_price=None,
-            confidence=signal.confidence,
+        # SYN-S51: target_position is the authoritative sizing input; the
+        # risk manager ceiling only de-sizes. Confidence is applied exactly
+        # once inside _resolve_order_quantity. For SELL we pass the held
+        # quantity so the resolver can full-close / cap; for BUY we pass None.
+        held_quantity = (
+            self._positions[signal.symbol].quantity
+            if side == OrderSide.SELL
+            else None
+        )
+        equity = self._get_current_equity()
+        quantity = self._resolve_order_quantity(
+            signal=signal,
+            side=side,
+            last_price=last_price,
+            equity=equity,
+            held_quantity=held_quantity,
         )
 
         if quantity <= Decimal("0"):
@@ -711,20 +721,18 @@ class PaperExecutionEngine(BaseExecutionEngine):
             )
             return []
 
-        # For SELL, cap quantity at current position size
-        if side == OrderSide.SELL:
-            position = self._positions[signal.symbol]
-            quantity = min(quantity, position.quantity)
-
         # Build the proposed order
         client_order_id = f"{self._run_id}-{uuid4().hex[:12]}"
+        # ROUND_DOWN prevents overselling exchange-reported balances with >8dp
+        # precision; BUY keeps ROUND_HALF_UP.
+        rounding = ROUND_DOWN if side == OrderSide.SELL else ROUND_HALF_UP
         proposed_order = Order(
             client_order_id=client_order_id,
             run_id=self._run_id,
             symbol=symbol,
             side=side,
             order_type=OrderType.MARKET,
-            quantity=quantity.quantize(_QTY_PRECISION, rounding=ROUND_HALF_UP),
+            quantity=quantity.quantize(_QTY_PRECISION, rounding=rounding),
         )
 
         # Pre-trade risk check

@@ -25,7 +25,7 @@ from __future__ import annotations
 import asyncio
 import time
 from datetime import UTC, datetime
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -610,13 +610,22 @@ class LiveExecutionEngine(BaseExecutionEngine):
             )
             return []
 
-        # Calculate position size
+        # SYN-S51: target_position is the authoritative sizing input; the
+        # risk manager ceiling only de-sizes. equity is fetched from the
+        # same source the legacy calculate_position_size call used; for SELL
+        # we pass the held quantity so the resolver can full-close / cap.
         equity = await self._fetch_equity()
-        quantity = self._risk_manager.calculate_position_size(
+        held_quantity = (
+            self._positions[signal.symbol].quantity
+            if side == OrderSide.SELL
+            else None
+        )
+        quantity = self._resolve_order_quantity(
+            signal=signal,
+            side=side,
+            last_price=last_price,
             equity=equity,
-            entry_price=last_price,
-            stop_loss_price=None,
-            confidence=signal.confidence,
+            held_quantity=held_quantity,
         )
 
         if quantity <= Decimal("0"):
@@ -629,11 +638,6 @@ class LiveExecutionEngine(BaseExecutionEngine):
                 confidence=signal.confidence,
             )
             return []
-
-        # For SELL, cap at current position
-        if side == OrderSide.SELL:
-            position = self._positions[signal.symbol]
-            quantity = min(quantity, position.quantity)
 
         # ------------------------------------------------------------------
         # Exchange minimum order size validation
@@ -683,13 +687,16 @@ class LiveExecutionEngine(BaseExecutionEngine):
 
         # Build the proposed order
         client_order_id = f"{self._run_id}-{uuid4().hex[:12]}"
+        # ROUND_DOWN prevents overselling exchange-reported balances with >8dp
+        # precision; BUY keeps ROUND_HALF_UP.
+        rounding = ROUND_DOWN if side == OrderSide.SELL else ROUND_HALF_UP
         proposed_order = Order(
             client_order_id=client_order_id,
             run_id=self._run_id,
             symbol=signal.symbol,
             side=side,
             order_type=OrderType.MARKET,
-            quantity=quantity.quantize(_QTY_PRECISION, rounding=ROUND_HALF_UP),
+            quantity=quantity.quantize(_QTY_PRECISION, rounding=rounding),
         )
 
         # Pre-trade risk check

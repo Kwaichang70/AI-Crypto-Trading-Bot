@@ -697,11 +697,18 @@ class TestSignalProcessing:
         When pre_trade_check approves but returns a smaller adjusted_quantity,
         the submitted order uses the capped quantity, not the originally proposed size.
 
-        Setup: calculate_position_size returns 0.1, but pre_trade_check caps it to 0.05.
-        The filled order quantity must equal 0.05.
+        Sprint 51 Cycle 1 (SYN-S51): sizing is now target_position-authoritative.
+        Under the OLD risk-only sizing the proposed quantity came straight from
+        calculate_position_size (0.1) and the cap to 0.05 obviously bound. Under the
+        new contract the proposed quantity is resolved from the signal target
+        (base = (target_position / price) * confidence) capped by the risk ceiling.
+        To preserve this test's ORIGINAL intent -- prove pre_trade_check's
+        adjusted_quantity genuinely reduces an oversized order -- we raise
+        target_position high enough that target/price (0.2 BTC @ 50000 = 10000
+        notional) clears the 0.05 cap, so adjusted_quantity strictly reduces the order.
         """
-        # Build engine with calculate_position_size returning 0.1
-        engine, rm = _make_engine(position_size=Decimal("0.1"))
+        # ceiling mock returns 1.0 BTC so the risk ceiling does not bind first.
+        engine, rm = _make_engine(position_size=Decimal("1.0"))
         engine.set_last_price(_SYMBOL, _LAST_PRICE)
 
         # Override pre_trade_check to approve but with a smaller adjusted_quantity
@@ -713,7 +720,14 @@ class TestSignalProcessing:
             warnings=[],
         )
 
-        signal = _make_buy_signal()
+        # target 10000 @ 50000 -> resolved proposed qty 0.2 BTC (> capped 0.05).
+        signal = Signal(
+            strategy_id="test-strategy",
+            symbol=_SYMBOL,
+            direction=SignalDirection.BUY,
+            target_position=Decimal("10000"),
+            confidence=1.0,
+        )
         orders = await engine.process_signal(signal)
 
         assert len(orders) == 1

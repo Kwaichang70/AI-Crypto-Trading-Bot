@@ -21,8 +21,9 @@ from uuid import UUID
 
 import structlog
 
-from common.types import OrderStatus
+from common.types import OrderSide, OrderStatus
 from trading.models import Fill, Order, Signal
+from trading.risk import BaseRiskManager
 
 __all__ = [
     "BaseExecutionEngine",
@@ -135,6 +136,12 @@ class BaseExecutionEngine(abc.ABC):
       ``RiskCheckResult(approved=True)`` before any order is submitted.
     - The engine records every order and fill regardless of outcome.
     """
+
+    # Set by every concrete subclass in its __init__ (PaperExecutionEngine,
+    # LiveExecutionEngine). Declared here so shared helpers such as
+    # _resolve_order_quantity may reference self._risk_manager under
+    # mypy --strict without each call-site needing a cast.
+    _risk_manager: BaseRiskManager
 
     def __init__(self, run_id: str, config: dict[str, Any] | None = None) -> None:
         self._run_id = run_id
@@ -299,6 +306,99 @@ class BaseExecutionEngine(abc.ABC):
             to_status=to_status,
         )
         return updated
+
+    # ------------------------------------------------------------------
+    # Sizing contract (SYN-S51, Sprint 51 Cycle 1)
+    # ------------------------------------------------------------------
+
+    def _resolve_order_quantity(
+        self,
+        *,
+        signal: Signal,
+        side: OrderSide,
+        last_price: Decimal,
+        equity: Decimal,
+        held_quantity: Decimal | None,
+    ) -> Decimal:
+        """Resolve the base-asset order quantity for a signal (SYN-S51).
+
+        ``Signal.target_position`` (notional in quote currency) is the
+        AUTHORITATIVE sizing input; the risk manager's
+        ``calculate_position_size`` acts only as a *ceiling* that can
+        de-size — never up-size — the strategy's intent.
+
+        Confidence is applied **exactly once**, on the target.  The risk
+        ceiling is therefore computed at ``confidence=1.0`` so confidence
+        is never double-counted.
+
+        BUY:
+          * ``target_position <= 0`` → legacy risk-only fallback
+            (``calculate_position_size(..., confidence=signal.confidence)``)
+            so a strategy that emits BUY with no explicit notional still
+            trades at the risk-budgeted size.  This is a defensive,
+            currently-unreachable path: the 8 shipped strategies always emit
+            a positive ``target_position`` for a BUY (``0`` means flat per the
+            Signal contract), so in practice the explicit-target branch below
+            always fires.  The fallback exists so an unforeseen BUY+0 emitter
+            still trades at a risk-budgeted size rather than silently no-op.
+          * otherwise → ``base = (target / price) * confidence``;
+            ``ceiling = calculate_position_size(..., confidence=1.0)``;
+            return ``min(base, ceiling)``.
+
+        SELL:
+          * ``target_position <= 0`` → full close (return ``held_quantity``).
+          * otherwise → ``min((target / price) * confidence, held_quantity)``
+            so we never oversell the held position.
+
+        Parameters
+        ----------
+        signal:
+            The originating Signal. ``target_position`` and ``confidence``
+            are read; nothing is mutated.
+        side:
+            Mapped order side (BUY or SELL).
+        last_price:
+            Latest market price in quote currency (must be > 0).
+        equity:
+            Current portfolio equity in quote currency (ceiling input).
+        held_quantity:
+            Current ``Position.quantity`` for SELL signals; ``None`` for BUY.
+
+        Returns
+        -------
+        Decimal:
+            UNQUANTIZED base-asset quantity. The caller is responsible for
+            quantizing (``_QTY_PRECISION`` / side-aware rounding) and for the
+            ``quantity <= 0 -> no order`` guard.
+        """
+        conf = Decimal(str(max(0.0, min(1.0, signal.confidence))))
+
+        if side == OrderSide.BUY:
+            if signal.target_position <= Decimal(0):
+                # No explicit target → preserve legacy risk-only sizing.
+                # Confidence is passed through to the risk manager here
+                # (single application) rather than applied separately.
+                return self._risk_manager.calculate_position_size(
+                    equity=equity,
+                    entry_price=last_price,
+                    stop_loss_price=None,
+                    confidence=signal.confidence,
+                )
+            base_qty = (signal.target_position / last_price) * conf
+            ceiling_qty = self._risk_manager.calculate_position_size(
+                equity=equity,
+                entry_price=last_price,
+                stop_loss_price=None,
+                confidence=1.0,
+            )
+            return min(base_qty, ceiling_qty)
+
+        # SELL
+        held = held_quantity if held_quantity is not None else Decimal(0)
+        if signal.target_position <= Decimal(0):
+            return held
+        base_qty = (signal.target_position / last_price) * conf
+        return min(base_qty, held)
 
     # ------------------------------------------------------------------
     # Lifecycle

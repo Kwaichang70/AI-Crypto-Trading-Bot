@@ -856,17 +856,34 @@ class TestProcessSignal:
         """
         When pre_trade_check approves but returns a reduced adjusted_quantity,
         the submitted order uses that reduced quantity.
+
+        Sprint 51 Cycle 1 (SYN-S51): sizing is now target_position-authoritative.
+        Under the OLD risk-only sizing the proposed quantity came straight from
+        calculate_position_size (0.1) and the cap to 0.05 obviously bound. Under the
+        new contract the proposed quantity is resolved from the signal target
+        (base = (target_position / price) * confidence) capped by the risk ceiling.
+        To preserve this test's ORIGINAL intent -- prove pre_trade_check's
+        adjusted_quantity genuinely reduces an oversized order -- we build a signal
+        whose target/price (0.2 BTC @ 50000 = 10000 notional) clears the 0.05 cap and
+        a generous risk ceiling (1.0 BTC) so adjusted_quantity strictly reduces it.
         """
-        original_qty = Decimal("0.1")
         capped_qty = Decimal("0.05")
-        engine, rm, _ = _make_engine(position_size=original_qty)
+        # ceiling mock returns 1.0 BTC so the risk ceiling does not bind first.
+        engine, rm, _ = _make_engine(position_size=Decimal("1.0"))
         rm.pre_trade_check.return_value = RiskCheckResult(
             approved=True,
             adjusted_quantity=capped_qty,
             rejection_reasons=[],
             warnings=[],
         )
-        signal = _make_signal(direction=SignalDirection.BUY)
+        # target 10000 @ 50000 -> resolved proposed qty 0.2 BTC (> capped 0.05).
+        signal = Signal(
+            strategy_id="test-strategy",
+            symbol=_SYMBOL,
+            direction=SignalDirection.BUY,
+            target_position=Decimal("10000"),
+            confidence=1.0,
+        )
 
         orders = await engine.process_signal(signal)
 
