@@ -22,6 +22,8 @@ secrets/
 CLAUDE.local.md
 .claude/settings.local.json
 reports/
+.claude/worktrees/
+.claude/settings - kopie*.json
 
 
 # =============================================================================
