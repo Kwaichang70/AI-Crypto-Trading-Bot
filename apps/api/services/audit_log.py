@@ -63,6 +63,12 @@ _VALID_EVENT_TYPES: frozenset[str] = frozenset(
         # triggered emergency_stop/kill_switch so post-incident queries can
         # isolate autonomous risk-management stops from manual interventions.
         "circuit_breaker_halt_auto_stop",
+        # Sprint 50 Cycle 5 Sub-scope A: paper run promoted to live.
+        # Written on the new live run BEFORE the RunORM is created.
+        "paper_promoted_to_live",
+        # Sprint 50 Cycle 5 Sub-scope B: OOS gate bypassed by admin.
+        # Written before is_active is flipped.
+        "model_oos_gate_bypassed",
     }
 )
 

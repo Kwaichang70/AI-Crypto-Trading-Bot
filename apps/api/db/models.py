@@ -175,6 +175,20 @@ class RunORM(Base):
         comment="If this run was auto-recovered, the ID of the original orphaned run",
     )
 
+    # Promotion FK (Sprint 50 Cycle 5) -- set on the NEW live run that was
+    # created by promoting a stopped paper run.  NULL for all non-promoted runs.
+    # Mirrors the recovered_from_run_id self-reference pattern (Sprint 24).
+    promoted_from_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("runs.id"),
+        nullable=True,
+        default=None,
+        comment=(
+            "If this live run was created by promoting a paper run, "
+            "the ID of the source paper run. NULL for all non-promoted runs."
+        ),
+    )
+
     # M3 (Sprint 49): leaderboard SQL column -- closed trade count.
     # Populated by persist_backtest_results() for backtest runs from Sprint 49 onward.
     # NULL for pre-Sprint-49 runs and for paper/live runs.
@@ -1180,6 +1194,30 @@ class ModelVersionORM(Base):
         nullable=True,
         comment="Supplementary metadata: feature importances, class distribution, etc.",
     )
+
+    # Sprint 50 Cycle 5 OOS gate columns.
+    # walk_forward_oos_skill_score: scalar gate value -- directional z-score proxy
+    # (2*acc-1)*sqrt(n) across walk-forward folds (v2 schema). NOT a trading Sharpe --
+    # magnitude-blind; does not account for fees, slippage, or sizing. See Cycle 5
+    # quant review and reports/sprint50-cycle5-quant-backlog.md.
+    # NULL for models trained before Sprint 50 Cycle 5
+    # (gate treats NULL as "unknown / pass-with-warning").
+    # Raw per-fold values and computation details are embedded in the existing
+    # ``extra`` JSONB under the key "walk_forward" to avoid adding a second JSONB column.
+    walk_forward_oos_skill_score: Mapped[float | None] = mapped_column(
+        Numeric(precision=10, scale=6),
+        nullable=True,
+        comment=(
+            "DEFLATED MEDIAN OOS directional z-score skill proxy (2*acc-1)*sqrt(n) "
+            "across walk-forward folds (v2 schema). NOT a trading Sharpe -- "
+            "magnitude-blind; does not account for fees/slippage/sizing. "
+            "NULL for pre-Sprint-50-Cycle-5 models. "
+            "Raw per-fold values in model_versions.extra['walk_forward']. "
+            "The activation gate compares this value against "
+            "settings.min_oos_skill_score_for_activation."
+        ),
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -1449,7 +1487,9 @@ class AuditEventORM(Base):
             "event_type IN ("
             "'live_trading_enabled', 'model_activated', "
             "'circuit_breaker_reset', 'emergency_stop', 'kill_switch', "
-            "'circuit_breaker_halt_auto_stop'"
+            "'circuit_breaker_halt_auto_stop', "
+            "'paper_promoted_to_live', "
+            "'model_oos_gate_bypassed'"
             ")",
             name="ck_audit_events_event_type",
         ),

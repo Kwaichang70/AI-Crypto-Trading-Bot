@@ -430,6 +430,99 @@ class Settings(BaseSettings):
     )
 
     # ------------------------------------------------------------------
+    # Paper->Live Promotion Gate (Sprint 50 Cycle 5)
+    # ------------------------------------------------------------------
+    min_paper_trades_for_promotion: int = Field(
+        default=50,
+        ge=1,
+        le=10_000,
+        description=(
+            "Minimum number of closed trades a paper run must have accumulated "
+            "before it is eligible for promotion to live trading.  "
+            "This is a data-volume readiness threshold only -- performance "
+            "acceptability (Sharpe, drawdown) is left to the operator.  "
+            "Override with MIN_PAPER_TRADES_FOR_PROMOTION env var."
+        ),
+    )
+    min_paper_runtime_days: float = Field(
+        default=7.0,
+        gt=0.0,
+        le=365.0,
+        description=(
+            "Minimum runtime in fractional days a paper run must have completed "
+            "before it is eligible for promotion to live trading.  "
+            "7.0 days (one full calendar week) ensures the paper run has been "
+            "exposed to weekend liquidity conditions and at least one full "
+            "market-open/close cycle.  "
+            "Override with MIN_PAPER_RUNTIME_DAYS env var."
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # Walk-Forward OOS Model Activation Gate (Sprint 50 Cycle 5)
+    # NOTE: the gate metric is a directional z-score SKILL PROXY (2*acc-1)*sqrt(n),
+    # NOT a trading Sharpe. It is magnitude-blind: does not account for fees,
+    # slippage, or position sizing. See reports/sprint50-cycle5-quant-backlog.md
+    # for the Cycle 6+ plan to replace this proxy with a real BacktestRunner OOS gate.
+    # ------------------------------------------------------------------
+    min_oos_skill_score: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=5.0,
+        description=(
+            "Minimum aggregate out-of-sample (OOS) directional z-score skill score "
+            "required to activate a model version via PUT /ml/models/{id}/activate.  "
+            "The gate uses (2*acc-1)*sqrt(n) -- a directional z-score proxy, NOT a "
+            "trading Sharpe (magnitude-blind; no fees/slippage/sizing).  "
+            "Computed as the DEFLATED MEDIAN OOS skill score across walk-forward folds "
+            "during POST /ml/train.  Models trained before Sprint 50 Cycle 5 have "
+            "walk_forward_oos_skill_score=NULL and pass the gate by default "
+            "(operator is warned in the response).  "
+            "Set to 0.0 to disable the gate (allow all models).  "
+            "Override with MIN_OOS_SKILL_SCORE env var."
+        ),
+    )
+    min_worst_fold_skill_score: float = Field(
+        default=0.0,
+        ge=-10.0,
+        le=5.0,
+        description=(
+            "Minimum OOS directional z-score skill score for the WORST individual "
+            "walk-forward fold.  A model may pass the median deflated skill score gate "
+            "but still be blocked if even one fold is catastrophic (below this floor). "
+            "Default 0.0 -- the worst fold must at least break even. "
+            "Set to a negative value to allow some catastrophic folds. "
+            "Override with MIN_WORST_FOLD_SKILL_SCORE env var."
+        ),
+    )
+    min_trades_per_fold: int = Field(
+        default=20,
+        ge=1,
+        le=1000,
+        description=(
+            "Minimum number of OOS trades required in EVERY walk-forward fold "
+            "for the OOS skill score metrics to be considered statistically meaningful. "
+            "If any fold produces fewer trades than this threshold, the model "
+            "activation gate returns 'insufficient_oos_samples' (distinct from "
+            "'oos_skill_below_min') so the operator knows to train on more bars "
+            "or reduce num_wf_folds rather than improve the strategy. "
+            "Override with MIN_TRADES_PER_FOLD env var."
+        ),
+    )
+    wf_num_folds: int = Field(
+        default=5,
+        ge=2,
+        le=20,
+        description=(
+            "Number of walk-forward folds used by POST /ml/train to compute "
+            "the OOS Sharpe gate value.  Minimum 2 (degenerate single-fold "
+            "would be in-sample only).  Default 5 gives a reasonable "
+            "train_fraction=0.7 with 5 equal test windows.  "
+            "Override with WF_NUM_FOLDS env var."
+        ),
+    )
+
+    # ------------------------------------------------------------------
     # Telegram alerts (optional)
     # ------------------------------------------------------------------
     telegram_bot_token: str | None = Field(

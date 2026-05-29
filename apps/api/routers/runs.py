@@ -1315,6 +1315,286 @@ async def archive_run(
 
 
 # ---------------------------------------------------------------------------
+# GET /api/v1/runs/{run_id}/promotion-eligibility
+# Sprint 50 Cycle 5 Sub-scope A
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/{run_id}/promotion-eligibility",
+    summary="Check whether a paper run is eligible for promotion to live",
+    description=(
+        "Returns a data-volume eligibility report for the given paper run.  "
+        "Criteria: closed_trade_count >= MIN_PAPER_TRADES_FOR_PROMOTION and "
+        "runtime_days >= MIN_PAPER_RUNTIME_DAYS.  Performance metrics "
+        "(Sharpe, drawdown) are never gate criteria -- the operator decides "
+        "performance acceptability."
+    ),
+)
+async def get_promotion_eligibility(
+    run_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> dict[str, Any]:
+    """Return promotion gate eligibility for a paper run."""
+    from api.config import get_settings
+    from api.services.promotion_gate import evaluate_paper_run_eligibility
+
+    log = logger.bind(endpoint="get_promotion_eligibility", run_id=str(run_id))
+    settings = get_settings()
+
+    result_row = await db.execute(
+        select(RunORM).where(RunORM.id == run_id)
+    )
+    run_orm: RunORM | None = result_row.scalar_one_or_none()
+
+    if run_orm is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Run {run_id} not found.",
+        )
+
+    eligibility = await evaluate_paper_run_eligibility(
+        db=db,
+        run_orm=run_orm,
+        min_trades=settings.min_paper_trades_for_promotion,
+        min_runtime_days=settings.min_paper_runtime_days,
+    )
+
+    log.info(
+        "runs.promotion_eligibility_checked",
+        eligible=eligibility.eligible,
+        trade_count=eligibility.trade_count,
+        runtime_days=round(eligibility.runtime_days, 1),
+    )
+
+    return {
+        "run_id": str(run_id),
+        "eligible": eligibility.eligible,
+        "trade_count": eligibility.trade_count,
+        "runtime_days": round(eligibility.runtime_days, 1),
+        "min_trades_required": settings.min_paper_trades_for_promotion,
+        "min_runtime_days_required": settings.min_paper_runtime_days,
+        "reasons": eligibility.reasons,
+    }
+
+
+# ---------------------------------------------------------------------------
+# POST /api/v1/runs/{run_id}/promote-to-live
+# Sprint 50 Cycle 5 Sub-scope A
+# ---------------------------------------------------------------------------
+
+@router.post(
+    "/{run_id}/promote-to-live",
+    status_code=status.HTTP_201_CREATED,
+    summary="Promote a stopped paper run to a new live run",
+    description=(
+        "Creates a new live run with the same strategy configuration as the "
+        "given paper run, setting promoted_from_run_id to the source paper run. "
+        "Requires: (1) paper run is stopped, (2) data-volume gate passes "
+        "(trade_count + runtime), (3) the full 3-layer live-trading safety gate "
+        "(env flag + API keys + X-Live-Confirm-Token header). "
+        "An audit row is written before any state mutation."
+    ),
+    responses={
+        400: {"description": "Paper run not eligible (gate criteria not met)"},
+        403: {"description": "Live trading safety gate failed"},
+        404: {"description": "Source paper run not found"},
+    },
+)
+async def promote_to_live(
+    run_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    request: Request,
+    x_live_confirm_token: Annotated[str | None, Header()] = None,
+) -> RunDetailResponse:
+    """Promote a stopped paper run to a new live run.
+
+    Parameters
+    ----------
+    run_id:
+        UUID of the source paper run to promote.
+    db:
+        Injected async database session.
+    x_live_confirm_token:
+        Live-mode confirmation token via X-Live-Confirm-Token header
+        (SEC-004 mandatory -- no body fallback for promotion endpoint).
+
+    Returns
+    -------
+    RunDetailResponse
+        The newly created live run record.
+
+    Raises
+    ------
+    HTTPException 404:
+        Source paper run not found.
+    HTTPException 400:
+        Promotion gate criteria not met (data-volume insufficient).
+    HTTPException 403:
+        Live trading safety gate failed.
+    """
+    from api.config import get_settings
+    from api.services.audit_log import record_audit_event
+    from api.services.promotion_gate import evaluate_paper_run_eligibility
+    from trading.safety import LiveTradingGate
+
+    log = logger.bind(endpoint="promote_to_live", source_run_id=str(run_id))
+    settings = get_settings()
+
+    # Step 1: Fetch source paper run
+    row = await db.execute(select(RunORM).where(RunORM.id == run_id))
+    source_run: RunORM | None = row.scalar_one_or_none()
+
+    if source_run is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Paper run {run_id} not found.",
+        )
+
+    # Step 2: Promotion gate (data-volume only)
+    eligibility = await evaluate_paper_run_eligibility(
+        db=db,
+        run_orm=source_run,
+        min_trades=settings.min_paper_trades_for_promotion,
+        min_runtime_days=settings.min_paper_runtime_days,
+    )
+
+    if not eligibility.eligible:
+        log.warning(
+            "runs.promotion_gate_failed",
+            reasons=eligibility.reasons,
+            trade_count=eligibility.trade_count,
+            runtime_days=round(eligibility.runtime_days, 1),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Paper run {run_id} is not eligible for promotion. "
+                f"trade_count={eligibility.trade_count} "
+                f"(min={settings.min_paper_trades_for_promotion}), "
+                f"runtime={eligibility.runtime_days:.1f}d "
+                f"(min={settings.min_paper_runtime_days:.1f}d). "
+                f"Reasons: {', '.join(eligibility.reasons)}"
+            ),
+        )
+
+    # Step 3: 3-layer live trading gate (SEC-004 -- header only, no body fallback)
+    gate = LiveTradingGate()
+    gate_result = gate.check_gate(
+        settings=settings,
+        confirm_token=x_live_confirm_token or "",
+    )
+
+    if not gate_result.passed:
+        failed_layers = [layer.name for layer in gate_result.layers if not layer.passed]
+        log.warning("runs.promotion_live_gate_failed", failures=gate_result.failures)
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Live trading gate check failed. "
+                f"Failed layers: {', '.join(failed_layers)}."
+            ),
+        )
+
+    # Concurrency cap check (AR-006)
+    active_count = sum(1 for t in _RUN_TASKS.values() if not t.done())
+    if active_count >= settings.max_concurrent_runs:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                f"Concurrent run cap reached ({active_count}/{settings.max_concurrent_runs}). "
+                "Stop an existing run before promoting."
+            ),
+        )
+
+    # Step 4: Write audit row BEFORE creating the live run (SEC-002 + SAVEPOINT pattern).
+    # async with db.begin_nested() creates a SAVEPOINT so the audit insert is independently
+    # durable -- even if the outer transaction rolls back, the audit trail is preserved.
+    new_run_id = uuid.uuid4()
+    async with db.begin_nested():
+        await record_audit_event(
+            db,
+            event_type="paper_promoted_to_live",
+            resource_type="run",
+            resource_id=str(new_run_id),
+            request=request,
+            payload={
+                "source_paper_run_id": str(run_id),
+                "strategy_name": source_run.config.get("strategy_name"),
+                "symbols": source_run.config.get("symbols"),
+                "timeframe": source_run.config.get("timeframe"),
+            },
+        )
+    # SAVEPOINT released: audit row is now independently committed.
+    # The outer transaction continues for RunORM creation below.
+
+    # Step 5: Reconstruct config from source paper run, override mode.
+    now = datetime.now(tz=UTC)
+    promoted_config: dict[str, Any] = {
+        **source_run.config,
+        "mode": "live",
+        "promoted_from_run_id": str(run_id),
+    }
+    # Remove backtest-specific keys that have no meaning for live mode.
+    for _key in ("backtest_start", "backtest_end", "seed", "backtest_metrics"):
+        promoted_config.pop(_key, None)
+
+    strategy_name = source_run.config.get("strategy_name", "")
+    strategy_cls = _get_strategy_registry().get(strategy_name)
+    if strategy_cls is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Strategy '{strategy_name}' from source run is no longer registered.",
+        )
+
+    timeframe_val = TimeFrame(str(source_run.config.get("timeframe", "1h")))
+
+    live_run_orm = RunORM(
+        id=new_run_id,
+        run_mode="live",
+        status="running",
+        config=promoted_config,
+        started_at=now,
+        created_at=now,
+        updated_at=now,
+        promoted_from_run_id=run_id,
+    )
+    db.add(live_run_orm)
+    await db.flush()
+
+    # Step 6: Commit FIRST -- the live engine must find the RunORM row on its
+    # first DB read, so the row must be durable before the task starts.
+    await db.commit()
+
+    # Step 7: Launch live engine background task AFTER commit (CR5-003).
+    task = asyncio.create_task(
+        _run_live_engine(
+            run_id_str=str(new_run_id),
+            strategy_cls=strategy_cls,
+            strategy_name=strategy_name,
+            strategy_params=source_run.config.get("strategy_params", {}),
+            symbols=source_run.config.get("symbols", []),
+            timeframe=timeframe_val,
+            initial_capital=source_run.config.get("initial_capital", "10000"),
+            trailing_stop_pct=source_run.config.get("strategy_params", {}).get(
+                "trailing_stop_pct"
+            ),
+            enable_adaptive_learning=False,
+        ),
+        name=f"live-engine-promoted-{new_run_id}",
+    )
+    _RUN_TASKS[str(new_run_id)] = task
+
+    log.info(
+        "runs.promoted_to_live",
+        source_run_id=str(run_id),
+        new_run_id=str(new_run_id),
+        strategy=strategy_name,
+    )
+
+    return _run_orm_to_detail_response(live_run_orm)
+
+
+# ---------------------------------------------------------------------------
 # Live diagnostics endpoint
 # ---------------------------------------------------------------------------
 

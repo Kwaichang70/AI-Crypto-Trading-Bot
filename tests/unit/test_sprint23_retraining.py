@@ -124,6 +124,8 @@ def _make_model_version_orm(
     mv.trigger = "manual"
     mv.extra = None
     mv.created_at = datetime(2024, 1, 1, 11, 0, 0, tzinfo=UTC)
+    # Sprint 50 Cycle 5: walk-forward OOS skill score gate column (NULL = pre-Cycle-5 model)
+    mv.walk_forward_oos_skill_score = None
     return mv
 
 
