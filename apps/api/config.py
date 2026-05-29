@@ -466,12 +466,16 @@ class Settings(BaseSettings):
     # for the Cycle 6+ plan to replace this proxy with a real BacktestRunner OOS gate.
     # ------------------------------------------------------------------
     min_oos_skill_score: float = Field(
-        default=0.5,
+        default=1.64,
         ge=0.0,
         le=5.0,
         description=(
             "Minimum aggregate out-of-sample (OOS) directional z-score skill score "
             "required to activate a model version via PUT /ml/models/{id}/activate.  "
+            "Default 1.64 ~= one-sided 95% confidence that the classifier beats a "
+            "coin flip on the z-score scale; a 0.5 default would mean only ~69% "
+            "confidence and is too weak to gate live model activation (cycle 5 "
+            "quant caveat #4).  "
             "The gate uses (2*acc-1)*sqrt(n) -- a directional z-score proxy, NOT a "
             "trading Sharpe (magnitude-blind; no fees/slippage/sizing).  "
             "Computed as the DEFLATED MEDIAN OOS skill score across walk-forward folds "
