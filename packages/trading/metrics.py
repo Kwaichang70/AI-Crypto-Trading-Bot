@@ -352,6 +352,34 @@ class BacktestResult(BaseModel):
         ),
     )
 
+    # Sprint 50 Cycle 6 (IMPL-C6-001): realized out-of-sample trading Sharpe.
+    # Populated ONLY when BacktestRunner.run() is called with oos_start_index set
+    # (the walk-forward model-activation gate path). None for every normal
+    # backtest / paper / optimizer call-site, so all existing callers and tests
+    # are byte-for-byte unaffected. This is a REALIZED trading Sharpe net of
+    # fees + slippage on the OOS window only (warmup + in-sample bars excluded),
+    # NOT the magnitude-blind directional z-score proxy it replaces.
+    oos_sharpe: float | None = Field(
+        default=None,
+        description=(
+            "Annualised Sharpe ratio computed over the out-of-sample window only "
+            "(bars from oos_start_index onward). Net of Coinbase 60/40 bps fees + "
+            "Sprint-42 slippage. None when run() was called without oos_start_index. "
+            "0.0 when the OOS window has fewer than 2 per-period returns "
+            "(compute_sharpe convention)."
+        ),
+    )
+    oos_n_returns: int | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Number of per-period return observations in the OOS window "
+            "(len(oos_equity_slice) - 1). None when run() was called without "
+            "oos_start_index. Used by callers to gauge statistical sufficiency "
+            "of oos_sharpe."
+        ),
+    )
+
 
 # ===================================================================
 # Standalone metric functions

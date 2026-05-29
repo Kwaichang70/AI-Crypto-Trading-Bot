@@ -252,7 +252,9 @@ class TestNewConfigSettings:
         get_settings.cache_clear()
         with patch.dict("os.environ", {}, clear=False):
             settings = get_settings()
-        assert settings.min_oos_skill_score == 0.5
+        # Sprint 50 Cycle 6 lowered this default to 1.0 (realized OOS
+        # Sharpe gate; was 0.5 in Cycle 5, 1.64 after the quant caveat).
+        assert settings.min_oos_skill_score == 1.0
         get_settings.cache_clear()
 
     def test_min_worst_fold_skill_score_default(self) -> None:
@@ -268,7 +270,9 @@ class TestNewConfigSettings:
         get_settings.cache_clear()
         with patch.dict("os.environ", {}, clear=False):
             settings = get_settings()
-        assert settings.min_trades_per_fold == 20
+        # Sprint 50 Cycle 6 lowered this default 20 -> 5 (realized OOS
+        # trade counts are sparse over ~120-bar folds at threshold 0.60).
+        assert settings.min_trades_per_fold == 5
         get_settings.cache_clear()
 
 

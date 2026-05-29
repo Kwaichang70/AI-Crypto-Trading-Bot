@@ -172,25 +172,28 @@ async def train_model(
     db.add(model_version)
     await db.flush()
 
-    # Persist walk-forward OOS metrics (Sprint 50 Cycle 5).
+    # Persist walk-forward REALIZED OOS Sharpe metrics (Sprint 50 Cycle 6).
     # CR5v2-001: source existing_extra from the ORM row, not the result dict,
     # to avoid overwriting prior feature-importance metadata on retrain.
     existing_extra: dict[str, Any] = dict(model_version.extra or {})
     existing_extra["walk_forward"] = {
-        "schema_version": 2,
-        "metric_type": "directional_zscore_proxy",
+        "schema_version": 3,
+        "metric_type": "realized_oos_sharpe",
+        "oos_measurement": "oos_window",
         "status": result.get("walk_forward_status", "ok"),
         "num_folds": num_wf_folds,
-        "fold_skill_scores_raw": result.get("walk_forward_fold_skill_scores", []),
+        # Gate-read keys (unchanged names so the gate keeps working):
+        "oos_skill_worst": result.get("walk_forward_oos_sharpe_worst"),
         "fold_trade_counts": result.get("walk_forward_fold_trade_counts", []),
-        "oos_skill_median_raw": result.get("walk_forward_oos_skill_score_raw"),
-        "oos_skill_worst": result.get("walk_forward_oos_skill_score_worst"),
-        "oos_skill_median_deflated": result.get("walk_forward_oos_skill_score"),
         "folds_below_threshold": result.get("walk_forward_folds_below_threshold", []),
+        # New Cycle-6 keys:
+        "oos_sharpe_median": result.get("walk_forward_oos_sharpe_median"),
+        "fold_sharpes": result.get("walk_forward_fold_sharpes", []),
+        "worst_fold_drawdown": result.get("walk_forward_worst_fold_drawdown"),
     }
     model_version.extra = existing_extra
-    # The typed column stores the DEFLATED MEDIAN directional z-score skill proxy --
-    # canonical gate value. NOT a trading Sharpe (magnitude-blind).
+    # The typed column now stores the MEDIAN REALIZED OOS trading Sharpe across
+    # walk-forward folds (Cycle 6). Column name unchanged for backward compat.
     model_version.walk_forward_oos_skill_score = result.get("walk_forward_oos_skill_score")
 
     await db.commit()
@@ -277,42 +280,58 @@ def _train_model_with_wf_sync(
     num_wf_folds: int = 5,
     min_trades_per_fold: int = 20,
 ) -> dict[str, Any]:
-    """Synchronous training pipeline with walk-forward OOS Sharpe computation.
+    """Synchronous training pipeline with REAL walk-forward OOS Sharpe (Cycle 6).
 
     Extends ``_train_model_sync`` to additionally run ``WalkForwardValidator``
-    on the fetched OHLCV data.  Each fold trains a fresh ``ModelTrainer`` on
-    the train bars and evaluates a simplified OOS accuracy-based Sharpe proxy
-    using the fold's test bars.
+    on the fetched OHLCV data.  For each fold:
 
-    The DEFLATED MEDIAN OOS Sharpe (Bailey & Lopez de Prado) is the canonical
-    gate value persisted to ``ModelVersionORM.walk_forward_oos_skill_score``.
+    1. A fresh v1 (10-feature) ``ModelTrainer`` is trained on the fold's train
+       bars and saved to a temp dir.
+    2. A ``ModelStrategy`` loads that fold model and is run through a real
+       ``BacktestRunner`` mini-backtest over ``train_tail[-200:] + test_bars``.
+    3. The backtest computes a REALIZED out-of-sample trading Sharpe over the
+       test (OOS) window only, net of Coinbase 60/40 bps fees + the Sprint-42
+       slippage default, with fixed-fractional sizing (A1 — no ATR plumb-through).
 
-    OOS skill score per fold is computed as: (2*accuracy - 1) * sqrt(n_test_samples).
-    This is a directional z-score PROXY, NOT a trading Sharpe -- magnitude-blind:
-    does not account for fees, slippage, or position sizing.
-    A value > 0 means the model predicts better than random on the OOS window.
+    The MEDIAN realized OOS Sharpe across folds is the canonical gate value
+    persisted to ``ModelVersionORM.walk_forward_oos_skill_score`` (column name
+    unchanged for backward compatibility; the VALUE is now a trading Sharpe, not
+    the old directional z-score proxy).  ``oos_sharpe_worst`` = min across folds
+    feeds the worst-fold floor, and ``worst_fold_drawdown`` = max per-fold OOS
+    max-drawdown feeds the Cycle-6 drawdown floor (B1).
+
+    This REPLACES the magnitude-blind ``(2*acc-1)*sqrt(n)`` proxy and its
+    ``deflated_sharpe_ratio`` deflation (removed).
+
+    Determinism: every fold backtest pins ``seed=42`` so the gate is
+    reproducible.
 
     Parameters
     ----------
     symbol, exchange, timeframe, bars, n_estimators, horizon, threshold:
         Passed through to the main training path (same as ``_train_model_sync``).
+        NOTE: ``threshold`` is the RETURN-labeling threshold for ModelTrainer;
+        it is NOT the ModelStrategy probability gate (that is fixed at 0.60).
     num_wf_folds:
         Number of walk-forward folds.  Must be >= 2.
     min_trades_per_fold:
-        Minimum OOS test samples per fold to consider skill score statistically
-        meaningful.  Folds below this set walk_forward_status="insufficient_samples".
+        Minimum REALIZED OOS trades per fold for the Sharpe to be considered
+        statistically meaningful.  Folds below this set
+        walk_forward_status="insufficient_samples".  WARNING: at
+        prediction_threshold=0.60 over ~120-bar OOS folds this is likely
+        unreachable — see reports/sprint50-cycle6-oos-backtest-producer.md §7.2.
     """
-    import math
-
     import ccxt
-    import numpy as _np
     import pandas as pd
 
     from common.models import OHLCVBar
     from common.types import TimeFrame as _TimeFrame
     from data.ml_training import ModelTrainer
     from datetime import UTC, datetime as _dt
-    from trading.walk_forward import WalkForwardValidator, deflated_sharpe_ratio
+    from decimal import Decimal as _Decimal
+    from trading.backtest import BacktestRunner
+    from trading.strategies.model_strategy import ModelStrategy
+    from trading.walk_forward import WalkForwardValidator
 
     # 1. Fetch candles via synchronous ccxt
     exchange_cls = getattr(ccxt, exchange, None)
@@ -366,22 +385,30 @@ def _train_model_with_wf_sync(
 
     bars_by_symbol: dict[str, list[OHLCVBar]] = {symbol: ohlcv_bars}
 
-    # 4. Walk-forward: train per-fold model + compute OOS accuracy-based skill score proxy
+    # 4. Walk-forward: per-fold real BacktestRunner OOS Sharpe (Sprint 50 Cycle 6).
     validator = WalkForwardValidator(num_folds=num_wf_folds, train_fraction=0.7, mode="expanding")
     try:
         folds = validator.split(bars_by_symbol)
     except ValueError:
-        # Not enough bars for the requested folds -- fall back to no WF metrics
+        # Not enough bars for the requested folds -- fall back to no WF metrics.
         folds = []
 
-    fold_skill_scores: list[float] = []
-    fold_trade_counts: list[int] = []  # used as OOS test-sample counts
+    # BacktestRunner ModelStrategy warmup = max(feature_window * 2, 50). With
+    # feature_window=100 the warmup is 200 bars, so the backtest series MUST
+    # exceed 200 bars or the runner raises "Insufficient bars for warm-up".
+    _MODEL_WARMUP_BARS: int = 200
+
+    fold_sharpes: list[float] = []
+    fold_trade_counts: list[int] = []
+    fold_drawdowns: list[float] = []
 
     with tempfile.TemporaryDirectory(prefix="wf_fold_") as _tmpdir:
         for fold in folds:
             try:
-                # Build DataFrame from fold train bars
                 fold_train_bars = fold.train_bars.get(symbol, [])
+                fold_test_bars = fold.test_bars.get(symbol, [])
+
+                # 4a. Train a fresh v1 (10-feature) fold model on the train bars.
                 fold_df_rows = [
                     [
                         int(b.timestamp.timestamp() * 1000),
@@ -394,64 +421,111 @@ def _train_model_with_wf_sync(
                     fold_df_rows,
                     columns=["timestamp", "open", "high", "low", "close", "volume"],
                 )
-
-                fold_trainer = ModelTrainer(model_dir=_tmpdir)
+                # FORCE feature_schema_version=1 so the gate model matches the
+                # ModelStrategy feature_window=100 / 10-feature builder. v2 (14
+                # features incl. FGI/BTC-dom) needs external history not available
+                # in this offline training context.
+                fold_trainer = ModelTrainer(model_dir=_tmpdir, feature_schema_version=1)
                 fold_X_train, fold_y_train = fold_trainer.prepare_dataset(
                     fold_df, horizon=horizon, threshold=threshold
                 )
                 fold_trainer.train(fold_X_train, fold_y_train, n_estimators=n_estimators)
-
-                # Build OOS test DataFrame from fold test bars
-                fold_test_bars = fold.test_bars.get(symbol, [])
-                fold_test_df_rows = [
-                    [
-                        int(b.timestamp.timestamp() * 1000),
-                        float(b.open), float(b.high), float(b.low),
-                        float(b.close), float(b.volume),
-                    ]
-                    for b in fold_test_bars
-                ]
-                fold_test_df = pd.DataFrame(
-                    fold_test_df_rows,
-                    columns=["timestamp", "open", "high", "low", "close", "volume"],
+                fold_model_path = fold_trainer.save_model(
+                    symbol=symbol, version_suffix=f"wf_fold_{fold.index}"
                 )
 
-                try:
-                    fold_X_test, fold_y_test = fold_trainer.prepare_dataset(
-                        fold_test_df, horizon=horizon, threshold=threshold
-                    )
-                    fold_model = fold_trainer._model
-                    if fold_model is not None and len(fold_X_test) > 0:
-                        fold_y_pred = fold_model.predict(fold_X_test)
-                        fold_acc = float(_np.mean(fold_y_pred == fold_y_test))
-                        n_test = len(fold_y_test)
-                        # Accuracy-based pseudo-Sharpe: (2*acc - 1) * sqrt(n)
-                        fold_skill_score = (2.0 * fold_acc - 1.0) * math.sqrt(n_test)
-                        fold_skill_scores.append(fold_skill_score)
-                        fold_trade_counts.append(n_test)
-                    else:
-                        fold_skill_scores.append(0.0)
-                        fold_trade_counts.append(0)
-                except Exception as oos_exc:
+                # 4b. Assemble the mini-backtest series: tail of train (for warmup
+                # + indicator convergence) + the full OOS test window.
+                bt_series = fold_train_bars[-200:] + fold_test_bars
+                if len(bt_series) <= _MODEL_WARMUP_BARS:
+                    # BacktestRunner would raise on warmup-insufficiency. Skip the
+                    # fold with a neutral (zero) contribution and a loud warning.
                     logger.warning(
-                        "ml.walk_forward_fold_oos_eval_failed",
+                        "ml.wf_fold_warmup_short",
                         fold_index=fold.index,
-                        error=str(oos_exc),
+                        bt_series_len=len(bt_series),
+                        warmup_bars=_MODEL_WARMUP_BARS,
+                        msg=(
+                            "Fold backtest series too short for ModelStrategy "
+                            "warmup (200). Appending 0.0 Sharpe / 0 trades."
+                        ),
                     )
-                    fold_skill_scores.append(0.0)
+                    fold_sharpes.append(0.0)
                     fold_trade_counts.append(0)
+                    fold_drawdowns.append(0.0)
+                    continue
+
+                # 4c. Build the ModelStrategy bound to the fold model.
+                strat = ModelStrategy(
+                    strategy_id=f"wf_gate_fold_{fold.index}",
+                    params={
+                        "model_path": str(fold_model_path),
+                        "model_dir": _tmpdir,
+                        "feature_window": 100,
+                        "prediction_threshold": 0.60,  # PROBABILITY gate, not `threshold`
+                        "position_size": 1000.0,
+                    },
+                )
+
+                # 4d. Run the real mini-backtest. Coinbase taker/maker 60/40 bps,
+                # Sprint-42 default slippage (BacktestRunner default slippage_bps=5),
+                # fixed-fractional sizing (A1 — no ATR risk_params), seed=42.
+                runner = BacktestRunner(
+                    strategies=[strat],
+                    symbols=[symbol],
+                    timeframe=tf_enum,
+                    initial_capital=_Decimal("10000"),
+                    taker_fee_bps=60,
+                    maker_fee_bps=40,
+                    seed=42,
+                )
+
+                # OOS window starts where the test bars begin within bt_series.
+                # CR-C6-002: an out-of-range oos_start_index (e.g. a short train
+                # tail left bt_series <= warmup) yields a logged 0.0 Sharpe
+                # contribution from BacktestRunner.run (oos_sharpe stays None ->
+                # coerced to 0.0 below), NOT a fold skip.
+                oos_start_index = len(bt_series) - len(fold_test_bars)
+
+                # asyncio.run is safe: _train_model_with_wf_sync runs inside
+                # asyncio.to_thread (see train_model), so this thread has no
+                # running event loop.
+                result = asyncio.run(
+                    runner.run({symbol: bt_series}, oos_start_index=oos_start_index)
+                )
+
+                fold_sharpe = (
+                    result.oos_sharpe if result.oos_sharpe is not None else 0.0
+                )
+                fold_trades = int(result.total_trades)
+                fold_max_dd = float(result.max_drawdown_pct)
+
+                fold_sharpes.append(fold_sharpe)
+                fold_trade_counts.append(fold_trades)
+                fold_drawdowns.append(fold_max_dd)
+
+                logger.info(
+                    "ml.wf_fold_backtest_complete",
+                    fold_index=fold.index,
+                    oos_sharpe=round(fold_sharpe, 4),
+                    oos_n_returns=result.oos_n_returns,
+                    trades=fold_trades,
+                    max_drawdown_pct=round(fold_max_dd, 4),
+                )
 
             except Exception as exc:
                 logger.warning(
                     "ml.walk_forward_fold_failed",
                     fold_index=fold.index,
                     error=str(exc),
+                    error_type=type(exc).__name__,
                 )
-                fold_skill_scores.append(0.0)
+                fold_sharpes.append(0.0)
                 fold_trade_counts.append(0)
+                fold_drawdowns.append(0.0)
         # TemporaryDirectory.__exit__ deletes _tmpdir and all per-fold files.
 
-    # 5. QT5-003: check for insufficient OOS samples in any fold
+    # 5. Insufficient-samples check on REAL trade counts (Cycle 6).
     folds_below_threshold: list[int] = [
         i for i, tc in enumerate(fold_trade_counts)
         if tc < min_trades_per_fold
@@ -464,43 +538,38 @@ def _train_model_with_wf_sync(
             folds_below_threshold=folds_below_threshold,
             min_trades_per_fold=min_trades_per_fold,
             actual_min=actual_min_fold_trades,
+            note=(
+                "Realized OOS trade counts. At prediction_threshold=0.60 over "
+                "~120-bar folds this is frequently triggered — consider lowering "
+                "MIN_TRADES_PER_FOLD or increasing bars/reducing num_wf_folds."
+            ),
         )
 
-    # 6. QT5-001 + QT5-002: MEDIAN + Deflated Sharpe aggregation over skill scores
-    #    NOTE: "Deflated Sharpe" here refers to the Bailey-Lopez de Prado (2014)
-    #    deflation formula applied to the DIRECTIONAL Z-SCORE PROXY (2*acc-1)*sqrt(n),
-    #    NOT to a realized trading Sharpe.  The result is still a skill proxy.
-    oos_skill_median_raw: float | None = None
-    oos_skill_worst: float | None = None
-    oos_skill_median_deflated: float | None = None
+    # 6. Aggregate realized OOS Sharpe: MEDIAN (gate) + WORST (floor) + worst DD.
+    oos_sharpe_median: float | None = None
+    oos_sharpe_worst: float | None = None
+    worst_fold_drawdown: float | None = None
 
-    if len(fold_skill_scores) >= 2:
-        oos_skill_median_raw = _statistics_stdlib.median(fold_skill_scores)
-        oos_skill_worst = min(fold_skill_scores)
-        skill_std = _statistics_stdlib.stdev(fold_skill_scores)
-        oos_skill_median_deflated = deflated_sharpe_ratio(
-            observed_sharpe=oos_skill_median_raw,
-            sharpe_stddev=skill_std,
-            num_trials=len(fold_skill_scores),
-        )
-    elif len(fold_skill_scores) == 1:
-        oos_skill_median_raw = fold_skill_scores[0]
-        oos_skill_worst = fold_skill_scores[0]
-        oos_skill_median_deflated = fold_skill_scores[0]
-    # else: no folds computed -- all WF metrics remain None
+    if len(fold_sharpes) >= 1:
+        oos_sharpe_median = _statistics_stdlib.median(fold_sharpes)
+        oos_sharpe_worst = min(fold_sharpes)
+        # Single-fold and multi-fold both well-defined; for a single fold the
+        # median equals that fold and the worst equals it too.
+    if fold_drawdowns:
+        worst_fold_drawdown = max(fold_drawdowns)
+    # else: no folds computed -- all WF metrics remain None.
 
-    # Quant review caveat (Cycle 5): emit warning so operator knows the gate
-    # value is a classification-accuracy proxy, not a realized trading metric.
-    logger.warning(
-        "ml.walk_forward_skill_proxy",
+    logger.info(
+        "ml.walk_forward_realized_oos_sharpe",
         msg=(
-            "OOS gate uses directional z-score proxy (2*acc-1)*sqrt(n), NOT a "
-            "trading Sharpe. Magnitude-blind: does not account for fees/slippage/"
-            "sizing. See cycle 5 quant review and sprint50-cycle5-quant-backlog.md."
+            "OOS gate now uses a REALIZED trading Sharpe over the OOS window "
+            "(net Coinbase 60/40 fees + Sprint-42 slippage), replacing the "
+            "Cycle-5 directional z-score proxy."
         ),
-        model_version_id=None,  # not yet persisted at this point; caller logs model_id
-        oos_skill_score_deflated=oos_skill_median_deflated,
-        oos_skill_score_raw=oos_skill_median_raw,
+        oos_sharpe_median=oos_sharpe_median,
+        oos_sharpe_worst=oos_sharpe_worst,
+        worst_fold_drawdown=worst_fold_drawdown,
+        num_folds=len(fold_sharpes),
     )
 
     return {
@@ -513,13 +582,14 @@ def _train_model_with_wf_sync(
         "training_samples": metrics["train_samples"],
         "test_samples": metrics["test_samples"],
         "metrics": metrics,
-        # Walk-forward OOS skill score metrics (Sprint 50 Cycle 5)
-        # Key prefix uses "skill_score" not "sharpe" -- directional z-score proxy.
-        "walk_forward_oos_skill_score": oos_skill_median_deflated,
-        "walk_forward_oos_skill_score_raw": oos_skill_median_raw,
-        "walk_forward_oos_skill_score_worst": oos_skill_worst,
-        "walk_forward_fold_skill_scores": fold_skill_scores,
+        # Walk-forward REALIZED OOS Sharpe metrics (Sprint 50 Cycle 6).
+        # Column walk_forward_oos_skill_score <- oos_sharpe_median (name unchanged).
+        "walk_forward_oos_skill_score": oos_sharpe_median,
+        "walk_forward_oos_sharpe_median": oos_sharpe_median,
+        "walk_forward_oos_sharpe_worst": oos_sharpe_worst,
+        "walk_forward_fold_sharpes": fold_sharpes,
         "walk_forward_fold_trade_counts": fold_trade_counts,
+        "walk_forward_worst_fold_drawdown": worst_fold_drawdown,
         "walk_forward_status": "insufficient_samples" if insufficient_samples else "ok",
         "walk_forward_folds_below_threshold": folds_below_threshold,
     }
@@ -665,13 +735,16 @@ async def activate_model_version(
 ) -> ModelVersionResponse:
     """Activate a specific model version by UUID, deactivating the current active one.
 
-    Sprint 50 Cycle 5: checks walk-forward OOS skill score gate before activation.
-    The gate uses a directional z-score proxy (2*acc-1)*sqrt(n), NOT a trading Sharpe.
-    If the model's OOS skill score (directional z-score proxy) is below
-    ``min_oos_skill_score`` the endpoint returns HTTP 422 with ``oos_gate_failed``
-    error.  Supply ``X-Override-OOS-Gate: <admin_key>`` to bypass the gate for
-    exceptional cases; the bypass is always recorded as an audit event before state
-    mutation.
+    Sprint 50 Cycle 6: checks the walk-forward REALIZED OOS Sharpe gate before
+    activation.  The gate value is the MEDIAN realized out-of-sample trading
+    Sharpe across walk-forward folds (net Coinbase 60/40 fees + Sprint-42
+    slippage), with a worst-fold floor and a per-fold max-drawdown floor (B1).
+    If the model's OOS Sharpe is below ``min_oos_skill_score`` (or a fold's
+    drawdown exceeds ``max_fold_drawdown``) the endpoint returns HTTP 422 with
+    ``oos_gate_failed``.  Legacy models tagged ``metric_type=directional_zscore_proxy``
+    (Cycle 5) are NOT comparable to the realized-Sharpe threshold and pass with a
+    warning recommending retrain.  Supply ``X-Override-OOS-Gate: <admin_key>`` to
+    bypass; the bypass is always recorded as an audit event before state mutation.
     """
     import hmac
 
@@ -735,6 +808,7 @@ async def activate_model_version(
         min_oos_skill_score=settings.min_oos_skill_score,
         min_worst_fold_skill_score=settings.min_worst_fold_skill_score,
         min_trades_per_fold=settings.min_trades_per_fold,
+        max_fold_drawdown=settings.max_fold_drawdown,
     )
 
     if not oos_result.eligible and not oos_override_active:
@@ -750,8 +824,8 @@ async def activate_model_version(
                     "Retrain via POST /ml/train to compute updated OOS metrics, "
                     "lower MIN_OOS_SKILL_SCORE in settings, "
                     "or supply X-Override-OOS-Gate: <admin_key> to bypass. "
-                    "Note: the gate uses a directional z-score proxy (2*acc-1)*sqrt(n), "
-                    "NOT a trading Sharpe."
+                    "The gate value is the MEDIAN realized OOS trading Sharpe "
+                    "across walk-forward folds (net fees + slippage)."
                 ),
             },
         )

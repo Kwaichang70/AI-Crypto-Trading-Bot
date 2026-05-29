@@ -692,10 +692,18 @@ class TestRunBacktestWithHtfBars:
             self_engine: StrategyEngine,
             bars_by_symbol: dict[str, list[OHLCVBar]],
             htf_bars: dict[str, dict[str, list[OHLCVBar]]] | None = None,
+            *,
+            # Sprint 50 Cycle 6: run_backtest now also receives a keyword-only
+            # oos_start_index (None on this path); accept + forward it.
+            oos_start_index: int | None = None,
         ) -> dict[str, Any]:
             captured["htf_bars"] = htf_bars
+            captured["oos_start_index"] = oos_start_index
             return await original_run_backtest(
-                self_engine, bars_by_symbol, htf_bars=htf_bars
+                self_engine,
+                bars_by_symbol,
+                htf_bars=htf_bars,
+                oos_start_index=oos_start_index,
             )
 
         with patch.object(

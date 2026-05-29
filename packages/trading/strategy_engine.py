@@ -485,6 +485,8 @@ class StrategyEngine:
         self,
         bars_by_symbol: dict[str, list[OHLCVBar]],
         htf_bars: dict[str, dict[str, list[OHLCVBar]]] | None = None,
+        *,
+        oos_start_index: int | None = None,
     ) -> dict[str, Any]:
         """
         Walk through historical bars deterministically.
@@ -501,6 +503,16 @@ class StrategyEngine:
         htf_bars :
             Optional higher-timeframe bar data keyed by timeframe string,
             then by symbol. Passed to strategies via MultiTimeframeContext.
+        oos_start_index :
+            Sprint 50 Cycle 6 (IMPL-C6-002): bar ordinal (0-based into the
+            shortest symbol series) marking the first out-of-sample bar. When
+            set, the engine records the live equity-curve length at the exact
+            moment processing crosses into that bar and returns it in the
+            summary dict under "oos_equity_curve_offset". This lets
+            BacktestRunner.run() slice OOS-only per-period returns CORRECTLY
+            even though the equity curve is NOT 1:1 with bars (every fill
+            appends an extra point). None = no OOS measurement (default; zero
+            behaviour change).
 
         Returns
         -------
@@ -543,6 +555,13 @@ class StrategyEngine:
         self._exposure_bars_total = 0
         self._exposure_bars_per_symbol = {s: 0 for s in self._symbols}
 
+        # Sprint 50 Cycle 6 (IMPL-C6-002): equity-curve length captured at the
+        # moment processing crosses into the first OOS bar. Stays None when
+        # oos_start_index is None OR when num_bars never reaches the boundary.
+        # The equity curve is NOT 1:1 with bars (every fill appends a point), so
+        # we read the LIVE len() at the boundary rather than computing an offset.
+        oos_equity_curve_offset: int | None = None
+
         self._log.info(
             "engine.backtest_starting",
             total_bars=num_bars,
@@ -557,6 +576,18 @@ class StrategyEngine:
                     bar_index=bar_idx,
                 )
                 break
+
+            # Sprint 50 Cycle 6 (IMPL-C6-002): capture the equity-curve length
+            # the instant we reach the first OOS bar, BEFORE this bar appends any
+            # equity points. Everything appended from here on is the OOS window.
+            # Guard `is None` so a re-entry (impossible in a single loop, but
+            # defensive) cannot overwrite the boundary.
+            if (
+                oos_start_index is not None
+                and oos_equity_curve_offset is None
+                and bar_idx >= oos_start_index
+            ):
+                oos_equity_curve_offset = len(self._portfolio.get_equity_curve())
 
             # Build the current bar snapshot and the growing history
             current_bars: dict[str, OHLCVBar] = {}
@@ -610,6 +641,9 @@ class StrategyEngine:
         # directly instead of the post-hoc _estimate_bars_in_market heuristic.
         summary["exposure_bars_total"] = self._exposure_bars_total
         summary["exposure_bars_per_symbol"] = dict(self._exposure_bars_per_symbol)
+        # Sprint 50 Cycle 6 (IMPL-C6-002): OOS equity-curve boundary offset.
+        # None when oos_start_index was not supplied OR the loop never reached it.
+        summary["oos_equity_curve_offset"] = oos_equity_curve_offset
         return summary
 
     # ------------------------------------------------------------------

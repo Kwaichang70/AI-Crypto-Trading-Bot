@@ -273,6 +273,8 @@ class BacktestRunner:
         self,
         bars_by_symbol: dict[str, list[OHLCVBar]],
         htf_bars: dict[str, dict[str, list[OHLCVBar]]] | None = None,
+        *,
+        oos_start_index: int | None = None,
     ) -> BacktestResult:
         """
         Execute a backtest over the provided historical bars.
@@ -286,6 +288,15 @@ class BacktestRunner:
             Optional higher-timeframe bars keyed by timeframe string,
             then by symbol. Passed through to the strategy engine for
             multi-timeframe strategies. Default None.
+        oos_start_index : int | None
+            Sprint 50 Cycle 6 (IMPL-C6-003): when set, compute a realized
+            out-of-sample trading Sharpe over bars [oos_start_index:] only and
+            populate result.oos_sharpe / result.oos_n_returns. The warmup region
+            and the in-sample (train) region are excluded. Must satisfy
+            self._warmup_bars <= oos_start_index < num_bars; out-of-range values
+            are logged and the OOS fields are left None (no crash). Default None
+            (no OOS measurement — strictly zero behaviour change for all existing
+            backtest/paper/optimizer call-sites).
 
         Returns
         -------
@@ -336,7 +347,11 @@ class BacktestRunner:
 
         try:
             # 6. Run backtest through the strategy engine
-            engine_summary = await engine.run_backtest(bars_by_symbol, htf_bars=htf_bars)
+            engine_summary = await engine.run_backtest(
+                bars_by_symbol,
+                htf_bars=htf_bars,
+                oos_start_index=oos_start_index,
+            )
         finally:
             # 7. Stop engine (always, even on error)
             await engine.stop()
@@ -434,6 +449,58 @@ class BacktestRunner:
         sharpe = compute_sharpe(per_period_returns, periods_per_year)
         sortino = compute_sortino(per_period_returns, periods_per_year)
         calmar = compute_calmar(cagr, max_dd)
+
+        # Sprint 50 Cycle 6 (IMPL-C6-003): realized OOS Sharpe over the OOS window.
+        # The equity curve is NOT 1:1 with bars (every fill appends an extra
+        # point), so we do NOT compute an offset from oos_start_index. Instead we
+        # read the boundary the engine captured (the LIVE equity-curve length at
+        # the moment processing crossed into the first OOS bar) and slice the
+        # equity curve there. Returns into the OOS window = compute_returns over
+        # equity_curve[boundary-1:] (the return INTO the first OOS point belongs
+        # to the OOS window; boundary-1 includes the prior point as the return base).
+        oos_sharpe: float | None = None
+        oos_n_returns: int | None = None
+        if oos_start_index is not None:
+            oos_offset = engine_summary.get("oos_equity_curve_offset")
+            n_bars_total = min(len(bars_by_symbol[s]) for s in self._symbols)
+            if oos_start_index < self._warmup_bars or oos_start_index >= n_bars_total:
+                self._log.warning(
+                    "backtest.oos_start_index_out_of_range",
+                    oos_start_index=oos_start_index,
+                    warmup_bars=self._warmup_bars,
+                    num_bars=n_bars_total,
+                    msg=(
+                        "oos_start_index must satisfy warmup_bars <= idx < num_bars; "
+                        "OOS Sharpe left None."
+                    ),
+                )
+            elif oos_offset is None:
+                self._log.warning(
+                    "backtest.oos_offset_missing",
+                    oos_start_index=oos_start_index,
+                    msg=(
+                        "Engine did not record an OOS boundary (loop may have "
+                        "stopped early). OOS Sharpe left None."
+                    ),
+                )
+            else:
+                # boundary is the curve length BEFORE the first OOS bar appended
+                # any point. The return INTO the first OOS point uses the point at
+                # index (boundary-1) as its base, so slice the curve from
+                # (boundary-1) to capture that first OOS return. Clamp at 0.
+                slice_start = max(0, int(oos_offset) - 1)
+                oos_curve = equity_curve[slice_start:]
+                oos_returns = compute_returns_from_equity(oos_curve)
+                oos_n_returns = len(oos_returns)
+                oos_sharpe = compute_sharpe(oos_returns, periods_per_year)
+                self._log.info(
+                    "backtest.oos_sharpe_computed",
+                    oos_start_index=oos_start_index,
+                    oos_equity_curve_offset=int(oos_offset),
+                    oos_n_returns=oos_n_returns,
+                    oos_sharpe=f"{oos_sharpe:.4f}",
+                    full_curve_len=len(equity_curve),
+                )
 
         # M4 (Sprint 49): PSR + statistical confidence fields
         n_obs = len(per_period_returns)
@@ -543,6 +610,10 @@ class BacktestRunner:
             reporting_currency=None,
             # M7 (Sprint 49 INF-9): seed pinning for reproducibility
             seed=self._seed,
+            # Sprint 50 Cycle 6 (IMPL-C6-003): realized OOS Sharpe (None unless
+            # oos_start_index was supplied).
+            oos_sharpe=oos_sharpe,
+            oos_n_returns=oos_n_returns,
         )
 
         self._log.info(

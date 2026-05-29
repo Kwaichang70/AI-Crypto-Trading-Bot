@@ -8,26 +8,32 @@ The gate reads the persisted ``walk_forward_oos_skill_score`` from a
 NULL OOS skill score (pre-Cycle-5 models) passes with a diagnostic warning --
 operators are informed but not blocked on legacy models.
 
-IMPORTANT: the gate metric is a directional z-score SKILL PROXY (2*acc-1)*sqrt(n),
-NOT a trading Sharpe ratio.  It is magnitude-blind: does not account for fees,
-slippage, or position sizing.  Cycle 6+ will replace this proxy with a real
-per-fold BacktestRunner OOS gate.  See reports/sprint50-cycle5-quant-backlog.md.
+IMPORTANT (Sprint 50 Cycle 6): the gate metric is now a REALIZED out-of-sample
+trading Sharpe computed by a per-fold BacktestRunner mini-backtest (net Coinbase
+60/40 bps fees + Sprint-42 slippage), persisted on
+``ModelVersionORM.walk_forward_oos_skill_score`` (column name retained).  Legacy
+models tagged ``metric_type=directional_zscore_proxy`` (Cycle 5) are not
+comparable to the realized-Sharpe threshold and pass with a retrain warning.
 
 This module is purposely free of routing logic; the router calls
 ``check_oos_eligibility()`` and decides whether to raise HTTP 422.
 
 Gate logic (in order):
+0. If JSONB ``extra["walk_forward"]["metric_type"] == "directional_zscore_proxy"``
+   (legacy Cycle-5 model): pass with ``warning`` -- the z-score proxy is not
+   comparable to the realized-Sharpe threshold; operator is told to retrain.
 1. If ``walk_forward_oos_skill_score`` is NULL (pre-Cycle-5 model): pass with
    ``warning`` populated (backward-compatible pass-with-warning).
-2. If JSONB ``extra["walk_forward"]["status"] == "insufficient_samples"``
-   (QT5-003): reject with reason="insufficient_oos_samples".  This is
-   semantically distinct from "skill is bad" -- it means "we cannot measure
-   skill."
-3. If ``walk_forward_oos_skill_score`` < ``min_oos_skill_score`` (deflated median
-   gate): reject with reason="oos_skill_below_min".
-4. If worst-fold skill score < ``min_worst_fold_skill_score`` floor: reject with
+2. If JSONB ``extra["walk_forward"]["status"] == "insufficient_samples"``:
+   reject with reason="insufficient_oos_samples".  Distinct from "skill is bad"
+   -- it means "we cannot measure skill" (too few realized OOS trades).
+3. If ``walk_forward_oos_skill_score`` < ``min_oos_skill_score`` (median realized
+   OOS Sharpe gate): reject with reason="oos_skill_below_min".
+4. If worst-fold Sharpe < ``min_worst_fold_skill_score`` floor: reject with
    reason="worst_fold_below_floor".
-5. Otherwise: eligible.
+5. If any fold's OOS max drawdown > ``max_fold_drawdown`` (B1): reject with
+   reason="fold_drawdown_exceeds_floor".
+6. Otherwise: eligible.
 
 CR5v2-002 (Option A): ``OOSEligibility`` has a separate ``detail`` field for
 human-readable rejection messages (distinct from ``warning`` which is reserved
@@ -87,6 +93,9 @@ class OOSEligibility:
     detail: str = ""
     reason: str = ""
     worst_fold_skill_score: float | None = None
+    # Sprint 50 Cycle 6 (B1): worst per-fold OOS max drawdown read from JSONB
+    # extra["walk_forward"]["worst_fold_drawdown"]. None when unavailable.
+    worst_fold_drawdown_observed: float | None = None
 
     # ---------------------------------------------------------------------------
     # Backward-compatibility properties: old callers that read .oos_sharpe /
@@ -110,6 +119,7 @@ def check_oos_eligibility(
     min_oos_skill_score: float,
     min_worst_fold_skill_score: float = 0.0,
     min_trades_per_fold: int = 20,
+    max_fold_drawdown: float = 0.25,
     # Backward-compat aliases (ml.py still passes these names via **kwargs)
     min_oos_sharpe: float | None = None,
     min_worst_fold_sharpe: float | None = None,
@@ -135,6 +145,10 @@ def check_oos_eligibility(
         be considered statistically meaningful.  Passed for the warning
         message only; the gate itself reads JSONB status "insufficient_samples"
         as written by the train endpoint.
+    max_fold_drawdown:
+        Sprint 50 Cycle 6 (B1).  Maximum tolerated per-fold OOS max drawdown
+        (decimal fraction).  If JSONB ``worst_fold_drawdown`` exceeds this the
+        gate rejects with reason="fold_drawdown_exceeds_floor".  Default 0.25.
     min_oos_sharpe:
         Deprecated alias for min_oos_skill_score (backward compat).
     min_worst_fold_sharpe:
@@ -150,6 +164,34 @@ def check_oos_eligibility(
         min_oos_skill_score = min_oos_sharpe
     if min_worst_fold_sharpe is not None:
         min_worst_fold_skill_score = min_worst_fold_sharpe
+
+    # Read the JSONB walk_forward block once (used by several gates below).
+    wf_meta: dict[str, Any] = {}
+    if model_version.extra and isinstance(model_version.extra, dict):
+        wf_meta = model_version.extra.get("walk_forward", {}) or {}
+
+    # Gate -1 (Sprint 50 Cycle 6): legacy Cycle-5 z-score-proxy models are NOT
+    # comparable to the realized-Sharpe threshold. Pass with a retrain warning
+    # rather than gating them on a metric they were never measured against.
+    if wf_meta.get("metric_type") == "directional_zscore_proxy":
+        logger.warning(
+            "model_activation_gate.legacy_zscore_proxy_passthrough",
+            model_id=str(model_version.id),
+            symbol=model_version.symbol,
+            timeframe=model_version.timeframe,
+        )
+        raw_legacy = getattr(model_version, "walk_forward_oos_skill_score", None)
+        return OOSEligibility(
+            eligible=True,
+            oos_skill_score=float(raw_legacy) if raw_legacy is not None else None,
+            threshold=min_oos_skill_score,
+            warning=(
+                "This model was scored with the legacy Cycle-5 directional "
+                "z-score proxy, which is NOT comparable to the realized-OOS-Sharpe "
+                "gate (Sprint 50 Cycle 6). It is allowed to activate, but you "
+                "should retrain via POST /ml/train to obtain a realized OOS Sharpe."
+            ),
+        )
 
     # Support both old (walk_forward_oos_sharpe) and new (walk_forward_oos_skill_score)
     # ORM attribute names during the transition window.
@@ -179,13 +221,9 @@ def check_oos_eligibility(
             ),
         )
 
-    # QT5-003: reject before skill check if OOS sample count was insufficient.
-    # This is distinct from "skill is bad" -- it means "we cannot measure skill".
-    wf_status = ""
-    wf_meta: dict[str, Any] = {}
-    if model_version.extra and isinstance(model_version.extra, dict):
-        wf_meta = model_version.extra.get("walk_forward", {})
-        wf_status = wf_meta.get("status", "")
+    # Reject before skill check if OOS sample count was insufficient.
+    # Distinct from "skill is bad" -- it means "we cannot measure skill".
+    wf_status = wf_meta.get("status", "")
 
     if wf_status == "insufficient_samples":
         actual_min = min(wf_meta.get("fold_trade_counts", [0]))
@@ -215,7 +253,7 @@ def check_oos_eligibility(
             model_id=str(model_version.id),
             oos_skill_score=oos_skill_score,
             threshold=min_oos_skill_score,
-            note="OOS gate uses directional z-score proxy (2*acc-1)*sqrt(n), NOT a trading Sharpe",
+            note="OOS gate uses the realized OOS trading Sharpe (net fees + slippage)",
         )
         return OOSEligibility(
             eligible=False,
@@ -223,9 +261,9 @@ def check_oos_eligibility(
             threshold=min_oos_skill_score,
             reason="oos_skill_below_min",
             detail=(
-                f"OOS skill score (directional z-score proxy) {oos_skill_score:.4f} "
-                f"is below the configured minimum {min_oos_skill_score:.4f}. "
-                "Note: this metric is magnitude-blind (no fees/slippage/sizing)."
+                f"Median realized OOS Sharpe {oos_skill_score:.4f} is below the "
+                f"configured minimum {min_oos_skill_score:.4f} "
+                "(net Coinbase 60/40 fees + Sprint-42 slippage)."
             ),
         )
 
@@ -242,7 +280,7 @@ def check_oos_eligibility(
             model_id=str(model_version.id),
             worst_fold_skill_score=worst_fold_skill_score,
             floor=min_worst_fold_skill_score,
-            note="OOS gate uses directional z-score proxy (2*acc-1)*sqrt(n), NOT a trading Sharpe",
+            note="OOS gate uses the realized OOS trading Sharpe (net fees + slippage)",
         )
         return OOSEligibility(
             eligible=False,
@@ -250,12 +288,38 @@ def check_oos_eligibility(
             threshold=min_oos_skill_score,
             reason="worst_fold_below_floor",
             detail=(
-                f"Worst-fold OOS skill score (directional z-score proxy) "
-                f"{worst_fold_skill_score:.4f} is below the configured floor "
-                f"{min_worst_fold_skill_score:.4f}. "
-                "Note: this metric is magnitude-blind (no fees/slippage/sizing)."
+                f"Worst-fold realized OOS Sharpe {worst_fold_skill_score:.4f} is "
+                f"below the configured floor {min_worst_fold_skill_score:.4f} "
+                "(net fees + slippage)."
             ),
             worst_fold_skill_score=worst_fold_skill_score,
+        )
+
+    # Gate 3 (Sprint 50 Cycle 6 / B1): per-fold max-drawdown floor.
+    # Read worst_fold_drawdown from JSONB; reject if it exceeds max_fold_drawdown.
+    worst_fold_drawdown_raw = wf_meta.get("worst_fold_drawdown")
+    worst_fold_drawdown: float | None = (
+        float(worst_fold_drawdown_raw) if worst_fold_drawdown_raw is not None else None
+    )
+    if worst_fold_drawdown is not None and worst_fold_drawdown > max_fold_drawdown:
+        logger.warning(
+            "model_activation_gate.fold_drawdown_exceeds_floor",
+            model_id=str(model_version.id),
+            worst_fold_drawdown=worst_fold_drawdown,
+            max_fold_drawdown=max_fold_drawdown,
+        )
+        return OOSEligibility(
+            eligible=False,
+            oos_skill_score=oos_skill_score,
+            threshold=min_oos_skill_score,
+            reason="fold_drawdown_exceeds_floor",
+            detail=(
+                f"Worst-fold OOS max drawdown {worst_fold_drawdown:.2%} exceeds "
+                f"the configured floor {max_fold_drawdown:.2%}. At least one "
+                "walk-forward fold suffered a catastrophic drawdown."
+            ),
+            worst_fold_skill_score=worst_fold_skill_score,
+            worst_fold_drawdown_observed=worst_fold_drawdown,
         )
 
     logger.info(
@@ -263,11 +327,12 @@ def check_oos_eligibility(
         model_id=str(model_version.id),
         oos_skill_score=oos_skill_score,
         threshold=min_oos_skill_score,
-        note="OOS gate uses directional z-score proxy (2*acc-1)*sqrt(n), NOT a trading Sharpe",
+        note="OOS gate uses the realized OOS trading Sharpe (net fees + slippage)",
     )
     return OOSEligibility(
         eligible=True,
         oos_skill_score=oos_skill_score,
         threshold=min_oos_skill_score,
         worst_fold_skill_score=worst_fold_skill_score,
+        worst_fold_drawdown_observed=worst_fold_drawdown,
     )

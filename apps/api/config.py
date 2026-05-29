@@ -459,29 +459,28 @@ class Settings(BaseSettings):
     )
 
     # ------------------------------------------------------------------
-    # Walk-Forward OOS Model Activation Gate (Sprint 50 Cycle 5)
-    # NOTE: the gate metric is a directional z-score SKILL PROXY (2*acc-1)*sqrt(n),
-    # NOT a trading Sharpe. It is magnitude-blind: does not account for fees,
-    # slippage, or position sizing. See reports/sprint50-cycle5-quant-backlog.md
-    # for the Cycle 6+ plan to replace this proxy with a real BacktestRunner OOS gate.
+    # Walk-Forward OOS Model Activation Gate (Sprint 50 Cycle 6)
+    # The gate metric is now a REALIZED out-of-sample trading Sharpe computed by
+    # a per-fold BacktestRunner mini-backtest (net Coinbase 60/40 bps fees +
+    # Sprint-42 slippage). It REPLACES the Cycle-5 directional z-score proxy.
     # ------------------------------------------------------------------
     min_oos_skill_score: float = Field(
-        default=1.64,
+        default=1.0,
         ge=0.0,
         le=5.0,
         description=(
-            "Minimum aggregate out-of-sample (OOS) directional z-score skill score "
-            "required to activate a model version via PUT /ml/models/{id}/activate.  "
-            "Default 1.64 ~= one-sided 95% confidence that the classifier beats a "
-            "coin flip on the z-score scale; a 0.5 default would mean only ~69% "
-            "confidence and is too weak to gate live model activation (cycle 5 "
-            "quant caveat #4).  "
-            "The gate uses (2*acc-1)*sqrt(n) -- a directional z-score proxy, NOT a "
-            "trading Sharpe (magnitude-blind; no fees/slippage/sizing).  "
-            "Computed as the DEFLATED MEDIAN OOS skill score across walk-forward folds "
-            "during POST /ml/train.  Models trained before Sprint 50 Cycle 5 have "
+            "Minimum median realized OOS trading Sharpe (net Coinbase 60/40 bps "
+            "fees + Sprint-42 slippage) across walk-forward folds required to "
+            "activate a model version via PUT /ml/models/{id}/activate.  "
+            "Default 1.0 -- a realized annualised Sharpe of 1.0 on the "
+            "out-of-sample window is a conventional floor for a deployable "
+            "strategy.  Computed as the MEDIAN per-fold OOS Sharpe during "
+            "POST /ml/train (Sprint 50 Cycle 6).  "
+            "Models trained before Sprint 50 Cycle 5 have "
             "walk_forward_oos_skill_score=NULL and pass the gate by default "
-            "(operator is warned in the response).  "
+            "(operator is warned in the response).  Legacy Cycle-5 models tagged "
+            "metric_type=directional_zscore_proxy are not comparable to this "
+            "realized-Sharpe threshold and also pass with a retrain warning.  "
             "Set to 0.0 to disable the gate (allow all models).  "
             "Override with MIN_OOS_SKILL_SCORE env var."
         ),
@@ -500,17 +499,38 @@ class Settings(BaseSettings):
         ),
     )
     min_trades_per_fold: int = Field(
-        default=20,
+        default=5,
         ge=1,
         le=1000,
         description=(
-            "Minimum number of OOS trades required in EVERY walk-forward fold "
-            "for the OOS skill score metrics to be considered statistically meaningful. "
+            "Minimum number of REALIZED closed OOS round-trip trades required in "
+            "EVERY walk-forward fold for the OOS Sharpe metrics to be considered "
+            "statistically meaningful (Sprint 50 Cycle 6). "
+            "5 is the MVP floor: at prediction_threshold=0.60 over ~120-bar OOS "
+            "folds a 10-feature RandomForest produces few closed round-trips, so a "
+            "higher floor (e.g. 20) would mark most real models "
+            "'insufficient_oos_samples' and block activation. "
             "If any fold produces fewer trades than this threshold, the model "
             "activation gate returns 'insufficient_oos_samples' (distinct from "
             "'oos_skill_below_min') so the operator knows to train on more bars "
             "or reduce num_wf_folds rather than improve the strategy. "
             "Override with MIN_TRADES_PER_FOLD env var."
+        ),
+    )
+    # Sprint 50 Cycle 6 (B1): per-fold max-drawdown floor.
+    max_fold_drawdown: float = Field(
+        default=0.25,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Maximum tolerated per-fold out-of-sample max drawdown (decimal "
+            "fraction, e.g. 0.25 = 25%) for model activation.  If ANY walk-forward "
+            "fold's OOS backtest had a max drawdown greater than this floor, the "
+            "activation gate rejects with reason 'fold_drawdown_exceeds_floor'.  "
+            "This catches models whose median OOS Sharpe is acceptable but that "
+            "suffer a catastrophic drawdown in at least one regime.  Applied after "
+            "the insufficient-samples and skill checks.  Set to 1.0 to disable. "
+            "Override with MAX_FOLD_DRAWDOWN env var."
         ),
     )
     wf_num_folds: int = Field(
