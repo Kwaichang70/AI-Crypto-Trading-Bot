@@ -7,7 +7,7 @@
  *   1. StrategyStatusBadge — renders "Backtest only" for demoted, "Experimental"
  *      for experimental, "Live-ready" for active, and NOTHING when status is
  *      undefined (graceful degrade for pre-lockdown API responses).
- *   2. StrategyCard (exported from strategies/page.tsx) — renders the demoted
+ *   2. StrategyCard (exported from components/strategies/strategy-card.tsx) — renders the demoted
  *      banner + demotionReason + promotion requirements for a demoted strategy;
  *      graceful-degrades (treated as active, no demoted UI) when the lockdown
  *      fields are absent.
@@ -18,7 +18,7 @@
 import React from "react";
 import { render, screen } from "@testing-library/react";
 import { StrategyStatusBadge } from "@/components/ui/strategy-status-badge";
-import { StrategyCard } from "@/app/strategies/page";
+import { StrategyCard } from "@/components/strategies/strategy-card";
 import type { Strategy } from "@/lib/types";
 
 // ---------------------------------------------------------------------------
