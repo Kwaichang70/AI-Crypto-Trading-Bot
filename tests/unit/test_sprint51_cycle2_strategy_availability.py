@@ -43,19 +43,24 @@ from trading.strategy_availability import (
 # Reference matrices (the single hand-written expectation used for assertions)
 # ---------------------------------------------------------------------------
 
-# The six strategies the system ships, partitioned by intended lockdown state.
+# The strategies the system ships, partitioned by intended lockdown state.
 _DEMOTED_STRATEGIES = {"ma_crossover", "breakout", "model_strategy"}
 _ACTIVE_STRATEGIES = {"dca_rsi_hybrid", "grid_trading", "rsi_mean_reversion"}
-_ALL_SIX = _DEMOTED_STRATEGIES | _ACTIVE_STRATEGIES
+# Sprint 51 Cycle 3: new strategies start EXPERIMENTAL (backtest-only) until
+# they clear the walk-forward OOS profitability gate.
+_EXPERIMENTAL_STRATEGIES = {"sl_tp_reversion"}
+# Strategies restricted to backtest-only (demoted OR experimental).
+_BACKTEST_ONLY_STRATEGIES = _DEMOTED_STRATEGIES | _EXPERIMENTAL_STRATEGIES
+_ALL_STRATEGIES = _ACTIVE_STRATEGIES | _BACKTEST_ONLY_STRATEGIES
 
 # Exact expected (strategy, mode) -> allowed boolean.
-# Active -> all three modes True.  Demoted -> backtest True, paper/live False.
+# Active -> all three modes True.  Backtest-only -> backtest True, paper/live False.
 _TRUTH_TABLE: dict[tuple[str, RunMode], bool] = {}
 for _name in _ACTIVE_STRATEGIES:
     _TRUTH_TABLE[(_name, RunMode.BACKTEST)] = True
     _TRUTH_TABLE[(_name, RunMode.PAPER)] = True
     _TRUTH_TABLE[(_name, RunMode.LIVE)] = True
-for _name in _DEMOTED_STRATEGIES:
+for _name in _BACKTEST_ONLY_STRATEGIES:
     _TRUTH_TABLE[(_name, RunMode.BACKTEST)] = True
     _TRUTH_TABLE[(_name, RunMode.PAPER)] = False
     _TRUTH_TABLE[(_name, RunMode.LIVE)] = False
@@ -95,8 +100,8 @@ class TestIsModeAllowedTruthTable:
                 assert is_mode_allowed(name, mode) is True
 
     def test_every_demoted_allows_only_backtest(self) -> None:
-        """TEST-S51C2-003: DEMOTED strategies allow backtest ONLY."""
-        for name in _DEMOTED_STRATEGIES:
+        """TEST-S51C2-003: backtest-only strategies allow backtest ONLY."""
+        for name in _BACKTEST_ONLY_STRATEGIES:
             assert is_mode_allowed(name, RunMode.BACKTEST) is True
             assert is_mode_allowed(name, RunMode.PAPER) is False
             assert is_mode_allowed(name, RunMode.LIVE) is False
@@ -261,8 +266,8 @@ class TestKeysetConsistency:
         return keys
 
     def test_availability_registry_has_exactly_six(self) -> None:
-        """TEST-S51C2-050: the availability registry holds exactly the 6 strategies."""
-        assert self._availability_keys() == _ALL_SIX
+        """TEST-S51C2-050: the availability registry holds exactly the shipped strategies."""
+        assert self._availability_keys() == _ALL_STRATEGIES
 
     def test_runs_registry_matches_availability(self) -> None:
         """TEST-S51C2-051: runs.py registry keys == availability keys."""
@@ -277,16 +282,20 @@ class TestKeysetConsistency:
         avail = self._availability_keys()
         runs = self._runs_registry_keys()
         strategies = self._strategies_registry_keys()
-        assert avail == runs == strategies == _ALL_SIX
+        assert avail == runs == strategies == _ALL_STRATEGIES
 
     def test_active_demoted_partition_is_disjoint_and_exhaustive(self) -> None:
-        """TEST-S51C2-054: ACTIVE/DEMOTED partition is disjoint + covers all 6."""
-        # Disjoint
+        """TEST-S51C2-054: status partition is disjoint + covers every strategy."""
+        # Pairwise disjoint
         assert _ACTIVE_STRATEGIES.isdisjoint(_DEMOTED_STRATEGIES)
+        assert _ACTIVE_STRATEGIES.isdisjoint(_EXPERIMENTAL_STRATEGIES)
+        assert _DEMOTED_STRATEGIES.isdisjoint(_EXPERIMENTAL_STRATEGIES)
         # Exhaustive over the availability registry
-        assert (_ACTIVE_STRATEGIES | _DEMOTED_STRATEGIES) == self._availability_keys()
+        assert _ALL_STRATEGIES == self._availability_keys()
         # And the recorded status agrees with the partition for each key.
         for name in _ACTIVE_STRATEGIES:
             assert get_availability(name).status is StrategyStatus.ACTIVE
         for name in _DEMOTED_STRATEGIES:
             assert get_availability(name).status is StrategyStatus.DEMOTED
+        for name in _EXPERIMENTAL_STRATEGIES:
+            assert get_availability(name).status is StrategyStatus.EXPERIMENTAL

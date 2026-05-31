@@ -14,6 +14,7 @@ Available strategies
 - **ModelStrategy** -- ML model-based strategy (Sprint 2 placeholder)
 - **DCARSIHybridStrategy** -- DCA + RSI hybrid (systematic accumulation)
 - **GridTradingStrategy** -- Grid trading (buy low / sell high at fixed levels)
+- **SLTPReversionStrategy** -- RSI-2 dip entry for fixed/ATR bracket SL+TP exits
 
 Usage::
 
@@ -31,6 +32,7 @@ from trading.strategies.grid_trading import GridTradingStrategy
 from trading.strategies.ma_crossover import MACrossoverStrategy
 from trading.strategies.model_strategy import ModelStrategy
 from trading.strategies.rsi_mean_reversion import RSIMeanReversionStrategy
+from trading.strategies.sl_tp_reversion import SLTPReversionStrategy
 
 __all__ = [
     "MACrossoverStrategy",
@@ -39,4 +41,5 @@ __all__ = [
     "ModelStrategy",
     "DCARSIHybridStrategy",
     "GridTradingStrategy",
+    "SLTPReversionStrategy",
 ]

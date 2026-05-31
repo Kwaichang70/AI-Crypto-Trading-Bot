@@ -38,11 +38,14 @@ from decimal import Decimal
 from enum import StrEnum, auto
 from typing import Any
 
+import pandas as pd
 import structlog
 
 from common.models import MultiTimeframeContext, OHLCVBar
 from common.types import OrderSide, RunMode, SignalDirection, TimeFrame
+from data.indicators import atr as _atr_series
 from data.market_data import BaseMarketDataService, MarketDataError
+from trading.bracket_exit import BracketExitManager
 from trading.execution import BaseExecutionEngine
 from trading.models import Fill, Position, Signal, TradeResult
 from trading.portfolio import PortfolioAccounting
@@ -55,6 +58,17 @@ from trading.trailing_stop import TrailingStopManager
 __all__ = ["StrategyEngine", "EngineState"]
 
 logger = structlog.get_logger(__name__)
+
+
+def _opt_float(value: Any) -> float | None:
+    """Coerce a config value to float, mapping None / "" to None.
+
+    Used when building optional engine managers from the run config, where
+    a blank UI field may arrive as an empty string rather than absent.
+    """
+    if value is None or value == "":
+        return None
+    return float(value)
 
 
 # ---------------------------------------------------------------------------
@@ -242,6 +256,35 @@ class StrategyEngine:
                     trailing_stop_pct=trailing_stop_pct,
                 )
 
+        # Bracket exit manager (optional, fixed/ATR stop-loss + take-profit).
+        # Anchored to position entry price; complements the trailing stop.
+        # Config keys carry a ``bracket_`` prefix to avoid collision with any
+        # strategy's own parameter names.
+        self._bracket_exit: BracketExitManager | None = None
+        _bracket_keys = (
+            "bracket_stop_loss_pct",
+            "bracket_take_profit_pct",
+            "bracket_atr_sl_multiplier",
+            "bracket_atr_tp_multiplier",
+        )
+        if any(self._config.get(k) is not None for k in _bracket_keys):
+            try:
+                self._bracket_exit = BracketExitManager(
+                    stop_loss_pct=_opt_float(self._config.get("bracket_stop_loss_pct")),
+                    take_profit_pct=_opt_float(self._config.get("bracket_take_profit_pct")),
+                    bracket_mode=str(self._config.get("bracket_mode") or "fixed"),
+                    atr_sl_multiplier=_opt_float(self._config.get("bracket_atr_sl_multiplier")),
+                    atr_tp_multiplier=_opt_float(self._config.get("bracket_atr_tp_multiplier")),
+                    atr_period=int(self._config.get("bracket_atr_period") or 14),
+                    strategy_id="bracket_exit",
+                )
+            except (ValueError, TypeError) as exc:
+                structlog.get_logger(__name__).warning(
+                    "engine.bracket_exit_disabled",
+                    reason=str(exc),
+                    bracket_mode=self._config.get("bracket_mode"),
+                )
+
         # Higher-timeframe bar data (optional, for multi-TF strategies)
         self._htf_bars: dict[str, dict[str, list[OHLCVBar]]] | None = None
 
@@ -421,6 +464,10 @@ class StrategyEngine:
         # Reset trailing stop tracking state
         if self._trailing_stop is not None:
             self._trailing_stop.reset()
+
+        # Reset bracket exit tracking state
+        if self._bracket_exit is not None:
+            self._bracket_exit.reset()
 
         # Clear adaptive-learning trackers so a subsequent start() begins with
         # a clean MAE/MFE baseline and empty skip-trade log.
@@ -713,6 +760,33 @@ class StrategyEngine:
     # Core bar processing
     # ------------------------------------------------------------------
 
+    def _compute_atr_for_symbol(
+        self,
+        symbol: str,
+        history_by_symbol: dict[str, list[OHLCVBar]],
+    ) -> Decimal | None:
+        """
+        Compute the latest ATR (price units) for ``symbol`` from its history.
+
+        Returns None when there are too few bars for the configured ATR
+        period (Wilder warm-up) — the bracket manager treats None as
+        "hold, no ATR bracket this bar".  Used only in ATR bracket mode.
+        """
+        if self._bracket_exit is None:
+            return None
+        bars = history_by_symbol.get(symbol)
+        period = self._bracket_exit.atr_period
+        if not bars or len(bars) <= period:
+            return None
+        highs = pd.Series([float(b.high) for b in bars])
+        lows = pd.Series([float(b.low) for b in bars])
+        closes = pd.Series([float(b.close) for b in bars])
+        atr_series = _atr_series(highs, lows, closes, period=period)
+        last = atr_series.iloc[-1]
+        if pd.isna(last) or last <= 0:
+            return None
+        return Decimal(str(last))
+
     async def _process_bar(
         self,
         current_bars: dict[str, OHLCVBar],
@@ -963,6 +1037,51 @@ class StrategyEngine:
                         signal_context=dict(signal.metadata) if signal.metadata else None,
                     )
                 continue
+
+        # 5a. Check fixed/ATR brackets (stop-loss + take-profit) for open
+        # positions.  Runs BEFORE the trailing stop so a hard SL is the
+        # first line of defence; the trailing loop re-fetches the position
+        # and sees it flat if a bracket already closed it (no double exit).
+        # Bracket exits are SELL-only (full close), so no on_position_open
+        # bookkeeping is needed here — the excursion tracker state was set
+        # when the original entry filled in the strategy-signal loop above.
+        if self._bracket_exit is not None:
+            needs_atr = self._bracket_exit.requires_atr
+            for symbol, bar in current_bars.items():
+                try:
+                    position = self._portfolio.get_position(symbol)
+                    atr_value = (
+                        self._compute_atr_for_symbol(symbol, history_by_symbol)
+                        if needs_atr
+                        else None
+                    )
+                    exit_signal = self._bracket_exit.check(
+                        symbol=symbol,
+                        current_price=bar.close,
+                        position=position,
+                        atr_value=atr_value,
+                    )
+                    if exit_signal is not None:
+                        orders = await self._execution_engine.process_signal(exit_signal)
+                        bar_orders += len(orders)
+                        for order in orders:
+                            fills = await self._execution_engine.get_fills(order.order_id)
+                            bar_fills += len(fills)
+                            for fill in fills:
+                                pre_fill_pos = self._portfolio.get_position(fill.symbol)
+                                self._portfolio.update_position(fill, bar.close)
+                                self._record_trade_if_closed(
+                                    fill=fill,
+                                    pre_fill_position=pre_fill_pos,
+                                    strategy_id=exit_signal.strategy_id,
+                                    signal_metadata=dict(exit_signal.metadata) if exit_signal.metadata else None,
+                                )
+                                self._route_fill_to_risk_manager(fill, bar.close)
+                except Exception:
+                    self._log.exception(
+                        "engine.bracket_exit_error",
+                        symbol=symbol,
+                    )
 
         # 5b. Check trailing stops for open positions
         if self._trailing_stop is not None:

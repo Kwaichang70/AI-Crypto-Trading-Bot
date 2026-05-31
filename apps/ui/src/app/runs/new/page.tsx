@@ -49,6 +49,31 @@ function ParamInput({
     );
   }
 
+  // Enumerated string fields (e.g. bracket_mode: fixed | atr) render as a select.
+  if (Array.isArray(schema.enum) && schema.enum.length > 0) {
+    return (
+      <div>
+        <label className="block text-sm font-medium text-slate-700 dark:text-slate-300">
+          {label}
+          {schema.description && (
+            <span className="ml-1 text-xs font-normal text-slate-500"> — {schema.description}</span>
+          )}
+        </label>
+        <select
+          value={String(value ?? schema.default ?? schema.enum[0])}
+          onChange={(e) => onChange(e.target.value)}
+          className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200"
+        >
+          {schema.enum.map((opt) => (
+            <option key={String(opt)} value={String(opt)}>
+              {String(opt)}
+            </option>
+          ))}
+        </select>
+      </div>
+    );
+  }
+
   return (
     <div>
       <label className="block text-sm font-medium text-slate-700 dark:text-slate-300">

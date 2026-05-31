@@ -111,6 +111,7 @@ def _get_strategy_registry() -> dict[str, Any]:
             MACrossoverStrategy,
             ModelStrategy,
             RSIMeanReversionStrategy,
+            SLTPReversionStrategy,
         )
 
         _STRATEGY_REGISTRY = {
@@ -120,8 +121,51 @@ def _get_strategy_registry() -> dict[str, Any]:
             "model_strategy": ModelStrategy,
             "dca_rsi_hybrid": DCARSIHybridStrategy,
             "grid_trading": GridTradingStrategy,
+            "sl_tp_reversion": SLTPReversionStrategy,
         }
     return _STRATEGY_REGISTRY
+
+
+# Bracket-exit config keys consumed by the StrategyEngine.  All keys carry a
+# ``bracket_`` prefix so they never collide with a strategy's own parameter
+# names (e.g. dca_rsi_hybrid has its own ``take_profit_pct``; breakout has its
+# own ``atr_period``).  Numeric values are coerced to float; the period to int;
+# the mode stays a str.
+_BRACKET_FLOAT_KEYS = (
+    "bracket_stop_loss_pct",
+    "bracket_take_profit_pct",
+    "bracket_atr_sl_multiplier",
+    "bracket_atr_tp_multiplier",
+)
+
+
+def _extract_bracket_config(strategy_params: dict[str, Any]) -> dict[str, object]:
+    """
+    Pop ``bracket_*`` exit keys out of ``strategy_params`` in place.
+
+    Returns a dict of the resolved engine-level bracket config (keys keep
+    their ``bracket_`` prefix).  Blank values (``None`` / ``""``) are dropped
+    so they never reach either the strategy schema validator or the
+    StrategyEngine.  Mutates the input dict so the remaining params validate
+    cleanly against the strategy schema (bracket settings are engine-level,
+    not strategy params).  The ``bracket_`` prefix guarantees no collision
+    with any strategy's native parameter names.
+    """
+    bracket: dict[str, object] = {}
+    for key in _BRACKET_FLOAT_KEYS:
+        if key in strategy_params:
+            raw = strategy_params.pop(key)
+            if raw is not None and raw != "":
+                bracket[key] = float(raw)
+    if "bracket_atr_period" in strategy_params:
+        raw_period = strategy_params.pop("bracket_atr_period")
+        if raw_period is not None and raw_period != "":
+            bracket["bracket_atr_period"] = int(raw_period)
+    if "bracket_mode" in strategy_params:
+        raw_mode = strategy_params.pop("bracket_mode")
+        if raw_mode is not None and raw_mode != "":
+            bracket["bracket_mode"] = str(raw_mode)
+    return bracket
 
 
 # ---------------------------------------------------------------------------
@@ -408,6 +452,12 @@ async def create_run(
         else:
             del body.strategy_params["trailing_stop_pct"]
 
+    # Extract fixed/ATR bracket exit config (stop-loss + take-profit) from
+    # strategy params BEFORE schema validation.  These are engine-level
+    # settings consumed by the StrategyEngine, not strategy params, so they
+    # are always stripped out (a blank UI field arrives as "" and is dropped).
+    _bracket_config = _extract_bracket_config(body.strategy_params)
+
     # Validate strategy parameters against the declared parameter_schema
     schema = strategy_cls.parameter_schema()
     param_errors = _validate_params_against_schema(body.strategy_params, schema)
@@ -534,6 +584,11 @@ async def create_run(
         "mode": str(body.mode) if hasattr(body.mode, "value") else body.mode,
         "initial_capital": body.initial_capital,
     }
+    # Persist engine-level bracket-exit config separately from strategy_params
+    # (it was popped out before validation) so paper/live recovery and
+    # promotion can re-apply it.
+    if _bracket_config:
+        config_snapshot["bracket_config"] = _bracket_config
     if body.backtest_start is not None:
         config_snapshot["backtest_start"] = body.backtest_start.isoformat()
     if body.backtest_end is not None:
@@ -621,6 +676,7 @@ async def create_run(
                 timeframe=timeframe,
                 initial_capital=Decimal(body.initial_capital),
                 trailing_stop_pct=_trailing_stop_pct,
+                bracket_config=_bracket_config,
                 seed=body.seed,
             )
             # M7 (Sprint 49 INF-9): persist the resolved seed (auto-generated or
@@ -725,6 +781,7 @@ async def create_run(
                 timeframe=timeframe,
                 initial_capital=body.initial_capital,
                 trailing_stop_pct=_trailing_stop_pct,
+                bracket_config=_bracket_config,
                 enable_adaptive_learning=body.enable_adaptive_learning,
                 auto_apply_learning=body.auto_apply_learning,
             ),
@@ -748,6 +805,7 @@ async def create_run(
                 timeframe=timeframe,
                 initial_capital=body.initial_capital,
                 trailing_stop_pct=_trailing_stop_pct,
+                bracket_config=_bracket_config,
                 enable_adaptive_learning=body.enable_adaptive_learning,
             ),
             name=f"live-engine-{run_id}",
@@ -1638,6 +1696,7 @@ async def promote_to_live(
             trailing_stop_pct=source_run.config.get("strategy_params", {}).get(
                 "trailing_stop_pct"
             ),
+            bracket_config=source_run.config.get("bracket_config") or {},
             enable_adaptive_learning=False,
         ),
         name=f"live-engine-promoted-{new_run_id}",
@@ -2058,6 +2117,11 @@ async def recover_orphaned_runs() -> int:
                 if raw_tsp is not None:
                     recovery_trailing_pct = float(raw_tsp)
 
+                # Re-apply persisted bracket-exit config on recovery.
+                recovery_bracket_config: dict[str, object] = (
+                    orphan_config.get("bracket_config") or {}
+                )
+
                 coro = _run_paper_engine if orphan_mode == "paper" else _run_live_engine
                 task = asyncio.create_task(
                     coro(
@@ -2069,6 +2133,7 @@ async def recover_orphaned_runs() -> int:
                         timeframe=timeframe,
                         initial_capital=initial_capital,
                         trailing_stop_pct=recovery_trailing_pct,
+                        bracket_config=recovery_bracket_config,
                     ),
                     name=f"recovery-{orphan_mode}-{new_run_id_str[:8]}",
                 )

@@ -133,6 +133,19 @@ _AVAILABILITY: dict[str, StrategyAvailability] = {
         allowed_modes=_ALL_MODES,
         status=StrategyStatus.ACTIVE,
     ),
+    # ---- EXPERIMENTAL -> backtest-only until the OOS gate passes ----------
+    "sl_tp_reversion": StrategyAvailability(
+        allowed_modes=_BACKTEST_ONLY,
+        status=StrategyStatus.EXPERIMENTAL,
+        demotion_reason=(
+            "New strategy (Sprint 51 Cycle 3). Restricted to backtest until "
+            "it clears the walk-forward OOS profitability gate."
+        ),
+        promotion_requirements=[
+            "oos_walk_forward_pass",
+            "backtest_profit_factor_gt_1_2",
+        ],
+    ),
 }
 
 

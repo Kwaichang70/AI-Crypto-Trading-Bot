@@ -189,6 +189,7 @@ class BacktestRunner:
         taker_fee_bps: int = 15,
         seed: int | None = None,
         trailing_stop_pct: float | None = None,
+        bracket_config: dict[str, object] | None = None,
     ) -> None:
         if not strategies:
             raise ValueError("At least one strategy is required")
@@ -213,6 +214,10 @@ class BacktestRunner:
             seed = random.randint(0, 2**31 - 1)
         self._seed: int = seed
         self._trailing_stop_pct = trailing_stop_pct
+        # Engine-level fixed/ATR stop-loss + take-profit bracket config
+        # (stop_loss_pct, take_profit_pct, bracket_mode, atr_*_multiplier,
+        # atr_period).  Passed verbatim into the StrategyEngine config.
+        self._bracket_config: dict[str, object] = dict(bracket_config or {})
 
         # Build risk parameters with explicit fee overrides
         if risk_params is not None:
@@ -650,10 +655,16 @@ class BacktestRunner:
     # ------------------------------------------------------------------
 
     def _build_engine_config(self) -> dict[str, object]:
-        """Build the StrategyEngine config dict, including optional trailing stop."""
+        """Build the StrategyEngine config dict, including optional trailing
+        stop and fixed/ATR bracket exits."""
         config: dict[str, object] = {"warmup_bars": self._warmup_bars}
         if self._trailing_stop_pct is not None:
             config["trailing_stop_pct"] = self._trailing_stop_pct
+        # Merge bracket-exit keys (stop_loss_pct, take_profit_pct,
+        # bracket_mode, atr_sl_multiplier, atr_tp_multiplier, atr_period).
+        for key, value in self._bracket_config.items():
+            if value is not None:
+                config[key] = value
         return config
 
     def _build_engine(

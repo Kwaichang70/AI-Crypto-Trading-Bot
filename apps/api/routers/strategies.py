@@ -68,6 +68,7 @@ def _build_registry() -> dict[str, dict[str, Any]]:
         MACrossoverStrategy,
         ModelStrategy,
         RSIMeanReversionStrategy,
+        SLTPReversionStrategy,
     )
 
     strategies: dict[str, dict[str, Any]] = {}
@@ -79,6 +80,7 @@ def _build_registry() -> dict[str, dict[str, Any]]:
         ("model_strategy", ModelStrategy),
         ("dca_rsi_hybrid", DCARSIHybridStrategy),
         ("grid_trading", GridTradingStrategy),
+        ("sl_tp_reversion", SLTPReversionStrategy),
     ]
 
     for name, cls in entries:

@@ -577,6 +577,7 @@ async def run_paper_engine(
     timeframe: TimeFrame,
     initial_capital: str,
     trailing_stop_pct: float | None = None,
+    bracket_config: dict[str, object] | None = None,
     enable_adaptive_learning: bool = False,
     auto_apply_learning: bool = False,
 ) -> None:
@@ -718,6 +719,9 @@ async def run_paper_engine(
         engine_config: dict[str, object] = {}
         if trailing_stop_pct is not None:
             engine_config["trailing_stop_pct"] = trailing_stop_pct
+        for _bk, _bv in (bracket_config or {}).items():
+            if _bv is not None:
+                engine_config[_bk] = _bv
 
         engine = StrategyEngine(
             strategies=[strategy_instance],
@@ -884,6 +888,7 @@ async def run_live_engine(
     timeframe: TimeFrame,
     initial_capital: str,
     trailing_stop_pct: float | None = None,
+    bracket_config: dict[str, object] | None = None,
     enable_adaptive_learning: bool = False,
 ) -> None:
     """
@@ -1007,6 +1012,9 @@ async def run_live_engine(
         live_engine_config: dict[str, object] = {}
         if trailing_stop_pct is not None:
             live_engine_config["trailing_stop_pct"] = trailing_stop_pct
+        for _bk, _bv in (bracket_config or {}).items():
+            if _bv is not None:
+                live_engine_config[_bk] = _bv
 
         engine = StrategyEngine(
             strategies=[strategy_instance],
