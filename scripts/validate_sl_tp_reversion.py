@@ -115,22 +115,24 @@ async def _evaluate(
     bars_by_symbol: dict[str, list[OHLCVBar]], tf: TimeFrame,
     entry: dict[str, Any], bracket: dict[str, object], folds: int,
 ) -> dict[str, float]:
-    warmup = SLTPReversionStrategy(strategy_id="probe", params=entry).min_bars_required
+    # Mirror BacktestRunner: it warms up max(min_bars * 2, 50) bars and trades
+    # only after.  Each walk-forward fold therefore needs its OWN warmup prefix
+    # immediately before its out-of-sample window, or it trades nothing.
+    min_bars = SLTPReversionStrategy(strategy_id="probe", params=entry).min_bars_required
+    warmup = max(min_bars * 2, 50)
     pfs: list[float] = []
     sharpes: list[float] = []
     rets: list[float] = []
     trades = 0
     for symbol, bars in bars_by_symbol.items():
         n = len(bars)
-        oos_total = n - int(n * 0.5)  # second half is OOS, split into folds
-        fold_size = oos_total // folds
-        if fold_size <= warmup:
+        step = (n - warmup) // folds
+        if step <= warmup // 2:  # OOS window too small to be meaningful
             continue
         for i in range(folds):
-            test_start = int(n * 0.5) + i * fold_size
-            test_end = n if i == folds - 1 else test_start + fold_size
-            lo = max(0, test_start - warmup)
-            fold_bars = bars[lo:test_end]
+            oos_start = warmup + i * step
+            oos_end = n if i == folds - 1 else oos_start + step
+            fold_bars = bars[oos_start - warmup:oos_end]
             if len(fold_bars) <= warmup:
                 continue
             m = await _run_fold(fold_bars, symbol, tf, entry, bracket)
@@ -167,28 +169,33 @@ def main() -> None:
         bars_by_symbol[sym] = _to_bars(sym, tf, raw)
         print(f"  {sym}: {len(bars_by_symbol[sym])} bars", flush=True)
 
-    # Candidate configs: RSI-2 dip entry + fixed bracket (reward:risk grid).
+    # Candidate configs: RSI dip entry + fixed bracket.  Shorter/optional trend
+    # SMA keeps warmup small (vs SMA200's 402-bar warmup that starved folds);
+    # relaxed entry thresholds produce enough trades to evaluate.
     candidates: list[tuple[dict[str, Any], dict[str, object]]] = []
-    for entry_threshold in (5.0, 10.0):
-        for sl, tp in ((0.03, 0.05), (0.05, 0.08), (0.05, 0.10), (0.08, 0.12)):
-            entry = {
-                "rsi_period": 2, "entry_threshold": entry_threshold,
-                "trend_sma_period": 200, "position_size": 2000.0,
-            }
-            bracket = {
-                "bracket_mode": "fixed",
-                "bracket_stop_loss_pct": sl,
-                "bracket_take_profit_pct": tp,
-            }
-            candidates.append((entry, bracket))
+    for trend in (None, 50, 100):
+        for entry_threshold in (10.0, 15.0, 20.0, 25.0):
+            for sl, tp in (
+                (0.02, 0.04), (0.03, 0.05), (0.03, 0.06), (0.05, 0.08), (0.04, 0.04)
+            ):
+                entry = {
+                    "rsi_period": 2, "entry_threshold": entry_threshold,
+                    "trend_sma_period": trend, "position_size": 2000.0,
+                }
+                bracket = {
+                    "bracket_mode": "fixed",
+                    "bracket_stop_loss_pct": sl,
+                    "bracket_take_profit_pct": tp,
+                }
+                candidates.append((entry, bracket))
 
     print("\n=== Walk-forward OOS evaluation ===", flush=True)
     best: dict[str, Any] | None = None
     for entry, bracket in candidates:
         res = asyncio.run(_evaluate(bars_by_symbol, tf, entry, bracket, args.folds))
         label = (
-            f"rsi<{entry['entry_threshold']:>4} SL={bracket['bracket_stop_loss_pct']} "
-            f"TP={bracket['bracket_take_profit_pct']}"
+            f"sma={str(entry['trend_sma_period']):>4} rsi<{entry['entry_threshold']:>4} "
+            f"SL={bracket['bracket_stop_loss_pct']} TP={bracket['bracket_take_profit_pct']}"
         )
         print(
             f"  {label}: median_pf={res['median_pf']:.3f} "
@@ -197,7 +204,15 @@ def main() -> None:
             f"folds={res['n_folds']} trades={res['total_trades']}",
             flush=True,
         )
-        passes = res["median_sharpe"] > 0 and res["median_pf"] > 1.2 and res["n_folds"] >= 3
+        # Promotion gate: median OOS profit_factor > 1.2 AND median Sharpe > 0,
+        # over >= 4 folds and a meaningful trade count (guards against a lucky
+        # 2-trade fold).
+        passes = (
+            res["median_sharpe"] > 0
+            and res["median_pf"] > 1.2
+            and res["n_folds"] >= 4
+            and res["total_trades"] >= 30
+        )
         score = res["median_pf"] * (1.0 if res["median_sharpe"] > 0 else 0.0)
         if passes and (best is None or score > best["score"]):
             best = {"entry": entry, "bracket": bracket, "res": res, "score": score}
