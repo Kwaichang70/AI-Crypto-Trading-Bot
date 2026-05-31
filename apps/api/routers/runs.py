@@ -110,6 +110,7 @@ def _get_strategy_registry() -> dict[str, Any]:
             GridTradingStrategy,
             MACrossoverStrategy,
             ModelStrategy,
+            MomentumBreakoutStrategy,
             RSIMeanReversionStrategy,
             SLTPReversionStrategy,
         )
@@ -122,6 +123,7 @@ def _get_strategy_registry() -> dict[str, Any]:
             "dca_rsi_hybrid": DCARSIHybridStrategy,
             "grid_trading": GridTradingStrategy,
             "sl_tp_reversion": SLTPReversionStrategy,
+            "momentum_breakout": MomentumBreakoutStrategy,
         }
     return _STRATEGY_REGISTRY
 

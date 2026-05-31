@@ -31,6 +31,7 @@ from trading.strategies.dca_rsi_hybrid import DCARSIHybridStrategy
 from trading.strategies.grid_trading import GridTradingStrategy
 from trading.strategies.ma_crossover import MACrossoverStrategy
 from trading.strategies.model_strategy import ModelStrategy
+from trading.strategies.momentum_breakout import MomentumBreakoutStrategy
 from trading.strategies.rsi_mean_reversion import RSIMeanReversionStrategy
 from trading.strategies.sl_tp_reversion import SLTPReversionStrategy
 
@@ -42,4 +43,5 @@ __all__ = [
     "DCARSIHybridStrategy",
     "GridTradingStrategy",
     "SLTPReversionStrategy",
+    "MomentumBreakoutStrategy",
 ]

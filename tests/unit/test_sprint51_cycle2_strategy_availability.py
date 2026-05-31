@@ -49,12 +49,18 @@ _ACTIVE_STRATEGIES = {"dca_rsi_hybrid", "grid_trading", "rsi_mean_reversion"}
 # Sprint 51 Cycle 3: new strategies start EXPERIMENTAL (backtest-only) until
 # they clear the walk-forward OOS profitability gate.
 _EXPERIMENTAL_STRATEGIES = {"sl_tp_reversion"}
-# Strategies restricted to backtest-only (demoted OR experimental).
+# Paper-eligible: EXPERIMENTAL status but allowed in backtest + paper (NOT
+# live) — validated OOS in backtest, live withheld pending paper forward-test.
+_PAPER_ELIGIBLE_STRATEGIES = {"momentum_breakout"}
+# Strategies restricted to backtest-only (demoted OR backtest-only experimental).
 _BACKTEST_ONLY_STRATEGIES = _DEMOTED_STRATEGIES | _EXPERIMENTAL_STRATEGIES
-_ALL_STRATEGIES = _ACTIVE_STRATEGIES | _BACKTEST_ONLY_STRATEGIES
+_ALL_STRATEGIES = (
+    _ACTIVE_STRATEGIES | _BACKTEST_ONLY_STRATEGIES | _PAPER_ELIGIBLE_STRATEGIES
+)
 
 # Exact expected (strategy, mode) -> allowed boolean.
 # Active -> all three modes True.  Backtest-only -> backtest True, paper/live False.
+# Paper-eligible -> backtest True, paper True, live False.
 _TRUTH_TABLE: dict[tuple[str, RunMode], bool] = {}
 for _name in _ACTIVE_STRATEGIES:
     _TRUTH_TABLE[(_name, RunMode.BACKTEST)] = True
@@ -63,6 +69,10 @@ for _name in _ACTIVE_STRATEGIES:
 for _name in _BACKTEST_ONLY_STRATEGIES:
     _TRUTH_TABLE[(_name, RunMode.BACKTEST)] = True
     _TRUTH_TABLE[(_name, RunMode.PAPER)] = False
+    _TRUTH_TABLE[(_name, RunMode.LIVE)] = False
+for _name in _PAPER_ELIGIBLE_STRATEGIES:
+    _TRUTH_TABLE[(_name, RunMode.BACKTEST)] = True
+    _TRUTH_TABLE[(_name, RunMode.PAPER)] = True
     _TRUTH_TABLE[(_name, RunMode.LIVE)] = False
 
 
@@ -290,6 +300,8 @@ class TestKeysetConsistency:
         assert _ACTIVE_STRATEGIES.isdisjoint(_DEMOTED_STRATEGIES)
         assert _ACTIVE_STRATEGIES.isdisjoint(_EXPERIMENTAL_STRATEGIES)
         assert _DEMOTED_STRATEGIES.isdisjoint(_EXPERIMENTAL_STRATEGIES)
+        assert _PAPER_ELIGIBLE_STRATEGIES.isdisjoint(_ACTIVE_STRATEGIES)
+        assert _PAPER_ELIGIBLE_STRATEGIES.isdisjoint(_BACKTEST_ONLY_STRATEGIES)
         # Exhaustive over the availability registry
         assert _ALL_STRATEGIES == self._availability_keys()
         # And the recorded status agrees with the partition for each key.
@@ -297,5 +309,12 @@ class TestKeysetConsistency:
             assert get_availability(name).status is StrategyStatus.ACTIVE
         for name in _DEMOTED_STRATEGIES:
             assert get_availability(name).status is StrategyStatus.DEMOTED
-        for name in _EXPERIMENTAL_STRATEGIES:
+        for name in _EXPERIMENTAL_STRATEGIES | _PAPER_ELIGIBLE_STRATEGIES:
             assert get_availability(name).status is StrategyStatus.EXPERIMENTAL
+
+    def test_paper_eligible_allows_backtest_and_paper_not_live(self) -> None:
+        """Paper-eligible strategies allow backtest + paper but NOT live."""
+        for name in _PAPER_ELIGIBLE_STRATEGIES:
+            assert is_mode_allowed(name, RunMode.BACKTEST) is True
+            assert is_mode_allowed(name, RunMode.PAPER) is True
+            assert is_mode_allowed(name, RunMode.LIVE) is False

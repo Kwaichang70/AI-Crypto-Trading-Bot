@@ -76,6 +76,10 @@ _ALL_MODES: frozenset[RunMode] = frozenset(
 )
 # Backtest-only (the fail-closed / demoted restriction).
 _BACKTEST_ONLY: frozenset[RunMode] = frozenset({RunMode.BACKTEST})
+# Backtest + paper, but NOT live — for strategies validated out-of-sample in
+# backtest that must still prove themselves in paper forward-testing before
+# real capital is risked.
+_BACKTEST_PAPER: frozenset[RunMode] = frozenset({RunMode.BACKTEST, RunMode.PAPER})
 
 
 _AVAILABILITY: dict[str, StrategyAvailability] = {
@@ -138,12 +142,29 @@ _AVAILABILITY: dict[str, StrategyAvailability] = {
         allowed_modes=_BACKTEST_ONLY,
         status=StrategyStatus.EXPERIMENTAL,
         demotion_reason=(
-            "New strategy (Sprint 51 Cycle 3). Restricted to backtest until "
-            "it clears the walk-forward OOS profitability gate."
+            "RSI-2 mean-reversion failed held-out-symbol validation "
+            "(overfit). Backtest-only until a robust edge is demonstrated."
         ),
         promotion_requirements=[
-            "oos_walk_forward_pass",
+            "held_out_symbol_oos_pass",
             "backtest_profit_factor_gt_1_2",
+        ],
+    ),
+    # ---- EXPERIMENTAL (paper-eligible) -> backtest + paper, live withheld --
+    # Momentum breakout cleared walk-forward OOS on THREE independent symbol
+    # universes (BTC/ETH scan; SOL/BNB/XRP; ADA/AVAX/LINK/DOGE/LTC/DOT/ATOM/TRX)
+    # net of costs.  Live is withheld until it proves itself in paper
+    # forward-testing — it has no live/paper track record yet and is the same
+    # trend-following family as the demoted ``breakout`` strategy.
+    "momentum_breakout": StrategyAvailability(
+        allowed_modes=_BACKTEST_PAPER,
+        status=StrategyStatus.EXPERIMENTAL,
+        demotion_reason=(
+            "Validated out-of-sample in backtest across 3 symbol universes; "
+            "live withheld pending profitable paper forward-test."
+        ),
+        promotion_requirements=[
+            "paper_forward_test_profitable",
         ],
     ),
 }
