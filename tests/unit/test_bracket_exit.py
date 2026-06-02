@@ -209,6 +209,86 @@ class TestFixedBracket:
 
 
 # ---------------------------------------------------------------------------
+# CR-003: partial-fill / stuck-order live-safety (pending TTL)
+# ---------------------------------------------------------------------------
+
+
+class TestPartialFillSafety:
+    def test_ttl_validation(self) -> None:
+        with pytest.raises(ValueError, match="pending_exit_ttl"):
+            BracketExitManager(stop_loss_pct=0.02, pending_exit_ttl=0)
+
+    def test_ttl_property_default(self) -> None:
+        assert BracketExitManager(stop_loss_pct=0.02).pending_exit_ttl == 3
+
+    def test_partial_fill_reprotects_residual_immediately(self) -> None:
+        # Emit on a full position, then a partial fill leaves a smaller
+        # residual still in breach -> the bracket must re-emit at once
+        # (not wait for the TTL), so the residual is never left unprotected.
+        mgr = BracketExitManager(stop_loss_pct=0.02, pending_exit_ttl=5)
+        first = mgr.check("BTC/USD", Decimal("97"), _pos(quantity="0.01"))
+        assert first is not None
+        assert "BTC/USD" in mgr.pending_exit_symbols
+        # Next bar: position reduced (partial fill) but not flat, still breached.
+        residual = _pos(quantity="0.004")
+        second = mgr.check("BTC/USD", Decimal("96"), residual)
+        assert second is not None
+        assert second.metadata["stop_loss"] is True
+        # Re-protected -> pending re-armed for the residual quantity.
+        assert "BTC/USD" in mgr.pending_exit_symbols
+
+    def test_quantity_increase_while_pending_reprotects(self) -> None:
+        # CR-003-B: the strategy adds to the position (re-entry) while the
+        # protective SELL is in flight -> the prior pending exit no longer
+        # covers the live size, so re-protection must fire immediately, not
+        # wait for the TTL.
+        mgr = BracketExitManager(stop_loss_pct=0.02, pending_exit_ttl=5)
+        assert mgr.check("BTC/USD", Decimal("97"), _pos(quantity="0.01")) is not None
+        bigger = _pos(quantity="0.02")  # position grew while pending
+        sig = mgr.check("BTC/USD", Decimal("96"), bigger)
+        assert sig is not None
+        assert sig.metadata["stop_loss"] is True
+
+    def test_ttl_one_reemits_on_first_check(self) -> None:
+        # Minimum TTL: with a stuck (unchanged-quantity) order, ttl=1 re-emits
+        # on the very next check — the most aggressive valid setting.
+        mgr = BracketExitManager(stop_loss_pct=0.02, pending_exit_ttl=1)
+        pos = _pos(quantity="0.01")
+        assert mgr.check("BTC/USD", Decimal("97"), pos) is not None  # emit, age 0
+        # next check: age -> 1 >= ttl 1 -> force-clear + re-emit
+        assert mgr.check("BTC/USD", Decimal("97"), pos) is not None
+
+    def test_stuck_order_cleared_after_ttl(self) -> None:
+        # Order appears stuck (quantity unchanged): hold for TTL checks, then
+        # force-clear and re-emit so the position can't stay unprotected.
+        mgr = BracketExitManager(stop_loss_pct=0.02, pending_exit_ttl=2)
+        pos = _pos(quantity="0.01")
+        assert mgr.check("BTC/USD", Decimal("97"), pos) is not None  # emit, age 0
+        # age 1 < ttl 2 -> still suppressed
+        assert mgr.check("BTC/USD", Decimal("97"), pos) is None
+        # age 2 >= ttl 2 -> force-clear + re-emit
+        third = mgr.check("BTC/USD", Decimal("97"), pos)
+        assert third is not None
+        assert third.metadata["stop_loss"] is True
+
+    def test_no_reprotect_when_residual_not_breached(self) -> None:
+        # Partial fill leaves a residual, but price recovered inside brackets
+        # -> clear pending, but no new exit (nothing breached).
+        mgr = BracketExitManager(stop_loss_pct=0.02, take_profit_pct=0.04, pending_exit_ttl=5)
+        assert mgr.check("BTC/USD", Decimal("97"), _pos(quantity="0.01")) is not None
+        # residual smaller, price back inside [98, 104]
+        assert mgr.check("BTC/USD", Decimal("101"), _pos(quantity="0.004")) is None
+        assert "BTC/USD" not in mgr.pending_exit_symbols
+
+    def test_full_fill_flat_clears_pending_state(self) -> None:
+        mgr = BracketExitManager(stop_loss_pct=0.02)
+        mgr.check("BTC/USD", Decimal("97"), _pos(quantity="0.01"))
+        assert mgr.check("BTC/USD", Decimal("97"), _flat()) is None
+        # A fresh entry can be protected again immediately.
+        assert mgr.check("BTC/USD", Decimal("97"), _pos(quantity="0.02")) is not None
+
+
+# ---------------------------------------------------------------------------
 # ATR-mode check()
 # ---------------------------------------------------------------------------
 

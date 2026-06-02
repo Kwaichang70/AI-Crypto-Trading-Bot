@@ -91,6 +91,14 @@ class BracketExitManager:
     strategy_id : str
         Strategy ID on emitted signals.  Must NOT contain the substring
         ``"trailing_stop"`` (see module docstring).  Default ``"bracket_exit"``.
+    pending_exit_ttl : int
+        Live-safety backstop (CR-003).  After an exit SELL is emitted the
+        symbol is held "pending" so a slow fill does not trigger a duplicate
+        order.  A **partial** fill that reduces the position quantity is
+        detected and the residual is re-protected immediately.  If instead the
+        order appears stuck (position quantity unchanged) the pending guard is
+        force-cleared after this many :meth:`check` calls so a position can
+        never remain permanently unprotected.  Must be >= 1.  Default 3.
 
     Raises
     ------
@@ -108,11 +116,16 @@ class BracketExitManager:
         atr_tp_multiplier: float | None = None,
         atr_period: int = 14,
         strategy_id: str = "bracket_exit",
+        pending_exit_ttl: int = 3,
     ) -> None:
         if "trailing_stop" in strategy_id:
             raise ValueError(
                 "bracket_exit strategy_id must not contain 'trailing_stop' "
                 f"(would corrupt exit-reason classification), got {strategy_id!r}"
+            )
+        if pending_exit_ttl < 1:
+            raise ValueError(
+                f"pending_exit_ttl must be >= 1, got {pending_exit_ttl}"
             )
         if bracket_mode not in _VALID_MODES:
             raise ValueError(
@@ -165,9 +178,15 @@ class BracketExitManager:
         )
         self._atr_period = atr_period
         self._strategy_id = strategy_id
+        self._pending_exit_ttl = pending_exit_ttl
 
         # Symbols with an emitted-but-unfilled exit (fill-latency guard).
         self._pending_exit_symbols: set[str] = set()
+        # Position quantity captured when the exit was emitted — a later
+        # decrease signals a partial fill that left a residual to re-protect.
+        self._pending_qty: dict[str, Decimal] = {}
+        # check()-call count since pending was set, for the TTL backstop.
+        self._pending_age: dict[str, int] = {}
         # ATR-mode symbols already warned about a missing ATR (log once).
         self._atr_warned_symbols: set[str] = set()
 
@@ -202,6 +221,11 @@ class BracketExitManager:
         """Symbols with emitted but unfilled exit signals (read-only copy)."""
         return set(self._pending_exit_symbols)
 
+    @property
+    def pending_exit_ttl(self) -> int:
+        """Checks before a stuck pending exit is force-cleared (CR-003)."""
+        return self._pending_exit_ttl
+
     # ------------------------------------------------------------------ #
     # Core
     # ------------------------------------------------------------------ #
@@ -235,15 +259,53 @@ class BracketExitManager:
         Signal | None
             A full-close SELL signal if a bracket is breached, else None.
         """
-        # No position or flat — clean up tracking.
+        # No position or flat — clean up tracking (the exit filled fully).
         if position is None or position.is_flat:
-            self._pending_exit_symbols.discard(symbol)
+            self._clear_pending(symbol)
             self._atr_warned_symbols.discard(symbol)
             return None
 
-        # Skip if an exit was already emitted and the position hasn't closed.
+        # An exit was emitted but the position is not yet flat.  Decide
+        # whether to keep waiting (order in flight) or re-protect a residual.
         if symbol in self._pending_exit_symbols:
-            return None
+            # ``prev_qty`` is only ever None if _pending_exit_symbols and
+            # _pending_qty desynchronised — impossible in this class (_emit
+            # writes both, _clear_pending clears both), and the TTL backstop
+            # below would bound any future desync to ``pending_exit_ttl`` bars.
+            prev_qty = self._pending_qty.get(symbol)
+            if prev_qty is not None and position.quantity != prev_qty:
+                # The position size CHANGED while the exit was pending: a
+                # partial fill left a smaller residual, OR the strategy added
+                # to the position (re-entry).  Either way the prior pending
+                # exit no longer covers the live position — clear the guard
+                # and fall through to re-protect the current size now.
+                self._log.info(
+                    "bracket_exit.quantity_changed_reprotect",
+                    symbol=symbol,
+                    prev_quantity=str(prev_qty),
+                    new_quantity=str(position.quantity),
+                    direction=(
+                        "partial_fill"
+                        if position.quantity < prev_qty
+                        else "increase"
+                    ),
+                )
+                self._clear_pending(symbol)
+            else:
+                # Order still in flight (quantity unchanged).  Wait up to the
+                # TTL, then force-clear defensively so a stuck order cannot
+                # leave the position permanently unprotected.
+                self._pending_age[symbol] = self._pending_age.get(symbol, 0) + 1
+                if self._pending_age[symbol] < self._pending_exit_ttl:
+                    return None
+                self._log.warning(
+                    "bracket_exit.pending_ttl_expired",
+                    symbol=symbol,
+                    ttl=self._pending_exit_ttl,
+                    note="re-evaluating brackets; prior exit may be stuck",
+                )
+                self._clear_pending(symbol)
+            # fall through to re-evaluate brackets for the open/residual position
 
         entry = position.average_entry_price
         if entry <= Decimal(0):
@@ -260,6 +322,7 @@ class BracketExitManager:
                 entry=entry,
                 current_price=current_price,
                 level=stop_price,
+                quantity=position.quantity,
                 is_stop_loss=True,
             )
 
@@ -269,10 +332,17 @@ class BracketExitManager:
                 entry=entry,
                 current_price=current_price,
                 level=take_profit_price,
+                quantity=position.quantity,
                 is_stop_loss=False,
             )
 
         return None
+
+    def _clear_pending(self, symbol: str) -> None:
+        """Drop all pending-exit tracking for ``symbol``."""
+        self._pending_exit_symbols.discard(symbol)
+        self._pending_qty.pop(symbol, None)
+        self._pending_age.pop(symbol, None)
 
     def _levels(
         self,
@@ -327,10 +397,15 @@ class BracketExitManager:
         entry: Decimal,
         current_price: Decimal,
         level: Decimal,
+        quantity: Decimal,
         is_stop_loss: bool,
     ) -> Signal:
         """Build the full-close SELL signal and mark the symbol pending."""
         self._pending_exit_symbols.add(symbol)
+        # Capture the position quantity so a later partial fill (which reduces
+        # it) is detectable, and reset the TTL age for this pending exit.
+        self._pending_qty[symbol] = quantity
+        self._pending_age[symbol] = 0
         trigger = "bracket_stop_loss" if is_stop_loss else "bracket_take_profit"
 
         self._log.info(
@@ -368,4 +443,6 @@ class BracketExitManager:
     def reset(self) -> None:
         """Clear all tracking state."""
         self._pending_exit_symbols.clear()
+        self._pending_qty.clear()
+        self._pending_age.clear()
         self._atr_warned_symbols.clear()
