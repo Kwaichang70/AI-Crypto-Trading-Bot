@@ -621,6 +621,88 @@ class TestTrailingStopCheck:
 
 
 # ===========================================================================
+# TestTrailingPartialFillSafety (CR-003 parity with bracket_exit)
+# ===========================================================================
+
+
+class TestTrailingPartialFillSafety:
+    """Partial-fill / stuck-order live-safety for the pending-stop guard.
+
+    Mirrors bracket_exit CR-003: a partial fill (or re-entry) that changes
+    the position quantity while a stop SELL is pending must resume trailing
+    protection for the live size immediately; a stuck order (quantity
+    unchanged) is force-cleared after ``pending_stop_ttl`` checks.  Trailing
+    semantics: after the guard clears, the peak re-seeds from the current
+    price — a fresh trailing stop, not an immediate re-emit.
+    """
+
+    def test_ttl_validation(self) -> None:
+        with pytest.raises(ValueError):
+            TrailingStopManager(trailing_stop_pct=0.03, pending_stop_ttl=0)
+
+    def test_ttl_property_default(self) -> None:
+        assert TrailingStopManager(trailing_stop_pct=0.03).pending_stop_ttl == 3
+
+    def test_partial_fill_resumes_tracking_immediately(self) -> None:
+        mgr = TrailingStopManager(trailing_stop_pct=0.03, pending_stop_ttl=5)
+        full = _make_position(quantity="0.01")
+        mgr.check("BTC/USD", Decimal("50000"), full)
+        assert mgr.check("BTC/USD", Decimal("45000"), full) is not None  # stop emitted
+        # Partial fill left a residual -> guard cleared, peak re-seeds at 45000.
+        residual = _make_position(quantity="0.004")
+        assert mgr.check("BTC/USD", Decimal("45000"), residual) is None
+        assert "BTC/USD" not in mgr.pending_stop_symbols
+        assert mgr.peak_prices["BTC/USD"] == Decimal("45000")
+        # A further 3%+ drop from the new peak re-triggers for the residual.
+        sig = mgr.check("BTC/USD", Decimal("43000"), residual)
+        assert sig is not None
+        assert sig.direction == SignalDirection.SELL
+
+    def test_quantity_increase_resumes_tracking(self) -> None:
+        mgr = TrailingStopManager(trailing_stop_pct=0.03, pending_stop_ttl=5)
+        full = _make_position(quantity="0.01")
+        mgr.check("BTC/USD", Decimal("50000"), full)
+        assert mgr.check("BTC/USD", Decimal("45000"), full) is not None
+        bigger = _make_position(quantity="0.02")  # re-entry while pending
+        assert mgr.check("BTC/USD", Decimal("45000"), bigger) is None
+        assert "BTC/USD" not in mgr.pending_stop_symbols
+        assert "BTC/USD" in mgr.peak_prices  # fresh tracking armed
+
+    def test_stuck_order_cleared_after_ttl(self) -> None:
+        mgr = TrailingStopManager(trailing_stop_pct=0.03, pending_stop_ttl=2)
+        pos = _make_position(quantity="0.01")
+        mgr.check("BTC/USD", Decimal("50000"), pos)
+        assert mgr.check("BTC/USD", Decimal("45000"), pos) is not None  # emit, age 0
+        # age 1 < ttl 2 -> still suppressed
+        assert mgr.check("BTC/USD", Decimal("45000"), pos) is None
+        assert "BTC/USD" in mgr.pending_stop_symbols
+        # age 2 >= ttl 2 -> force-clear; tracking resumes (peak re-seeds)
+        assert mgr.check("BTC/USD", Decimal("45000"), pos) is None
+        assert "BTC/USD" not in mgr.pending_stop_symbols
+        assert mgr.peak_prices["BTC/USD"] == Decimal("45000")
+
+    def test_full_fill_flat_clears_all_pending_state(self) -> None:
+        mgr = TrailingStopManager(trailing_stop_pct=0.03)
+        pos = _make_position(quantity="0.01")
+        mgr.check("BTC/USD", Decimal("50000"), pos)
+        mgr.check("BTC/USD", Decimal("45000"), pos)
+        assert mgr.check("BTC/USD", Decimal("45000"), _flat_position()) is None
+        assert "BTC/USD" not in mgr.pending_stop_symbols
+        # Internal dicts cleaned alongside the set (no state leak).
+        assert mgr._pending_qty == {}  # type: ignore[attr-defined]
+        assert mgr._pending_age == {}  # type: ignore[attr-defined]
+
+    def test_reset_clears_pending_qty_and_age(self) -> None:
+        mgr = TrailingStopManager(trailing_stop_pct=0.03)
+        pos = _make_position(quantity="0.01")
+        mgr.check("BTC/USD", Decimal("50000"), pos)
+        mgr.check("BTC/USD", Decimal("45000"), pos)
+        mgr.reset()
+        assert mgr._pending_qty == {}  # type: ignore[attr-defined]
+        assert mgr._pending_age == {}  # type: ignore[attr-defined]
+
+
+# ===========================================================================
 # TestTrailingStopReset
 # ===========================================================================
 
