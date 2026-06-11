@@ -30,16 +30,27 @@ const EMPTY_SCHEMA = {
   properties: {},
 };
 
-function makeStrategy(overrides: Partial<Strategy> = {}): Strategy {
-  return {
+// Overrides may set fields to `undefined` explicitly: several tests simulate
+// a legacy API response with absent lockdown fields, which under
+// exactOptionalPropertyTypes requires `| undefined` in the override type.
+type StrategyOverrides = { [K in keyof Strategy]?: Strategy[K] | undefined };
+
+function makeStrategy(overrides: StrategyOverrides = {}): Strategy {
+  const base: Record<string, unknown> = {
     name: "ma_crossover",
     displayName: "MA Crossover",
     version: "1.0.0",
     description: "Moving-average crossover.",
     tags: ["trend"],
     parameterSchema: EMPTY_SCHEMA,
-    ...overrides,
   };
+  // An explicit `undefined` override DELETES the key — faithfully modelling a
+  // legacy API response in which the field is absent (not present-undefined).
+  for (const [key, value] of Object.entries(overrides)) {
+    if (value === undefined) delete base[key];
+    else base[key] = value;
+  }
+  return base as unknown as Strategy;
 }
 
 // ===========================================================================
