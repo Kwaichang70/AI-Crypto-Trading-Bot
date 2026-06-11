@@ -60,6 +60,15 @@ __all__ = ["StrategyEngine", "EngineState"]
 logger = structlog.get_logger(__name__)
 
 
+# Numeric encoding of the graduated circuit-breaker response for the
+# ``circuit_breaker_state`` gauge (Grafana alerts fire on value >= 3 = HALT).
+_CB_STATE_VALUES: dict[CircuitBreakerResponse, int] = {
+    CircuitBreakerResponse.OK: 0,
+    CircuitBreakerResponse.REDUCE: 1,
+    CircuitBreakerResponse.DAILY_LIMIT: 2,
+    CircuitBreakerResponse.HALT: 3,
+}
+
 # CR-005: ATR window for bracket exits — bars older than this many periods
 # have < e^-6 Wilder weight, so the bounded window is numerically equivalent
 # to full history while keeping per-bar ATR cost O(period) instead of O(n).
@@ -1182,6 +1191,18 @@ class StrategyEngine:
             _mc.gauge(
                 "active_positions",
                 float(_summary["open_positions"]),
+                labels=_run_label,
+            )
+            # Safety-state gauges so Grafana can alert on HALT / kill-switch
+            # without log scraping: OK=0, REDUCE=1, DAILY_LIMIT=2, HALT=3.
+            _mc.gauge(
+                "circuit_breaker_state",
+                float(_CB_STATE_VALUES.get(_cb_response, 0)),
+                labels=_run_label,
+            )
+            _mc.gauge(
+                "kill_switch_active",
+                1.0 if self._risk_manager.kill_switch_active else 0.0,
                 labels=_run_label,
             )
             _mc.observe(

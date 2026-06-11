@@ -657,6 +657,30 @@ class TestBracketExitInStrategyEngine:
 
         assert abs(float(bounded) - full) / full < 0.01
 
+    async def test_safety_state_gauges_set_each_bar(self) -> None:
+        # Grafana alerting depends on these gauges existing per bar:
+        # circuit_breaker_state (OK=0..HALT=3) and kill_switch_active (0/1).
+        from common.metrics import metrics as mc
+
+        engine, mocks = _make_engine(config={"bracket_stop_loss_pct": 0.05})
+        await engine.start("run-001")
+        mocks["execution"].check_resting_orders = None
+        mocks["strategy"].on_bar = MagicMock(return_value=[])
+        mocks["execution"].process_signal = AsyncMock(return_value=[])
+        mocks["portfolio"].get_position = MagicMock(return_value=_flat())
+        mocks["portfolio"].get_summary = MagicMock(return_value={
+            "current_equity": "10000", "drawdown_pct": 0.0,
+            "open_positions": 0, "total_trades": 0,
+        })
+
+        bar = _make_bar(close="100")
+        await engine._process_bar({"BTC/USD": bar}, {"BTC/USD": [bar]})
+
+        snapshot = mc.get_all()
+        gauge_keys = list(snapshot.get("gauges", {}))
+        assert any(k.startswith("circuit_breaker_state") for k in gauge_keys)
+        assert any(k.startswith("kill_switch_active") for k in gauge_keys)
+
     async def test_bracket_error_does_not_crash_bar_loop(self) -> None:
         engine, mocks = _make_engine(config={"bracket_stop_loss_pct": 0.05})
         await engine.start("run-001")

@@ -1,0 +1,142 @@
+# =============================================================================
+# Grafana unified-alerting provisioning — trading safety alerts
+#
+# Mounted read-only into the grafana container at
+# /etc/grafana/provisioning/alerting/ via docker-compose.yml (the existing
+# ./grafana/provisioning mount covers this directory).
+#
+# Backing metrics (exposed by the api at /metrics, scraped by prometheus):
+#   trading_circuit_breaker_state  0=OK 1=REDUCE 2=DAILY_LIMIT 3=HALT
+#   trading_kill_switch_active     0/1
+#   trading_drawdown_pct           fraction of peak equity (0.10 = 10%)
+#   up{job="trading-bot-api"}      prometheus scrape health
+#
+# Alerts fire in Grafana's alert list (and any configured contact points).
+# =============================================================================
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: trading-safety
+    folder: Trading
+    interval: 1m
+    rules:
+      - uid: trading-cb-halt
+        title: Circuit breaker HALT
+        condition: C
+        for: 1m
+        noDataState: OK
+        execErrState: Error
+        labels:
+          severity: critical
+        annotations:
+          summary: >-
+            A run's graduated circuit breaker reached HALT (state >= 3) —
+            trading on that run is fully stopped. Investigate immediately.
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              expr: max(trading_circuit_breaker_state)
+              instant: true
+          - refId: C
+            relativeTimeRange: { from: 0, to: 0 }
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [2.5] }
+
+      - uid: trading-kill-switch
+        title: Kill switch active
+        condition: C
+        for: 1m
+        noDataState: OK
+        execErrState: Error
+        labels:
+          severity: critical
+        annotations:
+          summary: >-
+            The risk-manager kill switch is active on at least one run —
+            all order placement is blocked until manually reset.
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              expr: max(trading_kill_switch_active)
+              instant: true
+          - refId: C
+            relativeTimeRange: { from: 0, to: 0 }
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [0.5] }
+
+      - uid: trading-high-drawdown
+        title: Drawdown above 10 percent
+        condition: C
+        for: 5m
+        noDataState: OK
+        execErrState: Error
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            A run's drawdown exceeded 10% of peak equity for 5+ minutes.
+            REDUCE/DAILY_LIMIT circuit-breaker levels may follow.
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              expr: max(trading_drawdown_pct)
+              instant: true
+          - refId: C
+            relativeTimeRange: { from: 0, to: 0 }
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [0.10] }
+
+      - uid: trading-api-down
+        title: Trading API down
+        condition: C
+        for: 2m
+        noDataState: Alerting
+        execErrState: Error
+        labels:
+          severity: critical
+        annotations:
+          summary: >-
+            Prometheus cannot scrape the trading API (/metrics) — the backend
+            (and every running engine task inside it) may be down.
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              expr: min(up{job="trading-bot-api"})
+              instant: true
+          - refId: C
+            relativeTimeRange: { from: 0, to: 0 }
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: lt, params: [0.5] }

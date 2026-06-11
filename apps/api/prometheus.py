@@ -141,6 +141,10 @@ _GAUGE_MAP: dict[str, str] = {
     "portfolio_equity": "trading_portfolio_equity",
     "portfolio_drawdown_pct": "trading_drawdown_pct",
     "active_positions": "trading_active_positions",
+    # Safety-state gauges for Grafana alerting (HALT / kill-switch):
+    # circuit_breaker_state encodes OK=0, REDUCE=1, DAILY_LIMIT=2, HALT=3.
+    "circuit_breaker_state": "trading_circuit_breaker_state",
+    "kill_switch_active": "trading_kill_switch_active",
 }
 
 _SUMMARY_MAP: dict[str, str] = {
