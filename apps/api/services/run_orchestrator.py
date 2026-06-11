@@ -567,6 +567,137 @@ async def auto_stop_after(
 # original underscore-prefixed name for backwards compatibility.
 
 
+# ---------------------------------------------------------------------------
+# Auto-retry for crashed PAPER runs (Sprint 48 D2 design)
+# ---------------------------------------------------------------------------
+# A paper engine task that dies with an exception used to stay dead until the
+# next API restart picked it up via orphan recovery.  Auto-retry recreates the
+# run (new RunORM row linked via recovered_from_run_id, like recovery) after
+# an exponential backoff, up to a bounded number of attempts.
+#
+# Deliberately PAPER-ONLY: a crashed LIVE engine requires operator attention
+# (alerts fire via the safety gauges); silently relaunching real-money trading
+# is not acceptable.  Backoff: 60s, 120s, 240s for attempts 0->1, 1->2, 2->3.
+_AUTO_RETRY_MAX_ATTEMPTS = 3
+_AUTO_RETRY_BASE_DELAY_SECONDS = 60.0
+
+
+async def _auto_retry_paper_run(
+    *,
+    crashed_run_id: str,
+    auto_retry_attempt: int,
+    strategy_cls: type,
+    strategy_name: str,
+    strategy_params: dict[str, Any],
+    symbols: list[str],
+    timeframe: TimeFrame,
+    initial_capital: str,
+    trailing_stop_pct: float | None,
+    bracket_config: dict[str, object] | None,
+    enable_adaptive_learning: bool,
+    auto_apply_learning: bool,
+) -> None:
+    """Recreate a crashed paper run after a backoff (bounded attempts).
+
+    ``auto_retry_attempt`` is the attempt counter of the CRASHED run (0 for
+    an original run); the new run carries ``auto_retry_attempt + 1``.
+
+    Notes
+    -----
+    Retry fires on ANY unhandled engine exception, including deterministic
+    strategy bugs — monitor ``runs.auto_retry_exhausted`` as the signal that
+    a run needs human attention.  The bounded-attempts guarantee is
+    per-process-lifetime: orphan recovery re-reads the counter from the run
+    config at API restart (CR-002), but a recovery-created run starts a
+    fresh lineage.
+    """
+    from api.db.models import RunORM
+    from api.db.session import get_session_factory
+
+    log = logger.bind(crashed_run_id=crashed_run_id)
+    next_attempt = auto_retry_attempt + 1
+    if next_attempt > _AUTO_RETRY_MAX_ATTEMPTS:
+        log.warning(
+            "runs.auto_retry_exhausted",
+            attempts=auto_retry_attempt,
+            max_attempts=_AUTO_RETRY_MAX_ATTEMPTS,
+        )
+        return
+
+    delay = _AUTO_RETRY_BASE_DELAY_SECONDS * (2**auto_retry_attempt)
+    log.info(
+        "runs.auto_retry_scheduled",
+        next_attempt=next_attempt,
+        delay_seconds=delay,
+    )
+    await asyncio.sleep(delay)
+
+    try:
+        new_run_id = uuid.uuid4()
+        factory = get_session_factory()
+        async with factory() as db:
+            result = await db.execute(
+                select(RunORM).where(RunORM.id == uuid.UUID(crashed_run_id))
+            )
+            crashed = result.scalar_one_or_none()
+            if crashed is None:
+                log.warning("runs.auto_retry_source_missing")
+                return
+            # CR-001 guard: only retry a run that is still in 'error'.  If an
+            # operator manually restarted/archived it during the backoff
+            # window, creating a second engine would double exposure.
+            if crashed.status != "error":
+                log.info(
+                    "runs.auto_retry_superseded",
+                    crashed_status=crashed.status,
+                )
+                return
+            new_config = dict(crashed.config or {})
+            # Observability only — orphan recovery reads this back explicitly
+            # at its call site; nothing else consumes it (CR-006).
+            new_config["auto_retry_attempt"] = next_attempt
+            new_config["auto_retried_from"] = crashed_run_id
+            now = datetime.now(tz=UTC)
+            db.add(
+                RunORM(
+                    id=new_run_id,
+                    run_mode="paper",
+                    status="running",
+                    config=new_config,
+                    started_at=now,
+                    recovered_from_run_id=crashed.id,
+                )
+            )
+            await db.commit()
+
+        task = asyncio.create_task(
+            run_paper_engine(
+                run_id_str=str(new_run_id),
+                strategy_cls=strategy_cls,
+                strategy_name=strategy_name,
+                strategy_params=strategy_params,
+                symbols=symbols,
+                timeframe=timeframe,
+                initial_capital=initial_capital,
+                trailing_stop_pct=trailing_stop_pct,
+                bracket_config=bracket_config,
+                enable_adaptive_learning=enable_adaptive_learning,
+                auto_apply_learning=auto_apply_learning,
+                auto_retry_attempt=next_attempt,
+            ),
+            name=f"paper-engine-retry-{new_run_id}",
+        )
+        _RUN_TASKS[str(new_run_id)] = task
+        log.info(
+            "runs.auto_retry_started",
+            new_run_id=str(new_run_id),
+            attempt=next_attempt,
+        )
+    except Exception:
+        # Best-effort: a failed retry must never take the API down.
+        log.exception("runs.auto_retry_failed")
+
+
 async def run_paper_engine(
     *,
     run_id_str: str,
@@ -580,6 +711,7 @@ async def run_paper_engine(
     bracket_config: dict[str, object] | None = None,
     enable_adaptive_learning: bool = False,
     auto_apply_learning: bool = False,
+    auto_retry_attempt: int = 0,
 ) -> None:
     """
     Background coroutine that runs a paper trading engine for a single run.
@@ -876,6 +1008,30 @@ async def run_paper_engine(
                     log.exception("runs.paper_engine_db_update_failed")
         except Exception:
             log.exception("runs.paper_engine_db_session_failed")
+
+        # Auto-retry crashed paper runs (Sprint 48 D2): only on a genuine
+        # error exit — operator stops and graceful shutdowns never reach
+        # final_status == "error" (CancelledError re-raises above).  The
+        # retry task is fire-and-forget; it sleeps the backoff first so this
+        # finally block returns immediately.
+        if final_status == "error":
+            asyncio.create_task(
+                _auto_retry_paper_run(
+                    crashed_run_id=run_id_str,
+                    auto_retry_attempt=auto_retry_attempt,
+                    strategy_cls=strategy_cls,
+                    strategy_name=strategy_name,
+                    strategy_params=strategy_params,
+                    symbols=symbols,
+                    timeframe=timeframe,
+                    initial_capital=initial_capital,
+                    trailing_stop_pct=trailing_stop_pct,
+                    bracket_config=bracket_config,
+                    enable_adaptive_learning=enable_adaptive_learning,
+                    auto_apply_learning=auto_apply_learning,
+                ),
+                name=f"auto-retry-{run_id_str[:8]}",
+            )
 
 
 async def run_live_engine(

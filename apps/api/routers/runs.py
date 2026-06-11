@@ -1982,6 +1982,29 @@ async def recover_orphaned_runs() -> int:
             )
             orphans = list(result.scalars().all())
 
+            # CR-004 (auto-retry review): runs created by recovery OR by the
+            # paper auto-retry carry a non-null recovered_from_run_id and are
+            # deliberately excluded above (chain prevention).  If any are
+            # stuck in 'running' after a restart they will never be recovered
+            # — surface them loudly so the operator can stop/restart manually.
+            skipped_result = await session.execute(
+                select(RunORM.id).where(
+                    RunORM.status == "running",
+                    RunORM.run_mode.in_(["paper", "live"]),
+                    RunORM.recovered_from_run_id.is_not(None),
+                )
+            )
+            stuck_chain_ids = [str(rid) for rid in skipped_result.scalars().all()]
+            if stuck_chain_ids:
+                log.warning(
+                    "recovery.chained_runs_not_recovered",
+                    run_ids=stuck_chain_ids,
+                    note=(
+                        "recovered/auto-retried runs are excluded from orphan "
+                        "recovery; stop and restart these manually"
+                    ),
+                )
+
         if not orphans:
             log.debug("recovery.no_orphans_found")
             return 0
@@ -2124,19 +2147,27 @@ async def recover_orphaned_runs() -> int:
                     orphan_config.get("bracket_config") or {}
                 )
 
+                _engine_kwargs: dict[str, Any] = {
+                    "run_id_str": new_run_id_str,
+                    "strategy_cls": strategy_cls,
+                    "strategy_name": strategy_name,
+                    "strategy_params": strategy_params,
+                    "symbols": symbols,
+                    "timeframe": timeframe,
+                    "initial_capital": initial_capital,
+                    "trailing_stop_pct": recovery_trailing_pct,
+                    "bracket_config": recovery_bracket_config,
+                }
+                if orphan_mode == "paper":
+                    # CR-002 (auto-retry review): carry the auto-retry attempt
+                    # counter across an API restart so a persistently crashing
+                    # run cannot reset its bounded retry budget via recovery.
+                    _engine_kwargs["auto_retry_attempt"] = int(
+                        orphan_config.get("auto_retry_attempt", 0)
+                    )
                 coro = _run_paper_engine if orphan_mode == "paper" else _run_live_engine
                 task = asyncio.create_task(
-                    coro(
-                        run_id_str=new_run_id_str,
-                        strategy_cls=strategy_cls,
-                        strategy_name=strategy_name,
-                        strategy_params=strategy_params,
-                        symbols=symbols,
-                        timeframe=timeframe,
-                        initial_capital=initial_capital,
-                        trailing_stop_pct=recovery_trailing_pct,
-                        bracket_config=recovery_bracket_config,
-                    ),
+                    coro(**_engine_kwargs),
                     name=f"recovery-{orphan_mode}-{new_run_id_str[:8]}",
                 )
                 _RUN_TASKS[new_run_id_str] = task
