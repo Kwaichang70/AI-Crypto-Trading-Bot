@@ -28,6 +28,7 @@ import { StatCard } from "@/components/ui/stat-card";
 import { DataTable, type Column } from "@/components/ui/data-table";
 import { Tabs } from "@/components/ui/tabs";
 import { EquityCurveChart } from "@/components/charts/equity-curve";
+import { aggregateTradesBySymbol } from "@/lib/aggregate";
 import { useToast } from "@/components/ui/toast";
 
 // ---------------------------------------------------------------------------
@@ -665,6 +666,63 @@ export default function RunDetailPage() {
                   </div>
                   <EquityCurveChart points={equityPoints} height={260} />
                 </div>
+
+                {/* Per-symbol PnL breakdown (from the fetched trades window) */}
+                {trades.length > 0 && (
+                  <div className="card">
+                    <div className="mb-3 flex items-center justify-between">
+                      <h3 className="text-sm font-semibold text-slate-700 dark:text-slate-300">
+                        PnL per Symbol
+                      </h3>
+                      {trades.length >= 100 && (
+                        <span className="text-xs text-slate-500">
+                          based on the {trades.length} most recent trades
+                        </span>
+                      )}
+                    </div>
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-sm">
+                        <thead>
+                          <tr className="border-b border-slate-200 text-left text-xs uppercase text-slate-500 dark:border-slate-700">
+                            <th className="py-2 pr-4">Symbol</th>
+                            <th className="py-2 pr-4 text-right">Trades</th>
+                            <th className="py-2 pr-4 text-right">Win rate</th>
+                            <th className="py-2 pr-4 text-right">Fees</th>
+                            <th className="py-2 text-right">Net PnL</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {aggregateTradesBySymbol(trades).map((s) => (
+                            <tr
+                              key={s.symbol}
+                              className="border-b border-slate-100 last:border-0 dark:border-slate-800"
+                            >
+                              <td className="py-2 pr-4 font-mono text-xs">{s.symbol}</td>
+                              <td className="py-2 pr-4 text-right">{s.trades}</td>
+                              <td className="py-2 pr-4 text-right">
+                                {s.trades > 0 ? `${Math.round((100 * s.wins) / s.trades)}%` : "—"}
+                              </td>
+                              <td className="py-2 pr-4 text-right text-slate-500">
+                                {s.fees.toFixed(2)}
+                              </td>
+                              <td
+                                className={`py-2 text-right font-medium ${
+                                  s.netPnl > 0
+                                    ? "text-emerald-600 dark:text-emerald-400"
+                                    : s.netPnl < 0
+                                      ? "text-red-600 dark:text-red-400"
+                                      : "text-slate-500"
+                                }`}
+                              >
+                                {s.netPnl.toFixed(2)}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                )}
 
                 {/* Live Diagnostics -- shown only for running runs */}
                 {run.status === "running" && diagnostics && (
