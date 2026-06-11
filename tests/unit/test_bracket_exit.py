@@ -624,6 +624,39 @@ class TestBracketExitInStrategyEngine:
         assert len(sells) >= 1
         assert sells[0].metadata["stop_loss"] is True
 
+    async def test_bounded_atr_window_matches_full_history(self) -> None:
+        # CR-005: the engine slices history to 6*period bars before computing
+        # ATR.  Wilder weight of older bars is < e^-6, so the bounded result
+        # must match a full-history computation to well within 1%.
+        import pandas as pd
+
+        from data.indicators import atr as full_atr
+
+        engine, _ = _make_engine(config={
+            "bracket_mode": "atr",
+            "bracket_atr_sl_multiplier": 2.0,
+            "bracket_atr_period": 14,
+        })
+        await engine.start("run-001")
+        assert engine._bracket_exit is not None  # type: ignore[attr-defined]
+
+        # 600-bar trending series with varying ranges.
+        history = [
+            _make_bar(close=str(100 + i * 0.3 + (7 if i % 9 == 0 else 0)))
+            for i in range(600)
+        ]
+        bounded = engine._compute_atr_for_symbol(  # type: ignore[attr-defined]
+            "BTC/USD", {"BTC/USD": history}
+        )
+        assert bounded is not None
+
+        highs = pd.Series([float(b.high) for b in history])
+        lows = pd.Series([float(b.low) for b in history])
+        closes = pd.Series([float(b.close) for b in history])
+        full = float(full_atr(highs, lows, closes, period=14).iloc[-1])
+
+        assert abs(float(bounded) - full) / full < 0.01
+
     async def test_bracket_error_does_not_crash_bar_loop(self) -> None:
         engine, mocks = _make_engine(config={"bracket_stop_loss_pct": 0.05})
         await engine.start("run-001")

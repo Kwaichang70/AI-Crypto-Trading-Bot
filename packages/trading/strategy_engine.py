@@ -60,6 +60,12 @@ __all__ = ["StrategyEngine", "EngineState"]
 logger = structlog.get_logger(__name__)
 
 
+# CR-005: ATR window for bracket exits — bars older than this many periods
+# have < e^-6 Wilder weight, so the bounded window is numerically equivalent
+# to full history while keeping per-bar ATR cost O(period) instead of O(n).
+_ATR_WINDOW_MULTIPLIER = 6
+
+
 def _opt_float(value: Any) -> float | None:
     """Coerce a config value to float, mapping None / "" to None.
 
@@ -778,6 +784,13 @@ class StrategyEngine:
         period = self._bracket_exit.atr_period
         if not bars or len(bars) <= period:
             return None
+        # CR-005: bound the window so long backtests stay O(period) per bar
+        # instead of O(n) (full history made ATR-mode backtests O(n^2)).
+        # Wilder smoothing decays by (1-1/period) per bar, so bars older than
+        # 6*period contribute < e^-6 (~0.25%) — numerically equivalent.
+        window = period * _ATR_WINDOW_MULTIPLIER + 1
+        if len(bars) > window:
+            bars = bars[-window:]
         highs = pd.Series([float(b.high) for b in bars])
         lows = pd.Series([float(b.low) for b in bars])
         closes = pd.Series([float(b.close) for b in bars])

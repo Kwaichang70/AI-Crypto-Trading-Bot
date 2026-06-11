@@ -886,7 +886,13 @@ class TestModelVersionEndpoints:
         db.execute = AsyncMock(return_value=select_result)
         db.refresh = AsyncMock(side_effect=lambda obj: None)
 
-        await activate_model_version(model_id=mv.id, request=MagicMock(), db=db)
+        # headers must be a real dict: the Sprint 50 Cycle 5 OOS-override gate
+        # calls request.headers.get("X-Override-OOS-Gate") and .encode()s any
+        # non-None result — a bare MagicMock returns a Mock there (TypeError in
+        # hmac.compare_digest) where production FastAPI returns str | None.
+        await activate_model_version(
+            model_id=mv.id, request=MagicMock(headers={}), db=db
+        )
 
         # 1 SELECT + 2 UPDATEs = 3 execute calls
         assert db.execute.call_count == 3, (
