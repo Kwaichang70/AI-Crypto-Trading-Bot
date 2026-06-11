@@ -31,6 +31,7 @@ import {
   formatPct,
 } from "@/lib/api";
 import type { Run, Portfolio, EquityPoint } from "@/lib/types";
+import { quoteCurrencyPrefix } from "@/lib/currency";
 import { Header } from "@/components/layout/header";
 import { RunStatusBadge } from "@/components/ui/status-badge";
 
@@ -101,7 +102,8 @@ const METRIC_ROWS: MetricRow[] = [
     },
     display: (d) => {
       const v = d.portfolio?.initialCash ?? d.run.backtestMetrics?.initialCapital ?? null;
-      return v !== null ? `$${formatCurrency(String(v))}` : "—";
+      const ccy = quoteCurrencyPrefix(d.run.config?.symbols, d.run.backtestMetrics?.quoteCurrency);
+      return v !== null ? `${ccy}${formatCurrency(String(v))}` : "—";
     },
     higherIsBetter: true,
   },
@@ -113,7 +115,8 @@ const METRIC_ROWS: MetricRow[] = [
     },
     display: (d) => {
       const v = d.portfolio?.currentEquity ?? d.run.backtestMetrics?.finalEquity ?? null;
-      return v !== null ? `$${formatCurrency(String(v))}` : "—";
+      const ccy = quoteCurrencyPrefix(d.run.config?.symbols, d.run.backtestMetrics?.quoteCurrency);
+      return v !== null ? `${ccy}${formatCurrency(String(v))}` : "—";
     },
     higherIsBetter: true,
   },
@@ -450,9 +453,14 @@ function RunCompareInner() {
                   axisLine={false}
                   width={62}
                   tickFormatter={(v: number) => {
-                    if (v >= 1_000_000) return `$${(v / 1_000_000).toFixed(1)}M`;
-                    if (v >= 1_000) return `$${(v / 1_000).toFixed(1)}k`;
-                    return `$${v.toFixed(0)}`;
+                    // One axis for all compared runs: only show a symbol when
+                    // every run shares the same quote currency.
+                    const axisCcy = quoteCurrencyPrefix(
+                      items.flatMap((it) => it.run.config?.symbols ?? []),
+                    );
+                    if (v >= 1_000_000) return `${axisCcy}${(v / 1_000_000).toFixed(1)}M`;
+                    if (v >= 1_000) return `${axisCcy}${(v / 1_000).toFixed(1)}k`;
+                    return `${axisCcy}${v.toFixed(0)}`;
                   }}
                 />
                 <Tooltip

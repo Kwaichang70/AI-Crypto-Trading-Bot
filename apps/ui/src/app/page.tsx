@@ -173,7 +173,10 @@ export default async function DashboardPage() {
               label="Total Realized PnL"
               value={
                 aggregate
-                  ? `$${formatCurrency(aggregate.totalRealisedPnl)}`
+                  // No currency symbol: this aggregates runs that may trade
+                    // different quote currencies (FX conversion is the deferred
+                    // M6b follow-up) — a single symbol would be misleading.
+                    ? formatCurrency(aggregate.totalRealisedPnl)
                   : "—"
               }
               subValue={

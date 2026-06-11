@@ -19,6 +19,9 @@ interface EquityCurveChartProps {
   points: readonly EquityPoint[];
   height?: number;
   showDrawdown?: boolean;
+  /** Monetary prefix for axis/tooltip values, e.g. "€". "" hides the symbol
+   *  (mixed-currency data); defaults to "$" for backwards compatibility. */
+  currencyPrefix?: string;
 }
 
 interface ChartDatum {
@@ -38,10 +41,10 @@ function formatDate(ts: number): string {
   });
 }
 
-function formatCurrency(v: number): string {
-  if (v >= 1_000_000) return `$${(v / 1_000_000).toFixed(1)}M`;
-  if (v >= 1_000) return `$${(v / 1_000).toFixed(1)}k`;
-  return `$${v.toFixed(0)}`;
+function formatCurrency(v: number, prefix: string): string {
+  if (v >= 1_000_000) return `${prefix}${(v / 1_000_000).toFixed(1)}M`;
+  if (v >= 1_000) return `${prefix}${(v / 1_000).toFixed(1)}k`;
+  return `${prefix}${v.toFixed(0)}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -58,9 +61,10 @@ interface CustomTooltipProps {
   active?: boolean;
   payload?: TooltipPayloadEntry[];
   label?: number;
+  currencyPrefix?: string;
 }
 
-function CustomTooltip({ active, payload, label }: CustomTooltipProps) {
+function CustomTooltip({ active, payload, label, currencyPrefix = "$" }: CustomTooltipProps) {
   if (!active || !payload || payload.length === 0 || label === undefined) {
     return null;
   }
@@ -84,7 +88,7 @@ function CustomTooltip({ active, payload, label }: CustomTooltipProps) {
       </p>
       {equityEntry && (
         <p style={{ color: "#6366f1", margin: 0 }}>
-          Equity: <strong>${equityEntry.value.toFixed(2)}</strong>
+          Equity: <strong>{currencyPrefix}{equityEntry.value.toFixed(2)}</strong>
         </p>
       )}
       {drawdownEntry && (
@@ -104,6 +108,7 @@ export function EquityCurveChart({
   points,
   height = 280,
   showDrawdown = true,
+  currencyPrefix = "$",
 }: EquityCurveChartProps) {
   if (points.length === 0) {
     return (
@@ -157,10 +162,10 @@ export function EquityCurveChart({
             minTickGap={60}
           />
 
-          {/* Left axis — equity in dollars */}
+          {/* Left axis — equity in the run's quote currency */}
           <YAxis
             yAxisId="left"
-            tickFormatter={formatCurrency}
+            tickFormatter={(v: number) => formatCurrency(v, currencyPrefix)}
             stroke="#475569"
             fontSize={11}
             tickLine={false}
@@ -182,7 +187,7 @@ export function EquityCurveChart({
             />
           )}
 
-          <Tooltip content={<CustomTooltip />} />
+          <Tooltip content={<CustomTooltip currencyPrefix={currencyPrefix} />} />
 
           {/* Equity area */}
           <Area

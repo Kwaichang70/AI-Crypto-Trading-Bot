@@ -672,7 +672,7 @@ export default function RunDetailPage() {
                       data={equityPoints}
                     />
                   </div>
-                  <EquityCurveChart points={equityPoints} height={260} />
+                  <EquityCurveChart points={equityPoints} height={260} currencyPrefix={ccy} />
                 </div>
 
                 {/* Per-symbol PnL breakdown (from the fetched trades window) */}
