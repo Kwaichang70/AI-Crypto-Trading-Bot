@@ -29,6 +29,7 @@ import { DataTable, type Column } from "@/components/ui/data-table";
 import { Tabs } from "@/components/ui/tabs";
 import { EquityCurveChart } from "@/components/charts/equity-curve";
 import { aggregateTradesBySymbol } from "@/lib/aggregate";
+import { quoteCurrencyPrefix } from "@/lib/currency";
 import { useToast } from "@/components/ui/toast";
 
 // ---------------------------------------------------------------------------
@@ -491,6 +492,13 @@ export default function RunDetailPage() {
     setIsStopping(false);
   }
 
+  // Currency-consistent monetary prefix: derived from the run's quote
+  // currency (explicit backend value wins; else parsed from the symbols).
+  const ccy = quoteCurrencyPrefix(
+    run?.config?.symbols,
+    run?.backtestMetrics?.quoteCurrency,
+  );
+
   function handleDuplicate() {
     if (!run?.config) return;
     const { strategy_name, symbols: configSymbols, timeframe, initial_capital } = run.config;
@@ -620,7 +628,7 @@ export default function RunDetailPage() {
                 <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
                   <StatCard
                     label="Current Equity"
-                    value={portfolio ? `$${formatCurrency(portfolio.currentEquity)}` : "—"}
+                    value={portfolio ? `${ccy}${formatCurrency(portfolio.currentEquity)}` : "—"}
                     isLoading={!portfolio}
                   />
                   <StatCard
@@ -649,7 +657,7 @@ export default function RunDetailPage() {
                   <StatCard
                     label="Total Trades"
                     value={portfolio?.totalTrades ?? "—"}
-                    subValue={portfolio ? `$${formatCurrency(portfolio.totalRealisedPnl)} PnL` : undefined}
+                    subValue={portfolio ? `${ccy}${formatCurrency(portfolio.totalRealisedPnl)} PnL` : undefined}
                     isLoading={!portfolio}
                   />
                 </div>
@@ -735,7 +743,7 @@ export default function RunDetailPage() {
                         label="Current Equity"
                         value={
                           typeof diagnostics.currentEquity === "string"
-                            ? `$${formatCurrency(diagnostics.currentEquity)}`
+                            ? `${ccy}${formatCurrency(diagnostics.currentEquity)}`
                             : "--"
                         }
                       />
@@ -880,17 +888,17 @@ export default function RunDetailPage() {
                       />
                       <StatCard
                         label="Avg Trade PnL"
-                        value={`$${formatCurrency(run.backtestMetrics.averageTradePnl)}`}
+                        value={`${ccy}${formatCurrency(run.backtestMetrics.averageTradePnl)}`}
                         trend={parseFloat(run.backtestMetrics.averageTradePnl) >= 0 ? "up" : "down"}
                       />
                       <StatCard
                         label="Largest Win"
-                        value={`$${formatCurrency(run.backtestMetrics.largestWin)}`}
+                        value={`${ccy}${formatCurrency(run.backtestMetrics.largestWin)}`}
                         trend="up"
                       />
                       <StatCard
                         label="Largest Loss"
-                        value={`$${formatCurrency(run.backtestMetrics.largestLoss)}`}
+                        value={`${ccy}${formatCurrency(run.backtestMetrics.largestLoss)}`}
                         trend="down"
                       />
                     </div>
