@@ -45,13 +45,20 @@ from trading.strategy_availability import (
 
 # The strategies the system ships, partitioned by intended lockdown state.
 _DEMOTED_STRATEGIES = {"ma_crossover", "breakout", "model_strategy"}
-_ACTIVE_STRATEGIES = {"dca_rsi_hybrid", "grid_trading", "rsi_mean_reversion"}
+_ACTIVE_STRATEGIES = {
+    "dca_rsi_hybrid",
+    "grid_trading",
+    "rsi_mean_reversion",
+    # Promoted 2026-09-24 from paper-eligible after a profitable 3-month paper
+    # forward-test (6 trades, PF 1.82) met paper_forward_test_profitable.
+    "momentum_breakout",
+}
 # Sprint 51 Cycle 3: new strategies start EXPERIMENTAL (backtest-only) until
 # they clear the walk-forward OOS profitability gate.
 _EXPERIMENTAL_STRATEGIES = {"sl_tp_reversion"}
-# Paper-eligible: EXPERIMENTAL status but allowed in backtest + paper (NOT
-# live) — validated OOS in backtest, live withheld pending paper forward-test.
-_PAPER_ELIGIBLE_STRATEGIES = {"momentum_breakout"}
+# Paper-eligible tier (EXPERIMENTAL status, backtest + paper, NOT live).
+# Currently unoccupied: momentum_breakout was promoted to ACTIVE.
+_PAPER_ELIGIBLE_STRATEGIES: set[str] = set()
 # Strategies restricted to backtest-only (demoted OR backtest-only experimental).
 _BACKTEST_ONLY_STRATEGIES = _DEMOTED_STRATEGIES | _EXPERIMENTAL_STRATEGIES
 _ALL_STRATEGIES = (
@@ -313,8 +320,20 @@ class TestKeysetConsistency:
             assert get_availability(name).status is StrategyStatus.EXPERIMENTAL
 
     def test_paper_eligible_allows_backtest_and_paper_not_live(self) -> None:
-        """Paper-eligible strategies allow backtest + paper but NOT live."""
+        """Paper-eligible strategies allow backtest + paper but NOT live.
+
+        The tier is currently unoccupied (momentum_breakout was promoted to
+        ACTIVE); assert that explicitly so the loop is not silently vacuous,
+        and pin momentum_breakout's new live-allowed contract.
+        """
+        assert _PAPER_ELIGIBLE_STRATEGIES == set()
         for name in _PAPER_ELIGIBLE_STRATEGIES:
             assert is_mode_allowed(name, RunMode.BACKTEST) is True
             assert is_mode_allowed(name, RunMode.PAPER) is True
             assert is_mode_allowed(name, RunMode.LIVE) is False
+        # momentum_breakout is now ACTIVE -> live permitted at the availability
+        # layer (the independent 3-layer live gate still governs real runs).
+        assert is_mode_allowed("momentum_breakout", RunMode.LIVE) is True
+        assert (
+            get_availability("momentum_breakout").status is StrategyStatus.ACTIVE
+        )

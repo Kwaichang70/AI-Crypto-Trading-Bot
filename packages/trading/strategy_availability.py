@@ -76,9 +76,8 @@ _ALL_MODES: frozenset[RunMode] = frozenset(
 )
 # Backtest-only (the fail-closed / demoted restriction).
 _BACKTEST_ONLY: frozenset[RunMode] = frozenset({RunMode.BACKTEST})
-# Backtest + paper, but NOT live — for strategies validated out-of-sample in
-# backtest that must still prove themselves in paper forward-testing before
-# real capital is risked.
+# Reserved paper-eligible tier (backtest + paper, live withheld) for future
+# EXPERIMENTAL strategies; currently unoccupied after momentum_breakout's promotion.
 _BACKTEST_PAPER: frozenset[RunMode] = frozenset({RunMode.BACKTEST, RunMode.PAPER})
 
 
@@ -150,22 +149,20 @@ _AVAILABILITY: dict[str, StrategyAvailability] = {
             "backtest_profit_factor_gt_1_2",
         ],
     ),
-    # ---- EXPERIMENTAL (paper-eligible) -> backtest + paper, live withheld --
+    # ---- ACTIVE (promoted 2026-09-24 from paper-eligible) -> all three modes
     # Momentum breakout cleared walk-forward OOS on THREE independent symbol
     # universes (BTC/ETH scan; SOL/BNB/XRP; ADA/AVAX/LINK/DOGE/LTC/DOT/ATOM/TRX)
-    # net of costs.  Live is withheld until it proves itself in paper
-    # forward-testing — it has no live/paper track record yet and is the same
-    # trend-following family as the demoted ``breakout`` strategy.
+    # net of costs, then confirmed its edge out-of-sample in a 3-month paper
+    # forward-test (6 trades, 50% win, net +EUR 281, PF 1.82 -- inside the
+    # backtest-validated 1.66-2.03 range).  The ``paper_forward_test_profitable``
+    # promotion requirement is met, so live is now permitted.  NOTE: the sample
+    # is small (edge-consistent, not yet statistically conclusive); real-money
+    # deployment is still governed independently by the 3-layer live gate
+    # (ENABLE_LIVE_TRADING + API keys + X-Live-Confirm-Token) and the operator's
+    # explicit go-live action.
     "momentum_breakout": StrategyAvailability(
-        allowed_modes=_BACKTEST_PAPER,
-        status=StrategyStatus.EXPERIMENTAL,
-        demotion_reason=(
-            "Validated out-of-sample in backtest across 3 symbol universes; "
-            "live withheld pending profitable paper forward-test."
-        ),
-        promotion_requirements=[
-            "paper_forward_test_profitable",
-        ],
+        allowed_modes=_ALL_MODES,
+        status=StrategyStatus.ACTIVE,
     ),
 }
 
