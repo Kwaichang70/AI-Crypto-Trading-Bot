@@ -203,6 +203,17 @@ class StrategyEngine:
         self._run_mode = run_mode
         self._config: dict[str, Any] = config or {}
 
+        # WP1.1 (Verbeterplan v2, C1/C22): attach the portfolio as the
+        # execution engine's live position source. Duck-typed -- only
+        # LiveExecutionEngine implements attach_position_source; paper/
+        # backtest engines have no such method, so this is a no-op there.
+        # This is the ONLY change this WP makes in this file.
+        _attach_position_source = getattr(
+            self._execution_engine, "attach_position_source", None
+        )
+        if callable(_attach_position_source):
+            _attach_position_source(self._portfolio, symbols=self._symbols)
+
         # Derived configuration
         config_warmup = self._config.get("warmup_bars")
         if config_warmup is not None:

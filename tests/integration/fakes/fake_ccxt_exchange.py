@@ -32,9 +32,9 @@ Design notes
   returns this one instance; see ``tests/integration/fakes/live_harness.py``).
 - Market orders always fill *immediately* and *fully* at the current
   scripted price (``push_bar``'s ``close``), with a configurable taker fee
-  deducted in quote currency. No partial fills, no slippage — determinism
-  over realism; realism is achieved instead by mirroring Coinbase's
-  documented async settlement quirk (see below).
+  deducted in quote currency by default. No slippage — determinism over
+  realism; realism is achieved instead by mirroring Coinbase's documented
+  async settlement quirk (see below).
 - To mirror the real Coinbase behaviour that ``LiveExecutionEngine`` already
   codes defensively around (``live.py`` docstring: "Coinbase processes
   market orders asynchronously"), ``create_order`` returns
@@ -49,6 +49,25 @@ Design notes
 - No randomness, no wall-clock reads anywhere in this module — every
   timestamp is derived from a synthetic bar cursor advanced only by
   ``push_bar`` / ``seed_flat_bars``.
+
+WP1.1 (Verbeterplan v2 §4 row 1.1, R-23) extensions
+----------------------------------------------------
+Added for the live position-ledger fix's integration coverage, all
+test-side configuration (not part of the real CCXT surface):
+
+- ``set_fee_currency(symbol, "base")`` — charge the taker fee for that
+  symbol's fills in the base asset instead of quote (D6/A-05's
+  fee-normalisation path).
+- ``lock_balance(currency, amount)`` — simulate funds locked in another
+  open order: ``fetch_balance``'s ``free`` becomes ``total - locked``,
+  proving the SELL cap uses ``free`` (I1/D9), not ``total``.
+- ``queue_balance_error(exc)`` — the next ``fetch_balance`` call raises
+  ``exc`` (fault injection for the "balance unavailable" paths, I1/I4).
+- ``queue_partial_fill(symbol, first_fraction)`` — the next order for
+  ``symbol`` reports a partial fill on its *first* ``fetch_order`` poll
+  (``first_fraction`` of the requested amount) and completes fully on the
+  second poll, exercising ``LiveExecutionEngine``'s partial-fill /
+  idempotent-routing path (I9) against a real reconcile cycle.
 """
 
 from __future__ import annotations
@@ -113,12 +132,23 @@ class FakeCCXTExchange:
         self._taker_fee_pct = taker_fee_pct
         self._market_defs: dict[str, dict[str, Any]] = {}
         self._balances: dict[str, Decimal] = {}
+        # WP1.1 (R-23): currency -> amount locked in some *other* open
+        # order, subtracted from `free` but not from `total`.
+        self._locked: dict[str, Decimal] = {}
+        # WP1.1 (R-23): symbol -> fee currency override ("base" or "quote";
+        # default is "quote", matching the pre-WP1.1 unconditional behaviour).
+        self._fee_currency_override: dict[str, str] = {}
         # symbol -> list of [ts_ms, open, high, low, close, volume]
         self._closed_bars: dict[str, list[list[Any]]] = {}
         self._orders: dict[str, dict[str, Any]] = {}
         self._trades: list[dict[str, Any]] = []
         self._order_seq = 0
         self._queued_errors: dict[str, Exception] = {}
+        # WP1.1 (R-23): one-shot fault injection for the next fetch_balance().
+        self._queued_balance_error: Exception | None = None
+        # WP1.1 (R-23): symbol -> fraction of the next order's amount to
+        # report as filled on the *first* fetch_order poll only.
+        self._queued_partial_fills: dict[str, Decimal] = {}
         self._closed = False
 
         # Test-visible audit log of every create_order call, in call order.
@@ -159,12 +189,47 @@ class FakeCCXTExchange:
         }
 
     def set_balance(self, currency: str, amount: Decimal) -> None:
-        """Set the total (== free; the fake never locks funds) balance for ``currency``."""
+        """Set the total balance for ``currency``.
+
+        ``free`` mirrors ``total`` unless :meth:`lock_balance` has locked
+        some of it away (R-23).
+        """
         self._balances[currency] = amount
 
+    def lock_balance(self, currency: str, amount: Decimal) -> None:
+        """WP1.1 (R-23): simulate ``amount`` of ``currency`` locked in some
+        *other* open order (e.g. a resting limit order).
+
+        ``fetch_balance``'s ``free[currency]`` becomes
+        ``total[currency] - amount`` (floored at 0); ``total`` is
+        unaffected. Exercises the I1/D9 invariant that the SELL cap uses
+        ``free``, never ``total``.
+        """
+        self._locked[currency] = amount
+
     def balance_of(self, currency: str) -> Decimal:
-        """Return the current balance for ``currency`` (test-side accessor)."""
+        """Return the current total balance for ``currency`` (test-side accessor)."""
         return self._balances.get(currency, Decimal("0"))
+
+    def set_fee_currency(self, symbol: str, currency: str) -> None:
+        """WP1.1 (R-23): charge the taker fee for ``symbol``'s fills in
+        ``currency`` instead of the market's quote currency.
+
+        ``currency`` is normally ``"base"`` or ``"quote"`` (case-sensitive
+        market currency codes also work directly, e.g. ``"BTC"``).
+        """
+        self._fee_currency_override[symbol] = currency
+
+    def queue_balance_error(self, exc: Exception) -> None:
+        """WP1.1 (R-23): make the *next* ``fetch_balance`` call raise ``exc``."""
+        self._queued_balance_error = exc
+
+    def queue_partial_fill(self, symbol: str, first_fraction: Decimal) -> None:
+        """WP1.1 (R-23): the next order created for ``symbol`` reports only
+        ``first_fraction`` of its amount as filled on the first
+        ``fetch_order`` poll, then completes fully on the second poll.
+        """
+        self._queued_partial_fills[symbol] = first_fraction
 
     @property
     def taker_fee_pct(self) -> Decimal:
@@ -239,8 +304,22 @@ class FakeCCXTExchange:
     # ------------------------------------------------------------------
 
     async def fetch_balance(self, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        if self._queued_balance_error is not None:
+            exc = self._queued_balance_error
+            self._queued_balance_error = None
+            raise exc
+
         total = {currency: float(amount) for currency, amount in self._balances.items()}
-        return {"total": total, "free": dict(total), "used": dict.fromkeys(total, 0.0)}
+        free: dict[str, float] = {}
+        used: dict[str, float] = {}
+        for currency, amount in self._balances.items():
+            locked = self._locked.get(currency, Decimal("0"))
+            free_amount = amount - locked
+            if free_amount < Decimal("0"):
+                free_amount = Decimal("0")
+            free[currency] = float(free_amount)
+            used[currency] = float(locked)
+        return {"total": total, "free": free, "used": used}
 
     # ------------------------------------------------------------------
     # CCXT surface -- market data
@@ -262,14 +341,25 @@ class FakeCCXTExchange:
         bars = self._closed_bars.get(symbol, [])
         if not bars:
             return []
+
+        n = limit if limit is not None else len(bars)
+
+        if n >= len(bars):
+            # WP10-C-05 fix: the caller wants (at least) the full seeded
+            # history -- expose it unpadded so no real bar is silently
+            # dropped. This is the ``_warmup_bar_windows()`` call pattern
+            # (limit == the seeded count); the synthetic "still forming"
+            # duplicate below is only meaningful for a small recent window.
+            return [list(row) for row in (bars[-n:] if n > 0 else [])]
+
         # Pad with an exact duplicate of the last closed bar so that
         # CCXTMarketDataService.get_latest_bar()'s ``bars[-2]`` convention
         # ("the last candle returned might still be forming, use the one
         # before it") always resolves to the most recently pushed *closed*
         # bar -- see the module docstring and the producer report §"Bar
-        # padding convention" for the full derivation.
+        # padding convention" for the full derivation. Only reached when
+        # ``n < len(bars)``, i.e. there is at least one real bar to spare.
         exposed = [*bars, bars[-1]]
-        n = limit if limit is not None else len(exposed)
         tail = exposed[-n:] if n > 0 else []
         return [list(row) for row in tail]
 
@@ -321,17 +411,38 @@ class FakeCCXTExchange:
                     f"insufficient {base} balance: have {held}, need {qty}"
                 )
 
-        fee_cost = (notional * self._taker_fee_pct).quantize(_QTY_PRECISION)
-        self._apply_fill(base=base, quote=quote, side=side, qty=qty, price=fill_price, fee=fee_cost)
+        # WP1.1 (R-23): fee currency defaults to quote (pre-WP1.1 behaviour)
+        # unless overridden per-symbol via set_fee_currency("base").
+        fee_currency_choice = self._fee_currency_override.get(symbol, "quote")
+        fee_currency = base if fee_currency_choice == "base" else quote
+        if fee_currency == base:
+            fee_cost = (qty * self._taker_fee_pct).quantize(_QTY_PRECISION)
+        else:
+            fee_cost = (notional * self._taker_fee_pct).quantize(_QTY_PRECISION)
+
+        self._apply_fill(
+            base=base,
+            quote=quote,
+            side=side,
+            qty=qty,
+            price=fill_price,
+            fee=fee_cost,
+            fee_currency=fee_currency,
+        )
 
         self._order_seq += 1
         exchange_order_id = f"fake-order-{self._order_seq}"
         ts_ms = self._now_ms(symbol)
 
+        # WP1.1 (R-23): a queued partial-fill fraction for this symbol
+        # attaches to this order only; consumed (one-shot) here.
+        partial_fraction = self._queued_partial_fills.pop(symbol, None)
+
         # Mirrors Coinbase: the initial response is still "open"/unfilled;
         # the caller (LiveExecutionEngine) reconciles via fetch_order after
-        # its post-submit wait. fetch_order below always reports "closed".
-        order_record = {
+        # its post-submit wait. fetch_order below always reports "closed"
+        # unless a partial-fill fraction was queued for this order.
+        order_record: dict[str, Any] = {
             "id": exchange_order_id,
             "symbol": symbol,
             "side": side,
@@ -343,6 +454,8 @@ class FakeCCXTExchange:
             "filled": None,
             "average": None,
             "timestamp": ts_ms,
+            "_partial_fraction": (str(partial_fraction) if partial_fraction is not None else None),
+            "_partial_polled_once": False,
         }
         self._orders[exchange_order_id] = order_record
 
@@ -353,7 +466,7 @@ class FakeCCXTExchange:
                 "side": side,
                 "amount": float(qty),
                 "price": float(fill_price),
-                "fee": {"cost": float(fee_cost), "currency": quote},
+                "fee": {"cost": float(fee_cost), "currency": fee_currency},
                 "takerOrMaker": "taker",
                 "timestamp": ts_ms,
             }
@@ -380,6 +493,23 @@ class FakeCCXTExchange:
         order = self._orders.get(id)
         if order is None:
             raise ccxt.OrderNotFound(str(id))
+
+        # WP1.1 (R-23): a partial-fill fraction was queued for this order --
+        # report it as still-open/partially-filled on the FIRST poll only,
+        # then fall through to the normal fully-closed response afterwards.
+        partial_fraction_raw = order.get("_partial_fraction")
+        if partial_fraction_raw is not None and not order.get("_partial_polled_once"):
+            order["_partial_polled_once"] = True
+            partial_fraction = Decimal(partial_fraction_raw)
+            partial_amount = (Decimal(str(order["amount"])) * partial_fraction).quantize(
+                _QTY_PRECISION
+            )
+            settled = dict(order)
+            settled["status"] = "open"
+            settled["filled"] = float(partial_amount)
+            settled["average"] = order["average_fill_price"]
+            return settled
+
         settled = dict(order)
         settled["status"] = "closed"
         settled["filled"] = order["amount"]
@@ -435,12 +565,21 @@ class FakeCCXTExchange:
         qty: Decimal,
         price: Decimal,
         fee: Decimal,
+        fee_currency: str,
     ) -> None:
         if side == "buy":
             cost = qty * price
-            self._balances[quote] = self._balances.get(quote, Decimal("0")) - cost - fee
-            self._balances[base] = self._balances.get(base, Decimal("0")) + qty
+            if fee_currency == base:
+                self._balances[quote] = self._balances.get(quote, Decimal("0")) - cost
+                self._balances[base] = self._balances.get(base, Decimal("0")) + qty - fee
+            else:
+                self._balances[quote] = self._balances.get(quote, Decimal("0")) - cost - fee
+                self._balances[base] = self._balances.get(base, Decimal("0")) + qty
         else:
             proceeds = qty * price
-            self._balances[quote] = self._balances.get(quote, Decimal("0")) + proceeds - fee
-            self._balances[base] = self._balances.get(base, Decimal("0")) - qty
+            if fee_currency == base:
+                self._balances[quote] = self._balances.get(quote, Decimal("0")) + proceeds
+                self._balances[base] = self._balances.get(base, Decimal("0")) - qty - fee
+            else:
+                self._balances[quote] = self._balances.get(quote, Decimal("0")) + proceeds - fee
+                self._balances[base] = self._balances.get(base, Decimal("0")) - qty

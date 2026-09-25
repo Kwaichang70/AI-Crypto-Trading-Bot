@@ -1258,6 +1258,16 @@ class TestLifecycle:
     async def test_on_start_calls_load_markets_when_enabled(self) -> None:
         """on_start() calls exchange.load_markets() when live trading is enabled."""
         engine, _, ex = _make_engine(enable_live_trading=True)
+        # WP1.1 round 2 (S-09): on_start() now fails closed without a
+        # position source attached -- this test is about load_markets(),
+        # so attach a minimal stub (returning None/empty/zero, matching an
+        # empty PortfolioAccounting) to reach that code path.
+        stub_source = MagicMock(
+            get_position=MagicMock(return_value=None),
+            get_open_positions=MagicMock(return_value=[]),
+            get_daily_pnl=MagicMock(return_value=Decimal("0")),
+        )
+        engine.attach_position_source(stub_source, symbols=[_SYMBOL])
 
         await engine.on_start()
 
@@ -1314,6 +1324,15 @@ class TestLifecycle:
     @pytest.mark.asyncio
     async def test_on_start_reraises_load_markets_failure(self) -> None:
         engine, _, ex = _make_engine(enable_live_trading=True)
+        # WP1.1 round 2 (S-09): attach a stub source so this test still
+        # reaches load_markets() (the behaviour under test) rather than
+        # failing closed at the missing-source gate.
+        stub_source = MagicMock(
+            get_position=MagicMock(return_value=None),
+            get_open_positions=MagicMock(return_value=[]),
+            get_daily_pnl=MagicMock(return_value=Decimal("0")),
+        )
+        engine.attach_position_source(stub_source, symbols=[_SYMBOL])
         ex.load_markets.side_effect = Exception("exchange down")
         with pytest.raises(Exception, match="exchange down"):
             await engine.on_start()
