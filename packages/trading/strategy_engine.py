@@ -24,7 +24,13 @@ Run modes
 
 Safety invariants
 -----------------
-- In LIVE mode the risk manager kill-switch is checked before each bar
+- In every mode, the risk manager kill-switch blocks new *entries* only
+  (D3, WP1.2): BUY signals are dropped after the strategy loop via
+  ``_drop_entry_signals``; strategy SELLs, bracket exits (5a), trailing
+  stops (5b) and resting-order fills (6) all keep running while it is
+  active. The side-aware ``DefaultRiskManager`` gate is what actually
+  enforces this; the engine-level filter only avoids a pointless
+  downstream attempt for BUYs and keeps the skip audit populated.
 - Strategy exceptions are caught and logged without crashing the bar loop
 - The bar loop never crashes -- all errors are logged and processing continues
 """
@@ -857,25 +863,13 @@ class StrategyEngine:
         # 2. Tick risk manager cooldown
         self._risk_manager.tick_cooldown()
 
-        # 3. In LIVE mode, check kill switch before processing.
-        # NOTE: PAPER mode deliberately continues through kill-switch events
-        # so strategies can still be monitored and signals recorded. The paper
-        # execution engine's pre_trade_check will block actual order placement.
-        if self._run_mode == RunMode.LIVE and self._risk_manager.kill_switch_active:
-            # Record kill-switch-suppressed trades so the post-run audit shows
-            # exactly which symbols would have entered had the switch been off.
-            if self._skip_logger is not None:
-                for sym, sym_bar in current_bars.items():
-                    self._skip_logger.log_skip(
-                        symbol=sym,
-                        skip_reason="kill_switch",
-                        hypothetical_entry_price=sym_bar.close,
-                    )
-            self._log.warning(
-                "engine.bar_skipped_kill_switch",
-                bar_timestamp=str(bar_timestamp),
-            )
-            return
+        # 3. Kill switch blocks new entries in every mode; exits keep
+        # running (D3, WP1.2). BUY signals are dropped after the strategy
+        # loop below via ``_drop_entry_signals``; SELLs, brackets (5a),
+        # trailing stops (5b) and resting orders (6) are unaffected. `is
+        # True` guards against a MagicMock risk manager in tests -- a mock
+        # attribute is truthy even when a test never sets it explicitly.
+        entries_blocked = self._risk_manager.kill_switch_active is True
 
         # Count only bars that reach strategy processing
         self._bar_count += 1
@@ -957,6 +951,15 @@ class StrategyEngine:
                     bar_index=self._bar_count,
                 )
                 continue
+
+        # WP1.2 (S6): drop BUY-only entries while the kill switch is active.
+        # Runs before the circuit-breaker filter below, which is a
+        # separate, still BUY+SELL-suppressing legacy behaviour for
+        # HALT/DAILY_LIMIT (C23, out of scope for WP1.2 -- see WP1.6).
+        if entries_blocked:
+            bar_signals = self._drop_entry_signals(
+                bar_signals, current_bars, skip_reason="kill_switch"
+            )
 
         # C2 (cont.): filter/reduce signals based on graduated CB response
         if _suppress_new_signals:
@@ -1225,6 +1228,51 @@ class StrategyEngine:
             # Metrics must never crash bar processing; surface at debug level
             # so operational regressions are still observable in verbose logs.
             self._log.debug("engine.metrics_update_failed", exc_info=True)
+
+    # ------------------------------------------------------------------
+    # Entry-signal filtering (WP1.2 / S6)
+    # ------------------------------------------------------------------
+
+    def _drop_entry_signals(
+        self,
+        signals: list[Signal],
+        current_bars: dict[str, OHLCVBar],
+        *,
+        skip_reason: str,
+    ) -> list[Signal]:
+        """
+        Drop BUY signals only, logging a skip for each one.
+
+        Called while the kill switch is blocking new entries (D3). SELL
+        signals pass through unchanged -- exits must keep running even
+        while entries are blocked. The side-aware ``DefaultRiskManager``
+        gate is what actually enforces the block; this filter only avoids
+        a pointless downstream order attempt for BUYs and keeps the skip
+        audit populated.
+        """
+        kept: list[Signal] = []
+        dropped_buy_count = 0
+        for signal in signals:
+            if signal.direction != SignalDirection.BUY:
+                kept.append(signal)
+                continue
+            dropped_buy_count += 1
+            if self._skip_logger is not None:
+                bar_ref = current_bars.get(signal.symbol)
+                self._skip_logger.log_skip(
+                    symbol=signal.symbol,
+                    skip_reason=skip_reason,
+                    hypothetical_entry_price=bar_ref.close if bar_ref is not None else None,
+                    signal_context=dict(signal.metadata) if signal.metadata else None,
+                )
+        if dropped_buy_count:
+            _first_bar = next(iter(current_bars.values()), None)
+            self._log.warning(
+                "engine.kill_switch_entries_blocked",
+                bar_timestamp=str(_first_bar.timestamp) if _first_bar is not None else None,
+                dropped_buy_count=dropped_buy_count,
+            )
+        return kept
 
     # ------------------------------------------------------------------
     # Strategy invocation

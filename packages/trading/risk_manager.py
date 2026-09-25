@@ -82,44 +82,152 @@ class DefaultRiskManager(BaseRiskManager):
         violation is *blocking*, the order is rejected.  If only *warnings*
         exist, the order is approved -- but ``adjusted_quantity`` may be
         reduced when the position-size concentration cap applies.
+
+        Side-aware exits (WP1.2)
+        -------------------------
+        A SELL that :meth:`BaseRiskManager.is_exposure_reducing` classifies
+        as exposure-reducing (``0 < quantity <= held``) bypasses gates 1-5
+        above: each becomes a non-blocking warning via
+        :meth:`BaseRiskManager._bypass` instead of rejecting the order, and
+        step 6 (order-size / concentration) is skipped entirely -- an exit
+        needs no notional cap (C24). A SELL that exceeds ``held`` (with
+        ``held > 0``) is clamped to ``min(quantity, held)`` -- a warning
+        (``sell_clamped_to_held``), not a block -- and is then treated as
+        reducing too. A SELL with ``held == 0`` is always blocked by the
+        new ``sell_without_position`` rule and runs through every gate
+        unchanged, exactly like a BUY. A SELL with ``quantity <= 0`` is
+        always blocked by ``invalid_quantity`` (WP12-S-01) -- never
+        clamped, since that would raise rather than lower the quantity;
+        this only matters for a caller that bypasses ``Order``'s own
+        ``gt=0`` validation (e.g. via ``model_copy``). Portfolio / cluster
+        exposure (5b) stays BUY-only, unchanged.
         """
         violations: list[RiskViolation] = []
 
+        held = self._held_for(order.symbol, open_positions)
+        reducing = self.is_exposure_reducing(order, open_positions)
+        adjusted_qty = order.quantity
+
+        if order.side == OrderSide.SELL and not reducing:
+            if order.quantity <= Decimal(0):
+                # WP12-S-01: a non-reducing SELL with quantity <= 0 must be
+                # rejected outright. The clamp below only ever LOWERS a
+                # quantity; treating quantity<=0 as "exceeds held" would
+                # instead RAISE it to `held`, breaking the "adjusted never
+                # exceeds requested" contract for a caller that bypasses
+                # Order's own `gt=0` validation (e.g. via `model_copy`).
+                violations.append(
+                    RiskViolation(
+                        rule="invalid_quantity",
+                        message=(
+                            f"invalid_quantity: SELL quantity {order.quantity} "
+                            f"for {order.symbol} is <= 0."
+                        ),
+                        blocking=True,
+                    )
+                )
+            elif held > Decimal(0):
+                # S3: SELL exceeds held. Clamp instead of reject -- a block
+                # here would reopen C6 through an edge case neither engine
+                # produces today. Treat the clamped order as reducing so it
+                # also bypasses gates 1-5 and the order-size check below.
+                # WP12-S-01: `min(...)` is defence in depth -- `quantity`
+                # is already known to be > held in this branch (`quantity
+                # > 0` and `not reducing`), so this is currently equivalent
+                # to `held`, but it can never raise the quantity even if
+                # that invariant is ever broken upstream.
+                adjusted_qty = min(order.quantity, held)
+                reducing = True
+                violations.append(
+                    RiskViolation(
+                        rule="sell_clamped_to_held",
+                        message=(
+                            f"sell_clamped_to_held: SELL quantity {order.quantity} "
+                            f"for {order.symbol} exceeds held {held}; clamped to "
+                            f"{adjusted_qty}."
+                        ),
+                        blocking=False,
+                    )
+                )
+                self._log.warning(
+                    "risk.sell_clamped_to_held",
+                    order_id=str(order.order_id),
+                    symbol=order.symbol,
+                    requested_qty=str(order.quantity),
+                    held=str(held),
+                    adjusted_qty=str(adjusted_qty),
+                )
+            else:
+                # S4: defence in depth -- a SELL with nothing held is always
+                # rejected. Not reducing, so every gate below still applies
+                # to it (including order-size), exactly like a BUY.
+                violations.append(
+                    RiskViolation(
+                        rule="sell_without_position",
+                        message=(
+                            f"sell_without_position: SELL rejected for "
+                            f"{order.symbol}: no held quantity (held=0)."
+                        ),
+                        blocking=True,
+                    )
+                )
+
+        bypassed_rules: list[str] = []
+
+        def _gate(gate_violation: RiskViolation | None) -> None:
+            if gate_violation is None:
+                return
+            if reducing and gate_violation.rule in self._ENTRY_ONLY_RULES:
+                bypassed_rules.append(gate_violation.rule)
+                violations.append(self._bypass(gate_violation))
+            else:
+                violations.append(gate_violation)
+
         # 1. Kill switch
-        v = self._check_kill_switch()
-        if v is not None:
-            violations.append(v)
+        _gate(self._check_kill_switch())
 
         # 2. Cooldown
-        v = self._check_cooldown()
-        if v is not None:
-            violations.append(v)
+        _gate(self._check_cooldown())
 
         # 3. Max open positions
-        v = self._check_max_positions(open_positions)
-        if v is not None:
-            violations.append(v)
+        _gate(self._check_max_positions(open_positions))
 
         # 4. Daily loss
-        v = self._check_daily_loss(daily_pnl, current_equity)
-        if v is not None:
-            violations.append(v)
+        _gate(self._check_daily_loss(daily_pnl, current_equity))
 
         # 5. Drawdown
-        v = self._check_drawdown(current_equity, peak_equity)
-        if v is not None:
-            violations.append(v)
+        _gate(self._check_drawdown(current_equity, peak_equity))
 
-        # 5b. Portfolio exposure
+        # 5b. Portfolio exposure (already BUY-only; unchanged by WP1.2)
         v = self._check_portfolio_exposure(order, current_equity, open_positions)
         if v is not None:
             violations.append(v)
 
-        # 6. Order size / concentration
-        order_violations, adjusted_qty = self._check_order_size(
-            order, current_equity, open_positions, market_price=market_price,
-        )
-        violations.extend(order_violations)
+        # 6. Order size / concentration. C24: a reducing SELL (including a
+        # clamped one) needs no notional cap and skips this step entirely;
+        # adjusted_qty was already set above (order.quantity, or `held` if
+        # clamped).
+        if not reducing:
+            order_violations, sized_qty = self._check_order_size(
+                order,
+                current_equity,
+                open_positions,
+                market_price=market_price,
+            )
+            violations.extend(order_violations)
+            adjusted_qty = sized_qty
+
+        if bypassed_rules:
+            self._log.warning(
+                "risk.exposure_reducing_bypass",
+                order_id=str(order.order_id),
+                symbol=order.symbol,
+                side=order.side.value,
+                requested_qty=str(order.quantity),
+                held=str(held),
+                adjusted_qty=str(adjusted_qty),
+                bypassed_rules=bypassed_rules,
+            )
 
         # ----- Partition into blocking / warning -----
         blocking = [v for v in violations if v.blocking]
@@ -139,6 +247,7 @@ class DefaultRiskManager(BaseRiskManager):
                 "risk.pre_trade_check.rejected",
                 order_id=str(order.order_id),
                 symbol=order.symbol,
+                side=order.side.value,
                 rejection_reasons=blocking_msgs,
                 warnings=warning_msgs,
             )
@@ -155,6 +264,7 @@ class DefaultRiskManager(BaseRiskManager):
             "risk.pre_trade_check.approved",
             order_id=str(order.order_id),
             symbol=order.symbol,
+            side=order.side.value,
             adjusted_quantity=str(adjusted_qty),
             warnings=warning_msgs,
         )

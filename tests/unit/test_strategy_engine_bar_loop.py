@@ -290,25 +290,56 @@ class TestProcessBar:
 
         mocks["risk_manager"].tick_cooldown.assert_called_once()
 
-    async def test_kill_switch_in_live_mode_returns_early(self) -> None:
+    async def test_kill_switch_live_drops_buy_forwards_sell_bracket_evaluated(
+        self,
+    ) -> None:
         """
-        In LIVE mode, when risk_manager.kill_switch_active is True, _process_bar()
-        must return before reaching strategy invocation and must NOT increment
-        bar_count.
-
-        The kill switch check comes after tick_cooldown but before bar_count
-        increment and strategy dispatch.
+        WP1.2 (D3/S6): rewritten from test_kill_switch_in_live_mode_returns_early
+        -- the kill switch no longer returns early. In LIVE mode with
+        risk_manager.kill_switch_active True, _process_bar() still calls
+        on_bar and increments bar_count; a BUY signal is dropped before it
+        reaches process_signal, a SELL signal is forwarded, and the
+        bracket-exit check (5a) still evaluates.
         """
         engine, mocks = _make_engine(run_mode=RunMode.LIVE)
         await engine.start("run-001")
         mocks["risk_manager"].kill_switch_active = True
         mocks["execution"].check_resting_orders = None
+        mocks["execution"].process_signal = AsyncMock(return_value=[])
+        mocks["portfolio"].get_position = MagicMock(return_value=None)
+
+        bracket = MagicMock()
+        bracket.requires_atr = False
+        bracket.check = MagicMock(return_value=None)
+        engine._bracket_exit = bracket
+
+        buy_signal = Signal(
+            strategy_id="test_strategy",
+            symbol="BTC/USDT",
+            direction=SignalDirection.BUY,
+            target_position=Decimal("100"),
+        )
+        sell_signal = Signal(
+            strategy_id="test_strategy",
+            symbol="BTC/USDT",
+            direction=SignalDirection.SELL,
+            target_position=Decimal("0"),
+        )
+        mocks["strategy"].on_bar = MagicMock(return_value=[buy_signal, sell_signal])
 
         bar = _make_bar()
         await engine._process_bar({"BTC/USDT": bar}, {"BTC/USDT": [bar]})
 
-        assert engine.bar_count == 0
-        mocks["strategy"].on_bar.assert_not_called()
+        assert engine.bar_count == 1
+        mocks["strategy"].on_bar.assert_called_once()
+
+        forwarded_signals = [
+            call.args[0] for call in mocks["execution"].process_signal.call_args_list
+        ]
+        assert sell_signal in forwarded_signals
+        assert buy_signal not in forwarded_signals
+
+        bracket.check.assert_called_once()
 
     async def test_kill_switch_in_paper_mode_does_not_skip(self) -> None:
         """
@@ -538,6 +569,92 @@ class TestProcessBar:
 
         assert mocks["execution"].process_signal.await_count == 2
         assert engine._total_signals == 2
+
+
+# ===========================================================================
+# WP1.2 (D3/S6): kill switch is an entry-only filter in every mode
+# ===========================================================================
+
+
+class TestKillSwitchEntryOnlyFilterAllModes:
+    """
+    WP1.2: with the kill switch active, in both LIVE and PAPER mode,
+    ``_process_bar()`` still calls ``on_bar`` and increments ``bar_count``;
+    only BUY signals are dropped (with a skip-log entry) before reaching
+    ``process_signal``; SELL signals are forwarded; the bracket-exit check
+    (5a) still evaluates.
+    """
+
+    @pytest.mark.parametrize("run_mode", [RunMode.LIVE, RunMode.PAPER])
+    async def test_on_bar_called_and_bar_count_increments(self, run_mode: RunMode) -> None:
+        engine, mocks = _make_engine(run_mode=run_mode)
+        await engine.start("run-001")
+        mocks["risk_manager"].kill_switch_active = True
+        mocks["execution"].check_resting_orders = None
+        mocks["strategy"].on_bar = MagicMock(return_value=[])
+
+        bar = _make_bar()
+        await engine._process_bar({"BTC/USDT": bar}, {"BTC/USDT": [bar]})
+
+        mocks["strategy"].on_bar.assert_called_once()
+        assert engine.bar_count == 1
+
+    @pytest.mark.parametrize("run_mode", [RunMode.LIVE, RunMode.PAPER])
+    async def test_buy_dropped_with_skip_log_sell_forwarded(self, run_mode: RunMode) -> None:
+        engine, mocks = _make_engine(run_mode=run_mode)
+        await engine.start("run-001")
+        mocks["risk_manager"].kill_switch_active = True
+        mocks["execution"].check_resting_orders = None
+        mocks["execution"].process_signal = AsyncMock(return_value=[])
+        mocks["portfolio"].get_position = MagicMock(return_value=None)
+
+        buy_signal = Signal(
+            strategy_id="test_strategy",
+            symbol="BTC/USDT",
+            direction=SignalDirection.BUY,
+            target_position=Decimal("100"),
+        )
+        sell_signal = Signal(
+            strategy_id="test_strategy",
+            symbol="BTC/USDT",
+            direction=SignalDirection.SELL,
+            target_position=Decimal("0"),
+        )
+        mocks["strategy"].on_bar = MagicMock(return_value=[buy_signal, sell_signal])
+
+        bar = _make_bar()
+        await engine._process_bar({"BTC/USDT": bar}, {"BTC/USDT": [bar]})
+
+        forwarded_signals = [
+            call.args[0] for call in mocks["execution"].process_signal.call_args_list
+        ]
+        assert sell_signal in forwarded_signals
+        assert buy_signal not in forwarded_signals
+
+        skipped = engine._skip_logger.get_all_skipped()
+        assert any(s.symbol == "BTC/USDT" and s.skip_reason == "kill_switch" for s in skipped), (
+            f"expected a kill_switch skip-log entry; got {skipped!r}"
+        )
+
+    @pytest.mark.parametrize("run_mode", [RunMode.LIVE, RunMode.PAPER])
+    async def test_bracket_exit_still_evaluated(self, run_mode: RunMode) -> None:
+        engine, mocks = _make_engine(run_mode=run_mode)
+        await engine.start("run-001")
+        mocks["risk_manager"].kill_switch_active = True
+        mocks["execution"].check_resting_orders = None
+        mocks["execution"].process_signal = AsyncMock(return_value=[])
+        mocks["portfolio"].get_position = MagicMock(return_value=None)
+        mocks["strategy"].on_bar = MagicMock(return_value=[])
+
+        bracket = MagicMock()
+        bracket.requires_atr = False
+        bracket.check = MagicMock(return_value=None)
+        engine._bracket_exit = bracket
+
+        bar = _make_bar()
+        await engine._process_bar({"BTC/USDT": bar}, {"BTC/USDT": [bar]})
+
+        bracket.check.assert_called_once()
 
 
 # ===========================================================================

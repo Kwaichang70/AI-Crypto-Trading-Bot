@@ -11,14 +11,24 @@ Design principles
 -----------------
 - All checks are additive: multiple rules can fail simultaneously.
   All failures are collected and returned in ``RiskCheckResult.rejection_reasons``.
-- The kill-switch is an emergency override that immediately blocks all orders.
+- The kill-switch is an emergency override that blocks all *new entries*.
 - Position sizing uses fixed-fractional Kelly criterion by default.
 - MVP: spot-only, max_leverage = 1 (no short positions).
+- WP1.2 (side-aware exits): a SELL that only reduces an existing position
+  (``is_exposure_reducing`` -- ``0 < quantity <= held``, derived solely from
+  the order and ``open_positions``, never from a caller flag) bypasses the
+  five entry-only gates (kill switch, cooldown, max open positions, daily
+  loss, drawdown) as non-blocking warnings, and skips the order-size /
+  notional check entirely. A SELL above ``held`` is clamped to ``held``
+  (warning, not a block) and then treated as reducing; a SELL with
+  ``held == 0`` is always rejected (``sell_without_position``). Portfolio /
+  cluster exposure stays BUY-only, unchanged.
 """
 
 from __future__ import annotations
 
 import abc
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
@@ -223,6 +233,21 @@ class BaseRiskManager(abc.ABC):
         Immutable risk parameters for this run.
     """
 
+    #: Rule names that only guard against *opening new risk*.  A SELL that
+    #: :meth:`is_exposure_reducing` classifies as exposure-reducing bypasses
+    #: exactly these five gates (WP1.2 / S2); everything else (portfolio
+    #: exposure, order-size / concentration) either stays BUY-only already
+    #: or is skipped for a different reason (see ``pre_trade_check``).
+    _ENTRY_ONLY_RULES: frozenset[str] = frozenset(
+        {
+            "kill_switch",
+            "loss_cooldown",
+            "max_open_positions",
+            "max_daily_loss",
+            "max_drawdown",
+        }
+    )
+
     def __init__(self, run_id: str, params: RiskParameters) -> None:
         self._run_id = run_id
         self._params = params
@@ -424,6 +449,63 @@ class BaseRiskManager(abc.ABC):
     def in_cooldown(self) -> bool:
         """True when the engine is in a post-loss cooldown period."""
         return self._cooldown_bars_remaining > 0
+
+    # ------------------------------------------------------------------
+    # Side-aware exits (WP1.2 / S1-S4)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _held_for(symbol: str, open_positions: Sequence[Position]) -> Decimal:
+        """Sum of ``quantity`` across all non-flat positions for ``symbol``."""
+        return sum(
+            (p.quantity for p in open_positions if p.symbol == symbol and not p.is_flat),
+            Decimal(0),
+        )
+
+    @staticmethod
+    def is_exposure_reducing(order: Order, open_positions: Sequence[Position]) -> bool:
+        """
+        True when ``order`` is a SELL that does not exceed the quantity
+        currently held for its symbol.
+
+        Reducing status is derived *only* from ``order`` and
+        ``open_positions`` -- never from a caller-supplied flag or
+        ``signal.metadata`` -- because a strategy could fake either of
+        those (WP12-R-01). ``held`` is the sum of ``quantity`` over every
+        non-flat position for ``order.symbol`` in ``open_positions``. A
+        SELL that exceeds ``held`` is NOT reducing by this definition; the
+        caller (``pre_trade_check``) clamps it to ``held`` instead of
+        rejecting it (S3) and treats the clamped order as reducing from
+        that point on.
+
+        Callers must pass at most one Position per symbol. ``_held_for``
+        sums every non-flat entry matching ``order.symbol``, so duplicate
+        entries for the same symbol would inflate ``held`` (WP12-S-02);
+        both engines already build ``open_positions`` from a dict keyed
+        by symbol, so this cannot happen through the production call
+        sites today.
+        """
+        if order.side != OrderSide.SELL or order.quantity <= Decimal(0):
+            return False
+        held = BaseRiskManager._held_for(order.symbol, open_positions)
+        return Decimal(0) < order.quantity <= held
+
+    def _bypass(self, v: RiskViolation) -> RiskViolation:
+        """
+        Downgrade an entry-only violation to a non-blocking warning.
+
+        Used for a SELL order that ``is_exposure_reducing`` (or the S3
+        clamp path) classifies as exposure-reducing: on spot with no
+        leverage such an order can only shrink risk, so it must never be
+        blocked by an entry-only gate. The rule name is preserved -- only
+        ``blocking`` flips and the message gets a prefix identifying it as
+        a bypass, so callers can still tell which gate was involved.
+        """
+        return RiskViolation(
+            rule=v.rule,
+            message=f"bypassed (exposure-reducing SELL): {v.message}",
+            blocking=False,
+        )
 
     # ------------------------------------------------------------------
     # Shared helper — used by concrete implementations

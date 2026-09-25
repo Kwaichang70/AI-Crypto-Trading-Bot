@@ -15,17 +15,24 @@ minimum-set (§4) require before any live run may restart. WP1.0 proved
 finding **C1** ("live-engine kan geen SELL uitvoeren") with 4 of these
 scenarios xfailing; WP1.1 (`reports/vp2-wp1.1/synthesis-spec.md`) fixes C1
 by wiring ``PortfolioAccounting`` in as the engine's
-``LivePositionSource`` (D1) and flips those 4 scenarios green:
+``LivePositionSource`` (D1) and flips those 4 scenarios green. WP1.2
+(`reports/vp2-wp1.2/synthesis-spec.md`) then fixes **C6** -- the kill
+switch now blocks new entries only (D3), in every mode, so protective
+exits (and strategy SELLs) keep running while it is active:
 
-    buy_only                        PASSES (proves harness validity)
-    sell_without_position_rejected  PASSES (SELL genuinely without a
-                                     position must always be rejected)
-    buy_then_stop_loss              PASSES (WP1.1)
-    buy_then_take_profit            PASSES (WP1.1)
-    buy_then_trailing_stop          PASSES (WP1.1)
-    buy_then_kill_switch            xfail -- C6 (WP1.2); C1 no longer applies
-    buy_restart_reconcile_stop_loss xfail -- I2/D15 by design (WP1.8)
-    external_holdings_not_sold      PASSES (WP1.1, R-21)
+    buy_only                                  PASSES (proves harness validity)
+    sell_without_position_rejected            PASSES (SELL genuinely without
+                                               a position must always be
+                                               rejected)
+    buy_then_stop_loss                        PASSES (WP1.1)
+    buy_then_take_profit                      PASSES (WP1.1)
+    buy_then_trailing_stop                    PASSES (WP1.1)
+    buy_then_kill_switch                      PASSES (WP1.2, C6 / D3)
+    kill_switch_blocks_new_buy                PASSES (WP1.2)
+    kill_switch_strategy_sell_passes          PASSES (WP1.2)
+    buy_then_max_open_positions_stop_loss     PASSES (WP1.2, S2/G2)
+    buy_restart_reconcile_stop_loss           xfail -- I2/D15 by design (WP1.8)
+    external_holdings_not_sold                PASSES (WP1.1, R-21)
 
 Two new WP1.1 scenarios cover R-22 (startup sync with an external balance
 never fabricates a position / false take-profit) and R-23 (the fake
@@ -39,12 +46,15 @@ I/O -- see the ``_fast_sleep`` fixture and ``FakeCCXTExchange``).
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 from decimal import Decimal
+from typing import Any
 
 import pytest
 from structlog.testing import capture_logs
 
-from common.types import TimeFrame
+from common.models import MultiTimeframeContext, OHLCVBar
+from common.types import SignalDirection, TimeFrame
 from tests.integration.fakes.fake_ccxt_exchange import FakeCCXTExchange
 from tests.integration.fakes.live_harness import (
     LiveStack,
@@ -54,6 +64,9 @@ from tests.integration.fakes.live_harness import (
     step_bar,
 )
 from tests.integration.fakes.scripted_strategy import ScriptedSignalStrategy
+from trading.models import Signal
+from trading.risk import RiskParameters
+from trading.strategy import BaseStrategy, StrategyMetadata
 
 # ---------------------------------------------------------------------------
 # Fixed scenario constants -- deterministic, no randomness, no wall clock.
@@ -95,6 +108,74 @@ def _approx_eq(a: Decimal, b: Decimal, tol: Decimal = _QTY_TOLERANCE) -> bool:
     round-trip and are compared with exact equality instead.
     """
     return abs(a - b) <= tol
+
+
+class _ScriptedSequenceStrategy(BaseStrategy):
+    """WP1.2 harness-only strategy: emits one scripted signal per entry in
+    ``schedule``, HOLD otherwise.
+
+    ``ScriptedSignalStrategy`` (WP1.0) fires exactly one signal per
+    instance for its whole life, which is enough for every "one BUY, then
+    a protective manager exits it" scenario. The WP1.2 kill-switch
+    scenarios need more than that: a strategy-originated SELL (not a
+    bracket/trailing exit) arriving *after* the switch is already active,
+    or a second BUY attempt on a later bar to prove it gets dropped. This
+    class scripts an arbitrary sequence of (call_index, direction,
+    target_notional) triples instead of just one.
+
+    Params
+    ------
+    schedule:
+        Sequence of ``(call_index, direction, target_notional)`` triples.
+        ``call_index`` is 0-based over post-warmup ``on_bar`` calls (same
+        convention as ``ScriptedSignalStrategy``). ``direction`` is
+        ``"buy"`` or ``"sell"``; ``target_notional`` is ignored for
+        ``"sell"`` (fixed at ``"0"``, i.e. full-close), matching how the
+        real bracket/trailing managers emit their exit signals.
+    """
+
+    metadata = StrategyMetadata(
+        name="wp12_scripted_sequence_test_strategy",
+        description=(
+            "WP1.2 harness-only: emits a caller-scripted sequence of "
+            "BUY/SELL signals, HOLD otherwise."
+        ),
+        tags=["test-only"],
+    )
+
+    def __init__(self, strategy_id: str, params: dict[str, Any] | None = None) -> None:
+        super().__init__(strategy_id, params)
+        self._schedule: dict[int, tuple[SignalDirection, Decimal]] = {
+            int(call_index): (SignalDirection(direction), Decimal(str(target_notional)))
+            for call_index, direction, target_notional in self._params.get("schedule", [])
+        }
+        self._call_count = -1
+
+    @property
+    def min_bars_required(self) -> int:
+        return 1
+
+    def on_bar(
+        self,
+        bars: Sequence[OHLCVBar],
+        *,
+        mtf_context: MultiTimeframeContext | None = None,
+    ) -> list[Signal]:
+        self._call_count += 1
+        if not bars or self._call_count not in self._schedule:
+            return []
+        direction, target_notional = self._schedule[self._call_count]
+        symbol = bars[-1].symbol
+        target = Decimal("0") if direction == SignalDirection.SELL else target_notional
+        return [
+            Signal(
+                strategy_id=self.strategy_id,
+                symbol=symbol,
+                direction=direction,
+                target_position=target,
+                confidence=1.0,
+            )
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +231,7 @@ async def _build_and_warm(
     *,
     engine_config: dict[str, object] | None = None,
     run_id: str = "wp10-test-run",
+    risk_params: RiskParameters | None = None,
 ) -> LiveStack:
     stack = await build_live_stack(
         exchange=exchange,
@@ -159,6 +241,7 @@ async def _build_and_warm(
         initial_capital=INITIAL_CAPITAL,
         run_id=run_id,
         engine_config=engine_config,
+        risk_params=risk_params,
     )
     await start_and_warmup(stack, run_id)
     return stack
@@ -317,52 +400,161 @@ async def test_buy_then_trailing_stop(exchange: FakeCCXTExchange) -> None:
 
 
 # ---------------------------------------------------------------------------
-# buy_then_kill_switch -- still xfail: C6 (WP1.2). WP1.1 fixed C1, but the
-# kill-switch early-return in LIVE mode (before the bracket/trailing
-# sections even run) is unchanged and is out of this WP's scope.
+# buy_then_kill_switch -- WP1.2 (C6, D3) fixes this: the kill switch blocks
+# new entries only, in every mode; protective exits (bracket, trailing,
+# strategy SELLs) keep running. A BUY attempted on the same bar the
+# stop-loss breaches is dropped (engine.kill_switch_entries_blocked) while
+# the stop-loss SELL still fills.
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "C6 (Verbeterplan v2 WP1.2): in LIVE mode, StrategyEngine._process_bar "
-        "returns immediately when the kill switch is active (before the "
-        "bracket/trailing sections run at all), so a protective stop-loss "
-        "is never even evaluated while the switch is on -- target semantics "
-        "per plan decision D3 is 'block new entries, protective exits keep "
-        "running'. C1 (WP1.1) is fixed: the resulting SELL would now reach "
-        "the exchange if the bracket/trailing sections ran, but they never "
-        "get the chance to. Fixed by WP1.2."
-    ),
-)
-async def test_buy_then_kill_switch_blocks_protective_exit(exchange: FakeCCXTExchange) -> None:
-    strategy = ScriptedSignalStrategy("buy-kill-switch", _buy_params())
+async def test_buy_then_kill_switch_protective_exit_still_fires(
+    exchange: FakeCCXTExchange,
+) -> None:
+    strategy = _ScriptedSequenceStrategy(
+        "buy-kill-switch",
+        {
+            "schedule": [
+                (0, "buy", str(TARGET_NOTIONAL)),
+                (1, "buy", str(TARGET_NOTIONAL)),
+            ]
+        },
+    )
     stack = await _build_and_warm(exchange, strategy, engine_config={"bracket_stop_loss_pct": 0.05})
 
     await step_bar(stack, SYMBOL, START_PRICE, timeframe=TIMEFRAME_STR)
     position_after_buy = stack.portfolio.get_position(SYMBOL)
     assert position_after_buy is not None and not position_after_buy.is_flat
+    bought_qty = exchange.order_log[-1]["amount"]
 
-    stack.risk_manager.trigger_kill_switch("wp10-harness-test")
+    stack.risk_manager.trigger_kill_switch("wp12-harness-test")
 
     breach_price = START_PRICE * Decimal("0.80")
     with capture_logs() as cap:
         await step_bar(stack, SYMBOL, breach_price, timeframe=TIMEFRAME_STR)
 
-    skip_events = [e for e in cap if e.get("event") == "engine.bar_skipped_kill_switch"]
-    assert skip_events, (
-        "expected _process_bar to log engine.bar_skipped_kill_switch and "
-        f"return before evaluating the bracket exit (C6); got: {cap!r}"
+    blocked_events = [e for e in cap if e.get("event") == "engine.kill_switch_entries_blocked"]
+    assert blocked_events, (
+        "expected the second BUY attempt to be dropped as "
+        f"engine.kill_switch_entries_blocked while the switch is active; got {cap!r}"
     )
 
     sell_orders = [o for o in exchange.order_log if o["side"] == "sell"]
     assert sell_orders, (
         "expected the protective stop-loss to still exit while the kill "
-        "switch blocks new entries (D3 / WP1.2); today the bracket/trailing "
-        "sections are never reached at all while the kill switch is active "
-        "(C6), so the stop-loss is never evaluated."
+        "switch blocks new entries (D3 / WP1.2)"
     )
+    assert sell_orders[-1]["amount"] == bought_qty
+
+    position_after_breach = stack.portfolio.get_position(SYMBOL)
+    assert position_after_breach is not None and position_after_breach.is_flat
+
+    assert stack.risk_manager.kill_switch_active is True, "the latch must stay active"
+
+    buy_orders = [o for o in exchange.order_log if o["side"] == "buy"]
+    assert len(buy_orders) == 1, "the second BUY attempt must never reach the exchange"
+
+    await stack.engine.stop()
+
+
+# ---------------------------------------------------------------------------
+# kill_switch_blocks_new_buy -- a BUY attempted while the switch is already
+# active (before any position exists) never reaches the exchange.
+# ---------------------------------------------------------------------------
+
+
+async def test_kill_switch_blocks_new_buy(exchange: FakeCCXTExchange) -> None:
+    strategy = ScriptedSignalStrategy("kill-switch-blocks-buy", _buy_params())
+    stack = await _build_and_warm(exchange, strategy)
+    stack.risk_manager.trigger_kill_switch("wp12-harness-test")
+
+    with capture_logs() as cap:
+        await step_bar(stack, SYMBOL, START_PRICE, timeframe=TIMEFRAME_STR)
+
+    blocked_events = [e for e in cap if e.get("event") == "engine.kill_switch_entries_blocked"]
+    assert blocked_events, f"expected the BUY to be dropped; got {cap!r}"
+
+    assert exchange.order_log == [], "no order may reach the exchange while entries are blocked"
+    position = stack.portfolio.get_position(SYMBOL)
+    assert position is None or position.is_flat
+
+    await stack.engine.stop()
+
+
+# ---------------------------------------------------------------------------
+# kill_switch_strategy_sell_passes -- a strategy-originated SELL (not a
+# bracket/trailing exit) still reaches the exchange while the switch blocks
+# entries (D3): the side-aware gate is not limited to protective managers.
+# ---------------------------------------------------------------------------
+
+
+async def test_kill_switch_strategy_sell_passes(exchange: FakeCCXTExchange) -> None:
+    strategy = _ScriptedSequenceStrategy(
+        "kill-switch-strategy-sell",
+        {"schedule": [(0, "buy", str(TARGET_NOTIONAL)), (2, "sell", "0")]},
+    )
+    stack = await _build_and_warm(exchange, strategy)
+
+    await step_bar(stack, SYMBOL, START_PRICE, timeframe=TIMEFRAME_STR)
+    bought_qty = exchange.order_log[-1]["amount"]
+    position_after_buy = stack.portfolio.get_position(SYMBOL)
+    assert position_after_buy is not None and not position_after_buy.is_flat
+
+    stack.risk_manager.trigger_kill_switch("wp12-harness-test")
+
+    # bar1: HOLD (call_count == 1) -- lets the switch settle before the
+    # strategy SELL is due at call_count == 2.
+    await step_bar(stack, SYMBOL, START_PRICE, timeframe=TIMEFRAME_STR)
+
+    with capture_logs() as cap:
+        await step_bar(stack, SYMBOL, START_PRICE, timeframe=TIMEFRAME_STR)
+
+    sell_orders = [o for o in exchange.order_log if o["side"] == "sell"]
+    assert sell_orders, f"expected the strategy SELL to reach the exchange; got {cap!r}"
+    assert sell_orders[-1]["amount"] == bought_qty
+
+    position_after_sell = stack.portfolio.get_position(SYMBOL)
+    assert position_after_sell is not None and position_after_sell.is_flat
+
+    assert stack.risk_manager.kill_switch_active is True, "the latch must stay active"
+
+    await stack.engine.stop()
+
+
+# ---------------------------------------------------------------------------
+# buy_then_max_open_positions_stop_loss -- with max_open_positions=1 already
+# saturated by the bot's own position, the exposure-reducing stop-loss SELL
+# must not be blocked by that same gate (S2 / G2).
+# ---------------------------------------------------------------------------
+
+
+async def test_buy_then_max_open_positions_stop_loss(exchange: FakeCCXTExchange) -> None:
+    strategy = ScriptedSignalStrategy("buy-max-open-positions", _buy_params())
+    stack = await _build_and_warm(
+        exchange,
+        strategy,
+        engine_config={"bracket_stop_loss_pct": 0.05},
+        risk_params=RiskParameters(max_open_positions=1),
+    )
+
+    await step_bar(stack, SYMBOL, START_PRICE, timeframe=TIMEFRAME_STR)
+    position_after_buy = stack.portfolio.get_position(SYMBOL)
+    assert position_after_buy is not None and not position_after_buy.is_flat
+    bought_qty = exchange.order_log[-1]["amount"]
+
+    breach_price = START_PRICE * Decimal("0.80")
+    with capture_logs() as cap:
+        await step_bar(stack, SYMBOL, breach_price, timeframe=TIMEFRAME_STR)
+
+    sell_orders = [o for o in exchange.order_log if o["side"] == "sell"]
+    assert sell_orders, (
+        "expected the stop-loss SELL to fill despite max_open_positions=1 "
+        f"already being saturated by the bot's own position; captured logs: {cap!r}"
+    )
+    assert sell_orders[-1]["amount"] == bought_qty
+
+    position_after_breach = stack.portfolio.get_position(SYMBOL)
+    assert position_after_breach is not None and position_after_breach.is_flat
 
     await stack.engine.stop()
 

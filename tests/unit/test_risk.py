@@ -36,6 +36,8 @@ Test coverage  (48 tests total)
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from uuid import uuid4
@@ -146,8 +148,11 @@ def _make_position(
 class TestKillSwitch:
     """Tests for kill-switch activation and reset."""
 
-    def test_kill_switch_blocks_all_orders(self) -> None:
-        """After triggering the kill switch, pre_trade_check rejects everything."""
+    def test_kill_switch_blocks_buy_orders(self) -> None:
+        """WP1.2: renamed from test_kill_switch_blocks_all_orders -- the
+        kill switch only blocks entries now (D3). This still passes
+        because ``_make_limit_order``'s default side is BUY, which is
+        always blocked while the switch is active."""
         manager = _make_manager()
         manager.trigger_kill_switch("test halt")
         order = _make_limit_order()
@@ -1033,6 +1038,470 @@ class TestMultipleSimultaneousViolations:
 
 
 # ===========================================================================
+# WP1.2: side-aware entry-only gates
+#
+# The five entry-only gates (kill switch, cooldown, max_open_positions,
+# daily_loss, drawdown) must block every BUY but bypass a SELL that
+# reduces the position held for its symbol (S2-S4, G1/G2).
+# ===========================================================================
+
+_HELD_SYMBOL = "BTC/USDT"
+_HELD_QTY = Decimal("0.1")
+_HELD_PRICE = Decimal("50000")
+
+
+@dataclass(frozen=True)
+class _GateCase:
+    """One entry-only gate, parametrized for ``TestSideAwareGates``."""
+
+    gate_id: str
+    rejection_substr: str  # lowercase substring expected in the rule's message
+    build_manager: Callable[[], DefaultRiskManager]
+    current_equity: Decimal
+    daily_pnl: Decimal
+    peak_equity: Decimal
+
+
+def _kill_switch_case() -> _GateCase:
+    def _build() -> DefaultRiskManager:
+        manager = _make_manager()
+        manager.trigger_kill_switch("wp1.2 gate test")
+        return manager
+
+    return _GateCase(
+        gate_id="kill_switch",
+        rejection_substr="kill switch",
+        build_manager=_build,
+        current_equity=Decimal("10000"),
+        daily_pnl=Decimal("0"),
+        peak_equity=Decimal("10000"),
+    )
+
+
+def _loss_cooldown_case() -> _GateCase:
+    def _build() -> DefaultRiskManager:
+        manager = _make_manager(cooldown_after_loss_streak=5, loss_streak_count=1)
+        manager.update_after_fill(Decimal("-1"), is_loss=True)
+        assert manager.in_cooldown is True
+        return manager
+
+    return _GateCase(
+        gate_id="loss_cooldown",
+        rejection_substr="cooldown",
+        build_manager=_build,
+        current_equity=Decimal("10000"),
+        daily_pnl=Decimal("0"),
+        peak_equity=Decimal("10000"),
+    )
+
+
+def _max_open_positions_case() -> _GateCase:
+    def _build() -> DefaultRiskManager:
+        return _make_manager(max_open_positions=1)
+
+    return _GateCase(
+        gate_id="max_open_positions",
+        rejection_substr="max open positions",
+        build_manager=_build,
+        current_equity=Decimal("10000"),
+        daily_pnl=Decimal("0"),
+        peak_equity=Decimal("10000"),
+    )
+
+
+def _max_daily_loss_case() -> _GateCase:
+    def _build() -> DefaultRiskManager:
+        return _make_manager(max_daily_loss_pct=0.05)
+
+    return _GateCase(
+        gate_id="max_daily_loss",
+        rejection_substr="daily loss",
+        build_manager=_build,
+        current_equity=Decimal("10000"),
+        daily_pnl=Decimal("-1000"),  # exceeds -500 (5% of 10000) threshold
+        peak_equity=Decimal("10000"),
+    )
+
+
+def _max_drawdown_case() -> _GateCase:
+    def _build() -> DefaultRiskManager:
+        return _make_manager(max_drawdown_pct=0.10)
+
+    return _GateCase(
+        gate_id="max_drawdown",
+        rejection_substr="drawdown",
+        build_manager=_build,
+        current_equity=Decimal("8000"),
+        daily_pnl=Decimal("0"),
+        peak_equity=Decimal("10000"),  # 20% drawdown >= 10% limit
+    )
+
+
+_GATE_CASES: list[_GateCase] = [
+    _kill_switch_case(),
+    _loss_cooldown_case(),
+    _max_open_positions_case(),
+    _max_daily_loss_case(),
+    _max_drawdown_case(),
+]
+
+
+class TestSideAwareGates:
+    """
+    WP1.2 (S2-S4, G1/G2): parametrized over the five entry-only gates.
+
+    Each gate case (``_GATE_CASES``) is a manager with exactly that one
+    gate tripped, plus a held BTC/USDT position (0.1 @ 50 000) that both
+    the BUY and SELL orders in these tests reference:
+        - a BUY is rejected, and the rejection message names the gate;
+        - a SELL of exactly ``held`` is approved with
+          ``adjusted_quantity == held`` and a matching bypass warning;
+        - a partial SELL (below ``held``) is approved unchanged.
+    """
+
+    @pytest.mark.parametrize("case", _GATE_CASES, ids=lambda c: c.gate_id)
+    def test_buy_rejected_by_gate(self, case: _GateCase) -> None:
+        manager = case.build_manager()
+        held_position = _make_position(
+            symbol=_HELD_SYMBOL,
+            quantity=_HELD_QTY,
+            current_price=_HELD_PRICE,
+        )
+        order = _make_limit_order(
+            symbol=_HELD_SYMBOL,
+            side=OrderSide.BUY,
+            quantity=Decimal("0.01"),
+            price=_HELD_PRICE,
+        )
+        result = manager.pre_trade_check(
+            order=order,
+            current_equity=case.current_equity,
+            open_positions=[held_position],
+            daily_pnl=case.daily_pnl,
+            peak_equity=case.peak_equity,
+        )
+        assert result.approved is False, f"[{case.gate_id}] BUY must be rejected"
+        assert any(case.rejection_substr in r.lower() for r in result.rejection_reasons), (
+            f"[{case.gate_id}] expected '{case.rejection_substr}' in {result.rejection_reasons}"
+        )
+
+    @pytest.mark.parametrize("case", _GATE_CASES, ids=lambda c: c.gate_id)
+    def test_full_sell_of_held_bypasses_gate(self, case: _GateCase) -> None:
+        manager = case.build_manager()
+        held_position = _make_position(
+            symbol=_HELD_SYMBOL,
+            quantity=_HELD_QTY,
+            current_price=_HELD_PRICE,
+        )
+        order = _make_limit_order(
+            symbol=_HELD_SYMBOL,
+            side=OrderSide.SELL,
+            quantity=_HELD_QTY,
+            price=_HELD_PRICE,
+        )
+        result = manager.pre_trade_check(
+            order=order,
+            current_equity=case.current_equity,
+            open_positions=[held_position],
+            daily_pnl=case.daily_pnl,
+            peak_equity=case.peak_equity,
+        )
+        assert result.approved is True, (
+            f"[{case.gate_id}] a SELL of exactly `held` must bypass this "
+            f"gate; rejection_reasons={result.rejection_reasons}"
+        )
+        assert result.adjusted_quantity == _HELD_QTY
+        assert any(
+            case.rejection_substr in w.lower() and "bypassed" in w.lower() for w in result.warnings
+        ), f"[{case.gate_id}] expected a bypass warning; got {result.warnings}"
+
+    @pytest.mark.parametrize("case", _GATE_CASES, ids=lambda c: c.gate_id)
+    def test_partial_sell_bypasses_gate(self, case: _GateCase) -> None:
+        manager = case.build_manager()
+        held_position = _make_position(
+            symbol=_HELD_SYMBOL,
+            quantity=_HELD_QTY,
+            current_price=_HELD_PRICE,
+        )
+        partial_qty = _HELD_QTY / 2
+        order = _make_limit_order(
+            symbol=_HELD_SYMBOL,
+            side=OrderSide.SELL,
+            quantity=partial_qty,
+            price=_HELD_PRICE,
+        )
+        result = manager.pre_trade_check(
+            order=order,
+            current_equity=case.current_equity,
+            open_positions=[held_position],
+            daily_pnl=case.daily_pnl,
+            peak_equity=case.peak_equity,
+        )
+        assert result.approved is True, (
+            f"[{case.gate_id}] a partial reducing SELL must bypass this "
+            f"gate; rejection_reasons={result.rejection_reasons}"
+        )
+        assert result.adjusted_quantity == partial_qty
+
+
+class TestAllSideAwareGatesSimultaneously:
+    """WP1.2: with all five entry-only gates tripped at once, a BUY lists
+    all five as rejection reasons, while a SELL of the held quantity is
+    approved with all five appearing only as bypass warnings."""
+
+    _GATE_SUBSTRINGS = (
+        "kill switch",
+        "cooldown",
+        "max open positions",
+        "daily loss",
+        "drawdown",
+    )
+
+    def _tripped_manager(self) -> DefaultRiskManager:
+        manager = _make_manager(
+            max_open_positions=1,
+            max_daily_loss_pct=0.05,
+            max_drawdown_pct=0.10,
+            cooldown_after_loss_streak=5,
+            loss_streak_count=1,
+        )
+        manager.trigger_kill_switch("all gates test")
+        manager.update_after_fill(Decimal("-1"), is_loss=True)
+        assert manager.in_cooldown is True
+        return manager
+
+    def test_buy_lists_all_five_reasons(self) -> None:
+        manager = self._tripped_manager()
+        held_position = _make_position(
+            symbol=_HELD_SYMBOL,
+            quantity=_HELD_QTY,
+            current_price=_HELD_PRICE,
+        )
+        order = _make_limit_order(
+            symbol=_HELD_SYMBOL,
+            side=OrderSide.BUY,
+            quantity=Decimal("0.01"),
+            price=_HELD_PRICE,
+        )
+        result = manager.pre_trade_check(
+            order=order,
+            current_equity=Decimal("8000"),
+            open_positions=[held_position],
+            daily_pnl=Decimal("-1000"),
+            peak_equity=Decimal("10000"),
+        )
+        assert result.approved is False
+        reasons_lower = " | ".join(result.rejection_reasons).lower()
+        for substr in self._GATE_SUBSTRINGS:
+            assert substr in reasons_lower, (
+                f"expected '{substr}' among rejection_reasons: {result.rejection_reasons}"
+            )
+
+    def test_sell_of_held_approved_with_all_five_bypassed(self) -> None:
+        manager = self._tripped_manager()
+        held_position = _make_position(
+            symbol=_HELD_SYMBOL,
+            quantity=_HELD_QTY,
+            current_price=_HELD_PRICE,
+        )
+        order = _make_limit_order(
+            symbol=_HELD_SYMBOL,
+            side=OrderSide.SELL,
+            quantity=_HELD_QTY,
+            price=_HELD_PRICE,
+        )
+        result = manager.pre_trade_check(
+            order=order,
+            current_equity=Decimal("8000"),
+            open_positions=[held_position],
+            daily_pnl=Decimal("-1000"),
+            peak_equity=Decimal("10000"),
+        )
+        assert result.approved is True, result.rejection_reasons
+        assert result.adjusted_quantity == _HELD_QTY
+        warnings_lower = " | ".join(result.warnings).lower()
+        for substr in self._GATE_SUBSTRINGS:
+            assert substr in warnings_lower, (
+                f"expected bypassed '{substr}' among warnings: {result.warnings}"
+            )
+
+    def test_kill_switch_active_survives_bypass(self) -> None:
+        """WP1.2: bypassing the kill switch for a reducing SELL must not
+        clear the latch -- ``kill_switch_active`` stays True (G5)."""
+        manager = self._tripped_manager()
+        held_position = _make_position(
+            symbol=_HELD_SYMBOL,
+            quantity=_HELD_QTY,
+            current_price=_HELD_PRICE,
+        )
+        order = _make_limit_order(
+            symbol=_HELD_SYMBOL,
+            side=OrderSide.SELL,
+            quantity=_HELD_QTY,
+            price=_HELD_PRICE,
+        )
+        result = manager.pre_trade_check(
+            order=order,
+            current_equity=Decimal("8000"),
+            open_positions=[held_position],
+            daily_pnl=Decimal("-1000"),
+            peak_equity=Decimal("10000"),
+        )
+        assert result.approved is True
+        assert manager.kill_switch_active is True
+
+
+class TestSellWithoutPosition:
+    """WP1.2 (S4/G3): a SELL with ``held == 0`` is always rejected by the
+    new ``sell_without_position`` rule -- whether the book is flat or the
+    bot holds a different symbol entirely."""
+
+    def test_flat_book_rejected(self) -> None:
+        manager = _make_manager()
+        order = _make_limit_order(
+            symbol=_HELD_SYMBOL,
+            side=OrderSide.SELL,
+            quantity=Decimal("0.1"),
+            price=_HELD_PRICE,
+        )
+        result = manager.pre_trade_check(
+            order=order,
+            current_equity=Decimal("10000"),
+            open_positions=[],
+            daily_pnl=Decimal("0"),
+            peak_equity=Decimal("10000"),
+        )
+        assert result.approved is False
+        assert any("sell_without_position" in r.lower() for r in result.rejection_reasons), (
+            result.rejection_reasons
+        )
+
+    def test_holding_different_symbol_rejected(self) -> None:
+        manager = _make_manager()
+        other_position = _make_position(
+            symbol="ETH/USDT",
+            quantity=Decimal("1"),
+            current_price=Decimal("3000"),
+        )
+        order = _make_limit_order(
+            symbol=_HELD_SYMBOL,
+            side=OrderSide.SELL,
+            quantity=Decimal("0.1"),
+            price=_HELD_PRICE,
+        )
+        result = manager.pre_trade_check(
+            order=order,
+            current_equity=Decimal("10000"),
+            open_positions=[other_position],
+            daily_pnl=Decimal("0"),
+            peak_equity=Decimal("10000"),
+        )
+        assert result.approved is False
+        assert any("sell_without_position" in r.lower() for r in result.rejection_reasons), (
+            result.rejection_reasons
+        )
+
+
+class TestSellClampedToHeld:
+    """WP1.2 (S3/G2): a SELL above ``held`` (with ``held > 0``) is clamped
+    to ``held`` instead of rejected, with a non-blocking warning."""
+
+    def test_clamp_case(self) -> None:
+        manager = _make_manager()
+        held_position = _make_position(
+            symbol=_HELD_SYMBOL,
+            quantity=Decimal("0.2"),
+            current_price=_HELD_PRICE,
+        )
+        order = _make_limit_order(
+            symbol=_HELD_SYMBOL,
+            side=OrderSide.SELL,
+            quantity=Decimal("0.5"),
+            price=_HELD_PRICE,
+        )
+        result = manager.pre_trade_check(
+            order=order,
+            current_equity=Decimal("10000"),
+            open_positions=[held_position],
+            daily_pnl=Decimal("0"),
+            peak_equity=Decimal("10000"),
+        )
+        assert result.approved is True, result.rejection_reasons
+        assert result.adjusted_quantity == Decimal("0.2")
+        assert any("sell_clamped_to_held" in w.lower() for w in result.warnings), result.warnings
+
+
+class TestInvalidQuantitySell:
+    """WP1.2 (WP12-S-01, security round 2): a non-reducing SELL whose
+    quantity is <= 0 must be rejected as ``invalid_quantity`` -- never
+    clamped up to ``held``. ``Order.quantity`` has ``gt=0`` at
+    construction, so this can only be reached via ``model_copy``, which
+    skips validation; the risk manager must still hold the line."""
+
+    def test_zero_quantity_sell_rejected_not_raised_to_held(self) -> None:
+        manager = _make_manager()
+        held_position = _make_position(
+            symbol=_HELD_SYMBOL,
+            quantity=Decimal("0.7"),
+            current_price=_HELD_PRICE,
+        )
+        valid_order = _make_limit_order(
+            symbol=_HELD_SYMBOL,
+            side=OrderSide.SELL,
+            quantity=Decimal("0.1"),
+            price=_HELD_PRICE,
+        )
+        order = valid_order.model_copy(update={"quantity": Decimal("0")})
+
+        result = manager.pre_trade_check(
+            order=order,
+            current_equity=Decimal("10000"),
+            open_positions=[held_position],
+            daily_pnl=Decimal("0"),
+            peak_equity=Decimal("10000"),
+        )
+        assert result.approved is False, (
+            "a SELL of quantity 0 must be rejected, not clamped up to held"
+        )
+        assert any("invalid_quantity" in r.lower() for r in result.rejection_reasons), (
+            result.rejection_reasons
+        )
+        # G2/WP12-S-01: adjusted_quantity must never exceed the requested
+        # quantity (0), regardless of how much is held.
+        assert result.adjusted_quantity <= order.quantity
+        assert result.adjusted_quantity == Decimal("0")
+
+
+class TestReducingSellWithUnknownPrice:
+    """WP1.2 (C24): a reducing SELL needs no price at all -- price
+    resolution only happens inside the order-size check, which is skipped
+    entirely for a reducing SELL."""
+
+    def test_market_sell_with_no_resolvable_price_is_approved(self) -> None:
+        manager = _make_manager()
+        held_position = _make_position(
+            symbol=_HELD_SYMBOL,
+            quantity=_HELD_QTY,
+            current_price=Decimal("0"),
+        )
+        order = _make_market_order(
+            symbol=_HELD_SYMBOL,
+            side=OrderSide.SELL,
+            quantity=_HELD_QTY,
+        )
+        result = manager.pre_trade_check(
+            order=order,
+            current_equity=Decimal("10000"),
+            open_positions=[held_position],
+            daily_pnl=Decimal("0"),
+            peak_equity=Decimal("10000"),
+            market_price=None,
+        )
+        assert result.approved is True, result.rejection_reasons
+        assert result.adjusted_quantity == _HELD_QTY
+
+
+# ===========================================================================
 # RiskParameters validation (new coverage)
 # ===========================================================================
 
@@ -1248,31 +1717,35 @@ class TestSellOrderConcentrationBypass:
             f"got: {result.rejection_reasons}"
         )
 
-    def test_sell_still_checked_by_notional_cap(self) -> None:
+    def test_reducing_sell_not_capped_by_notional(self) -> None:
         """
-        SELL orders bypass the concentration cap (section b) but are still
-        subject to the absolute notional cap (section a).
+        WP1.2 (S3/C24): a SELL that exceeds ``held`` is clamped to ``held``
+        and treated as exposure-reducing -- it is NOT blocked by the
+        absolute notional cap, because a reducing SELL skips order-size
+        checking entirely.
 
-        With max_order_size_quote = 0.000000001 USDT (1 nano-USDT) any
-        meaningful SELL quantity has its notional value quantized down to
-        zero at 8 decimal places, which triggers the blocking path in
-        section a (lines 307-323 of risk_manager.py).
+        Before WP1.2 this test asserted the opposite (SELL still blocked
+        by the notional cap): 0.5 BTC vs. 0.2 BTC held used to be treated
+        as "not reducing" (qty > held), so it fell through to the ordinary
+        order-size path, where max_order_size_quote=1 nano-USDT quantizes
+        the capped quantity down to zero -- a blocking rejection. Under
+        S3, the same order is now clamped to held (0.2) and treated as
+        reducing, so order-size is skipped and it is approved instead.
 
         Setup:
             equity              = 100 000 USDT
             max_order_size_quote = 0.000000001 USDT  (1 nano-USDT)
+            existing position   = 0.2 BTC @ 50 000  (held = 0.2)
             order               = SELL 0.5 BTC @ 50 000  (25 000 USDT notional)
-        Expected: approved=False, rejection contains notional-cap language.
-
-        This confirms section a still runs for SELL orders, preserving the
-        absolute order-size safety net regardless of direction.
+        Expected: approved=True, adjusted_quantity == 0.2 (held), with a
+        ``sell_clamped_to_held`` warning -- no notional-cap rejection.
         """
         manager = _make_manager(
             max_position_size_pct=self._CAP_PCT,
             max_order_size_quote=Decimal("0.000000001"),  # 1 nano-USDT: forces qty to 0
             max_open_positions=5,
         )
-        existing = self._make_position_at_cap()
+        existing = self._make_position_at_cap()  # 0.2 BTC held
         order = _make_limit_order(
             symbol="BTC/USDT",
             side=OrderSide.SELL,
@@ -1286,18 +1759,77 @@ class TestSellOrderConcentrationBypass:
             daily_pnl=Decimal("0"),
             peak_equity=self._PEAK,
         )
-        assert result.approved is False, (
-            "SELL order must be blocked by the notional cap when "
-            "max_order_size_quote forces quantity to zero"
+        assert result.approved is True, (
+            f"reducing SELL must not be blocked by the notional cap "
+            f"(order-size is skipped for it entirely); "
+            f"rejection_reasons={result.rejection_reasons}"
         )
-        assert any(
-            "max_order_size" in r.lower()
-            or "notional" in r.lower()
-            or "cannot be reduced" in r.lower()
-            for r in result.rejection_reasons
-        ), (
-            f"Expected notional-cap blocking reason for SELL, "
-            f"got: {result.rejection_reasons}"
+        assert result.adjusted_quantity == Decimal("0.2")
+        assert any("sell_clamped_to_held" in w.lower() for w in result.warnings), (
+            f"expected a sell_clamped_to_held warning; got {result.warnings}"
+        )
+
+    def test_reducing_sell_exact_held_notional_not_capped_but_buy_still_capped(
+        self,
+    ) -> None:
+        """
+        WP1.2 (S2/C24): a SELL of exactly ``held`` bypasses the notional
+        cap even when its notional far exceeds it; a BUY of the same
+        notional is still capped.
+
+        Setup:
+            equity              = 100 000 USDT
+            max_order_size_quote = 10 000 USDT
+            existing position   = 0.5 BTC @ 50 000  (held = 0.5, 25 000 USDT)
+            SELL order          = 0.5 BTC @ 50 000  (== held, 25 000 USDT notional)
+            BUY order           = 0.5 BTC @ 50 000  (25 000 USDT notional)
+        Expected: SELL approved with the full 0.5 BTC (no reduction); BUY
+        capped down to <= 10 000 / 50 000 = 0.2 BTC.
+        """
+        manager = _make_manager(
+            max_position_size_pct=1.0,  # disable concentration cap for this test
+            max_order_size_quote=Decimal("10000"),
+            max_open_positions=5,
+        )
+        existing = _make_position(
+            symbol="BTC/USDT", quantity=Decimal("0.5"), current_price=Decimal("50000"),
+        )
+
+        sell_order = _make_limit_order(
+            symbol="BTC/USDT",
+            side=OrderSide.SELL,
+            quantity=Decimal("0.5"),
+            price=Decimal("50000"),
+        )
+        sell_result = manager.pre_trade_check(
+            order=sell_order,
+            current_equity=self._EQUITY,
+            open_positions=[existing],
+            daily_pnl=Decimal("0"),
+            peak_equity=self._PEAK,
+        )
+        assert sell_result.approved is True, sell_result.rejection_reasons
+        assert sell_result.adjusted_quantity == Decimal("0.5"), (
+            "a reducing SELL of exactly `held` must not be capped by the "
+            f"notional cap; got adjusted_quantity={sell_result.adjusted_quantity}"
+        )
+
+        buy_order = _make_limit_order(
+            symbol="BTC/USDT",
+            side=OrderSide.BUY,
+            quantity=Decimal("0.5"),
+            price=Decimal("50000"),
+        )
+        buy_result = manager.pre_trade_check(
+            order=buy_order,
+            current_equity=self._EQUITY,
+            open_positions=[existing],
+            daily_pnl=Decimal("0"),
+            peak_equity=self._PEAK,
+        )
+        assert buy_result.adjusted_quantity < Decimal("0.5"), (
+            "a BUY of the same notional must still be capped by "
+            f"max_order_size_quote; got {buy_result.adjusted_quantity}"
         )
 
 
