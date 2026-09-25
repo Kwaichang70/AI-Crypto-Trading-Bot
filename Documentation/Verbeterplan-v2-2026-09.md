@@ -60,7 +60,7 @@ Ernst: **C** = kritiek (kapitaal-/veiligheidsrisico of foutief bewijs), **S** = 
 | ID | Bevinding | Bewijs |
 |---|---|---|
 | **C18** | Caddy stuurt `/api/*` rechtstreeks naar `api:8000`; browser stuurt geen `X-API-Key`; werkt alleen omdat `REQUIRE_API_AUTH=false` (server!). NextAuth-rollen alleen in UI afgedwongen; viewer kan live runs starten/modellen activeren. UI stuurt confirm-token in body (deprecated pad). `ADMIN_API_KEY`/`INTERNAL_ADMIN_API_KEY` niet in compose doorgegeven → UI kill-switch mogelijk 503 (op server verifiëren). `/metrics` publiek. | `infra/Caddyfile`, `apps/ui/src/lib/api.ts:115-119`, `lib/auth.ts:6-14`, `runs/new/page.tsx:259`, `docker-compose.yml` |
-| **C19** | **Geen CI:** `.github/workflows/ci.yml` verwijderd in working tree (uncommitted, Codex-sessie). HEAD-versie waarschijnlijk toch stuk (`next build` vereist `NEXTAUTH_SECRET` sinds Sprint 50); geen jest-job, geen pip-audit/npm-audit/gitleaks. Deploy volledig handmatig (rsync + compose), geen rollback, **geen pg_dump-backup**, geen docker log-rotatie. | `git status`, `infra/docker-compose.yml`, `scripts/` |
+| **C19** | **Geen CI:** `.github/workflows/ci.yml` verwijderd (sinds 2026-09-25 gecommit in `364bb99`; zie §11). HEAD-versie waarschijnlijk toch stuk (`next build` vereist `NEXTAUTH_SECRET` sinds Sprint 50); geen jest-job, geen pip-audit/npm-audit/gitleaks. Deploy volledig handmatig (rsync + compose), geen rollback, **geen pg_dump-backup**, geen docker log-rotatie. | `git status`, `infra/docker-compose.yml`, `scripts/` |
 | **C20** | Grafana alert-rules bestaan (4), maar geen contact points/notification policies → alerts bereiken niemand. | `infra/grafana/provisioning/alerting/` |
 | **S10** | `whale_tracker` logt URL incl. `api_key` bij failure; Telegram-token is `str` i.p.v. `SecretStr`; `NEXTAUTH_SECRET` + Google-secret als build-ARG in UI-image-layers; `GRAFANA_PASSWORD` default `admin`. | `whale_tracker.py:267-291`, `config.py:552`, `Dockerfile.ui:72-84` |
 
@@ -312,7 +312,7 @@ Ernst: **C** = kritiek (kapitaal-/veiligheidsrisico of foutief bewijs), **S** = 
 | Grote refactors (4.1/4.2) regresseren live-gedrag | Protective-path-harness is de regressie-gate; refactors pas ná Fase 1-harness. |
 | Hervalidatie geeft no-go voor momentum_breakout | Dan is er geen live-eligible strategie; kapitaal blijft paper — dat is de juiste uitkomst, geen falen van het plan. |
 | Agent-keten-doorvoer (2 rejections → arbiter) blaast schattingen op | Schattingen bevatten één rejection-ronde; kleine WP's (≤ 2 cycli) verkleinen het rejection-oppervlak. |
-| `.github/workflows/ci.yml`-verwijdering per ongeluk committen | Q7 herstelt het bestand; tot die tijd niet `git add -A`. |
+| Repo zonder CI (verwijdering gecommit in `364bb99`) | Q7 herstelt het bestand vanuit `364bb99^`; tot die tijd lokaal `ruff`/`mypy`/`pytest` vóór elke merge. |
 
 ---
 
@@ -330,3 +330,64 @@ Ernst: **C** = kritiek (kapitaal-/veiligheidsrisico of foutief bewijs), **S** = 
 - `apps/api/routers/runs.py`
 - `packages/trading/backtest.py`, `packages/trading/portfolio.py`, `packages/trading/bracket_exit.py`
 - `infra/docker-compose.yml`, `infra/Caddyfile`, `.github/workflows/ci.yml`
+
+---
+
+## 11. Aanvulling 2026-09-25 — her-verificatie en nieuwe bevindingen
+
+**Basis:** twee nieuwe onafhankelijke read-only passes: (1) her-verificatie van C1–C9 en de quant-bevindingen met bestand+regel, (2) frontend/infra/tests opnieuw. Geen codewijzigingen.
+
+### 11.1 Her-verificatie
+- **Opnieuw bevestigd:** C1–C11, C16 en S1 (`runs.py` 2193 regels, `create_run` `:349-818`, 3 mutable registries, `--workers 1`).
+- **Q2 genuanceerd (C6):** portfolio-/cluster-exposure en concentratie gelden alleen voor BUY. Max-open-positions, daily loss, drawdown ≥ 30%, loss-streak-cooldown en de kill-switch blokkeren ook SELLs, en `max_order_size` kapt de SELL-hoeveelheid (`risk_manager.py:375`).
+- **Correctie:** de verwijdering van `ci.yml` is gecommit (`364bb99`); zie C19.
+- **Tijdkritisch:** de D1-deadline (2026-09-25 14:13 UTC) is vandaag. Controleer eerst de status van run `f36fb44e` (`/runs/f36fb44e/orders`, Coinbase-balance) voordat een ander WP start.
+
+### 11.2 Nieuwe bevindingen
+
+| ID | Bevinding | Bewijs | Opname in plan |
+|---|---|---|---|
+| **C21** | **Kill-switch werkt niet end-to-end.** Caddy stuurt alleen `/api/auth/*` naar de UI, dus `/api/admin/kill-switch` gaat naar FastAPI (geen route, 404). Daarbij ontbreken `INTERNAL_ADMIN_API_KEY` (UI → 503) en `ADMIN_API_KEY` (API → 401) in compose. Scherpt C18 aan van "mogelijk 503" naar "zeker kapot". | `infra/Caddyfile` (`handle /api/*`), `apps/ui/.../admin/kill-switch/route.ts:62-68`, `apps/api/deps.py:107` | **WP1.7** (Fase 1-minimumset): Caddy `handle /api/admin/*` → UI, env-vars in compose, e2e-test via Caddy. |
+| **C22** | **`sync_positions` verkoopt meer dan de bot bezit.** De positiegrootte wordt de volledige exchange-balance van de base-asset, inclusief holdings die de bot niet kocht. Een full-close SELL (`held_quantity`) verkoopt dus alles. | `live.py:1083-1093`, `execution.py:349` | **WP1.1**: de bot-positie komt uit eigen fills. Exchange-balance dient alleen als bovengrens en reconcile-check (`min(eigen, exchange)`). Test: account met 0,5 BTC extern + 0,01 BTC via de bot → SELL = 0,01. |
+| **C23** | Een aangesloten circuit breaker leegt óók SELL-signalen (`bar_signals = []`), terwijl het commentaar zegt dat alleen entries worden onderdrukt. | `strategy_engine.py:967` | **WP1.6**, extra acceptatie: HALT/REDUCE filteren alleen BUY; test "HALT + strategie-SELL gaat door". |
+| **C24** | `max_order_size` kapt exits; drawdown en cooldown blokkeren de stop-loss juist wanneer die nodig is. | `risk_manager.py:375`, `risk.py:441-451, 486-503` | **WP1.2**: scope uitgebreid met `max_order_size`. |
+| **C25** | `BacktestRunner` herbouwt `RiskParameters` zonder `sizing_mode`, `atr_risk_multiplier` en `max_cluster_exposure_pct`, waardoor custom risk in backtests deels wordt genegeerd. | `backtest.py:224-237` | **WP1.9** (één `RiskParameters`-pad voor alle modi) + pariteitstest in **WP2.1**. |
+| **S12** | **Live-run-pagina is fragiel.** Eén mislukte poll vervangt de hele pagina door een foutmelding, omdat `error` nooit gewist wordt. Polls overlappen zonder in-flight guard, dus oudere responses kunnen nieuwere overschrijven. `createRun` heeft 120 s timeout zonder idempotency-key, dus een retry kan een tweede live run starten. | `runs/[id]/page.tsx:420-422, 445, 538`, `lib/api.ts` (`createRun`) | **Nieuw WP7.0** (~1 cyclus, vóór live-herstart): laatste goede data + "stale"-badge, in-flight guard, `Idempotency-Key`-header met backend-dedupe. |
+| **S13** | **Live-UX mist veiligheidsstappen.** Geen getypte bevestiging voor LIVE-start; het confirm-token gaat in de body (deprecated pad) i.p.v. de `X-Live-Confirm-Token`-header. Geen LIVE-banner. Stop heeft geen bevestiging en geen waarschuwing over open posities. De kill-switch staat alleen op `/`. | `runs/new/page.tsx:259, 599-603`, `runs/[id]/page.tsx:566, 570-576`, `app/page.tsx:124` | **WP1.7** UI-deel (stop-dialoog, kill-switch in header) + **WP3.2** (token alleen via header). |
+| **S14** | `/health` geeft altijd "ok" zonder DB-, exchange- of engine-task-check. De UI-healthcheck probeert `/api/health`, dat niet bestaat. Grafana's "Kill switch active"-alert kijkt naar de risk-manager-vlag, niet naar de globale kill-switch. | `main.py:654-658`, compose UI-healthcheck, `grafana/provisioning/alerting/trading-alerts.yml` | **WP3.4**: readiness-endpoint met DB-check en task-heartbeats; alerts op task-dood en globale kill-switch. |
+| **S15** | Niets verhindert >1 worker of replica (dubbele runs door in-memory state). Migraties draaien bij elke start zonder lock en zonder dump vooraf. | `Dockerfile.api:150`, `docker-entrypoint.sh` | **WP4.4**: Postgres advisory/leader-lock bij startup. **WP3.5**: `pg_dump` vóór `alembic upgrade`. |
+| **S16** | Infra-hygiëne:<br>• `REDIS_PASSWORD` default leeg<br>• images niet op digest gepind; uv via `curl \| sh`<br>• `/docs` en `/openapi.json` publiek<br>• CORS-wildcard-check alleen actief met auth aan<br>• `NEXT_PUBLIC_API_URL=http://localhost:8000` in `.env.example` wordt in de productiebundle gebakken | compose, Dockerfiles, `main.py:622-624`, `config.py:210`, `.env.example:237` | **WP3.3** (QW Q14–Q16). |
+| **S17** | Frontend-types zijn handgeschreven en drijven al af: `HealthResponse.components` bestaat niet in de backend; het UI-veld `error` heet in de backend `error_msg`. Jest draait niet in CI, en `src/app/**` valt buiten de coverage. | `apps/ui/src/lib/types.ts`, `route.ts:29` vs `emergency.py` | **WP7.1**: types genereren uit `/openapi.json`. **WP3.1**: jest-job. |
+| **S18** | Flaky tests:<br>• timing: `test_adaptive_learning.py:612-654`<br>• datumgrens via `datetime.now()`: `test_graduated_circuit_breaker.py:258`<br>• ~39 tests op wall-clock<br>`filterwarnings=error` en `fail_under=80` worden zonder CI nergens afgedwongen. | zie kolom Bevinding | **WP4.8**: klok-injectie en fake timers. |
+
+### 11.3 Gevolgen voor minimumset, quick wins en inspanning
+
+**Minimumset vóór live-herstart (vervangt §4 Fase 1):**
+- 1.0
+- 1.1 + C22
+- 1.2 + C24
+- 1.3a
+- 1.4
+- 1.7 + C21/S13
+- 1.8
+- **7.0** (nieuw)
+
+Aanbevolen erbij: 1.3b, 1.5 en 1.6 + C23.
+
+**Extra quick wins:**
+
+| # | Item | Bevinding |
+|---|---|---|
+| Q14 | `REDIS_PASSWORD` en `GRAFANA_PASSWORD` verplicht (`:?`) | S16 |
+| Q15 | `/docs` en `openapi.json` alleen bij `DEBUG`; CORS-wildcard-check altijd | S16 |
+| Q16 | `NEXT_PUBLIC_API_URL` leeg in `.env.example` | S16 |
+| Q17 | Caddy `handle /api/admin/*` → UI | C21 |
+| Q18 | `error` wissen bij succesvolle poll + in-flight guard | S12 |
+
+**Inspanning:** +~3 cycli (7.0 ≈ 1; scope-uitbreiding 1.1/1.2/1.6/1.7 ≈ 2). **Totaal ~85 (ML bevriezen) – ~90 (ML fixen).** Volgorde ongewijzigd, met 7.0 parallel aan Fase 1.
+
+**Aanvullende beslissing voor de gebruiker:**
+
+| ID | Beslissing | Aanbeveling |
+|---|---|---|
+| D15 | Mag de bot crypto op de account aanraken die hij niet zelf kocht (C22)? | **Nee**: de positie is altijd `min(eigen fills, exchange-balance)`. |
