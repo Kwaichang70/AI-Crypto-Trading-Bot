@@ -92,7 +92,7 @@ import ccxt.async_support as ccxt_async
 import structlog
 
 from common.types import OrderSide, OrderStatus, OrderType, SignalDirection
-from trading.execution import BaseExecutionEngine
+from trading.execution import BaseExecutionEngine, EquitySnapshot
 from trading.ccxt_errors import translate_ccxt_error
 from trading.ccxt_retry import ccxt_retry
 from trading.models import Fill, Order, Position, Signal
@@ -442,7 +442,8 @@ def _parse_ccxt_trades(
 
 class LivePositionSource(Protocol):
     """Duck-typed interface the live engine reads its own held quantity,
-    open positions, and daily PnL from (WP11-A-02).
+    open positions, daily PnL, run NAV/cash and peak from (WP11-A-02,
+    extended WP1.4/WP14-A-01).
 
     ``PortfolioAccounting`` already implements this surface exactly;
     nothing new needs to be built there -- ``StrategyEngine`` just attaches
@@ -454,6 +455,19 @@ class LivePositionSource(Protocol):
     def get_open_positions(self) -> list[Position]: ...
 
     def get_daily_pnl(self) -> Decimal: ...
+
+    # WP1.4 (D5/I-1): run NAV, cash and peak all come from here -- never
+    # the exchange balance. ``PortfolioAccounting`` implements all four.
+    @property
+    def cash(self) -> Decimal: ...
+
+    @property
+    def initial_cash(self) -> Decimal: ...
+
+    @property
+    def current_equity(self) -> Decimal: ...
+
+    def get_peak_equity(self) -> Decimal: ...
 
 
 class LiveExecutionEngine(BaseExecutionEngine):
@@ -485,11 +499,25 @@ class LiveExecutionEngine(BaseExecutionEngine):
         *,
         enable_live_trading: bool = False,
         config: dict[str, Any] | None = None,
+        buy_cap_slippage_pct: Decimal = Decimal("0.005"),
+        buy_inflight_stale_after_s: float = 900.0,
     ) -> None:
         super().__init__(run_id=run_id, config=config)
         self._risk_manager = risk_manager
         self._exchange = exchange
         self._enable_live_trading = enable_live_trading
+
+        # WP1.4 (S-02, security round 2): additional margin folded into the
+        # BUY affordability cap's buf, on top of the market's own taker fee
+        # -- covers a fill above last/ask and a misreported taker fee
+        # (amends I-4: cap price is max(last, ask), buf = taker + this).
+        self._buy_cap_slippage_pct = buy_cap_slippage_pct
+        # WP1.4 (S-04, security round 2): how long a BUY may keep blocking
+        # every other BUY before an operator-facing stale alert fires
+        # (once, at error level). Does not expire the block itself (S-02:
+        # "no age expiry" still holds) -- it only makes a stuck block
+        # impossible to miss in the logs.
+        self._buy_inflight_stale_after_s = buy_inflight_stale_after_s
 
         # Fill registry: order_id -> list of Fill objects
         self._fills: dict[UUID, list[Fill]] = {}
@@ -507,6 +535,25 @@ class LiveExecutionEngine(BaseExecutionEngine):
         # WP1.1 (I4): per-symbol reconcile flag -> reason code. Blocks BUYs
         # only; never blocks a SELL/exit.
         self._reconcile_required: dict[str, str] = {}
+
+        # WP1.4 (S-04): run-wide BUY block reason, set once at on_start
+        # (e.g. "quote_mismatch") and never self-healed mid-run (unlike
+        # _reconcile_required's per-symbol, sometimes-self-clearing flags).
+        self._run_buy_block: str | None = None
+
+        # WP1.4 (S-01, security round 2): order_id -> the price
+        # process_signal's affordability cap sized the BUY against.
+        # submit_order's Coinbase market-BUY path pops this instead of
+        # fetching a SECOND, later ticker -- a rising price between the
+        # two fetches let a BUY spend more than the cap allowed.
+        self._buy_sizing_price: dict[UUID, Decimal] = {}
+
+        # WP1.4 (S-04, security round 2): order_id -> the moment this
+        # engine first observed the order blocking new BUYs, and the set
+        # of order_ids already alerted on (so the stale alert fires
+        # exactly once per stuck order).
+        self._inflight_block_started_at: dict[UUID, datetime] = {}
+        self._inflight_block_stale_alerted: set[UUID] = set()
 
         # WP1.1 (I9): idempotent fill routing. order_id -> set of trade keys
         # already turned into a routed Fill (or explicitly skipped as a
@@ -706,6 +753,40 @@ class LiveExecutionEngine(BaseExecutionEngine):
         quote = market.get("quote")
         return str(quote) if quote else "USD"
 
+    def _quote_asset(self, symbol: str) -> str | None:
+        """WP1.4 (S-04/R-09): ``market["quote"]`` for ``symbol``, or
+        ``None`` if the market or its quote is unknown. Unlike
+        ``_quote_currency`` (which defaults to ``"USD"`` for fee-currency
+        bookkeeping only), a missing quote here must block a BUY -- it is
+        never silently defaulted."""
+        markets: dict[str, Any] = getattr(self._exchange, "markets", {}) or {}
+        market = markets.get(symbol)
+        if market is None:
+            return None
+        quote = market.get("quote")
+        return str(quote) if quote else None
+
+    def _taker_buffer(self, symbol: str) -> Decimal:
+        """WP1.4 (S-08): the market's own taker fee, used as the BUY
+        affordability cap's safety margin -- deliberately NOT
+        ``risk_manager.params`` (the ledger tests mock that, and the fee
+        is a property of the market, not the risk config). Defaults to 1%
+        when the market or its taker fee is unknown/unparseable.
+
+        Security round 2 (S-03): also falls back to 1% when the exchange
+        reports a taker fee that is negative or non-finite (NaN/Inf) --
+        a negative fee would double the allowed quantity (only the risk
+        manager's own size cap saved it from oversizing), and a non-finite
+        one propagates into a ``ZeroDivisionError`` or a silently-wrong
+        comparison downstream.
+        """
+        markets: dict[str, Any] = getattr(self._exchange, "markets", {}) or {}
+        market = markets.get(symbol) or {}
+        buf = _safe_decimal(market.get("taker"), default=Decimal("0.01"))
+        if not buf.is_finite() or buf < Decimal("0"):
+            return Decimal("0.01")
+        return buf
+
     # ------------------------------------------------------------------
     # WP1.1: held-quantity / SELL cap (WP11-A-03, D9, I1; round 2 S-03/S-07)
     # ------------------------------------------------------------------
@@ -771,6 +852,90 @@ class LiveExecutionEngine(BaseExecutionEngine):
             elif order.status in _SETTLED_ORDER_STATUSES:
                 pending += max(order.filled_quantity - routed_gross, Decimal("0"))
         return pending
+
+    def _inflight_buy_orders(self) -> Order | None:
+        """WP1.4 (S-02/A-04, hardened security round 2): the first BUY
+        order this engine has ever submitted, anywhere in the run (not
+        just this symbol), that is still in flight
+        (``PENDING_SUBMIT``/``OPEN``/``PARTIAL``) or settled with more
+        than a dust residual unrouted
+        (``filled_quantity - routed_gross > _amount_tolerance(symbol)``),
+        or ``None`` if nothing is blocking. ``REJECTED`` never blocks (it
+        is neither in-flight nor in ``_SETTLED_ORDER_STATUSES``).
+
+        Security round 2 (WP14-S-04): the settled branch used a bare
+        ``>`` against the *exact* routed amount -- a sub-satoshi rounding
+        residual the exchange reports on ``filled`` (e.g. ``amount +
+        1e-9``) then blocked every future BUY forever, with nothing in
+        ``reconcile_required`` and no order id in the log. Tolerating up
+        to one amount step (the same dust tolerance the I8 mismatch check
+        already uses) fixes the false positive while still catching a
+        genuine unrouted fill. The caller (``process_signal``) is
+        responsible for the one-time stale alert
+        (``live.buy_inflight_block_stale``) and for logging
+        ``blocking_order_id``/``blocking_status``/``unrouted`` on
+        ``live.buy_blocked_inflight_buy``.
+
+        Security round 2 (WP14-S-05): a PENDING_SUBMIT BUY with no
+        exchange id (``create_order`` raised before the exchange ever
+        acknowledged it -- its state is genuinely unknown, it may have
+        been accepted anyway) additionally flags
+        ``reconcile_required[symbol] = "buy_order_state_unknown"``,
+        mirroring the SELL side's WP11-S-R2-01 handling -- unlike the
+        SELL path (which stops *reserving* it but still sells), a BUY has
+        no "reserve, don't block" fallback, so it keeps blocking.
+
+        Unlike ``_pending_sell_quantity``, there is no age expiry (R3): a
+        stuck BUY blocks every new BUY, run-wide, until it genuinely
+        settles and routes or an operator intervenes -- the R-03
+        alternative (reduce available run cash by the in-flight estimate
+        instead of blocking outright) was rejected in favour of this
+        simpler, fail-closed rule (one engine per run, so a run-wide block
+        cannot starve an unrelated run).
+        """
+        for order in self._orders.values():
+            if order.side != OrderSide.BUY:
+                continue
+            if order.status in (
+                OrderStatus.PENDING_SUBMIT, OrderStatus.OPEN, OrderStatus.PARTIAL,
+            ):
+                if (
+                    order.status == OrderStatus.PENDING_SUBMIT
+                    and order.order_id not in self._exchange_order_map
+                ):
+                    self._flag_reconcile(order.symbol, "buy_order_state_unknown")
+                return order
+            if order.status in _SETTLED_ORDER_STATUSES:
+                routed_gross = self._routed_gross_qty.get(order.order_id, Decimal("0"))
+                unrouted = order.filled_quantity - routed_gross
+                if unrouted > self._amount_tolerance(order.symbol):
+                    return order
+        return None
+
+    def _maybe_log_inflight_block_stale(self, order: Order) -> None:
+        """WP1.4 (S-04, security round 2): once ``order`` has been
+        blocking new BUYs for longer than ``_buy_inflight_stale_after_s``
+        (default 15 minutes), log ``live.buy_inflight_block_stale`` at
+        error level -- exactly once per order -- so a genuinely stuck BUY
+        is impossible to miss in the logs.
+
+        This is an ALERT only: per spec S-02, there is still no age
+        expiry -- the block itself never lifts on its own.
+        """
+        now = datetime.now(tz=UTC)
+        started_at = self._inflight_block_started_at.setdefault(order.order_id, now)
+        if order.order_id in self._inflight_block_stale_alerted:
+            return
+        age_s = (now - started_at).total_seconds()
+        if age_s > self._buy_inflight_stale_after_s:
+            self._inflight_block_stale_alerted.add(order.order_id)
+            self._log.error(
+                "live.buy_inflight_block_stale",
+                order_id=str(order.order_id),
+                symbol=order.symbol,
+                status=order.status.value,
+                age_seconds=age_s,
+            )
 
     async def _held_quantity(self, symbol: str) -> tuple[Decimal, Decimal, Decimal]:
         """Return ``(own, own_avail, capped)`` for a SELL against ``symbol``.
@@ -1027,6 +1192,17 @@ class LiveExecutionEngine(BaseExecutionEngine):
         order = self._transition(order, OrderStatus.PENDING_SUBMIT)
 
         try:
+            # WP14-S-10 (security round 2 follow-up): pop the sizing-price
+            # hint unconditionally, before anything else in this block can
+            # raise. Previously this only happened inside the Coinbase
+            # branch below, so a hint recorded for a BUY on any OTHER
+            # exchange (or one that fails before reaching that branch)
+            # was never removed and leaked in _buy_sizing_price for the
+            # life of the run. Harmless (order ids are unique, so a stale
+            # hint can never be reused for a different order), but worth
+            # cleaning up rather than deferring to the WP14-S-06 rewrite.
+            sizing_price_hint = self._buy_sizing_price.pop(order.order_id, None)
+
             # Build CCXT order parameters
             ccxt_order_type = order.order_type.value  # 'market' or 'limit'
             ccxt_side = order.side.value  # 'buy' or 'sell'
@@ -1040,17 +1216,26 @@ class LiveExecutionEngine(BaseExecutionEngine):
                 and ccxt_side == "buy"
                 and self._exchange.id == "coinbase"
             ):
-                try:
-                    ticker = await ccxt_retry(
-                        self._exchange.fetch_ticker, order.symbol,
-                        max_retries=1, base_delay=0.5, operation=f"fetch_ticker_for_buy({order.symbol})",
-                    )
-                    price_param = str(ticker.get("last", "0"))
-                except Exception:
-                    self._log.warning(
-                        "live.market_buy_price_fallback_failed",
-                        symbol=order.symbol,
-                    )
+                # WP14-S-01 (security round 2): reuse the SAME price
+                # process_signal's affordability cap already sized this
+                # BUY against, instead of fetching a second, later ticker
+                # -- a rising price between the two fetches let the order
+                # spend more than run cash allowed (amount * this second
+                # price > the cap that was actually enforced).
+                if sizing_price_hint is not None:
+                    price_param = str(sizing_price_hint)
+                else:
+                    try:
+                        ticker = await ccxt_retry(
+                            self._exchange.fetch_ticker, order.symbol,
+                            max_retries=1, base_delay=0.5, operation=f"fetch_ticker_for_buy({order.symbol})",
+                        )
+                        price_param = str(ticker.get("last", "0"))
+                    except Exception:
+                        self._log.warning(
+                            "live.market_buy_price_fallback_failed",
+                            symbol=order.symbol,
+                        )
 
             params: dict[str, Any] = {}
             if order.client_order_id:
@@ -1314,6 +1499,29 @@ class LiveExecutionEngine(BaseExecutionEngine):
         ``reconcile_required`` blocks BUYs only (I4/D2) -- SELLs are always
         allowed, capped at ``min(own_avail, free)`` (I1/D15/S-03).
 
+        WP1.4 (D5): with a source attached, a BUY additionally passes a
+        quote-mismatch check, an in-flight-BUY check, a NAV snapshot
+        (``_equity_snapshot``, blocking on ``live.nav_unavailable``) and a
+        cash/free-quote affordability cap before the existing min-amount/
+        min-cost/precision checks -- sizes at ``min(NAV, initial_capital)``
+        (I-2), never the exchange balance (I-1). The risk gate itself
+        always sees the raw NAV, not the sizing basis (I-3). SELLs and the
+        no-source (D8) path are unaffected (I-5).
+
+        Security round 2 (amends I-4): the affordability cap prices at
+        ``max(last, ask)`` (WP14-S-02, a bare ``last`` under-caps whenever
+        a market BUY actually fills above it) and ``buf = taker +
+        buy_cap_slippage_pct`` (a configurable margin beyond the taker fee
+        alone). The same price is handed to ``submit_order`` via
+        ``_buy_sizing_price`` so its Coinbase market-BUY path sizes the
+        order against the SAME number instead of a second, later ticker
+        (WP14-S-01). ``_inflight_buy_orders`` now returns the blocking
+        ``Order`` (not just a bool) so ``live.buy_blocked_inflight_buy``
+        can log which order and by how much (WP14-S-04), tolerates a dust
+        rounding residual instead of blocking forever on it (WP14-S-04),
+        and flags ``reconcile_required`` for a PENDING_SUBMIT BUY with no
+        exchange id, mirroring the SELL side (WP14-S-05).
+
         Parameters
         ----------
         signal:
@@ -1351,6 +1559,44 @@ class LiveExecutionEngine(BaseExecutionEngine):
                     reason=self._reconcile_required[signal.symbol],
                 )
                 return []
+            if self._position_source is not None:
+                # WP1.4 (S-04): a run whose symbols don't share one quote
+                # currency never sizes/caps a BUY off the right balance --
+                # blocked once at on_start, never healed mid-run.
+                if self._run_buy_block is not None:
+                    self._log.warning(
+                        "live.buy_blocked_quote_mismatch",
+                        strategy_id=signal.strategy_id,
+                        symbol=signal.symbol,
+                        reason=self._run_buy_block,
+                    )
+                    return []
+                # WP1.4 (S-02/A-04): a BUY still in flight anywhere in the
+                # run, or filled but not yet routed, blocks every new BUY
+                # -- otherwise a late fill lets the next BUY spend the
+                # same run cash twice (R-03's alternative, a reduced
+                # run_cash_avail, was rejected in favour of this simpler
+                # rule). No age expiry (R3): a stuck order blocks until it
+                # genuinely routes or an operator intervenes.
+                blocking_order = self._inflight_buy_orders()
+                if blocking_order is not None:
+                    # Security round 2 (WP14-S-04): a one-time, error-level
+                    # alert if this has been blocking for too long, plus
+                    # the blocking order's id/status/unrouted amount on
+                    # every occurrence -- both were missing before.
+                    self._maybe_log_inflight_block_stale(blocking_order)
+                    blocking_routed = self._routed_gross_qty.get(
+                        blocking_order.order_id, Decimal("0")
+                    )
+                    self._log.warning(
+                        "live.buy_blocked_inflight_buy",
+                        strategy_id=signal.strategy_id,
+                        symbol=signal.symbol,
+                        blocking_order_id=str(blocking_order.order_id),
+                        blocking_status=blocking_order.status.value,
+                        unrouted=str(blocking_order.filled_quantity - blocking_routed),
+                    )
+                    return []
         else:
             own, own_avail, capped = await self._held_quantity(signal.symbol)
             if own <= Decimal("0"):
@@ -1412,7 +1658,38 @@ class LiveExecutionEngine(BaseExecutionEngine):
         # risk manager ceiling only de-sizes. equity is fetched from the
         # same source the legacy calculate_position_size call used; for SELL
         # we pass the held quantity so the resolver can full-close / cap.
-        equity = await self._fetch_equity()
+        #
+        # WP1.4 (D5/S-01): with a source attached, NAV/peak/basis come from
+        # the portfolio, never the exchange balance (I-1). BUY sizes at
+        # ``min(NAV, initial_capital)`` (I-2); SELL and the risk gate (I-3)
+        # both use the source's raw ``current_equity`` so a run in profit
+        # never shows a false drawdown. With no source, the legacy
+        # exchange-balance path (D8) is unchanged.
+        nav: Decimal
+        peak_equity: Decimal | None
+        if self._position_source is not None:
+            source = self._position_source
+            if side == OrderSide.BUY:
+                snapshot = self._equity_snapshot(signal.symbol, last_price)
+                if snapshot is None:
+                    self._log.warning(
+                        "live.nav_unavailable",
+                        strategy_id=signal.strategy_id,
+                        symbol=signal.symbol,
+                    )
+                    return []
+                equity = snapshot.sizing_basis
+                nav = snapshot.nav
+                peak_equity = snapshot.peak
+            else:
+                nav = source.current_equity
+                equity = nav
+                peak_equity = max(source.get_peak_equity(), nav)
+        else:
+            equity = await self._fetch_equity()
+            nav = equity
+            peak_equity = None  # fetched later, exactly where D8 always fetched it
+
         quantity = self._resolve_order_quantity(
             signal=signal,
             side=side,
@@ -1431,6 +1708,58 @@ class LiveExecutionEngine(BaseExecutionEngine):
                 confidence=signal.confidence,
             )
             return []
+
+        # WP1.4 (I-4/I-5): BUY affordability cap -- run cash and a fresh
+        # exchange free-quote balance, never the sizing basis alone (D5
+        # would otherwise let a run with a shrunk account balance still
+        # size off its own book). Applied before the min-amount/min-cost
+        # checks and the precision floor (spec BUY sequence step 7).
+        # SELLs are never touched by this guard (I-5).
+        #
+        # Security round 2 (amends I-4): the cap price is
+        # ``max(last, ask)``, not ``last`` alone, and ``buf`` folds in a
+        # slippage margin on top of the taker fee -- ``last`` (or a
+        # misreported taker fee) alone let a fill push run cash negative
+        # (WP14-S-02). ``buy_cap_price`` also becomes the price
+        # ``submit_order``'s Coinbase path sizes the order against
+        # (WP14-S-01) instead of fetching a second, later ticker.
+        buy_cap_price: Decimal | None = None
+        if side == OrderSide.BUY and self._position_source is not None:
+            source = self._position_source
+            quote = self._quote_asset(signal.symbol)
+            balance = await self._fetch_balance_cached(fresh=True)
+            free_quote = (
+                _safe_decimal((balance.get("free") or {}).get(quote), default=None)
+                if balance is not None and quote is not None
+                else None
+            )
+            # WP14-S-03 (security round 2): a non-finite (NaN/Inf) free
+            # balance is exactly as unusable as a missing one -- a NaN
+            # comparison below would otherwise raise InvalidOperation.
+            if free_quote is None or not free_quote.is_finite():
+                self._log.warning(
+                    "live.buy_blocked_balance_unavailable",
+                    strategy_id=signal.strategy_id,
+                    symbol=signal.symbol,
+                )
+                return []
+            cash = max(source.cash, Decimal("0"))
+            if free_quote < cash:
+                self._log.warning(
+                    "live.run_cash_exceeds_exchange_free",
+                    strategy_id=signal.strategy_id,
+                    symbol=signal.symbol,
+                    run_cash=str(cash),
+                    free_quote=str(free_quote),
+                )
+            ask_price = _safe_decimal(ticker.get("ask"), default=None)
+            if ask_price is None or not ask_price.is_finite() or ask_price <= Decimal("0"):
+                ask_price = last_price
+            buy_cap_price = max(last_price, ask_price)
+            buf = self._taker_buffer(signal.symbol) + self._buy_cap_slippage_pct
+            quantity = self._cap_buy_quantity(
+                quantity, buy_cap_price, min(cash, free_quote), buf
+            )
 
         # ------------------------------------------------------------------
         # Exchange minimum order size validation
@@ -1513,11 +1842,16 @@ class LiveExecutionEngine(BaseExecutionEngine):
                 p for p in self._positions.values() if not p.is_flat
             ]
         daily_pnl = self._calculate_daily_pnl()
-        peak_equity = await self._fetch_peak_equity()
+        if peak_equity is None:
+            # D8 (no source): fetched here, exactly where this call has
+            # always lived -- never moved earlier, so a return above this
+            # point (zero quantity, below-minimum, precision floor) still
+            # never triggers a peak fetch, unchanged from before WP1.4.
+            peak_equity = await self._fetch_peak_equity()
 
         risk_result = self._risk_manager.pre_trade_check(
             order=proposed_order,
-            current_equity=equity,
+            current_equity=nav,
             open_positions=open_positions,
             daily_pnl=daily_pnl,
             peak_equity=peak_equity,
@@ -1547,6 +1881,12 @@ class LiveExecutionEngine(BaseExecutionEngine):
                 symbol=signal.symbol,
                 warnings=risk_result.warnings,
             )
+
+        # WP14-S-01 (security round 2): record the price the affordability
+        # cap sized this BUY against so submit_order's Coinbase path can
+        # reuse it instead of fetching a second, later ticker.
+        if side == OrderSide.BUY and buy_cap_price is not None:
+            self._buy_sizing_price[proposed_order.order_id] = buy_cap_price
 
         # Submit
         submitted_order = await self.submit_order(proposed_order)
@@ -1942,7 +2282,7 @@ class LiveExecutionEngine(BaseExecutionEngine):
         return candidates
 
     # ------------------------------------------------------------------
-    # Equity helpers (exchange-aware)
+    # Equity helpers (exchange-aware; legacy no-source only, WP1.4 S-03)
     # ------------------------------------------------------------------
 
     async def _fetch_equity(self) -> Decimal:
@@ -1950,6 +2290,12 @@ class LiveExecutionEngine(BaseExecutionEngine):
         Fetch current account equity from the exchange.
 
         Falls back to local position tracking if exchange call fails.
+
+        WP1.4 (S-03): legacy no-source (D8) path ONLY. With a
+        ``LivePositionSource`` attached, NAV comes exclusively from
+        :meth:`_equity_snapshot` / the source's own ``current_equity`` --
+        this method is never called in that case. WP4.1 removes it once
+        the no-source path itself is retired.
 
         Returns
         -------
@@ -1988,6 +2334,13 @@ class LiveExecutionEngine(BaseExecutionEngine):
         to THIS run's starting equity, not a historical account high
         from before this run started.
 
+        WP1.4 (S-03): legacy no-source (D8) path ONLY -- same caveat as
+        ``_fetch_equity``. With a source attached, the portfolio is the
+        sole peak owner (A-05): this engine keeps no peak of its own, so
+        WP1.8's ``from_fills(peak_equity_hint=...)`` resume seed is never
+        overwritten by a stale exchange balance. WP4.1 removes this
+        method once the no-source path itself is retired.
+
         Returns
         -------
         Decimal:
@@ -2000,6 +2353,55 @@ class LiveExecutionEngine(BaseExecutionEngine):
         elif current > self._peak_equity:
             self._peak_equity = current
         return self._peak_equity
+
+    def _equity_snapshot(self, symbol: str, last: Decimal) -> EquitySnapshot | None:
+        """WP1.4 (S-01/A-01/A-02, D5): a read-only NAV/peak/basis snapshot
+        for a BUY on ``symbol``, computed entirely from the attached
+        ``LivePositionSource`` -- never the exchange balance (I-1).
+
+        ``nav`` is the source's own ``current_equity`` adjusted for
+        ``symbol`` alone, substituting the fresh ticker ``last`` for that
+        one position's (possibly one-bar-stale) mark; every other held
+        position's mark is exactly what ``current_equity`` already used,
+        refreshed at the start of the current bar (``strategy_engine.py``
+        marks before any signal fires).
+
+        Returns ``None`` ("NAV unavailable") when:
+
+        - any OTHER held run position's mark is <= 0 (a stale/invalid
+          mark makes the source's ``current_equity`` itself untrustworthy
+          -- R-08), or
+        - the resulting NAV is <= 0.
+
+        The caller blocks the BUY with ``live.nav_unavailable`` in either
+        case. Never mutates the source (I-6): only reads ``current_equity``,
+        ``get_position``, ``get_open_positions``, ``cash``, ``initial_cash``
+        and ``get_peak_equity()``.
+        """
+        source = self._position_source
+        assert source is not None, "_equity_snapshot requires an attached source"
+
+        for pos in source.get_open_positions():
+            if pos.symbol != symbol and pos.current_price <= Decimal("0"):
+                return None
+
+        own_qty = self._own_quantity(symbol)
+        position = source.get_position(symbol)
+        adjustment = Decimal("0")
+        if position is not None and own_qty > Decimal("0"):
+            adjustment = own_qty * (last - position.current_price)
+
+        nav = source.current_equity + adjustment
+        if nav <= Decimal("0"):
+            return None
+
+        peak = max(source.get_peak_equity(), nav)
+        return EquitySnapshot(
+            nav=nav,
+            peak=peak,
+            cash=source.cash,
+            sizing_basis=self._sizing_basis(nav, source.initial_cash),
+        )
 
     def _calculate_daily_pnl(self) -> Decimal:
         """
@@ -2127,7 +2529,15 @@ class LiveExecutionEngine(BaseExecutionEngine):
         Validates exchange connectivity and loads initial state.
 
         WP1.1 (WP11-A-07/D8, hardened round 2 S-09): runs ``sync_positions()``
-        last, after markets are loaded and peak equity is seeded.
+        last, after markets are loaded.
+
+        WP1.4 (S-04/S-05): once markets are loaded, checks that every run
+        symbol shares one quote currency (blocking BUYs run-wide,
+        ``live.quote_mismatch``, if not) and warns (never blocks)
+        ``live.initial_capital_exceeds_free_quote`` when the account's
+        free quote balance is below ``initial_capital``. No peak is
+        seeded here any more -- the portfolio is the sole peak owner
+        (A-05); see ``_fetch_equity``'s docstring.
 
         **Fails closed (S-09):** if live trading is enabled and no
         ``LivePositionSource`` is attached, logs
@@ -2175,8 +2585,53 @@ class LiveExecutionEngine(BaseExecutionEngine):
                 self._exchange.load_markets,
                 max_retries=3, base_delay=2.0, operation="load_markets",
             )
-            # Seed peak equity so the first drawdown check has a baseline.
-            self._peak_equity = await self._fetch_equity()
+            # WP1.4 (S-03/A-05): no peak seed here -- the portfolio is the
+            # sole peak owner once a source is attached (guaranteed at this
+            # point: the S-09 gate above already raised otherwise), so
+            # WP1.8's from_fills(peak_equity_hint=...) resume seed is never
+            # stomped by a stale exchange balance. See _fetch_equity's and
+            # _fetch_peak_equity's docstrings for the no-source path this
+            # replaces.
+            if self._position_source is not None:
+                # WP1.4 (S-04/R-09): every run symbol must share one quote
+                # currency -- the BUY affordability cap (I-4) reads a
+                # single free[quote] balance, so a mixed-quote run would
+                # cap against the wrong currency. Blocks BUYs for the rest
+                # of the run; never self-heals (unlike reconcile_required).
+                quotes: set[str] = set()
+                missing_quote = False
+                for run_symbol in self._run_symbols:
+                    q = self._quote_asset(run_symbol)
+                    if q is None:
+                        missing_quote = True
+                    else:
+                        quotes.add(q)
+                if missing_quote or len(quotes) > 1:
+                    self._run_buy_block = "quote_mismatch"
+                    self._log.warning(
+                        "live.quote_mismatch",
+                        symbols=list(self._run_symbols),
+                        quotes=sorted(quotes),
+                    )
+                else:
+                    # WP1.4 (S-05/A-07): informational only -- never raises
+                    # or blocks (_fetch_balance_cached already fails soft).
+                    quote = next(iter(quotes), None)
+                    free_quote: Decimal | None = None
+                    if quote is not None:
+                        balance = await self._fetch_balance_cached(fresh=True)
+                        if balance is not None:
+                            free_quote = _safe_decimal(
+                                (balance.get("free") or {}).get(quote), default=None
+                            )
+                    initial_cash = self._position_source.initial_cash
+                    if free_quote is None or free_quote < initial_cash:
+                        self._log.warning(
+                            "live.initial_capital_exceeds_free_quote",
+                            initial_cash=str(initial_cash),
+                            free_quote=str(free_quote) if free_quote is not None else None,
+                            quote=quote,
+                        )
             self._log.info(
                 "live.engine_started",
                 exchange=self._exchange.id,

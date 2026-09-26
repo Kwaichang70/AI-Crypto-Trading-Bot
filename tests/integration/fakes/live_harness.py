@@ -183,6 +183,7 @@ async def build_resumed_live_stack(
     engine_config: dict[str, object] | None = None,
     risk_params: RiskParameters | None = None,
     protective_mode: bool = False,
+    peak_equity_hint: Decimal | None = None,
 ) -> LiveStack:
     """Build a SECOND engine stack under the SAME ``run_id``, with its
     portfolio rebuilt from ``fills`` via the production
@@ -201,6 +202,12 @@ async def build_resumed_live_stack(
     naturally compares the correctly-rebuilt "own" quantity against the
     exchange balance -- a genuine mismatch flags per WP1.1 D2 (S9), exactly
     as it would in production.
+
+    ``peak_equity_hint`` (WP1.4/H4): forwarded verbatim to
+    ``PortfolioAccounting.from_fills`` -- the persisted-peak resume seed
+    (WP1.8) that the live engine itself no longer overwrites (WP1.4 S-03).
+    ``None`` (default) preserves every pre-WP1.4 caller's behaviour
+    unchanged.
     """
     risk_manager = DefaultRiskManager(run_id=run_id, params=risk_params)
     if protective_mode:
@@ -226,6 +233,7 @@ async def build_resumed_live_stack(
         run_id=run_id,
         initial_cash=initial_capital,
         fills=fills,
+        peak_equity_hint=peak_equity_hint,
     )
 
     engine = StrategyEngine(

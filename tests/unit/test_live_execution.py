@@ -1266,6 +1266,13 @@ class TestLifecycle:
             get_position=MagicMock(return_value=None),
             get_open_positions=MagicMock(return_value=[]),
             get_daily_pnl=MagicMock(return_value=Decimal("0")),
+            # WP1.4: LivePositionSource grew cash/initial_cash/
+            # current_equity/get_peak_equity() -- match an empty
+            # PortfolioAccounting (zero everywhere).
+            cash=Decimal("0"),
+            initial_cash=Decimal("0"),
+            current_equity=Decimal("0"),
+            get_peak_equity=MagicMock(return_value=Decimal("0")),
         )
         engine.attach_position_source(stub_source, symbols=[_SYMBOL])
 
@@ -1331,6 +1338,13 @@ class TestLifecycle:
             get_position=MagicMock(return_value=None),
             get_open_positions=MagicMock(return_value=[]),
             get_daily_pnl=MagicMock(return_value=Decimal("0")),
+            # WP1.4: LivePositionSource grew cash/initial_cash/
+            # current_equity/get_peak_equity() -- match an empty
+            # PortfolioAccounting (zero everywhere).
+            cash=Decimal("0"),
+            initial_cash=Decimal("0"),
+            current_equity=Decimal("0"),
+            get_peak_equity=MagicMock(return_value=Decimal("0")),
         )
         engine.attach_position_source(stub_source, symbols=[_SYMBOL])
         ex.load_markets.side_effect = Exception("exchange down")

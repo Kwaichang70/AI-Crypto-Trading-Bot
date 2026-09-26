@@ -138,6 +138,11 @@ class FakeCCXTExchange:
         # WP1.1 (R-23): symbol -> fee currency override ("base" or "quote";
         # default is "quote", matching the pre-WP1.1 unconditional behaviour).
         self._fee_currency_override: dict[str, str] = {}
+        # WP1.4 (security round 2, WP14-S-02 probe PA): symbol -> a
+        # fraction by which a market BUY's actual fill price exceeds the
+        # ticker's `last` at fill time -- simulates slippage the fake's
+        # otherwise-deterministic fill model doesn't produce on its own.
+        self._fill_slippage_pct: dict[str, Decimal] = {}
         # symbol -> list of [ts_ms, open, high, low, close, volume]
         self._closed_bars: dict[str, list[list[Any]]] = {}
         self._orders: dict[str, dict[str, Any]] = {}
@@ -146,6 +151,12 @@ class FakeCCXTExchange:
         self._queued_errors: dict[str, Exception] = {}
         # WP1.1 (R-23): one-shot fault injection for the next fetch_balance().
         self._queued_balance_error: Exception | None = None
+        # WP1.4: how many more fetch_balance() calls should still raise
+        # ``_queued_balance_error`` -- defaults to 1 (queue_balance_error's
+        # original WP1.1 single-shot contract); a caller that needs a
+        # fault to survive ccxt_retry's automatic retries passes
+        # ``times=`` to keep failing across every attempt.
+        self._queued_balance_error_remaining: int = 0
         # WP1.1 (R-23): symbol -> fraction of the next order's amount to
         # report as filled on the *first* fetch_order poll only.
         self._queued_partial_fills: dict[str, Decimal] = {}
@@ -216,6 +227,16 @@ class FakeCCXTExchange:
         """Return the current total balance for ``currency`` (test-side accessor)."""
         return self._balances.get(currency, Decimal("0"))
 
+    def set_fill_slippage_pct(self, symbol: str, pct: Decimal) -> None:
+        """WP1.4 (security round 2, probe PA): a market BUY for ``symbol``
+        fills at ``last_price * (1 + pct)`` instead of exactly
+        ``last_price`` -- proves the engine's affordability-cap slippage
+        margin (``buy_cap_slippage_pct``) keeps run cash non-negative even
+        when the exchange fills worse than the ticker quoted. BUY side
+        only (a real book's slippage always works against the taker).
+        """
+        self._fill_slippage_pct[symbol] = pct
+
     def set_fee_currency(self, symbol: str, currency: str) -> None:
         """WP1.1 (R-23): charge the taker fee for ``symbol``'s fills in
         ``currency`` instead of the market's quote currency.
@@ -225,9 +246,18 @@ class FakeCCXTExchange:
         """
         self._fee_currency_override[symbol] = currency
 
-    def queue_balance_error(self, exc: Exception) -> None:
-        """WP1.1 (R-23): make the *next* ``fetch_balance`` call raise ``exc``."""
+    def queue_balance_error(self, exc: Exception, *, times: int = 1) -> None:
+        """WP1.1 (R-23): make the *next* ``fetch_balance`` call raise ``exc``.
+
+        WP1.4: ``times`` (default 1, the original contract) lets a caller
+        make ``exc`` raise on each of the next ``times`` calls -- needed
+        when the caller goes through ``ccxt_retry`` (which transparently
+        retries a single transient failure), so the fault must survive
+        every retry attempt to actually reach the engine's own error
+        handling.
+        """
         self._queued_balance_error = exc
+        self._queued_balance_error_remaining = times
 
     def queue_partial_fill(self, symbol: str, first_fraction: Decimal) -> None:
         """WP1.1 (R-23): the next order created for ``symbol`` reports only
@@ -399,7 +429,9 @@ class FakeCCXTExchange:
     async def fetch_balance(self, params: dict[str, Any] | None = None) -> dict[str, Any]:
         if self._queued_balance_error is not None:
             exc = self._queued_balance_error
-            self._queued_balance_error = None
+            self._queued_balance_error_remaining -= 1
+            if self._queued_balance_error_remaining <= 0:
+                self._queued_balance_error = None
             raise exc
 
         total = {currency: float(amount) for currency, amount in self._balances.items()}
@@ -482,6 +514,12 @@ class FakeCCXTExchange:
 
         qty = Decimal(str(amount)).quantize(_QTY_PRECISION)
         fill_price = self._last_price(symbol)
+        if side == "buy":
+            slippage = self._fill_slippage_pct.get(symbol)
+            if slippage is not None:
+                fill_price = (fill_price * (Decimal("1") + slippage)).quantize(
+                    Decimal("0.00000001")
+                )
         notional = qty * fill_price
 
         limits = market.get("limits") or {}
