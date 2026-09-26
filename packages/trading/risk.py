@@ -255,6 +255,12 @@ class BaseRiskManager(abc.ABC):
         self._kill_switch_reason: str | None = None
         self._consecutive_losses: int = 0
         self._cooldown_bars_remaining: int = 0
+        # WP1.8 S-10: defence-in-depth mirror of a live resume's
+        # ``mode=protective`` flag (WP1.8a O9's strategy-layer
+        # ``_drop_entry_signals`` is the primary gate; this is the
+        # risk-layer backstop so a bug upstream of the strategy filter
+        # still cannot open new BUY risk while a run is protective).
+        self._protective_mode: bool = False
         self._log = structlog.get_logger(__name__).bind(run_id=run_id)
 
     # ------------------------------------------------------------------
@@ -272,6 +278,26 @@ class BaseRiskManager(abc.ABC):
     @property
     def kill_switch_active(self) -> bool:
         return self._kill_switch_active
+
+    @property
+    def protective_mode(self) -> bool:
+        """WP1.8 S-10: True once :meth:`set_protective_mode` has been
+        called with ``True`` -- blocks every BUY at the risk layer."""
+        return self._protective_mode
+
+    def set_protective_mode(self, active: bool) -> None:
+        """WP1.8 S-10: enable/disable the risk-layer BUY block.
+
+        Called once at engine construction time by the live-resume
+        pipeline (``mode=protective``, never toggled mid-run -- switching
+        back to normal requires a fresh orphan + resume per the synthesis
+        spec's out-of-scope list). Exposed as a plain setter (not a
+        one-way trigger like the kill switch) since protective mode is a
+        run-configuration flag, not an incident latch.
+        """
+        self._protective_mode = active
+        if active:
+            self._log.warning("risk.protective_mode_enabled")
 
     @property
     def consecutive_losses(self) -> int:
@@ -516,6 +542,18 @@ class BaseRiskManager(abc.ABC):
             return RiskViolation(
                 rule="kill_switch",
                 message=f"Kill switch active: {self._kill_switch_reason}",
+                blocking=True,
+            )
+        return None
+
+    def _check_protective_mode(self, order: Order) -> RiskViolation | None:
+        """WP1.8 S-10: block a BUY at the risk layer while protective mode
+        is active. Never fires for a SELL -- protective mode only ever
+        drops entries, exits keep working (O9)."""
+        if self._protective_mode and order.side == OrderSide.BUY:
+            return RiskViolation(
+                rule="protective_mode",
+                message="Protective mode active: BUY entries are blocked (WP1.8 S-10).",
                 blocking=True,
             )
         return None

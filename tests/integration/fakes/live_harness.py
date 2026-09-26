@@ -203,6 +203,11 @@ async def build_resumed_live_stack(
     as it would in production.
     """
     risk_manager = DefaultRiskManager(run_id=run_id, params=risk_params)
+    if protective_mode:
+        # WP1.8 S-10: risk-layer defence-in-depth mirror of the
+        # strategy-layer protective_mode filter below -- production wires
+        # this identically in run_orchestrator._run_live_engine.
+        risk_manager.set_protective_mode(True)
 
     # Mirrors run_orchestrator.py:1111-1123 (a fresh exchange handle, same
     # FakeCCXTExchange instance behind it via patch_exchange_factory).

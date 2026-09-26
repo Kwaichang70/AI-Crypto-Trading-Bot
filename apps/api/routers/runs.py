@@ -65,6 +65,7 @@ from api.services.run_orchestrator import (
     _RUN_TASKS,
     _normalize_exchange_secret,
     auto_stop_after as _auto_stop_after,
+    build_live_ccxt_exchange as _build_live_ccxt_exchange,
     flush_incremental as _flush_incremental,
     incremental_flush_loop as _incremental_flush_loop,
     notify_trade_telegram as _notify_trade_telegram,
@@ -79,7 +80,7 @@ from api.services.run_persistence import (
     run_orm_to_response as _run_orm_to_response,
 )
 from common.types import OrderSide, RunMode, TimeFrame
-from trading.recovery import ResumeRejected, check_fill_integrity
+from trading.recovery import ResumeRejected, check_fill_integrity, replay_sort_key
 from trading.strategy_availability import get_availability, is_mode_allowed
 
 __all__ = ["router", "recover_orphaned_runs"]
@@ -1167,6 +1168,7 @@ async def get_run(
 async def stop_run(
     run_id: uuid.UUID,
     db: Annotated[AsyncSession, Depends(get_db)],
+    request: Request,
 ) -> RunDetailResponse:
     """
     Stop a running trading run.
@@ -1177,6 +1179,10 @@ async def stop_run(
         UUID of the run to stop.
     db:
         Injected async database session.
+    request:
+        WP1.8b (S2-03): passed through to the orphaned/resuming-stop audit
+        row below so actor/IP/user-agent are captured (previously
+        ``request=None``).
 
     Returns
     -------
@@ -1196,6 +1202,10 @@ async def stop_run(
     # WP1.8a-round2 (C-01/S-01 item 4): lock the row before the status guard
     # so a concurrent resume's uncommitted orphaned->resuming->running
     # transition is waited on (not silently missed) rather than racing us.
+    # WP1.8b (S2-01): a resume no longer holds this lock for the duration
+    # of its exchange scan (only for its own two short CAS transactions),
+    # so this SELECT ... FOR UPDATE now blocks for, at most, a few
+    # milliseconds even while a resume's scan is in flight.
     stmt = select(RunORM).where(RunORM.id == run_id).with_for_update()
     result = await db.execute(stmt)
     run = result.scalar_one_or_none()
@@ -1209,19 +1219,22 @@ async def stop_run(
 
     # WP1.8a: an orphaned run has no background task (O1) but is still a
     # live, unresolved run the operator must be able to close out without
-    # first resuming it.
-    if run.status not in ("running", "orphaned"):
+    # first resuming it. WP1.8b (S2-01): 'resuming' is accepted too -- a
+    # stop issued while a resume's scan is in flight (no lock held) must
+    # win outright, not wait for the resume to finish.
+    if run.status not in ("running", "orphaned", "resuming"):
         log.warning("runs.not_stoppable", current_status=run.status)
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=(
                 f"Cannot stop run {run_id}: "
-                f"current status is '{run.status}'. Only 'running' or "
-                f"'orphaned' runs can be stopped."
+                f"current status is '{run.status}'. Only 'running', "
+                f"'orphaned' or 'resuming' runs can be stopped."
             ),
         )
 
-    was_orphaned = run.status == "orphaned"
+    was_orphaned_or_resuming = run.status in ("orphaned", "resuming")
+    previous_status = run.status
 
     now = datetime.now(tz=UTC)
     run.status = "stopped"
@@ -1230,11 +1243,17 @@ async def stop_run(
 
     await db.flush()
 
-    # WP1.8a-round2 (S-08): stopping an orphaned run may be closing out an
-    # unprotected position (S8) -- make that loud and durable, not a
-    # silent, unaudited transition like a normal stop.
-    if was_orphaned:
-        log.critical("runs.orphan_stopped", run_id=str(run_id), run_mode=run.run_mode)
+    # WP1.8a-round2 (S-08), extended WP1.8b for 'resuming': stopping an
+    # orphaned OR resuming run may be closing out an unprotected position
+    # (S8) -- make that loud and durable, not a silent, unaudited
+    # transition like a normal stop.
+    if was_orphaned_or_resuming:
+        log.critical(
+            "runs.orphan_stopped",
+            run_id=str(run_id),
+            run_mode=run.run_mode,
+            previous_status=previous_status,
+        )
         from api.services.audit_log import record_audit_event
 
         await record_audit_event(
@@ -1242,8 +1261,12 @@ async def stop_run(
             event_type="emergency_stop",
             resource_type="run",
             resource_id=str(run_id),
-            request=None,
-            payload={"run_mode": run.run_mode, "trigger": "stop_run_orphaned"},
+            request=request,
+            payload={
+                "run_mode": run.run_mode,
+                "trigger": "stop_run_orphaned",
+                "previous_status": previous_status,
+            },
         )
 
     # Cancel the background task if one exists for this run (an orphaned
@@ -1316,12 +1339,15 @@ async def emergency_stop_run(
 
     # WP1.8a-round2 (S-08): an orphaned run may still hold an unprotected
     # position -- emergency-stop must be able to close it out, not 409.
-    if run.status not in ("running", "orphaned"):
+    # WP1.8b (S2-01): 'resuming' is accepted too -- see stop_run's
+    # identical rationale.
+    if run.status not in ("running", "orphaned", "resuming"):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=(
                 f"Cannot emergency-stop run {run_id}: status is '{run.status}'. "
-                f"Only 'running' or 'orphaned' runs can be emergency-stopped."
+                f"Only 'running', 'orphaned' or 'resuming' runs can be "
+                f"emergency-stopped."
             ),
         )
 
@@ -1799,11 +1825,15 @@ async def _kill_switch_triggered_after(db: AsyncSession, run: RunORM) -> bool:
         "live-trading safety gate (env flag + API keys + X-Live-Confirm-Token "
         "header), even for mode=protective (U2: protective is token-gated and "
         "always manual). The compare-and-set orphaned->resuming transition "
-        "ensures exactly one of two concurrent resume requests succeeds. In "
-        "WP1.8a the exchange scan is a fail-closed stub -- every production "
-        "resume returns 409 'exchange_scan_not_implemented' until WP1.8b "
-        "lands (strictly safer than HEAD's silent auto-restart-with-empty-"
-        "portfolio)."
+        "ensures exactly one of two concurrent resume requests succeeds. "
+        "WP1.8b: scans the exchange for every order placed under this run's "
+        "clientOrderId prefix since it started, cancels any still open, "
+        "polls each to a terminal state, and imports any order/fill missing "
+        "from the DB before replaying. Any scan/cancel/trade-fetch failure, "
+        "or a fill-history inconsistency, returns 409 with a machine-"
+        "readable reason (e.g. 'fill_history_partial', 'fill_history_corrupt', "
+        "'exchange_scan_incomplete') and reverts the run to 'orphaned' -- "
+        "never overridable."
     ),
     dependencies=[Depends(require_admin)],
 )
@@ -1814,26 +1844,45 @@ async def resume_run(
     mode: Annotated[Literal["normal", "protective"], Query()] = "normal",
     x_live_confirm_token: Annotated[str | None, Header()] = None,
 ) -> RunDetailResponse:
-    """Resume an orphaned live run in place (WP1.8a, reworked WP1.8a-round2).
+    """Resume an orphaned live run in place (WP1.8a, reworked WP1.8a-round2
+    and again for WP1.8b's S2-01 three-short-transaction redesign).
 
     Order of steps: 404 -> gate layers 1-3 (403) -> resolve/validate ALL
     config (strategy/symbols/timeframe/params/trailing/bracket/capital,
-    422 on any failure -- C-03/S-03, moved before the CAS so a config
+    422 on any failure -- C-03/S-03, before any DB mutation so a config
     problem never leaves a run stuck 'resuming') -> concurrency cap (503)
-    -> compare-and-set orphaned->resuming (0 rows -> 409) -> S4 kill-switch
-    check #1 -> prepare_live_resume -> S4 kill-switch check #2 (C-01 item 1,
-    closes the window while the exchange-scan/validation step was running)
-    -> audit run_resumed{...} (S-09 enriched payload) -> resuming->running
-    (also persisting protective_mode into config, S-10) -> commit -> spawn
-    the task with NO awaits between the commit and task-registration
-    (C-01 item 2).
+    -> **transaction (a)**: compare-and-set orphaned->resuming, commit
+    IMMEDIATELY (0 rows -> 409; a real commit here, not a flush, is what
+    releases the row lock before the scan -- WP18a-S2-01) -> S4
+    kill-switch check #1 (no lock held) -> **transaction (b)**: build a
+    real CCXT exchange (P-02) and call ``prepare_live_resume`` (the
+    WP1.8b exchange scan/cancel/import -- also with no run-row lock held;
+    every write it performs is its own short transaction against the
+    orders/fills tables), guaranteed ``exchange.close()`` in a
+    ``finally`` -> S4 kill-switch check #2 (closes the window the scan
+    was running in) -> **transaction (c)**: audit ``run_resumed{...}``
+    (S-09 enriched payload), conditional resuming->running (0 rows -> 409
+    ``resume_state_lost``, reverting as appropriate), commit -> spawn the
+    task with NO awaits between the commit and task-registration (C-01
+    item 2).
 
-    Every exception raised between the first CAS succeeding and the final
-    commit -- other than an ``HTTPException`` this function itself raises
-    after already performing its own explicit rollback+audit -- reverts the
-    row back to 'orphaned' and writes a ``run_resume_rejected`` audit row
-    before surfacing a 500 (C-04/S-06 defense in depth: no exception on this
-    path may ever leave a run silently stuck at 'resuming').
+    WP18a-S2-01: because transaction (a) commits before the scan starts,
+    a kill-switch or stop/emergency-stop issued WHILE the scan is running
+    sees the row as plain 'resuming' with NO lock held on it and can act
+    immediately (kill-switch moves it to 'orphaned'; stop/emergency-stop
+    move it straight to 'stopped') -- it no longer waits out the whole
+    scan. Transaction (c)'s own conditional CAS then naturally detects
+    that pre-emption (0 rows matched) and reverts to a 409 instead of
+    silently overwriting a concurrent stop/kill-switch decision.
+
+    Every exception raised between transaction (a) committing and
+    transaction (c) committing -- other than an ``HTTPException`` this
+    function itself raises after already performing its own explicit
+    rollback+audit -- reverts the row back to 'orphaned' (a no-op if a
+    concurrent kill-switch/stop already moved it elsewhere, C-04/S-06
+    defense in depth) and writes a ``run_resume_rejected`` audit row
+    before surfacing a 500 (no exception on this path may ever leave a
+    run silently stuck at 'resuming').
     """
     from api.config import get_settings
     from api.services.audit_log import record_audit_event
@@ -1963,17 +2012,41 @@ async def resume_run(
             ),
         )
 
-    # Compare-and-set orphaned -> resuming.  0 rows updated means either the
-    # run was never orphaned, or a concurrent resume request already won
-    # the race -- both are a 409 (WP18-R-02).
-    now = datetime.now(tz=UTC)
+    # Transaction (a): compare-and-set orphaned -> resuming, committed
+    # IMMEDIATELY (WP18a-S2-01) -- 0 rows updated means either the run was
+    # never orphaned, or a concurrent resume request already won the race
+    # -- both are a 409 (WP18-R-02). A real commit (not a flush) here is
+    # what releases the row lock before the scan begins.
+    #
+    # WP18b-S-01: a fresh, random ``resume_attempt_id`` becomes this
+    # attempt's FENCE, embedded in ``config`` by this very CAS.  Every
+    # later mutation this attempt makes -- the final CAS, `_reject`, and
+    # every per-order import transaction inside `scan_and_import` -- is
+    # conditioned on `config->>'resume_attempt_id' == fence` in addition to
+    # `status == 'resuming'`.  Without the fence, a resume that a kill
+    # switch (or a second resume) has already cut off and recycled
+    # (`resuming -> orphaned -> resuming` again, under a NEW attempt) would
+    # match a plain `status == 'resuming'` WHERE clause even though the row
+    # now belongs to a DIFFERENT attempt -- an ABA race that lets a
+    # superseded resume both start its engine and double-import fills
+    # alongside the attempt that actually owns the row (WP18b-S-01).
+    #
+    # The fence is NOT ``runs.updated_at`` -- migration 001's
+    # ``BEFORE UPDATE`` trigger (``trigger_set_updated_at()``)
+    # unconditionally overwrites that column with the database's own
+    # ``now()`` on every UPDATE, so an application-supplied value can never
+    # be compared back for equality after a round trip. ``config`` (JSONB)
+    # has no such trigger, so a value written here survives verbatim.
+    fence = str(uuid.uuid4())
+    resuming_config = dict(orphan_config)
+    resuming_config["resume_attempt_id"] = fence
     cas_result = await db.execute(
         update(RunORM)
         .where(RunORM.id == run_id, RunORM.status == "orphaned")
-        .values(status="resuming", updated_at=now)
+        .values(status="resuming", updated_at=datetime.now(tz=UTC), config=resuming_config)
     )
-    await db.flush()
     if cas_result.rowcount == 0:  # type: ignore[attr-defined]
+        await db.rollback()
         await db.refresh(run)
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -1982,13 +2055,36 @@ async def resume_run(
                 f"{run.status!r}); it cannot be resumed."
             ),
         )
+    await db.commit()
     await db.refresh(run)
 
     async def _reject(reason: str) -> None:
-        """Roll status back to orphaned and audit the rejection (S11)."""
+        """Roll status back to orphaned and audit the rejection (S11).
+
+        WP18b-S-02: rolls back FIRST -- any half-finished work left
+        uncommitted on `db` by the caller (e.g. an order row flushed but
+        its fills not yet added, before an exception hit) must never be
+        silently committed by this function's own later `db.commit()`.
+        Without the rollback, a per-order write that raised partway
+        through could otherwise be persisted as a truncated, invalid
+        order-with-no-fills row that then poisons every future resume
+        attempt's own pre-scan integrity check (WP18b-S-02 PC evidence).
+
+        A short transaction of its own, fenced (WP18b-S-01): the CAS is a
+        safe no-op (0 rows) if a concurrent kill-switch/stop/emergency-stop
+        already moved the row away from 'resuming', OR if a DIFFERENT
+        resume attempt now owns 'resuming' under a new fence -- the audit
+        row is still written either way so the rejection is never silently
+        lost (S-03).
+        """
+        await db.rollback()
         await db.execute(
             update(RunORM)
-            .where(RunORM.id == run_id, RunORM.status == "resuming")
+            .where(
+                RunORM.id == run_id,
+                RunORM.status == "resuming",
+                RunORM.config["resume_attempt_id"].astext == fence,
+            )
             .values(status="orphaned", updated_at=datetime.now(tz=UTC))
         )
         await record_audit_event(
@@ -2005,7 +2101,8 @@ async def resume_run(
     try:
         # S4 check #1: normal resume is blocked by a kill-switch pressed
         # after this run started; protective resume is explicitly exempt
-        # (U2/S4).
+        # (U2/S4). No row lock held here (transaction (a) already
+        # committed) -- a plain read.
         if mode == "normal" and await _kill_switch_triggered_after(db, run):
             await _reject("kill_switch_after_start")
             raise HTTPException(
@@ -2013,19 +2110,30 @@ async def resume_run(
                 detail="kill_switch_after_start",
             )
 
+        # Transaction (b): build a real CCXT exchange for the scan
+        # (WP1.8b P-02) and run prepare_live_resume/scan_and_import with
+        # NO run-row lock held -- this is the step that can take real
+        # wall-clock time (cancel-then-poll up to 30s per open order).
+        # ``exchange.close()`` runs in a finally so a scan failure never
+        # leaks the connection (P-02: guaranteed cleanup).
+        exchange = _build_live_ccxt_exchange(settings)
         try:
-            snapshot = await prepare_live_resume(db, run, None)
+            snapshot = await prepare_live_resume(db, run, exchange, fence=fence)
         except ResumeRejected as exc:
             await _reject(exc.reason)
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=exc.reason,
             ) from exc
+        finally:
+            try:
+                await exchange.close()
+            except Exception:
+                log.warning("runs.resume_exchange_close_failed", exc_info=True)
 
-        # S4 check #2 (WP1.8a-round2 C-01 item 1): prepare_live_resume can
-        # take real wall-clock time (exchange scan in 1.8b); re-check right
-        # before the final CAS so a kill-switch pressed WHILE that call was
-        # running is not missed.
+        # S4 check #2 (WP1.8a-round2 C-01 item 1): the scan can take real
+        # wall-clock time; re-check right before transaction (c) so a
+        # kill-switch pressed WHILE it was running is not missed.
         kill_switch_after_start = await _kill_switch_triggered_after(db, run)
         if mode == "normal" and kill_switch_after_start:
             await _reject("kill_switch_after_start")
@@ -2036,15 +2144,19 @@ async def resume_run(
 
         # WP1.8a-round2 (S-09): enrich the audit payload with everything an
         # operator reviewing the incident timeline would want, computed
-        # from data already in hand (no extra DB round-trip).
+        # from data already in hand (no extra DB round-trip). S2-02:
+        # BUY-before-SELL tie-break on equal executed_at.
         fill_count = len(snapshot.fills)
         rebuilt_qty_by_symbol: dict[str, str] = {}
-        for fill in sorted(snapshot.fills, key=lambda f: (f.executed_at, str(f.fill_id))):
+        for fill in sorted(snapshot.fills, key=replay_sort_key):
             held = Decimal(rebuilt_qty_by_symbol.get(fill.symbol, "0"))
             held = held + fill.quantity if fill.side == OrderSide.BUY else held - fill.quantity
             rebuilt_qty_by_symbol[fill.symbol] = str(held)
         elapsed_seconds = max((datetime.now(tz=UTC) - run.started_at).total_seconds(), 0.0)
 
+        # Transaction (c): S4 re-check already done above; audit + the
+        # conditional final CAS + commit, all in one short transaction --
+        # no row lock is held any longer than this.
         await record_audit_event(
             db,
             event_type="run_resumed",
@@ -2072,18 +2184,65 @@ async def resume_run(
         final_now = datetime.now(tz=UTC)
         final_result = await db.execute(
             update(RunORM)
-            .where(RunORM.id == run_id, RunORM.status == "resuming")
+            .where(
+                RunORM.id == run_id,
+                RunORM.status == "resuming",
+                RunORM.config["resume_attempt_id"].astext == fence,
+            )
             .values(status="running", updated_at=final_now, config=updated_config)
         )
         if final_result.rowcount == 0:  # type: ignore[attr-defined]
-            # Defensive -- nothing else can touch a 'resuming' row, but never
-            # leave it stuck there if it somehow happens.
+            # WP18a-S2-01: this is no longer just defensive -- a
+            # concurrent kill-switch (resuming->orphaned) or
+            # stop/emergency-stop (resuming->stopped) issued WHILE the
+            # scan above was running lands here as the expected outcome,
+            # not an edge case. _reject's own CAS is a safe no-op in that
+            # case (the row is already wherever the pre-emption left it).
             await _reject("resume_state_lost")
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="resume_state_lost",
             )
         await db.commit()
+    except asyncio.CancelledError:
+        # WP18b-S-04: asyncio.CancelledError is a BaseException, not an
+        # Exception -- it is NOT caught by the `except Exception:` branch
+        # below, so without this handler a cancelled request (client
+        # disconnect, worker shutdown) used to leave the row stuck at
+        # 'resuming' with no audit row at all. The revert is fenced (S-01)
+        # and runs in a FRESH session under `asyncio.shield` -- `db` itself
+        # may be mid-teardown as part of the same cancellation, and a bare
+        # `await` here (unshielded) could be cancelled again before the
+        # revert completes.
+        async def _shielded_cancelled_revert() -> None:
+            from api.db.session import get_session_factory
+
+            try:
+                factory = get_session_factory()
+                async with factory() as fresh_db:
+                    await fresh_db.execute(
+                        update(RunORM)
+                        .where(
+                            RunORM.id == run_id,
+                            RunORM.status == "resuming",
+                            RunORM.config["resume_attempt_id"].astext == fence,
+                        )
+                        .values(status="orphaned", updated_at=datetime.now(tz=UTC))
+                    )
+                    await record_audit_event(
+                        fresh_db,
+                        event_type="run_resume_rejected",
+                        resource_type="run",
+                        resource_id=str(run_id),
+                        request=request,
+                        payload={"reason": "resume_cancelled", "mode": mode},
+                    )
+                    await fresh_db.commit()
+            except Exception:
+                log.exception("runs.resume_cancelled_revert_failed")
+
+        await asyncio.shield(_shielded_cancelled_revert())
+        raise
     except HTTPException:
         # Already handled: the branch that raised it already performed its
         # own explicit rollback-to-orphaned + audit row above.
@@ -2469,9 +2628,11 @@ async def recover_orphaned_runs() -> int:
     """Boot-time orphan handling for paper/live runs (WP1.8a S5/S6).
 
     Queries every run with ``run_mode IN ('paper', 'live')`` and
-    ``status IN ('running', 'orphaned')`` -- 'running' catches a hard kill
-    (the engine task never reached its own teardown), 'orphaned' catches a
-    graceful shutdown nobody has resumed yet.
+    ``status IN ('running', 'orphaned', 'resuming')`` -- 'running' catches
+    a hard kill (the engine task never reached its own teardown),
+    'orphaned' catches a graceful shutdown nobody has resumed yet, and
+    'resuming' (WP1.8a-round2 S-04/C-06) catches a hard kill mid-resume
+    that never reached its own final CAS.
 
     - Live runs are left/transitioned to 'orphaned' with no task started
       (O1); an operator must call ``POST /runs/{id}/resume``.

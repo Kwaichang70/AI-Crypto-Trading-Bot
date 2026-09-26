@@ -31,6 +31,7 @@ import structlog
 
 from common.types import OrderSide
 from trading.models import Fill, Position, TradeResult
+from trading.recovery import replay_sort_key
 
 __all__ = ["PortfolioAccounting"]
 
@@ -432,7 +433,7 @@ class PortfolioAccounting:
         portfolio = cls(run_id=run_id, initial_cash=initial_cash)
         resolved_now = now if now is not None else datetime.now(tz=UTC)
 
-        ordered_fills = sorted(fills, key=lambda f: (f.executed_at, str(f.fill_id)))
+        ordered_fills = sorted(fills, key=replay_sort_key)
         for fill in ordered_fills:
             portfolio._apply_fill(fill, fill.price, at=fill.executed_at, record_curve_point=False)
 

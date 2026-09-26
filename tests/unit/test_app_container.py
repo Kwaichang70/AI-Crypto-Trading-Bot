@@ -154,6 +154,7 @@ class TestHealthAllFalse:
             "equity_prune_task",
             "history_cache_warmer",   # S47-1 (Sprint 47)
             "fx_cache_warmer",        # M6 (Sprint 49)
+            "orphan_repeater_task",   # WP1.8b (P-06)
         }
         assert set(snapshot.keys()) == expected_keys
         assert all(v is False for v in snapshot.values())

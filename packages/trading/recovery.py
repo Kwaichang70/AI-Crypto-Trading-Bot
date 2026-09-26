@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 
 from common.types import OrderSide
@@ -32,12 +33,33 @@ __all__ = [
     "ResumeRejected",
     "ResumeSnapshot",
     "check_fill_integrity",
+    "replay_sort_key",
 ]
 
 #: Default tolerance for quantity comparisons -- one satoshi-scale unit.
 #: Matches the WP1.1 I8 tolerance convention (one amount step, or this
 #: fallback when the step size is unknown).
 _DEFAULT_TOLERANCE = Decimal("0.00000001")
+
+
+def replay_sort_key(fill: Fill) -> tuple[datetime, int, str]:
+    """Deterministic fill replay/audit ordering (WP1.8b S2-02).
+
+    ``(executed_at, buy_before_sell, fill_id)`` -- when a BUY and a SELL
+    share the exact same ``executed_at`` (two fills timestamped by the
+    same exchange trade batch, or two synthesised fills sharing an
+    order's ``updated_at``), the BUY is always replayed first. Without
+    this tie-break the previous ``(executed_at, str(fill_id))`` key
+    ordered same-timestamp fills by random UUID, so a legitimate
+    BUY-then-SELL history could occasionally replay SELL-first and be
+    rejected as an oversell by :func:`check_fill_integrity` (WP18a-S2-02,
+    fail-closed but availability-costly). Shared by
+    :func:`check_fill_integrity`, ``PortfolioAccounting.from_fills``,
+    ``PaperExecutionEngine.restore_from_fills`` and the resume endpoint's
+    own audit-payload reconstruction so every replay/report orders
+    identically.
+    """
+    return (fill.executed_at, 0 if fill.side == OrderSide.BUY else 1, str(fill.fill_id))
 
 
 class ResumeRejected(Exception):
@@ -49,8 +71,12 @@ class ResumeRejected(Exception):
     ----------
     reason:
         A short machine-readable reason code (e.g. ``"fill_history_corrupt"``,
-        ``"fill_history_partial"``, ``"exchange_scan_not_implemented"``).
-        Callers surface this verbatim in the 409 response body and in the
+        ``"fill_history_partial"``, ``"exchange_scan_incomplete"``,
+        ``"exchange_scan_failed"``, ``"order_cancel_failed"``,
+        ``"order_cancel_timeout"``, ``"trade_fetch_failed"`` -- the last
+        five raised by WP1.8b's ``apps.api.services.run_recovery
+        .scan_and_import``, not this module). Callers surface this
+        verbatim in the 409 response body and in the
         ``run_resume_rejected`` audit event payload.
     """
 
@@ -129,7 +155,18 @@ def check_fill_integrity(
         matching WP1.1 I8).
     """
     orders_by_id = {order.order_id: order for order in orders}
-    ordered_fills = sorted(fills, key=lambda f: (f.executed_at, str(f.fill_id)))
+    ordered_fills = sorted(fills, key=replay_sort_key)
+
+    # WP18a-S2-02 (INFO finding, promoted to a binding 1.8b condition): the
+    # per-fill loop below only ever looks up ``orders_by_id`` for an order
+    # that HAS a fill -- a foreign-symbol order with zero fills was
+    # previously invisible to this check entirely (it has no bearing on
+    # position math, but a resume must still fail closed on ANY row that
+    # does not belong to this run, fill or no fill). Check every persisted
+    # order's symbol up front, independent of whether it has fills.
+    for persisted_order in orders:
+        if persisted_order.symbol not in symbols:
+            raise ResumeRejected("fill_history_corrupt")
 
     running_qty: dict[str, Decimal] = {}
     seen_keys: set[tuple[object, object, Decimal, Decimal]] = set()
@@ -147,7 +184,17 @@ def check_fill_integrity(
             raise ResumeRejected("fill_history_corrupt")
 
         base_asset = fill.symbol.split("/")[0]
-        if fill.fee_currency == base_asset:
+        # WP18a-P-03 (false positive, fixed 1.8b): a NON-ZERO base-currency
+        # fee must already have been netted out of quantity at fill time
+        # (WP1.1 D6's _normalize_trade_fee) -- that is the actual
+        # corruption signal. A zero-fee record whose fee_currency
+        # nonetheless reports the base asset is not: some exchanges
+        # default the fee-currency field to the market base even when
+        # cost=0 (nothing was charged, so D6 had nothing to normalise),
+        # and rejecting that would fail a perfectly legitimate history
+        # closed. Documented rule: only ``fee_currency == base_asset AND
+        # fee > 0`` is corrupt.
+        if fill.fee_currency == base_asset and fill.fee > Decimal("0"):
             raise ResumeRejected("fill_history_corrupt")
 
         order = orders_by_id.get(fill.order_id)
@@ -155,14 +202,12 @@ def check_fill_integrity(
             raise ResumeRejected("fill_history_corrupt")
 
         # WP1.8a-round2 (S-05/C-02): a fill's own symbol/side must be
-        # internally consistent with its parent order, and the order's
-        # symbol must itself be one the run actually trades. Without this,
-        # a mislabelled or foreign-symbol fill could pass every other
-        # check (a 0 vs 0.02 quantity mismatch is otherwise invisible to
-        # the corrupt-history checks above) and silently poison the
-        # rebuilt portfolio on resume.
-        if order.symbol not in symbols:
-            raise ResumeRejected("fill_history_corrupt")
+        # internally consistent with its parent order (the order's OWN
+        # symbol is already checked against ``symbols`` up front above,
+        # WP18a-S2-02). Without this, a mislabelled or foreign-symbol fill
+        # could pass every other check (a 0 vs 0.02 quantity mismatch is
+        # otherwise invisible to the corrupt-history checks above) and
+        # silently poison the rebuilt portfolio on resume.
         if fill.symbol != order.symbol or fill.side != order.side:
             raise ResumeRejected("fill_history_corrupt")
 

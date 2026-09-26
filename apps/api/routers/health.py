@@ -16,6 +16,12 @@ NOTE: ``equity_prune_task`` (registered in
 Add it in a follow-up sprint if operators need to monitor it
 independently.
 
+WP1.8b (P-06): ``orphan_repeater_task`` (S8's 15-minute
+orphan-holding-unprotected alert loop, ``run_recovery.orphan_holding_repeater``)
+IS surfaced -- a plain ``asyncio.Task`` with no richer diagnostics of its
+own, so "is it still alive" (``running``) is the entire cheap signal
+worth exposing here.
+
 API-key auth required (operational endpoint -- mirrors /api/v1/runs).
 """
 
@@ -80,6 +86,15 @@ class ActiveRunsHealth(BaseModel):
     )
 
 
+class OrphanRepeaterHealth(BaseModel):
+    """Health snapshot for the WP1.8 S8 orphan-holding-unprotected alert
+    repeater. A plain ``asyncio.Task`` (no internal diagnostics), so
+    ``running`` is the only signal cheaply available here (P-06)."""
+
+    configured: bool = Field(description="True if the repeater task was scheduled at startup")
+    running: bool = Field(description="True if the repeater's asyncio.Task is alive")
+
+
 class FxCacheWarmerHealth(BaseModel):
     """Health snapshot for the FX rate cache warmer (M6 MVP stub)."""
 
@@ -102,6 +117,7 @@ class BackgroundHealthResponse(BaseModel):
     retraining_service: RetrainingServiceHealth
     active_runs: ActiveRunsHealth
     fx_cache_warmer: FxCacheWarmerHealth
+    orphan_repeater: OrphanRepeaterHealth
 
 
 # ---------------------------------------------------------------------------
@@ -174,9 +190,24 @@ async def background_health(request: Request) -> BackgroundHealthResponse:
     else:
         fx_warmer_health = FxCacheWarmerHealth(configured=False, running=False)
 
+    # Orphan-holding repeater (WP1.8b P-06). A bare asyncio.Task -- no
+    # richer diagnostics object like the warmers above -- so "configured"
+    # just means the container registered a task at all.
+    orphan_repeater_task = (
+        container.background_tasks.orphan_repeater_task if container is not None else None
+    )
+    if orphan_repeater_task is not None:
+        orphan_repeater_health = OrphanRepeaterHealth(
+            configured=True,
+            running=not orphan_repeater_task.done(),
+        )
+    else:
+        orphan_repeater_health = OrphanRepeaterHealth(configured=False, running=False)
+
     return BackgroundHealthResponse(
         history_cache_warmer=warmer_health,
         retraining_service=rsvc_health,
         active_runs=active,
         fx_cache_warmer=fx_warmer_health,
+        orphan_repeater=orphan_repeater_health,
     )

@@ -54,6 +54,7 @@ __all__ = [
     "_RUN_ENGINES",
     "_RUN_TASKS",
     "auto_stop_after",
+    "build_live_ccxt_exchange",
     "flush_incremental",
     "incremental_flush_loop",
     "mark_shutdown_requested",
@@ -88,6 +89,59 @@ def _normalize_exchange_secret(secret: str) -> str:
     if lines:
         return "".join(lines)
     return normalized
+
+
+# ---------------------------------------------------------------------------
+# WP1.8b (P-02): shared real-CCXT-exchange construction
+# ---------------------------------------------------------------------------
+
+
+def build_live_ccxt_exchange(settings: Any) -> Any:  # noqa: ANN401
+    """Construct a real ``ccxt.async_support`` exchange instance.
+
+    Extracted from ``_run_live_engine``'s inline construction block so the
+    WP1.8b resume path (``apps.api.routers.runs.resume_run``, which needs
+    a real exchange handle for its exchange-scan BEFORE the live engine
+    itself is spawned -- see ``run_recovery.scan_and_import``) builds the
+    exact same credentials/config as the production engine, from one
+    place, instead of a second hand-maintained copy.
+
+    Pure construction -- no I/O, no network call (``ccxt.async_support``
+    exchange ``__init__`` never opens a connection). Callers own the
+    resulting instance's lifecycle and MUST call ``await exchange.close()``
+    themselves (P-02: guaranteed cleanup) once done with it -- this
+    function never closes anything.
+
+    Raises
+    ------
+    RuntimeError
+        If ``settings.exchange_id`` is not a real CCXT exchange id.
+    """
+    import ccxt.async_support as ccxt_async
+
+    api_key: str | None = None
+    api_secret: str | None = None
+    if settings.exchange_api_key is not None:
+        api_key = settings.exchange_api_key.get_secret_value()
+    if settings.exchange_api_secret is not None:
+        api_secret = settings.exchange_api_secret.get_secret_value()
+    if api_secret is not None:
+        api_secret = _normalize_exchange_secret(api_secret)
+    api_passphrase: str | None = None
+    if settings.exchange_api_passphrase is not None:
+        api_passphrase = settings.exchange_api_passphrase.get_secret_value()
+
+    exchange_cls = getattr(ccxt_async, settings.exchange_id, None)
+    if exchange_cls is None:
+        raise RuntimeError(f"Unsupported CCXT exchange: {settings.exchange_id!r}")
+    exchange_config: dict[str, Any] = {"enableRateLimit": True}
+    if api_key is not None:
+        exchange_config["apiKey"] = api_key
+    if api_secret is not None:
+        exchange_config["secret"] = api_secret
+    if api_passphrase is not None:
+        exchange_config["password"] = api_passphrase
+    return exchange_cls(exchange_config)
 
 
 # ---------------------------------------------------------------------------
@@ -1181,8 +1235,6 @@ async def run_live_engine(
         Seconds already elapsed since the run's *original* ``started_at``
         (0.0 for a fresh run) -- see ``run_paper_engine``.
     """
-    import ccxt.async_support as ccxt_async
-
     from api.config import get_settings
     from api.db.models import RunORM
     from api.db.session import get_session_factory
@@ -1242,7 +1294,8 @@ async def run_live_engine(
         settings = get_settings()
         capital = Decimal(initial_capital)
 
-        # Extract exchange credentials
+        # Extract exchange credentials (needed by CCXTMarketDataService
+        # below, which takes them directly rather than a built exchange).
         api_key: str | None = None
         api_secret: str | None = None
         if settings.exchange_api_key is not None:
@@ -1255,20 +1308,9 @@ async def run_live_engine(
         if settings.exchange_api_passphrase is not None:
             api_passphrase = settings.exchange_api_passphrase.get_secret_value()
 
-        # Build CCXT async exchange instance
-        exchange_cls = getattr(ccxt_async, settings.exchange_id, None)
-        if exchange_cls is None:
-            raise RuntimeError(f"Unsupported CCXT exchange: {settings.exchange_id!r}")
-        exchange_config: dict[str, Any] = {
-            "enableRateLimit": True,
-        }
-        if api_key is not None:
-            exchange_config["apiKey"] = api_key
-        if api_secret is not None:
-            exchange_config["secret"] = api_secret
-        if api_passphrase is not None:
-            exchange_config["password"] = api_passphrase
-        exchange = exchange_cls(exchange_config)
+        # Build CCXT async exchange instance (WP1.8b P-02: shared with the
+        # resume endpoint's own pre-spawn exchange scan).
+        exchange = build_live_ccxt_exchange(settings)
 
         # Instantiate components
         market_data = CCXTMarketDataService(
@@ -1279,6 +1321,11 @@ async def run_live_engine(
             cache_ttl_seconds=60,
         )
         risk_manager = DefaultRiskManager(run_id=run_id_str)
+        if protective_mode:
+            # WP1.8 S-10: risk-layer defence-in-depth alongside the
+            # strategy-layer _drop_entry_signals filter (StrategyEngine's
+            # own protective_mode=protective_mode below).
+            risk_manager.set_protective_mode(True)
         execution = LiveExecutionEngine(
             run_id=run_id_str,
             risk_manager=risk_manager,

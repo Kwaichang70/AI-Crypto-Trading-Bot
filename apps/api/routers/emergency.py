@@ -205,17 +205,25 @@ async def kill_switch(
     # one row) -- without it, Postgres is free to lock matching rows in
     # whatever order it finds them, which is the classic precondition for
     # a lock-ordering deadlock once a second multi-row locker exists.
+    # WP1.8b (S2-01): 'resuming' rows are selected too, so a kill switch
+    # pressed while a resume's exchange scan is running is never blocked
+    # by that resume's row lock -- the resume itself only ever holds this
+    # row's lock for its own two short CAS transactions (never across the
+    # scan), so this ``FOR UPDATE`` returns almost immediately regardless
+    # of an in-flight scan.
     result = await db.execute(
         select(RunORM)
-        .where(RunORM.status.in_(["running", "orphaned"]))
+        .where(RunORM.status.in_(["running", "orphaned", "resuming"]))
         .order_by(RunORM.id)
         .with_for_update()
     )
     candidate_runs: list[RunORM] = list(result.scalars().all())
     running_runs: list[RunORM] = [r for r in candidate_runs if r.status == "running"]
+    resuming_runs: list[RunORM] = [r for r in candidate_runs if r.status == "resuming"]
     orphaned_live_run_ids = [
         str(r.id) for r in candidate_runs if r.status == "orphaned" and r.run_mode == "live"
     ]
+    resuming_run_ids = [str(r.id) for r in resuming_runs]
 
     run_ids_attempted = [str(r.id) for r in running_runs]
 
@@ -224,34 +232,80 @@ async def kill_switch(
     #    even when there is nothing running to stop (WP1.8a S4).
     #    Wrapped in a SAVEPOINT so the audit row commits independently
     #    if a subsequent per-run flush fails inside the loop below.
+    #    S-09: a flush failure here must not disappear silently -- log
+    #    it at CRITICAL (in addition to record_audit_event's own internal
+    #    warning-level swallow) so an operator notices a broken audit
+    #    trail during an incident, without blocking the kill switch
+    #    itself on it.
     # ------------------------------------------------------------------
     raw_admin_key = settings.admin_api_key.get_secret_value()
     admin_key_prefix = hashlib.sha256(raw_admin_key.encode("utf-8")).hexdigest()[:12]
     actor_id = f"admin_key_{admin_key_prefix}"
 
-    async with db.begin_nested():
-        await record_audit_event(
-            db,
-            event_type="kill_switch",
-            resource_type="global",
-            resource_id="kill_switch",
-            request=request,
-            actor_override=actor_id,
-            payload={
-                "runs_attempted": run_ids_attempted,
-                "runs_count": len(run_ids_attempted),
-                "orphaned_live_run_ids": orphaned_live_run_ids,
-                "reason": _sanitise_reason(reason),
-                "admin_key_prefix": admin_key_prefix,
-            },
-        )
-    # SAVEPOINT released: audit row is now independently committed.
+    try:
+        async with db.begin_nested():
+            await record_audit_event(
+                db,
+                event_type="kill_switch",
+                resource_type="global",
+                resource_id="kill_switch",
+                request=request,
+                actor_override=actor_id,
+                payload={
+                    "runs_attempted": run_ids_attempted,
+                    "runs_count": len(run_ids_attempted),
+                    "orphaned_live_run_ids": orphaned_live_run_ids,
+                    "resuming_run_ids": resuming_run_ids,
+                    "reason": _sanitise_reason(reason),
+                    "admin_key_prefix": admin_key_prefix,
+                },
+            )
+    except Exception:
+        log.critical("emergency.kill_switch_audit_flush_failed", exc_info=True)
+    # SAVEPOINT released: audit row is now independently committed (or the
+    # failure above was logged critical and swallowed -- the kill switch
+    # itself must still proceed).
     # The outer transaction continues for per-run status mutations below.
+
+    # ------------------------------------------------------------------
+    # 2b. WP1.8b (S2-01): move every 'resuming' row to 'orphaned' NOW, in
+    #     this same transaction. This is what makes an in-flight resume's
+    #     own final CAS (resuming -> running) match 0 rows and fail with
+    #     409 'resume_state_lost' instead of racing this kill switch --
+    #     the resume never has to be waited on for that to be safe.
+    # ------------------------------------------------------------------
+    resuming_now = datetime.now(tz=UTC)
+    for run in resuming_runs:
+        run.status = "orphaned"
+        run.updated_at = resuming_now
+        await db.flush()
+        try:
+            await record_audit_event(
+                db,
+                event_type="run_orphaned",
+                resource_type="run",
+                resource_id=str(run.id),
+                request=request,
+                actor_override=actor_id,
+                payload={"trigger": "kill_switch", "previous_status": "resuming"},
+            )
+        except Exception:
+            log.critical(
+                "emergency.kill_switch_audit_flush_failed",
+                run_id=str(run.id),
+                exc_info=True,
+            )
+        log.warning(
+            "emergency.kill_switch_resuming_orphaned",
+            run_id=str(run.id),
+            run_mode=run.run_mode,
+        )
 
     if not running_runs:
         log.info(
             "emergency.kill_switch_no_active_runs",
             orphaned_live_count=len(orphaned_live_run_ids),
+            resuming_count=len(resuming_run_ids),
         )
         return KillSwitchResponse(
             runs_stopped=[],
@@ -260,11 +314,11 @@ async def kill_switch(
             errors=[],
             note=(
                 "no active runs to stop"
-                if not orphaned_live_run_ids
+                if not orphaned_live_run_ids and not resuming_run_ids
                 else (
                     "no active runs to stop; "
                     f"{len(orphaned_live_run_ids)} orphaned live run(s) recorded, "
-                    "status unchanged"
+                    f"{len(resuming_run_ids)} resuming run(s) moved to orphaned"
                 )
             ),
         )

@@ -1515,3 +1515,110 @@ class TestGetAllFills:
         assert result[0].executed_at < result[1].executed_at, (
             "Fills must be sorted ascending by executed_at"
         )
+
+
+# ===========================================================================
+# WP1.8b: _parse_ccxt_trades (shared trade-parse helper) + dedup
+# ===========================================================================
+
+
+class TestParseCcxtTradesHelper:
+    """Unit tests for the module-level ``_parse_ccxt_trades`` (extracted
+    from ``get_fills`` so ``apps.api.services.run_recovery.scan_and_import``
+    shares it -- WP1.8b)."""
+
+    def test_parses_a_single_trade_into_one_fill(self) -> None:
+        from trading.engines.live import _parse_ccxt_trades
+
+        order = _make_market_order(side=OrderSide.BUY, quantity=Decimal("0.1"))
+        trade = _make_ccxt_trade(amount="0.1", price="50000", fee_cost="0.5")
+
+        fills, gross, keys = _parse_ccxt_trades(
+            order, [trade], base_asset="BTC", quote_currency="USDT"
+        )
+
+        assert len(fills) == 1
+        assert fills[0].quantity == Decimal("0.1")
+        assert fills[0].price == Decimal("50000")
+        assert fills[0].fee == Decimal("0.5")
+        assert gross == Decimal("0.1")
+        assert len(keys) == 1
+
+    def test_already_routed_trade_is_deduped(self) -> None:
+        """I9: a trade whose key is already in ``already_routed`` is
+        skipped -- the same idempotency guarantee ``get_fills`` relies on
+        so a repeated poll never double-routes a fill."""
+        from trading.engines.live import _parse_ccxt_trades, _trade_key
+
+        order = _make_market_order()
+        trade = _make_ccxt_trade()
+        trade["id"] = "dedup-trade-1"
+
+        first_fills, _gross, first_keys = _parse_ccxt_trades(
+            order, [trade], base_asset="BTC", quote_currency="USDT"
+        )
+        assert len(first_fills) == 1
+
+        second_fills, second_gross, second_keys = _parse_ccxt_trades(
+            order, [trade], already_routed=first_keys, base_asset="BTC", quote_currency="USDT"
+        )
+        assert second_fills == []
+        assert second_gross == Decimal("0")
+        assert second_keys == set()
+        assert first_keys == {_trade_key(trade)}
+
+    def test_duplicate_trades_within_one_batch_are_deduped(self) -> None:
+        """The SAME trade record appearing twice in one ``trades`` batch
+        (e.g. a paginated fetch returning overlap) must only produce one
+        fill."""
+        from trading.engines.live import _parse_ccxt_trades
+
+        order = _make_market_order()
+        trade = _make_ccxt_trade()
+        trade["id"] = "dupe-in-batch"
+
+        fills, gross, keys = _parse_ccxt_trades(
+            order, [trade, dict(trade)], base_asset="BTC", quote_currency="USDT"
+        )
+        assert len(fills) == 1
+        assert gross == Decimal(trade["amount"])
+        assert len(keys) == 1
+
+    def test_invalid_price_is_skipped_not_raised(self) -> None:
+        """I3: a non-positive price is a business case (flagged via
+        on_skip), not a parse error that aborts the batch."""
+        from trading.engines.live import _parse_ccxt_trades
+
+        order = _make_market_order()
+        bad_trade = _make_ccxt_trade(price="0")
+        good_trade = _make_ccxt_trade(amount="0.05")
+        good_trade["id"] = "good-1"
+
+        skipped: list[str] = []
+        fills, gross, _keys = _parse_ccxt_trades(
+            order,
+            [bad_trade, good_trade],
+            base_asset="BTC",
+            quote_currency="USDT",
+            on_skip=skipped.append,
+        )
+        assert len(fills) == 1
+        assert fills[0].quantity == Decimal("0.05")
+        assert gross == Decimal("0.05")
+        assert "fill_price_invalid" in skipped
+
+    def test_base_currency_fee_is_normalized_into_quote(self) -> None:
+        """D6: a fee charged in the base asset is netted out of the
+        returned Fill.quantity and re-expressed in quote currency."""
+        from trading.engines.live import _parse_ccxt_trades
+
+        order = _make_market_order(side=OrderSide.BUY, quantity=Decimal("0.1"))
+        trade = _make_ccxt_trade(amount="0.1", price="50000", fee_cost="0.001", fee_currency="BTC")
+
+        fills, _gross, _keys = _parse_ccxt_trades(
+            order, [trade], base_asset="BTC", quote_currency="USDT"
+        )
+        assert len(fills) == 1
+        assert fills[0].quantity == Decimal("0.099")
+        assert fills[0].fee_currency == "USDT"
+        assert fills[0].fee == Decimal("50")  # 0.001 BTC * 50000

@@ -262,8 +262,9 @@ class AppContainer:
 
         Keys: db_engine, telegram_notifier, retraining_service, fgi_client,
         coingecko_client, fred_client, whale_alert_client, equity_prune_task,
-        history_cache_warmer, fx_cache_warmer.
+        history_cache_warmer, fx_cache_warmer, orphan_repeater_task.
         """
+        orphan_repeater_task = self.background_tasks.orphan_repeater_task
         return {
             "db_engine": self.db_engine is not None,
             "telegram_notifier": self.services.telegram_notifier is not None,
@@ -280,5 +281,11 @@ class AppContainer:
             "fx_cache_warmer": (
                 self.background_tasks.fx_cache_warmer is not None
                 and self.background_tasks.fx_cache_warmer.running
+            ),
+            # WP1.8b (P-06): cheap alive-check for the S8 orphan-holding
+            # alert repeater -- a bare asyncio.Task with no diagnostics of
+            # its own beyond "is it still running".
+            "orphan_repeater_task": (
+                orphan_repeater_task is not None and not orphan_repeater_task.done()
             ),
         }

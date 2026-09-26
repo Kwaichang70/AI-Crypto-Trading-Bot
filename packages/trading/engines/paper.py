@@ -34,6 +34,7 @@ import structlog
 from common.types import OrderSide, OrderStatus, OrderType, SignalDirection
 from trading.execution import BaseExecutionEngine
 from trading.models import Fill, Order, Position, Signal
+from trading.recovery import replay_sort_key
 from trading.risk import BaseRiskManager
 
 __all__ = ["PaperExecutionEngine"]
@@ -395,7 +396,7 @@ class PaperExecutionEngine(BaseExecutionEngine):
         fills:
             Every persisted fill for this run, in any order.
         """
-        ordered = sorted(fills, key=lambda f: (f.executed_at, str(f.fill_id)))
+        ordered = sorted(fills, key=replay_sort_key)
         for fill in ordered:
             self._update_position(fill, at=fill.executed_at)
         self._log.info(

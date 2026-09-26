@@ -204,3 +204,77 @@ class TestS05FillOrderConsistency:
         with pytest.raises(ResumeRejected) as exc_info:
             check_fill_integrity([fill], [order], symbols=SYMBOLS)
         assert exc_info.value.reason == "fill_history_corrupt"
+
+
+class TestWP18bBindingConditions:
+    """WP1.8b: P-03 (fee_currency false positive), S2-02 (BUY-before-SELL
+    tie-break; order-symbol check over ALL orders, not just orders with
+    fills)."""
+
+    def test_zero_fee_reported_in_base_currency_is_accepted(self) -> None:
+        """P-03: a zero-fee record whose fee_currency nonetheless reports
+        the base asset (some exchanges default the field even when
+        cost=0) must NOT be rejected -- only a NON-ZERO base-currency fee
+        (which D6 should already have netted out) is corruption."""
+        order = _order()
+        fill = _fill_for(order, fee_currency="BTC")
+        object.__setattr__(fill, "fee", Decimal("0"))
+        # Must not raise.
+        check_fill_integrity([fill], [order], symbols=SYMBOLS)
+
+    def test_nonzero_fee_reported_in_base_currency_still_rejected(self) -> None:
+        """The documented rule's other half: fee > 0 with fee_currency ==
+        base is still corrupt (unchanged from WP1.8a)."""
+        order = _order()
+        fill = _fill_for(order, fee_currency="BTC")
+        object.__setattr__(fill, "fee", Decimal("0.0001"))
+        with pytest.raises(ResumeRejected) as exc_info:
+            check_fill_integrity([fill], [order], symbols=SYMBOLS)
+        assert exc_info.value.reason == "fill_history_corrupt"
+
+    def test_buy_before_sell_tie_break_on_equal_executed_at(self) -> None:
+        """S2-02: a BUY and a SELL sharing the EXACT same executed_at must
+        always replay BUY-first, regardless of fill_id ordering -- fed
+        deliberately with fill_ids that would sort SELL-first under the
+        OLD ``str(fill_id)`` tie-break (which would spuriously reject this
+        legitimate history as an oversell)."""
+        same_instant = datetime(2026, 9, 20, 12, tzinfo=UTC)
+        buy_order = _order(filled_quantity="0.01", quantity="0.01")
+        sell_order = _order(filled_quantity="0.01", quantity="0.01")
+        object.__setattr__(sell_order, "side", OrderSide.SELL)
+        buy = _fill_for(
+            buy_order, side=OrderSide.BUY, quantity="0.01", price="49000", executed_at=same_instant
+        )
+        sell = _fill_for(
+            sell_order,
+            side=OrderSide.SELL,
+            quantity="0.01",
+            price="51000",
+            executed_at=same_instant,
+        )
+
+        # Force fill_ids so a plain str(fill_id) sort would replay SELL
+        # before BUY (the pre-1.8b failure mode -- a SELL against a still-
+        # flat position is rejected as an oversell): keep drawing until
+        # sell's id sorts lexically BEFORE buy's, deterministically
+        # reproducing the old bug's worst case regardless of this run's
+        # random UUIDs.
+        object.__setattr__(sell, "fill_id", uuid4())
+        object.__setattr__(buy, "fill_id", uuid4())
+        while str(sell.fill_id) >= str(buy.fill_id):
+            object.__setattr__(buy, "fill_id", uuid4())
+
+        # Fed SELL-first in the input list too -- check_fill_integrity
+        # must re-sort by replay_sort_key internally, not trust input order.
+        check_fill_integrity([sell, buy], [buy_order, sell_order], symbols=SYMBOLS)
+
+    def test_foreign_symbol_order_with_zero_fills_rejected(self) -> None:
+        """S2-02: an order whose symbol the run does not trade, but which
+        has NO fills at all, was previously invisible (the per-fill loop
+        never inspects an order with zero fills) -- must now be rejected
+        too."""
+        order = _order()
+        object.__setattr__(order, "symbol", "XRP/USDT")
+        with pytest.raises(ResumeRejected) as exc_info:
+            check_fill_integrity([], [order], symbols=SYMBOLS)
+        assert exc_info.value.reason == "fill_history_corrupt"

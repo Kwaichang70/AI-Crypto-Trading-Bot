@@ -186,6 +186,11 @@ class DefaultRiskManager(BaseRiskManager):
         # 1. Kill switch
         _gate(self._check_kill_switch())
 
+        # 1b. Protective mode (WP1.8 S-10): risk-layer backstop alongside
+        # the strategy-layer _drop_entry_signals filter -- BUY entries
+        # stay blocked even if a bug ever bypasses the strategy filter.
+        _gate(self._check_protective_mode(order))
+
         # 2. Cooldown
         _gate(self._check_cooldown())
 

@@ -149,6 +149,11 @@ class FakeCCXTExchange:
         # WP1.1 (R-23): symbol -> fraction of the next order's amount to
         # report as filled on the *first* fetch_order poll only.
         self._queued_partial_fills: dict[str, Decimal] = {}
+        # WP1.8b: one-shot fault injection for scan_and_import's three
+        # exchange calls (fetch_orders / cancel_order / trade fetch).
+        self._queued_fetch_orders_errors: dict[str, Exception] = {}
+        self._queued_cancel_errors: dict[str, Exception] = {}
+        self._queued_trades_errors: dict[str, Exception] = {}
         self._closed = False
 
         # Test-visible audit log of every create_order call, in call order.
@@ -287,6 +292,94 @@ class FakeCCXTExchange:
         this fixture. Unused by the WP1.0 scenario table itself.
         """
         self._queued_errors[symbol] = exc
+
+    # ------------------------------------------------------------------
+    # WP1.8b: exchange-scan (scan_and_import) test-side extensions
+    # ------------------------------------------------------------------
+
+    def seed_exchange_order(
+        self,
+        *,
+        client_order_id: str,
+        symbol: str,
+        side: str,
+        amount: Decimal,
+        price: Decimal,
+        status: str = "open",
+        filled: Decimal | None = None,
+        timestamp_ms: int | None = None,
+        trades: list[dict[str, Any]] | None = None,
+    ) -> str:
+        """Directly seed an exchange-side order that predates this
+        ``FakeCCXTExchange`` session (WP1.8b) -- simulates an order placed
+        by a now-dead engine instance before a crash, for
+        ``scan_and_import`` tests.
+
+        Bypasses ``create_order`` entirely: no balance mutation, no
+        automatic trade generation. The caller supplies ``trades``
+        explicitly for a filled/partially-filled order. Marked internally
+        as "seeded/resting" so, unlike every order created through
+        ``create_order`` (which this fake always settles synchronously --
+        see the module docstring), :meth:`cancel_order` can genuinely
+        cancel it and :meth:`fetch_order` reports its OWN current status
+        (mutated in place by a later cancel), not an unconditional
+        "closed".
+
+        Returns
+        -------
+        str
+            The synthetic exchange order id (``fetch_orders``/
+            ``cancel_order``/``fetch_order`` all key off this).
+        """
+        self._order_seq += 1
+        exchange_order_id = f"fake-seeded-{self._order_seq}"
+        ts_ms = timestamp_ms if timestamp_ms is not None else self._now_ms(symbol)
+        filled_amount = filled if filled is not None else (
+            amount if status == "closed" else Decimal("0")
+        )
+        order_record: dict[str, Any] = {
+            "id": exchange_order_id,
+            "clientOrderId": client_order_id,
+            "symbol": symbol,
+            "side": side,
+            "type": "market",
+            "amount": float(amount),
+            "price": float(price),
+            "average_fill_price": float(price),
+            "status": status,
+            "filled": float(filled_amount),
+            "average": float(price) if filled_amount > Decimal("0") else None,
+            "timestamp": ts_ms,
+            "_partial_fraction": None,
+            "_partial_polled_once": True,
+            "_seeded_resting": True,
+        }
+        self._orders[exchange_order_id] = order_record
+        for trade in trades or []:
+            t = dict(trade)
+            t.setdefault("order", exchange_order_id)
+            t.setdefault("symbol", symbol)
+            t.setdefault("side", side)
+            t.setdefault("timestamp", ts_ms)
+            t.setdefault("takerOrMaker", "taker")
+            self._trades.append(t)
+        return exchange_order_id
+
+    def queue_fetch_orders_error(self, symbol: str, exc: Exception) -> None:
+        """WP1.8b: make the *next* ``fetch_orders(symbol=...)`` call raise ``exc``."""
+        self._queued_fetch_orders_errors[symbol] = exc
+
+    def queue_cancel_error(self, exchange_order_id: str, exc: Exception) -> None:
+        """WP1.8b: make the *next* ``cancel_order(exchange_order_id, ...)``
+        call raise ``exc`` (distinct from the built-in "already filled"/
+        "already terminal" races below)."""
+        self._queued_cancel_errors[exchange_order_id] = exc
+
+    def queue_trades_error(self, symbol: str, exc: Exception) -> None:
+        """WP1.8b: make the *next* ``fetch_my_trades(symbol=...)`` (the
+        fallback this fake always uses, ``has['fetchOrderTrades']`` is
+        False) call raise ``exc``."""
+        self._queued_trades_errors[symbol] = exc
 
     # ------------------------------------------------------------------
     # CCXT surface -- lifecycle
@@ -438,12 +531,18 @@ class FakeCCXTExchange:
         # attaches to this order only; consumed (one-shot) here.
         partial_fraction = self._queued_partial_fills.pop(symbol, None)
 
+        # WP1.8b: the real LiveExecutionEngine.submit_order passes the
+        # client_order_id through params["clientOrderId"]; ccxt normalises
+        # it onto the order dict's top-level "clientOrderId" key.
+        client_order_id = (params or {}).get("clientOrderId")
+
         # Mirrors Coinbase: the initial response is still "open"/unfilled;
         # the caller (LiveExecutionEngine) reconciles via fetch_order after
         # its post-submit wait. fetch_order below always reports "closed"
         # unless a partial-fill fraction was queued for this order.
         order_record: dict[str, Any] = {
             "id": exchange_order_id,
+            "clientOrderId": client_order_id,
             "symbol": symbol,
             "side": side,
             "type": type,
@@ -510,6 +609,15 @@ class FakeCCXTExchange:
             settled["average"] = order["average_fill_price"]
             return settled
 
+        if order.get("_seeded_resting", False):
+            # WP1.8b: a seeded exchange-side order reports its OWN current
+            # status/filled (mutated in place by cancel_order below), not
+            # the unconditional "closed" every create_order-originated
+            # order short-circuits to below -- this fake never advances a
+            # seeded order to "closed" on its own; only a test / the scan
+            # cancel path changes its status.
+            return dict(order)
+
         settled = dict(order)
         settled["status"] = "closed"
         settled["filled"] = order["amount"]
@@ -522,14 +630,51 @@ class FakeCCXTExchange:
         symbol: str | None = None,
         params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        queued = self._queued_cancel_errors.pop(id, None)
+        if queued is not None:
+            raise queued
+
         order = self._orders.get(id)
         if order is None:
             raise ccxt.OrderNotFound(str(id))
-        # Every order in this fake settles synchronously inside create_order,
-        # so by the time anything calls cancel_order the exchange-side order
-        # is already filled -- exercise the same race ccxt reports for a
-        # real already-filled order.
-        raise ccxt.InvalidOrder(f"order {id} already filled, cannot cancel")
+
+        if not order.get("_seeded_resting", False):
+            # Every order created via create_order settles synchronously in
+            # this fake, so by the time anything calls cancel_order the
+            # exchange-side order is already filled -- exercise the same
+            # race ccxt reports for a real already-filled order.
+            raise ccxt.InvalidOrder(f"order {id} already filled, cannot cancel")
+
+        if order["status"] in ("closed", "canceled", "expired", "rejected"):
+            # WP1.8b (P-01): the scan/test raced an already-cancelled or
+            # already-filled seeded order -- mirrors a real exchange's
+            # InvalidOrder/OrderNotFound for a second cancel attempt.
+            raise ccxt.InvalidOrder(f"order {id} already {order['status']}, cannot cancel")
+
+        order["status"] = "canceled"
+        return dict(order)
+
+    async def fetch_orders(
+        self,
+        symbol: str | None = None,
+        since: int | None = None,
+        limit: int | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """WP1.8b: every order (created via create_order OR seeded via
+        seed_exchange_order) for ``symbol``, since ``since`` (ms epoch)."""
+        if symbol is not None:
+            queued = self._queued_fetch_orders_errors.pop(symbol, None)
+            if queued is not None:
+                raise queued
+        results: list[dict[str, Any]] = []
+        for order in self._orders.values():
+            if symbol is not None and order["symbol"] != symbol:
+                continue
+            if since is not None and order["timestamp"] < since:
+                continue
+            results.append(dict(order))
+        return results
 
     async def fetch_my_trades(
         self,
@@ -538,6 +683,10 @@ class FakeCCXTExchange:
         limit: int | None = None,
         params: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
+        if symbol is not None:
+            queued = self._queued_trades_errors.pop(symbol, None)
+            if queued is not None:
+                raise queued
         if symbol is None:
             return list(self._trades)
         return [t for t in self._trades if t["symbol"] == symbol]

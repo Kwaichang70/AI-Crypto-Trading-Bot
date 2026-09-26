@@ -17,7 +17,12 @@ Mandatory test list (synthesis spec §6):
 - 409 when the run is not orphaned
 - two concurrent resumes -> exactly one 409
 - kill switch after start -> normal resume 409, protective resume 200
-- the 1.8a stub -> 409
+- an injected scanner failure (ResumeRejected) -> 409 with its reason
+  (WP1.8b: the 1.8a fail-closed stub is gone -- ``scan_and_import`` is the
+  real implementation now; the branch-by-branch S3 coverage --
+  fill_history_partial/corrupt, exchange_scan_incomplete, cancel/trade-
+  fetch failures -- lives in ``tests/migrations/test_wp18b_scan_and_import.py``
+  against a real exchange fake and real Postgres, not here)
 - the happy path with an injected scanner
 """
 
@@ -37,6 +42,7 @@ from sqlalchemy.sql.selectable import Select
 import api.routers.runs as runs_module
 from api.config import get_settings
 from api.services.run_recovery import ImportReport
+from trading.recovery import ResumeRejected
 
 CONFIRM_TOKEN = "wp18a-test-confirm-token"  # noqa: S105 -- test fixture, not a real secret
 ADMIN_KEY = "wp18a-test-admin-key-hex32-0123456789abcdef"  # noqa: S105 -- test fixture
@@ -311,7 +317,9 @@ class TestResumeConcurrency:
 
         scanner_calls = {"n": 0}
 
-        async def _fake_scan_and_import(db: Any, run: Any, exchange: Any) -> ImportReport:
+        async def _fake_scan_and_import(
+            db: Any, run: Any, exchange: Any, *, fence: Any = None
+        ) -> ImportReport:
             scanner_calls["n"] += 1
             return ImportReport()
 
@@ -366,7 +374,9 @@ class TestResumeKillSwitch:
         )
         client = _client(resume_app, session)
 
-        async def _fake_scan_and_import(db: Any, run: Any, exchange: Any) -> ImportReport:
+        async def _fake_scan_and_import(
+            db: Any, run: Any, exchange: Any, *, fence: Any = None
+        ) -> ImportReport:
             return ImportReport()
 
         import api.services.run_recovery as run_recovery_module
@@ -386,20 +396,36 @@ class TestResumeKillSwitch:
 
 
 class TestResumeStubAndHappyPath:
-    def test_1_8a_stub_returns_409(self, resume_app: Any) -> None:
-        """No scanner injected -- the production scan_and_import stub always
-        raises, so every resume in 1.8a is fail-closed 409."""
+    def test_scan_failure_returns_409(self, resume_app: Any) -> None:
+        """WP1.8b: an injected scanner failure (ResumeRejected, exactly
+        what the real scan_and_import raises on a scan/cancel/trade-fetch
+        failure -- see the branch-by-branch coverage in
+        test_wp18b_scan_and_import.py) is surfaced as 409 with its reason,
+        and the row reverts resuming -> orphaned."""
         session = _DispatchSession(
             run_row=_make_run_row(status="orphaned"), runs_update_rowcounts=[1, 1]
         )
         client = _client(resume_app, session)
 
-        resp = client.post(
-            f"/api/v1/runs/{RUN_ID}/resume",
-            headers={"X-Live-Confirm-Token": CONFIRM_TOKEN, "X-Admin-Key": ADMIN_KEY},
-        )
+        async def _failing_scan_and_import(
+            db: Any, run: Any, exchange: Any, *, fence: Any = None
+        ) -> ImportReport:
+            raise ResumeRejected("exchange_scan_failed")
+
+        import api.services.run_recovery as run_recovery_module
+
+        original_scan = run_recovery_module.scan_and_import
+        run_recovery_module.scan_and_import = _failing_scan_and_import
+        try:
+            resp = client.post(
+                f"/api/v1/runs/{RUN_ID}/resume",
+                headers={"X-Live-Confirm-Token": CONFIRM_TOKEN, "X-Admin-Key": ADMIN_KEY},
+            )
+        finally:
+            run_recovery_module.scan_and_import = original_scan
+
         assert resp.status_code == 409
-        assert resp.json()["detail"] == "exchange_scan_not_implemented"
+        assert resp.json()["detail"] == "exchange_scan_failed"
 
     def test_happy_path_with_injected_scanner_returns_200_and_spawns_task(
         self, resume_app: Any
@@ -408,7 +434,9 @@ class TestResumeStubAndHappyPath:
         session = _DispatchSession(run_row=run_row, runs_update_rowcounts=[1, 1])
         client = _client(resume_app, session)
 
-        async def _fake_scan_and_import(db: Any, run: Any, exchange: Any) -> ImportReport:
+        async def _fake_scan_and_import(
+            db: Any, run: Any, exchange: Any, *, fence: Any = None
+        ) -> ImportReport:
             return ImportReport()
 
         import api.services.run_recovery as run_recovery_module

@@ -82,7 +82,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from datetime import UTC, datetime
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 from typing import Any, Protocol, overload
@@ -98,7 +98,7 @@ from trading.ccxt_retry import ccxt_retry
 from trading.models import Fill, Order, Position, Signal
 from trading.risk import BaseRiskManager
 
-__all__ = ["LiveExecutionEngine", "LivePositionSource"]
+__all__ = ["LiveExecutionEngine", "LivePositionSource", "_parse_ccxt_trades"]
 
 logger = structlog.get_logger(__name__)
 
@@ -169,6 +169,275 @@ def _is_integral(value: int | float) -> bool:
     if isinstance(value, float):
         return value.is_integer()
     return False
+
+
+# ---------------------------------------------------------------------------
+# WP1.8b: module-level trade-parsing helpers, extracted from
+# LiveExecutionEngine.get_fills's per-trade loop (and the two smaller
+# helpers it used, ``_extract_fee_from_ccxt``/``_normalize_fee``) so
+# ``apps.api.services.run_recovery.scan_and_import``'s exchange-scan
+# import path normalises a batch of raw CCXT trade dicts IDENTICALLY to
+# the live-engine reconcile path -- same idempotency key, same
+# fee-currency normalisation (D6), same fail-soft per-trade behaviour
+# (WP11-S-04). Pure functions: no ``self``, no I/O, no logging side
+# effects beyond the ``log``/``on_skip`` callbacks the caller supplies.
+# The three ``LiveExecutionEngine`` instance methods of (almost) the same
+# name are now thin wrappers that resolve ``self._base_asset``/
+# ``self._quote_currency``/``self._log`` and delegate here -- kept as
+# methods (not removed) because existing unit tests call
+# ``engine._extract_fee_from_ccxt(...)`` directly.
+# ---------------------------------------------------------------------------
+
+
+def _trade_key(trade: dict[str, Any]) -> tuple[Any, ...]:
+    """I9: idempotency key for a CCXT trade record -- ``(id, trade id)``
+    when the exchange provides a trade id, else
+    ``(synthetic, timestamp, amount, price)``. See
+    ``LiveExecutionEngine._trade_key``'s original docstring (WP11-S-08)
+    for the documented same-order-without-then-with-id limitation this
+    key inherits.
+    """
+    trade_id = trade.get("id")
+    if trade_id:
+        return ("id", trade_id)
+    return ("synthetic", trade.get("timestamp"), trade.get("amount"), trade.get("price"))
+
+
+def _extract_fee_from_ccxt_trade(
+    ccxt_trade: dict[str, Any],
+    *,
+    symbol: str | None,
+    quote_currency: str,
+    log: Any = None,  # noqa: ANN401
+) -> tuple[Decimal, str]:
+    """Extract ``(fee_amount, fee_currency)`` from a single CCXT trade dict.
+
+    ``quote_currency`` is the caller-resolved market quote (D6 default
+    when the trade itself carries no fee currency); ``symbol``/``log`` are
+    used only for the negative-fee (maker rebate) warning's structured
+    fields and are optional so a caller with no logger (e.g. a one-shot
+    import script) can pass ``log=None``.
+    """
+    fee_info = ccxt_trade.get("fee") or {}
+    fee_cost = _safe_decimal(fee_info.get("cost"), default=Decimal("0"))
+    if fee_cost < Decimal("0"):
+        # WP11-S-R2-03: a negative fee (a maker rebate) would fail
+        # Fill.fee's ge=0 constraint later -- clamp it to 0.
+        if log is not None:
+            log.warning("live.fee_rebate_ignored", symbol=symbol)
+        fee_cost = Decimal("0")
+    fee_currency = fee_info.get("currency")
+    if not fee_currency:
+        fee_currency = quote_currency
+    return fee_cost, str(fee_currency)
+
+
+def _normalize_trade_fee(
+    *,
+    symbol: str,
+    side: OrderSide,
+    quantity: Decimal,
+    price: Decimal,
+    fee_amount: Decimal,
+    fee_currency: str,
+    base_asset: str | None,
+    quote_currency: str,
+    log: Any = None,  # noqa: ANN401
+) -> tuple[Decimal, Decimal, str]:
+    """WP11-A-05 (D6): normalise a CCXT trade's fee into quote currency.
+
+    Identical logic to the pre-WP1.8b ``LiveExecutionEngine._normalize_fee``
+    method, with ``base_asset``/``quote_currency`` passed in explicitly
+    instead of resolved via ``self._base_asset``/``self._quote_currency``
+    (a caller with no live exchange market cache -- e.g. WP1.8b's
+    ``scan_and_import``, which loads markets on its OWN throwaway exchange
+    handle -- can still call this).
+    """
+    if fee_amount <= Decimal("0") or base_asset is None or fee_currency != base_asset:
+        if (
+            fee_amount > Decimal("0")
+            and fee_currency not in (base_asset, quote_currency)
+            and log is not None
+        ):
+            log.warning(
+                "live.fee_currency_unconverted",
+                symbol=symbol,
+                fee_currency=fee_currency,
+            )
+        return quantity, fee_amount, fee_currency
+
+    fee_in_quote = (fee_amount * price).quantize(_QTY_PRECISION, rounding=ROUND_HALF_UP)
+    net_quantity = quantity - fee_amount if side == OrderSide.BUY else quantity
+    if log is not None:
+        log.info(
+            "live.fee_normalized_from_base",
+            symbol=symbol,
+            side=side.value,
+            fee_base=str(fee_amount),
+            fee_quote=str(fee_in_quote),
+        )
+    return net_quantity, fee_in_quote, quote_currency
+
+
+def _parse_ccxt_trades(
+    order: Order,
+    trades: Sequence[dict[str, Any]],
+    *,
+    already_routed: Collection[tuple[Any, ...]] = (),
+    base_asset: str | None,
+    quote_currency: str,
+    log: Any = None,  # noqa: ANN401
+    on_skip: Callable[[str], None] | None = None,
+) -> tuple[list[Fill], Decimal, set[tuple[Any, ...]]]:
+    """Shared trade-parse helper (WP1.8b S2/S3).
+
+    Turns a batch of raw CCXT trade dicts belonging to ``order`` into
+    ``Fill`` objects, applying the exact same idempotency-key dedup
+    (:func:`_trade_key`), fee-currency normalisation
+    (:func:`_normalize_trade_fee`/D6) and fail-soft per-trade handling
+    (WP11-S-04: one bad trade record flags/skips only itself; every fill
+    parsed earlier in the same batch is still returned) that
+    ``LiveExecutionEngine.get_fills`` used inline before WP1.8b. Used by
+    both ``get_fills`` (the live reconcile path) and
+    ``apps.api.services.run_recovery.scan_and_import`` (the WP1.8b
+    exchange-scan import path) so a resumed run's imported fills
+    normalise identically to one that was routed live.
+
+    Parameters
+    ----------
+    order:
+        The parent order every trade in ``trades`` belongs to.
+    trades:
+        Raw CCXT trade dicts (``fetch_order_trades``/``fetch_my_trades``).
+    already_routed:
+        Idempotency keys already turned into a ``Fill`` by a prior call --
+        skipped again here. Empty (the default) for a one-shot caller.
+    base_asset, quote_currency:
+        The order's market base/quote currency codes, resolved by the
+        caller (this function has no exchange handle of its own).
+    log:
+        Optional bound structlog logger for warnings (never raises).
+    on_skip:
+        Optional callback invoked with a reason code
+        (``"fill_parse_failed"`` or ``"fill_price_invalid"``) for every
+        trade this call could not turn into a ``Fill``. ``get_fills``
+        uses this to call its own ``_flag_reconcile``.
+
+    Returns
+    -------
+    tuple[list[Fill], Decimal, set[tuple[Any, ...]]]
+        ``(new_fills, gross_quantity_delta, newly_routed_keys)`` --
+        ``gross_quantity_delta`` is the RAW (pre fee-normalisation) trade
+        amount summed across every still-new trade in this batch (matches
+        ``order.filled_quantity``'s unit, S-02); ``newly_routed_keys`` is
+        the set of idempotency keys this call consumed.
+    """
+    pending_new_keys: set[tuple[Any, ...]] = set()
+    pending_fills: list[Fill] = []
+    pending_gross = Decimal("0")
+
+    for trade in trades:
+        key = _trade_key(trade)
+        if key in already_routed or key in pending_new_keys:
+            continue
+
+        price = _safe_decimal(trade.get("price"), default=None)
+        if price is None:
+            if on_skip is not None:
+                on_skip("fill_parse_failed")
+            if log is not None:
+                log.error(
+                    "live.fill_parse_failed",
+                    order_id=str(order.order_id),
+                    symbol=order.symbol,
+                    field="price",
+                )
+            continue
+        if price <= Decimal("0"):
+            # I3: a fill whose price is non-positive is a legitimate
+            # invalid-price business case (not a parse error) -- not
+            # routed, left pending for an operator/WP1.8 to resolve.
+            if on_skip is not None:
+                on_skip("fill_price_invalid")
+            if log is not None:
+                log.error(
+                    "live.invalid_fill_price",
+                    order_id=str(order.order_id),
+                    symbol=order.symbol,
+                )
+            continue
+
+        raw_quantity = _safe_decimal(trade.get("amount"), default=None)
+        if raw_quantity is None:
+            if on_skip is not None:
+                on_skip("fill_parse_failed")
+            if log is not None:
+                log.error(
+                    "live.fill_parse_failed",
+                    order_id=str(order.order_id),
+                    symbol=order.symbol,
+                    field="amount",
+                )
+            continue
+
+        fill: Fill | None = None
+        try:
+            fee_amount, fee_currency = _extract_fee_from_ccxt_trade(
+                trade, symbol=order.symbol, quote_currency=quote_currency, log=log
+            )
+            timestamp_raw = trade.get("timestamp")
+            if timestamp_raw is None:
+                timestamp_ms: float = order.updated_at.timestamp() * 1000
+            else:
+                timestamp_ms = float(timestamp_raw)
+            executed_at = datetime.fromtimestamp(timestamp_ms / 1000, tz=UTC)
+
+            quantity, fee_amount, fee_currency = _normalize_trade_fee(
+                symbol=order.symbol,
+                side=order.side,
+                quantity=raw_quantity,
+                price=price,
+                fee_amount=fee_amount,
+                fee_currency=fee_currency,
+                base_asset=base_asset,
+                quote_currency=quote_currency,
+                log=log,
+            )
+
+            if quantity > Decimal("0"):
+                fill = Fill(
+                    order_id=order.order_id,
+                    symbol=order.symbol,
+                    side=order.side,
+                    quantity=quantity,
+                    price=price,
+                    fee=fee_amount,
+                    fee_currency=fee_currency,
+                    is_maker=trade.get("takerOrMaker") == "maker",
+                    executed_at=executed_at,
+                )
+        except Exception as exc:
+            if on_skip is not None:
+                on_skip("fill_parse_failed")
+            if log is not None:
+                log.error(
+                    "live.fill_parse_failed",
+                    order_id=str(order.order_id),
+                    symbol=order.symbol,
+                    error=str(exc),
+                )
+            continue
+
+        # This trade is now accounted for either way (Fill produced or
+        # net-zero skip above) -- mark it routed and count its GROSS
+        # amount (S-02) so it is never reprocessed.
+        pending_new_keys.add(key)
+        pending_gross += raw_quantity
+
+        if fill is not None:
+            pending_fills.append(fill)
+
+    return pending_fills, pending_gross, pending_new_keys
 
 
 class LivePositionSource(Protocol):
@@ -669,23 +938,13 @@ class LiveExecutionEngine(BaseExecutionEngine):
         tuple[Decimal, str]:
             (fee_amount, fee_currency)
         """
-        fee_info = ccxt_trade.get("fee") or {}
-        # WP1.1 round 2 (S-04): parse via _safe_decimal -- a malformed
-        # ``fee.cost`` (e.g. None from a partially-populated trade record)
-        # must not raise here; the caller's own per-trade guard handles it
-        # as a parse-error candidate if this ever legitimately needs to
-        # fail the whole trade instead of defaulting to zero fee.
-        fee_cost = _safe_decimal(fee_info.get("cost"), default=Decimal("0"))
-        if fee_cost < Decimal("0"):
-            # WP11-S-R2-03: a negative fee (a maker rebate) would fail
-            # Fill.fee's ge=0 constraint later -- clamp it to 0 rather than
-            # let that raise deep inside the per-trade parse path.
-            self._log.warning("live.fee_rebate_ignored", symbol=symbol)
-            fee_cost = Decimal("0")
-        fee_currency = fee_info.get("currency")
-        if not fee_currency:
-            fee_currency = self._quote_currency(symbol) if symbol is not None else "USDT"
-        return fee_cost, str(fee_currency)
+        quote = self._quote_currency(symbol) if symbol is not None else "USDT"
+        # WP1.8b: delegates to the module-level, self-free helper so
+        # ``apps.api.services.run_recovery.scan_and_import`` shares this
+        # exact fee-parsing logic (see the docstring above _parse_ccxt_trades).
+        return _extract_fee_from_ccxt_trade(
+            ccxt_trade, symbol=symbol, quote_currency=quote, log=self._log
+        )
 
     def _normalize_fee(
         self,
@@ -714,30 +973,20 @@ class LiveExecutionEngine(BaseExecutionEngine):
         separately using the pre-normalisation raw trade amount, since
         ``order.filled_quantity`` from the exchange is always gross.
         """
-        base = self._base_asset(symbol)
-        quote = self._quote_currency(symbol)
-
-        if fee_amount <= Decimal("0") or base is None or fee_currency != base:
-            if fee_amount > Decimal("0") and fee_currency not in (base, quote):
-                self._log.warning(
-                    "live.fee_currency_unconverted",
-                    symbol=symbol,
-                    fee_currency=fee_currency,
-                )
-            return quantity, fee_amount, fee_currency
-
-        fee_in_quote = (fee_amount * price).quantize(
-            _QTY_PRECISION, rounding=ROUND_HALF_UP
-        )
-        net_quantity = quantity - fee_amount if side == OrderSide.BUY else quantity
-        self._log.info(
-            "live.fee_normalized_from_base",
+        # WP1.8b: delegates to the module-level, self-free helper (see
+        # _parse_ccxt_trades' docstring) -- identical behaviour, kept as a
+        # method because existing unit tests call it directly.
+        return _normalize_trade_fee(
             symbol=symbol,
-            side=side.value,
-            fee_base=str(fee_amount),
-            fee_quote=str(fee_in_quote),
+            side=side,
+            quantity=quantity,
+            price=price,
+            fee_amount=fee_amount,
+            fee_currency=fee_currency,
+            base_asset=self._base_asset(symbol),
+            quote_currency=self._quote_currency(symbol),
+            log=self._log,
         )
-        return net_quantity, fee_in_quote, quote
 
     # ------------------------------------------------------------------
     # Abstract interface implementation
@@ -1331,10 +1580,9 @@ class LiveExecutionEngine(BaseExecutionEngine):
         ever adds an exchange that is inconsistent within a single order's
         lifetime.
         """
-        trade_id = trade.get("id")
-        if trade_id:
-            return ("id", trade_id)
-        return ("synthetic", trade.get("timestamp"), trade.get("amount"), trade.get("price"))
+        # WP1.8b: delegates to the module-level, self-free helper (see
+        # _parse_ccxt_trades' docstring).
+        return _trade_key(trade)
 
     def _synthesize_unrouted_fill(self, order: Order) -> list[Fill]:
         """§3 scope / R-12: trades are empty or the fetch failed while the
@@ -1477,109 +1725,22 @@ class LiveExecutionEngine(BaseExecutionEngine):
         if not ccxt_trades:
             return self._synthesize_unrouted_fill(order)
 
-        # WP11-S-04: parse the whole batch into a local buffer first; only
-        # commit to shared state (_routed_trade_keys/_fills/_routed_gross_qty)
-        # once every still-new trade in this batch has been handled, so one
-        # bad trade record can never lose fills already parsed earlier in
-        # this same call.
-        pending_new_keys: set[tuple[Any, ...]] = set()
-        pending_fills: list[Fill] = []
-        pending_gross = Decimal("0")
-
-        for trade in ccxt_trades:
-            key = self._trade_key(trade)
-            if key in already_routed or key in pending_new_keys:
-                continue
-
-            price = _safe_decimal(trade.get("price"), default=None)
-            if price is None:
-                self._flag_reconcile(order.symbol, "fill_parse_failed")
-                self._log.error(
-                    "live.fill_parse_failed",
-                    order_id=str(order_id),
-                    symbol=order.symbol,
-                    field="price",
-                )
-                continue
-            if price <= Decimal("0"):
-                # I3: a fill whose price is non-positive is a legitimate
-                # invalid-price business case (not a parse error) -- not
-                # routed, symbol flagged, left pending (do not mark the key
-                # as routed; an operator/WP1.8 must resolve this).
-                self._flag_reconcile(order.symbol, "fill_price_invalid")
-                self._log.error(
-                    "live.invalid_fill_price",
-                    order_id=str(order_id),
-                    symbol=order.symbol,
-                )
-                continue
-
-            raw_quantity = _safe_decimal(trade.get("amount"), default=None)
-            if raw_quantity is None:
-                self._flag_reconcile(order.symbol, "fill_parse_failed")
-                self._log.error(
-                    "live.fill_parse_failed",
-                    order_id=str(order_id),
-                    symbol=order.symbol,
-                    field="amount",
-                )
-                continue
-
-            # WP11-S-R2-03/WP11-C-07: _normalize_fee and the Fill(...)
-            # construction now live inside this same try -- any failure in
-            # either (e.g. a pathological Decimal operation, or a future
-            # Fill validator raising) takes the fill_parse_failed path
-            # below instead of aborting the whole atomic-commit batch.
-            fill: Fill | None = None
-            try:
-                fee_amount, fee_currency = self._extract_fee_from_ccxt(trade, order.symbol)
-                timestamp_raw = trade.get("timestamp")
-                if timestamp_raw is None:
-                    timestamp_ms: float = order.updated_at.timestamp() * 1000
-                else:
-                    timestamp_ms = float(timestamp_raw)
-                executed_at = datetime.fromtimestamp(timestamp_ms / 1000, tz=UTC)
-
-                quantity, fee_amount, fee_currency = self._normalize_fee(
-                    symbol=order.symbol,
-                    side=order.side,
-                    quantity=raw_quantity,
-                    price=price,
-                    fee_amount=fee_amount,
-                    fee_currency=fee_currency,
-                )
-
-                if quantity > Decimal("0"):
-                    fill = Fill(
-                        order_id=order_id,
-                        symbol=order.symbol,
-                        side=order.side,
-                        quantity=quantity,
-                        price=price,
-                        fee=fee_amount,
-                        fee_currency=fee_currency,
-                        is_maker=trade.get("takerOrMaker") == "maker",
-                        executed_at=executed_at,
-                    )
-            except Exception as exc:
-                self._flag_reconcile(order.symbol, "fill_parse_failed")
-                self._log.error(
-                    "live.fill_parse_failed",
-                    order_id=str(order_id),
-                    symbol=order.symbol,
-                    error=str(exc),
-                )
-                continue
-
-            # This trade is now accounted for either way (Fill produced or
-            # net-zero skip above) -- mark it routed and count its GROSS
-            # amount (S-02) so it is never reprocessed and so under-routed
-            # detection uses the same unit as order.filled_quantity.
-            pending_new_keys.add(key)
-            pending_gross += raw_quantity
-
-            if fill is not None:
-                pending_fills.append(fill)
+        # WP1.8b: the per-trade parse loop now lives in the module-level,
+        # self-free _parse_ccxt_trades (shared with
+        # apps.api.services.run_recovery.scan_and_import) -- this call is
+        # byte-for-byte the same batch-then-commit contract WP11-S-04
+        # documented (one bad trade record can never lose fills already
+        # parsed earlier in this same call; nothing is committed to shared
+        # state until every still-new trade in the batch has been handled).
+        pending_fills, pending_gross, pending_new_keys = _parse_ccxt_trades(
+            order,
+            ccxt_trades,
+            already_routed=already_routed,
+            base_asset=self._base_asset(order.symbol),
+            quote_currency=self._quote_currency(order.symbol),
+            log=self._log,
+            on_skip=lambda reason: self._flag_reconcile(order.symbol, reason),
+        )
 
         # Commit atomically (S-04).
         if pending_new_keys:
