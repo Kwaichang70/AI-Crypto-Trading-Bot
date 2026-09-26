@@ -68,6 +68,39 @@ test-side configuration (not part of the real CCXT surface):
   (``first_fraction`` of the requested amount) and completes fully on the
   second poll, exercising ``LiveExecutionEngine``'s partial-fill /
   idempotent-routing path (I9) against a real reconcile cycle.
+
+WP1.4b (Verbeterplan v2 idempotent-submit spec, A-13) extensions
+------------------------------------------------------------------
+- On Coinbase (the default and only ``exchange_id`` any test uses today),
+  ``create_order`` now reads the client order id ONLY from
+  ``params["client_order_id"]`` (snake_case) -- exactly like real ccxt's
+  Coinbase adapter, which drops ``clientOrderId`` entirely. Any other
+  ``exchange_id`` keeps reading ``clientOrderId`` (unused today, kept for
+  forward compatibility).
+- ``queue_accept_then_timeout(symbol, exc=None, *, times=1)`` — the next
+  ``times`` ``create_order`` call(s) for ``symbol`` are placed FULLY (same
+  balance mutation, order/trade records, ``order_log`` entry as a normal
+  order) but raise ``exc`` (default ``ccxt.RequestTimeout``) instead of
+  returning -- simulates a request that timed out AFTER the exchange
+  actually accepted it (T1/T4).
+- ``queue_duplicate_cid(symbol, mode=...)`` — the next ``create_order``
+  call for ``symbol`` simulates the exchange detecting a re-used
+  client_order_id, WITHOUT placing a new order: ``"invalid_order"``
+  (default) raises ``ccxt.DuplicateOrderId``; ``"exchange_error"`` raises a
+  bare ``ccxt.ExchangeError``; ``"return_existing"`` returns the existing
+  order already on file for that cid instead of raising (T9).
+- ``hide_from_listing(symbol, calls=1)`` — the next ``calls``
+  ``fetch_orders(symbol=...)`` call(s) omit every order for ``symbol``
+  (simulates exchange listing lag, T5).
+- ``queue_fetch_orders_error(symbol, exc, times=1)`` — ``times`` now lets a
+  fault injected on ``fetch_orders`` survive more than one lookup (e.g. the
+  D5 inline 1s/2s/4s retry schedule) instead of only the first.
+- ``set_now_ms(now_ms)`` — override the fake's notion of "now" used to
+  stamp new orders/trades. Without this, orders are stamped with the
+  synthetic bar-time epoch (``_EPOCH_START_MS``, 2026-01-01), which a real
+  wall-clock ``since`` filter (the live engine's cid lookup computes
+  ``since`` from ``datetime.now(tz=UTC)``) would silently drop. Pass
+  ``None`` to go back to bar time.
 """
 
 from __future__ import annotations
@@ -128,6 +161,15 @@ class FakeCCXTExchange:
         self.has: dict[str, bool] = {"fetchOrderTrades": False}
         self.timeframes: dict[str, str] = dict.fromkeys(_TIMEFRAME_DURATION_MS, "")
         self.markets: dict[str, dict[str, Any]] = {}
+        # WP1.4b round 2 (S-02b): mirrors real ccxt's per-exchange
+        # ``options`` dict -- ``run_recovery._scan_pagination_cap`` reads
+        # ``paginationCalls``/``maxEntriesPerRequest`` from here (Coinbase's
+        # real defaults). A test can shrink these to make a truncation
+        # probe cheap (fewer seeded orders needed to reach the cap).
+        self.options: dict[str, Any] = {
+            "paginationCalls": 10,
+            "maxEntriesPerRequest": 1000,
+        }
 
         self._taker_fee_pct = taker_fee_pct
         self._market_defs: dict[str, dict[str, Any]] = {}
@@ -162,10 +204,31 @@ class FakeCCXTExchange:
         self._queued_partial_fills: dict[str, Decimal] = {}
         # WP1.8b: one-shot fault injection for scan_and_import's three
         # exchange calls (fetch_orders / cancel_order / trade fetch).
-        self._queued_fetch_orders_errors: dict[str, Exception] = {}
+        # WP1.4b (A-13): value is (exception, remaining_calls) so a fault
+        # can survive more than one lookup (``times=``).
+        # WP1.4b round 3 (S-R2-03): value is (exception, remaining_calls,
+        # skip_calls) -- ``skip_calls`` lets the first N fetch_orders(...)
+        # calls for that symbol through untouched before the fault starts
+        # firing (see queue_fetch_orders_error's ``after`` parameter).
+        self._queued_fetch_orders_errors: dict[str, tuple[Exception, int, int]] = {}
         self._queued_cancel_errors: dict[str, Exception] = {}
         self._queued_trades_errors: dict[str, Exception] = {}
         self._closed = False
+
+        # WP1.4b (A-13): symbol -> (exception, remaining_calls) -- the next
+        # ``remaining_calls`` create_order call(s) for that symbol are
+        # placed fully, then raise ``exception`` instead of returning.
+        self._queued_accept_then_timeout: dict[str, tuple[Exception, int]] = {}
+        # WP1.4b (A-13): symbol -> duplicate-cid response mode for the
+        # next create_order call ("invalid_order" | "exchange_error" |
+        # "return_existing").
+        self._queued_duplicate_cid: dict[str, str] = {}
+        # WP1.4b (A-13): symbol -> remaining fetch_orders(symbol=...) calls
+        # that must omit every order for that symbol (listing lag).
+        self._hide_from_listing: dict[str, int] = {}
+        # WP1.4b (A-13): overrides bar-time as this fake's notion of "now"
+        # for new order/trade timestamps -- see set_now_ms().
+        self._now_ms_override: int | None = None
 
         # Test-visible audit log of every create_order call, in call order.
         # Each entry: {"id", "symbol", "side", "amount" (Decimal), "price" (Decimal)}.
@@ -395,9 +458,77 @@ class FakeCCXTExchange:
             self._trades.append(t)
         return exchange_order_id
 
-    def queue_fetch_orders_error(self, symbol: str, exc: Exception) -> None:
-        """WP1.8b: make the *next* ``fetch_orders(symbol=...)`` call raise ``exc``."""
-        self._queued_fetch_orders_errors[symbol] = exc
+    def queue_fetch_orders_error(
+        self, symbol: str, exc: Exception, *, times: int = 1, after: int = 0,
+    ) -> None:
+        """WP1.8b: make the *next* ``fetch_orders(symbol=...)`` call raise ``exc``.
+
+        WP1.4b (A-13): ``times`` (default 1) lets ``exc`` survive more than
+        one lookup -- needed for the D5 inline 1s/2s/4s retry schedule, or
+        the per-bar resolver, to keep failing across every attempt (T7).
+
+        WP1.4b round 3 (S-R2-03): ``after`` (default 0) lets the first
+        ``after`` ``fetch_orders(symbol=...)`` call(s) through UNTOUCHED
+        before ``exc`` starts firing -- needed to target
+        ``run_recovery._targeted_cid_lookup``'s own call specifically (the
+        one AFTER the primary/supplementary scan call(s) for the same
+        symbol) without also failing those.
+        """
+        self._queued_fetch_orders_errors[symbol] = (exc, times, after)
+
+    def queue_accept_then_timeout(
+        self, symbol: str, exc: Exception | None = None, *, times: int = 1,
+    ) -> None:
+        """WP1.4b (A-13, T1/T4): the next ``times`` ``create_order`` call(s)
+        for ``symbol`` are placed FULLY (balance mutated, order/trade
+        records and ``order_log`` entry exactly like a normal order) but
+        raise ``exc`` instead of returning -- simulates a request that
+        timed out AFTER the exchange actually accepted it. Defaults to
+        ``ccxt.RequestTimeout``.
+        """
+        self._queued_accept_then_timeout[symbol] = (
+            exc if exc is not None else ccxt.RequestTimeout(f"{symbol} request timed out"),
+            times,
+        )
+
+    def queue_duplicate_cid(self, symbol: str, *, mode: str = "invalid_order") -> None:
+        """WP1.4b (A-13, T9): the next ``create_order`` call for ``symbol``
+        simulates the exchange detecting a re-used client_order_id,
+        WITHOUT placing a new order. ``mode``:
+
+        - ``"invalid_order"`` (default): raises ``ccxt.DuplicateOrderId``.
+        - ``"exchange_error"``: raises a bare ``ccxt.ExchangeError``
+          (Coinbase's fallback for an unmapped error body).
+        - ``"return_existing"``: returns the order already on file for
+          that cid (looked up in ``self._orders`` by ``clientOrderId``)
+          instead of raising -- some exchanges answer a duplicate
+          submission idempotently rather than erroring.
+
+        Either way, an order sharing the SAME client_order_id must already
+        exist on the exchange (placed via a prior ``create_order`` or
+        ``seed_exchange_order`` call) for a subsequent cid lookup (or this
+        method's own ``"return_existing"`` mode) to find.
+        """
+        if mode not in ("invalid_order", "exchange_error", "return_existing"):
+            raise ValueError(f"unknown duplicate-cid mode: {mode!r}")
+        self._queued_duplicate_cid[symbol] = mode
+
+    def hide_from_listing(self, symbol: str, *, calls: int = 1) -> None:
+        """WP1.4b (A-13, T5): the next ``calls`` ``fetch_orders(symbol=...)``
+        call(s) omit every order for ``symbol`` from their results --
+        simulates exchange listing lag. ``fetch_my_trades`` is unaffected.
+        """
+        self._hide_from_listing[symbol] = calls
+
+    def set_now_ms(self, now_ms: int | None) -> None:
+        """WP1.4b (A-13): override this fake's notion of "now" used to
+        stamp new orders/trades. Without this, orders are stamped with the
+        synthetic bar-time epoch (``_EPOCH_START_MS``, 2026-01-01), which a
+        real wall-clock ``since`` filter (the live engine's cid lookup
+        computes ``since`` from ``datetime.now(tz=UTC)``) would silently
+        drop. Pass ``None`` to go back to bar time.
+        """
+        self._now_ms_override = now_ms
 
     def queue_cancel_error(self, exchange_order_id: str, exc: Exception) -> None:
         """WP1.8b: make the *next* ``cancel_order(exchange_order_id, ...)``
@@ -508,6 +639,22 @@ class FakeCCXTExchange:
         if queued is not None:
             raise queued
 
+        # WP1.4b (A-13, T9): a duplicate client_order_id -- resolved WITHOUT
+        # placing a new order.
+        dup_mode = self._queued_duplicate_cid.pop(symbol, None)
+        if dup_mode is not None:
+            if dup_mode == "exchange_error":
+                raise ccxt.ExchangeError(f"{symbol} internal_server_error")
+            if dup_mode == "return_existing":
+                dup_cid = (params or {}).get(
+                    "client_order_id" if self.id == "coinbase" else "clientOrderId"
+                )
+                for existing in self._orders.values():
+                    if existing.get("clientOrderId") == dup_cid:
+                        return dict(existing)
+                raise ccxt.OrderNotFound(f"no existing order found for cid {dup_cid!r}")
+            raise ccxt.DuplicateOrderId(f"{symbol} duplicate client_order_id")
+
         market = self.markets.get(symbol) or self._market_defs.get(symbol)
         if market is None:
             raise ccxt.BadSymbol(f"{symbol} not listed on fake exchange {self.id!r}")
@@ -569,10 +716,16 @@ class FakeCCXTExchange:
         # attaches to this order only; consumed (one-shot) here.
         partial_fraction = self._queued_partial_fills.pop(symbol, None)
 
-        # WP1.8b: the real LiveExecutionEngine.submit_order passes the
-        # client_order_id through params["clientOrderId"]; ccxt normalises
-        # it onto the order dict's top-level "clientOrderId" key.
-        client_order_id = (params or {}).get("clientOrderId")
+        # WP1.4b (A-13): real ccxt's Coinbase adapter reads the client
+        # order id ONLY from params["client_order_id"] (snake_case) --
+        # "clientOrderId" is silently dropped, exactly like the real
+        # exchange class (see live.py's D1 fix). Any other exchange_id
+        # keeps reading "clientOrderId" (unused by any test today, kept
+        # for forward compatibility).
+        if self.id == "coinbase":
+            client_order_id = (params or {}).get("client_order_id")
+        else:
+            client_order_id = (params or {}).get("clientOrderId")
 
         # Mirrors Coinbase: the initial response is still "open"/unfilled;
         # the caller (LiveExecutionEngine) reconciles via fetch_order after
@@ -618,6 +771,20 @@ class FakeCCXTExchange:
                 "price": fill_price,
             }
         )
+
+        # WP1.4b (A-13, T1/T4): the order above is now fully placed
+        # (balance mutated, order/trade recorded, discoverable via
+        # fetch_orders/fetch_my_trades) -- but if a timeout was queued for
+        # this symbol, the CALLER never sees this response.
+        queued_timeout = self._queued_accept_then_timeout.get(symbol)
+        if queued_timeout is not None:
+            timeout_exc, remaining = queued_timeout
+            remaining -= 1
+            if remaining <= 0:
+                del self._queued_accept_then_timeout[symbol]
+            else:
+                self._queued_accept_then_timeout[symbol] = (timeout_exc, remaining)
+            raise timeout_exc
 
         return dict(order_record)
 
@@ -696,22 +863,66 @@ class FakeCCXTExchange:
         self,
         symbol: str | None = None,
         since: int | None = None,
-        limit: int | None = None,
+        limit: int | None = 100,
         params: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         """WP1.8b: every order (created via create_order OR seeded via
-        seed_exchange_order) for ``symbol``, since ``since`` (ms epoch)."""
+        seed_exchange_order) for ``symbol``, since ``since`` (ms epoch).
+
+        WP1.4b round 3 (S-R2-01): mirrors the REAL ccxt Coinbase adapter's
+        ``fetch_orders(symbol=None, since=None, limit=100, params={})`` --
+        ``limit`` defaults to 100 (not unbounded), and when it is not
+        ``None`` (default OR explicit), only the OLDEST ``limit`` matching
+        entries are returned, exactly like ccxt's own
+        ``filter_by_since_limit`` does. Production call sites must pass
+        ``limit=None`` explicitly to get everything in the window --
+        exactly what ``live.py``'s ``_lookup_by_cid`` and
+        ``run_recovery.py``'s ``_fetch_prefixed_orders``/
+        ``_targeted_cid_lookup`` now do.
+        """
         if symbol is not None:
-            queued = self._queued_fetch_orders_errors.pop(symbol, None)
+            queued = self._queued_fetch_orders_errors.get(symbol)
             if queued is not None:
-                raise queued
+                fetch_exc, remaining, skip = queued
+                if skip > 0:
+                    self._queued_fetch_orders_errors[symbol] = (fetch_exc, remaining, skip - 1)
+                else:
+                    remaining -= 1
+                    if remaining <= 0:
+                        del self._queued_fetch_orders_errors[symbol]
+                    else:
+                        self._queued_fetch_orders_errors[symbol] = (fetch_exc, remaining, skip)
+                    raise fetch_exc
+
+        # WP1.4b (A-13, T5): simulate exchange listing lag -- every order
+        # for ``symbol`` is omitted from the results for the next N calls.
+        if symbol is not None and self._hide_from_listing.get(symbol, 0) > 0:
+            remaining_hidden = self._hide_from_listing[symbol] - 1
+            if remaining_hidden <= 0:
+                del self._hide_from_listing[symbol]
+            else:
+                self._hide_from_listing[symbol] = remaining_hidden
+            return []
+
+        # WP1.4b round 2 (S-02a): honour params["until"] -- the targeted
+        # resume-scan lookup scopes both ends of the window.
+        until = (params or {}).get("until")
+
         results: list[dict[str, Any]] = []
         for order in self._orders.values():
             if symbol is not None and order["symbol"] != symbol:
                 continue
             if since is not None and order["timestamp"] < since:
                 continue
+            if until is not None and order["timestamp"] > until:
+                continue
             results.append(dict(order))
+
+        # WP1.4b round 3 (S-R2-01): mirror ccxt's oldest-first truncation
+        # under a non-None limit.
+        results.sort(key=lambda o: o["timestamp"])
+        if limit is not None:
+            results = results[:limit]
         return results
 
     async def fetch_my_trades(
@@ -740,6 +951,8 @@ class FakeCCXTExchange:
         return Decimal(str(bars[-1][4]))
 
     def _now_ms(self, symbol: str) -> int:
+        if self._now_ms_override is not None:
+            return self._now_ms_override
         bars = self._closed_bars.get(symbol)
         return bars[-1][0] if bars else _EPOCH_START_MS
 

@@ -35,6 +35,7 @@ Design notes
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_DOWN, Decimal
 from typing import Any
@@ -111,6 +112,9 @@ def _make_mock_exchange(
     exchange.has = {"fetchOrderTrades": has_fetch_order_trades, "fetchMyTrades": True}
     exchange.fetch_order_trades = AsyncMock(return_value=fetch_order_trades_response or [])
     exchange.fetch_my_trades = AsyncMock(return_value=fetch_order_trades_response or [])
+    # WP1.4b: the idempotent-submit cid lookup calls fetch_orders whenever
+    # create_order's outcome is ambiguous -- default to "nothing found".
+    exchange.fetch_orders = AsyncMock(return_value=[])
     return exchange
 
 
@@ -1061,43 +1065,69 @@ async def test_p6_get_fills_atomic_commit_on_per_trade_parse_error() -> None:
 
 
 @pytest.mark.asyncio
-async def test_p7_pending_submit_sell_with_no_exchange_id_not_reserved() -> None:
-    """P7 (WP11-S-R2-01, HIGH regression): a SELL whose create_order raised
-    before the exchange ever acknowledged it (stuck PENDING_SUBMIT, no
-    exchange id) must not block future SELLs forever.
-
-    Pre-fix: its full quantity was reserved by ``_pending_sell_quantity``,
-    so ``own_avail`` stayed permanently 0 and every later SELL silently
-    returned ``[]``."""
+async def test_p7_unknown_sell_reserved_until_never_placed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P7 rewritten for WP1.4b (I5b(a), supersedes WP11-S-R2-01): a SELL
+    whose create_order outcome is still AMBIGUOUS (here, a ValueError with
+    no matching order ever found by the cid lookup) now RESERVES its full
+    quantity -- unlike the pre-WP1.4b behaviour (which stopped reserving
+    it immediately). A second SELL signal is therefore capped to 0 and
+    blocked; re-selling the same quantity out of a possibly-external
+    holding would breach I5. The reservation is released ONLY once
+    ``_resolve_unknown_submits`` gathers D7's evidence (two absent lookups
+    >= 10s apart, the last >= the settle window after submit) and
+    confirms ``never_placed`` -- never on a timer (W3)."""
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
     engine, portfolio, _, ex = _make_engine_with_source(
         fetch_balance_response={"total": {_BASE: 0.02}, "free": {_BASE: 0.02}},
     )
     portfolio._position_snapshots[_SYMBOL] = _open_position(Decimal("0.02"))
 
     ex.create_order.side_effect = ValueError("exchange rejected the order shape")
-    with pytest.raises(ValueError):
-        await engine.submit_order(
-            Order(
-                client_order_id=f"{_RUN_ID}-{uuid4().hex[:12]}",
-                run_id=_RUN_ID,
-                symbol=_SYMBOL,
-                side=OrderSide.SELL,
-                order_type=OrderType.MARKET,
-                quantity=Decimal("0.02"),
-            )
+    stuck = await engine.submit_order(
+        Order(
+            client_order_id=f"{_RUN_ID}-{uuid4().hex[:12]}",
+            run_id=_RUN_ID,
+            symbol=_SYMBOL,
+            side=OrderSide.SELL,
+            order_type=OrderType.MARKET,
+            quantity=Decimal("0.02"),
         )
+    )
+    assert stuck.status == OrderStatus.PENDING_SUBMIT
+    assert stuck.order_id not in engine._exchange_order_map
+    assert engine.reconcile_required.get(_SYMBOL) == "sell_submit_unknown"
+    assert stuck.order_id in engine._unknown_submits
 
-    stuck = [o for o in engine._orders.values() if o.status == OrderStatus.PENDING_SUBMIT]
-    assert len(stuck) == 1
-    assert stuck[0].order_id not in engine._exchange_order_map
-
-    ex.create_order.side_effect = None  # the next attempt reaches the exchange normally
+    # I5b(a): the unknown SELL's full quantity is reserved -- a second
+    # SELL is capped to 0 and blocked, never re-selling the same quantity.
     second_orders = await engine.process_signal(
         _make_signal(direction=SignalDirection.SELL, target_position=Decimal("0"))
     )
+    assert second_orders == []
 
-    assert len(second_orders) == 1, "the next SELL must still be submitted"
-    assert engine.reconcile_required.get(_SYMBOL) == "sell_order_state_unknown"
+    # Simulate D7 evidence: age the entry past the settle window with two
+    # absent lookups >= 10s apart (real time was never actually waited --
+    # asyncio.sleep is mocked above -- so the clock is moved directly,
+    # exactly as a per-bar resolver running much later would observe).
+    entry = engine._unknown_submits[stuck.order_id]
+    entry.submit_at = datetime.now(UTC) - timedelta(seconds=130)
+    entry.first_absent_at = entry.submit_at + timedelta(seconds=1)
+    entry.last_absent_at = entry.submit_at + timedelta(seconds=5)
+    entry.absent_count = 1
+
+    await engine._resolve_unknown_submits(_SYMBOL)
+
+    assert engine._orders[stuck.order_id].status == OrderStatus.REJECTED
+    assert stuck.order_id not in engine._unknown_submits
+    assert engine.reconcile_required.get(_SYMBOL) is None
+
+    ex.create_order.side_effect = None  # the next attempt reaches the exchange normally
+    third_orders = await engine.process_signal(
+        _make_signal(direction=SignalDirection.SELL, target_position=Decimal("0"))
+    )
+    assert len(third_orders) == 1, "the next SELL is submitted once the reservation releases"
 
 
 @pytest.mark.asyncio

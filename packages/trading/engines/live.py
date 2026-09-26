@@ -83,6 +83,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Callable, Collection, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 from typing import Any, Protocol, overload
@@ -132,6 +133,105 @@ _SETTLED_ORDER_STATUSES = frozenset(
 # keep reserving its quantity against future SELLs (see
 # LiveExecutionEngine._pending_sell_quantity).
 _INFLIGHT_SELL_MAX_AGE_S = 300
+
+# ---------------------------------------------------------------------------
+# WP1.4b (Verbeterplan v2 idempotent-submit spec, D1-D16): ``submit_order``
+# calls ``create_order`` exactly once (W1/D2) -- no ``ccxt_retry``, which
+# would silently resend under our own ``client_order_id`` on a transient
+# failure (D6: no automatic resend, ever). Any exception is classified
+# (``_classify_submit_error``, D3) as either "not_placed" (REJECTED
+# immediately, no lookup -- the exchange body itself said no) or "ambiguous"
+# (the order may have executed anyway -- resolved by an exact
+# client-order-id lookup, D4/D5). An order that resolves neither way inline
+# stays PENDING_SUBMIT with no exchange id ("unknown submit", D8) --
+# ``_resolve_unknown_submits`` (called every bar from ``check_resting_orders``
+# and ``reconcile_open_orders``, and once with no sleeps from ``on_stop``,
+# D14) keeps retrying the lookup until D7's evidence bar is met.
+# ---------------------------------------------------------------------------
+
+# D5: inline lookup schedule during submit_order itself (adoption only) --
+# 1s, 2s, 4s after submit.
+_INLINE_LOOKUP_DELAYS_S: tuple[float, ...] = (1.0, 2.0, 4.0)
+
+# D7: two successful "absent" lookups must be at least this far apart before
+# "never placed" can be concluded (on top of the settle-window check against
+# submit time).
+_UNKNOWN_ABSENT_MIN_GAP_S = 10.0
+
+# WP1.4b round 2 (S-01b): the cid lookup widens its ``since`` anchor by this
+# margin -- raised from the original 300_000 (5 minutes, matching the WP1.8b
+# exchange-scan's own ``_SCAN_CLOCK_SKEW_MARGIN``) to a full hour. A 5-minute
+# margin let in-run clock skew alone (exchange vs. this process) produce a
+# false "absent" lookup result, feeding D7's evidence count with a
+# non-event.
+_LOOKUP_SINCE_MARGIN_MS = 3_600_000
+
+# WP1.4b round 2 (S-01c): once REJECTED as ``never_placed``, the cid stays on
+# a watch list for this long -- a later lookup that DOES find it (Coinbase's
+# own listing catching up, or evidence the D7 "never placed" verdict was
+# actually wrong) is a serious integrity break, not a silent no-op.
+_NEVER_PLACED_WATCH_S = 86_400.0
+
+# WP1.4b round 3 (S-R2-07, optional hardening): cap the watch list so a
+# pathological run (or an attacker forging many rejected cids) cannot grow
+# it, and the per-entry paginated fetch_orders cost, without bound. The
+# OLDEST entry (by rejected_at) is evicted -- unresolved, with a critical
+# log -- once this is exceeded.
+_NEVER_PLACED_WATCH_MAX_ENTRIES = 50
+
+
+@dataclass
+class _UnknownSubmit:
+    """D8: bookkeeping for one still-ambiguous ``create_order`` outcome.
+
+    ``absent_count``/``first_absent_at``/``last_absent_at`` track only
+    *successful* "not found" lookups (W4: a failed lookup is never counted
+    as absent) made AFTER the settle window has already elapsed since
+    ``submit_at`` (WP1.4b round 2, S-01a) -- D7 needs at least two of them,
+    at least ``_UNKNOWN_ABSENT_MIN_GAP_S`` apart, before the order can be
+    confirmed REJECTED (``never_placed``). Pre-settle absents (e.g. the 3
+    inline lookups) are never counted at all -- otherwise D7's "two absents"
+    bar could be met by a single flaky empty reply arriving just past the
+    settle window, since an inline lookup already supplied a free "first"
+    absent.
+
+    ``exists_evidence`` (S-04): set when the exchange's own reply is
+    POSITIVE evidence the cid exists (currently: a ``DuplicateOrderId``
+    error) -- ``never_placed`` must never fire while this is set, no matter
+    how many (implicitly contradictory) absent lookups follow.
+    """
+
+    symbol: str
+    side: OrderSide
+    submit_at: datetime
+    absent_count: int = 0
+    first_absent_at: datetime | None = None
+    last_absent_at: datetime | None = None
+    stale_alerted: bool = False
+    exists_evidence: bool = False
+    # WP1.4b round 3 (S-R2-08): the "half-applied adoption" critical alert
+    # (``live.order_submit_adoption_failed``) fires once per order, not on
+    # every resolver pass.
+    adoption_failed_alerted: bool = False
+
+
+@dataclass
+class _NeverPlacedWatch:
+    """WP1.4b round 2 (S-01c): one REJECTED ``never_placed`` order still
+    being watched for contradicting evidence.
+
+    WP1.4b round 3 (S-R2-04): ``submit_at`` (the ORIGINAL submit time, not
+    ``rejected_at``) anchors the watch's own cid lookup -- anchoring on
+    ``rejected_at`` instead left the watch blind after a long lookup outage
+    (the order could have been placed well before ``rejected_at - 1h``).
+    ``rejected_at`` is kept only for the 24h watch-list TTL.
+    """
+
+    symbol: str
+    side: OrderSide
+    client_order_id: str
+    submit_at: datetime
+    rejected_at: datetime
 
 
 @overload
@@ -501,6 +601,7 @@ class LiveExecutionEngine(BaseExecutionEngine):
         config: dict[str, Any] | None = None,
         buy_cap_slippage_pct: Decimal = Decimal("0.005"),
         buy_inflight_stale_after_s: float = 900.0,
+        unknown_submit_settle_s: float = 120.0,
     ) -> None:
         super().__init__(run_id=run_id, config=config)
         self._risk_manager = risk_manager
@@ -518,6 +619,10 @@ class LiveExecutionEngine(BaseExecutionEngine):
         # "no age expiry" still holds) -- it only makes a stuck block
         # impossible to miss in the logs.
         self._buy_inflight_stale_after_s = buy_inflight_stale_after_s
+        # WP1.4b (D7): how long after submit an unresolved ambiguous
+        # submit must stay "absent" on two lookups >= 10s apart before it
+        # is confirmed REJECTED (never_placed).
+        self._unknown_submit_settle_s = unknown_submit_settle_s
 
         # Fill registry: order_id -> list of Fill objects
         self._fills: dict[UUID, list[Fill]] = {}
@@ -586,6 +691,21 @@ class LiveExecutionEngine(BaseExecutionEngine):
 
         # Reverse map: exchange order ID -> internal order_id
         self._reverse_order_map: dict[str, UUID] = {}
+
+        # WP1.4b (D8): order_id -> bookkeeping for a still-ambiguous
+        # create_order outcome (an "unknown submit"). See _UnknownSubmit.
+        self._unknown_submits: dict[UUID, _UnknownSubmit] = {}
+        # WP1.4b round 2 (S-01c): order_id -> a REJECTED never_placed order
+        # still being watched for contradicting evidence. See
+        # _NeverPlacedWatch.
+        self._never_placed_watch: dict[UUID, _NeverPlacedWatch] = {}
+        # WP1.4b round 3 (S-R2-05): symbol -> quantity a contradicted SELL
+        # (a never_placed verdict the watch later found was wrong) turned
+        # out to actually be on the exchange. _pending_sell_quantity must
+        # keep reserving it (the run ledger was never reduced for it) --
+        # persists for the engine's lifetime, cleared only by an operator
+        # or a resume's WP1.8b import of the now-known order.
+        self._contradicted_sell_reserve: dict[str, Decimal] = {}
 
         self._log = self._log.bind(
             engine="live",
@@ -681,6 +801,36 @@ class LiveExecutionEngine(BaseExecutionEngine):
             self._log.info(
                 "live.reconcile_cleared", symbol=symbol, reason="balance_unavailable"
             )
+
+    def _flag_submit_unknown(self, symbol: str, reason: str) -> None:
+        """WP1.4b (D11): set ``reconcile_required[symbol] = reason``
+        UNLESS a DIFFERENT reason is already flagged for this symbol.
+        Unlike ``_flag_reconcile`` (which always overwrites, I4), the two
+        self-clearing "submit unknown" reasons must never stomp an
+        already-set, non-self-clearing reason (e.g. an I8 mismatch) --
+        that would let this WP's own bookkeeping silently erase an
+        operator-facing flag some other invariant is still relying on."""
+        existing = self._reconcile_required.get(symbol)
+        if existing is not None and existing != reason:
+            return
+        if existing == reason:
+            return
+        self._reconcile_required[symbol] = reason
+        self._log.error("live.reconcile_required", symbol=symbol, reason=reason)
+
+    def _maybe_clear_submit_unknown(self, symbol: str) -> None:
+        """WP1.4b (D11): ``buy_submit_unknown``/``sell_submit_unknown``
+        clear themselves once no unresolved submit remains on ``symbol`` --
+        provided the flag still carries exactly that reason (never clears a
+        different, operator- or WP1.8-set reason that happened to replace
+        it in the meantime)."""
+        current = self._reconcile_required.get(symbol)
+        if current not in ("buy_submit_unknown", "sell_submit_unknown"):
+            return
+        if any(entry.symbol == symbol for entry in self._unknown_submits.values()):
+            return
+        del self._reconcile_required[symbol]
+        self._log.info("live.reconcile_cleared", symbol=symbol, reason=current)
 
     # ------------------------------------------------------------------
     # WP1.1: precision helpers (D5)
@@ -820,12 +970,17 @@ class LiveExecutionEngine(BaseExecutionEngine):
                 order.status == OrderStatus.PENDING_SUBMIT
                 and order.order_id not in self._exchange_order_map
             ):
-                # WP11-S-R2-01 (regression fix): create_order raised before
-                # the exchange ever acknowledged this order -- it has no
-                # exchange id and will never resolve on its own. Reserving
-                # its full quantity would block every future SELL forever;
-                # flag it for an operator instead of reserving it.
-                self._flag_reconcile(symbol, "sell_order_state_unknown")
+                # WP1.4b (I5b(a)): an unknown SELL submit (create_order's
+                # outcome is still ambiguous, D8) reserves its FULL
+                # quantity, released only on W3 evidence (adoption or
+                # never_placed) -- never on a timer. The run ledger hasn't
+                # been reduced and ``free`` includes external holdings, so
+                # releasing early could let a second SELL sell the user's
+                # own coins (I5). The flag itself is set once, at
+                # registration time (``_register_unknown_submit``), not
+                # here -- repeating it on every call would fight D11's
+                # never-overwrite rule.
+                pending += order.quantity
                 continue
 
             routed_gross = self._routed_gross_qty.get(order.order_id, Decimal("0"))
@@ -851,6 +1006,11 @@ class LiveExecutionEngine(BaseExecutionEngine):
                 pending += max(order.quantity - routed_gross, Decimal("0"))
             elif order.status in _SETTLED_ORDER_STATUSES:
                 pending += max(order.filled_quantity - routed_gross, Decimal("0"))
+        # WP1.4b round 3 (S-R2-05): a contradicted SELL (a never_placed
+        # verdict the watch later found was wrong) is not represented by
+        # any order in PENDING_SUBMIT/OPEN/PARTIAL any more -- it is
+        # REJECTED, so the loop above never reserves it. Add it explicitly.
+        pending += self._contradicted_sell_reserve.get(symbol, Decimal("0"))
         return pending
 
     def _inflight_buy_orders(self) -> Order | None:
@@ -876,14 +1036,16 @@ class LiveExecutionEngine(BaseExecutionEngine):
         ``blocking_order_id``/``blocking_status``/``unrouted`` on
         ``live.buy_blocked_inflight_buy``.
 
-        Security round 2 (WP14-S-05): a PENDING_SUBMIT BUY with no
-        exchange id (``create_order`` raised before the exchange ever
-        acknowledged it -- its state is genuinely unknown, it may have
-        been accepted anyway) additionally flags
-        ``reconcile_required[symbol] = "buy_order_state_unknown"``,
-        mirroring the SELL side's WP11-S-R2-01 handling -- unlike the
-        SELL path (which stops *reserving* it but still sells), a BUY has
-        no "reserve, don't block" fallback, so it keeps blocking.
+        Security round 2 (WP14-S-05), superseded by WP1.4b (D9/D11): a
+        PENDING_SUBMIT BUY with no exchange id (``create_order``'s outcome
+        is still ambiguous -- it may have been accepted anyway) additionally
+        flags ``reconcile_required[symbol] = "buy_submit_unknown"`` via the
+        self-clearing ``_flag_submit_unknown`` (D11) -- unlike the SELL
+        side (which now RESERVES the unknown order's quantity instead of
+        merely flagging, I5b(a); D9 supersedes the old WP11-S-R2-01
+        "stop reserving, still sell" SELL behaviour), a BUY has no
+        "reserve, don't block" fallback, so it keeps blocking run-wide
+        until the submit resolves (adoption or ``never_placed``, D7/D8).
 
         Unlike ``_pending_sell_quantity``, there is no age expiry (R3): a
         stuck BUY blocks every new BUY, run-wide, until it genuinely
@@ -903,13 +1065,38 @@ class LiveExecutionEngine(BaseExecutionEngine):
                     order.status == OrderStatus.PENDING_SUBMIT
                     and order.order_id not in self._exchange_order_map
                 ):
-                    self._flag_reconcile(order.symbol, "buy_order_state_unknown")
+                    # WP1.4b (D11): renamed from "buy_order_state_unknown"
+                    # -- this is the same unknown-submit condition
+                    # ``_register_unknown_submit`` already flags; use the
+                    # self-clearing variant so it never stomps a different,
+                    # already-set reason.
+                    self._flag_submit_unknown(order.symbol, "buy_submit_unknown")
                 return order
             if order.status in _SETTLED_ORDER_STATUSES:
                 routed_gross = self._routed_gross_qty.get(order.order_id, Decimal("0"))
                 unrouted = order.filled_quantity - routed_gross
                 if unrouted > self._amount_tolerance(order.symbol):
                     return order
+        return None
+
+    def _stale_unknown_sell(self) -> _UnknownSubmit | None:
+        """WP1.4b round 2 (R-02(a)): an unknown SELL submit whose outcome
+        is still unresolved after ``_INFLIGHT_SELL_MAX_AGE_S`` (300s)
+        blocks every new BUY, run-wide -- I5b(a)'s reservation alone only
+        protects against overselling the SAME symbol/quantity; it says
+        nothing about a fresh BUY spending run cash while an exit's own
+        fate (did it fill? is it still live?) is genuinely unknown. Lifts
+        only when the SELL resolves on evidence (adoption or
+        ``never_placed``), never on a timer -- this check itself never
+        clears anything, it just re-evaluates ``_unknown_submits`` fresh
+        on every call."""
+        now = datetime.now(tz=UTC)
+        for entry in self._unknown_submits.values():
+            if (
+                entry.side == OrderSide.SELL
+                and (now - entry.submit_at).total_seconds() > _INFLIGHT_SELL_MAX_AGE_S
+            ):
+                return entry
         return None
 
     def _maybe_log_inflight_block_stale(self, order: Order) -> None:
@@ -1154,6 +1341,581 @@ class LiveExecutionEngine(BaseExecutionEngine):
         )
 
     # ------------------------------------------------------------------
+    # WP1.4b: idempotent order submit -- error classification, cid lookup,
+    # adoption and the unknown-submit resolver (D1-D16)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _classify_submit_error(exc: Exception) -> str:
+        """D3: classify a ``create_order`` exception as ``"not_placed"``
+        (the exchange body itself said no -- REJECTED immediately, no
+        lookup) or ``"ambiguous"`` (the order may have executed anyway --
+        resolved via an exact client-order-id lookup).
+
+        Checked in this exact order: ``DuplicateOrderId``/``OrderNotFound``
+        (the two ``InvalidOrder`` subclasses that mean "the exchange has
+        seen this cid before") are ambiguous even though every other
+        ``InvalidOrder`` is not placed. Everything not explicitly listed
+        below -- the entire ``NetworkError`` family (``InvalidNonce``,
+        ``RequestTimeout``, ``RateLimitExceeded``/``DDoSProtection``,
+        ``ExchangeNotAvailable``/``OnMaintenance``), ``BadResponse``/
+        ``NullResponse``, an exact-class ``ExchangeError``, and any
+        non-ccxt exception -- is ambiguous (fail closed, D3).
+        """
+        if isinstance(exc, (ccxt_async.DuplicateOrderId, ccxt_async.OrderNotFound)):
+            return "ambiguous"
+        if isinstance(
+            exc,
+            (
+                ccxt_async.InsufficientFunds,
+                ccxt_async.InvalidOrder,
+                ccxt_async.BadRequest,
+                ccxt_async.AuthenticationError,
+                ccxt_async.ArgumentsRequired,
+                ccxt_async.NotSupported,
+                ccxt_async.OperationRejected,
+            ),
+        ):
+            return "not_placed"
+        return "ambiguous"
+
+    async def _lookup_by_cid(
+        self, symbol: str, cid: str, submit_ms: int, side: OrderSide,
+    ) -> tuple[str, dict[str, Any] | None]:
+        """D4: resolve an ambiguous submit by exact client-order-id match.
+
+        Returns ``("found", raw_order)``, ``("absent", None)`` (the
+        exchange was reachable and genuinely has no such order -- W4: only
+        this outcome ever counts towards D7's "never placed" evidence) or
+        ``("failed", None)`` (the lookup itself errored -- never treated as
+        absent).
+
+        A cid match whose ``symbol``/``side`` disagrees with what THIS
+        order actually is is treated as ``"failed"`` (never adopted) and
+        flags the symbol -- a coincidental cid collision must never be
+        silently adopted (D4/T13).
+
+        WP1.4b round 3 (S-R2-01): ``limit=None`` is REQUIRED here -- the
+        real ccxt Coinbase adapter defaults ``fetch_orders``'s ``limit`` to
+        100 and returns the OLDEST 100 orders in the window (its paginated
+        path ends with ``filter_by_since_limit(sorted, since, limit)``).
+        With any active symbol trading more than ~100 orders inside the
+        lookup window, a real recent order would silently never come back,
+        making it indistinguishable from "never placed".
+        """
+        since_ms = submit_ms - _LOOKUP_SINCE_MARGIN_MS
+        try:
+            raw_orders = await self._exchange.fetch_orders(
+                symbol, since=since_ms, limit=None, params={"paginate": True},
+            )
+        except Exception as exc:
+            self._log.warning(
+                "live.submit_lookup_failed",
+                symbol=symbol,
+                error_type=type(exc).__name__,
+                error=str(exc)[:200],
+            )
+            return "failed", None
+
+        for raw in raw_orders or []:
+            raw_cid = raw.get("clientOrderId")
+            if not raw_cid or str(raw_cid) != cid:
+                continue
+            raw_symbol = raw.get("symbol")
+            raw_side = str(raw.get("side") or "").lower()
+            if raw_symbol != symbol or raw_side != side.value:
+                self._flag_reconcile(symbol, "submit_lookup_mismatch")
+                self._log.error(
+                    "live.submit_lookup_cid_mismatch",
+                    symbol=symbol,
+                    expected_side=side.value,
+                    found_side=raw_side,
+                )
+                return "failed", None
+            return "found", raw
+        return "absent", None
+
+    def _apply_create_response(self, order: Order, ccxt_response: dict[str, Any]) -> Order:
+        """Apply a successful ``create_order`` response OR an adopted
+        lookup match to ``order`` (D5) -- extracted, unchanged, from the
+        pre-WP1.4b inline body so both paths share identical
+        fill-on-creation handling. The state machine forbids
+        PENDING_SUBMIT -> FILLED/EXPIRED directly, so either goes through
+        OPEN first (WP1.4b round 2, S-05: EXPIRED needs exactly the same
+        treatment as an instant FILLED, or an adopted already-expired
+        order raises ``InvalidOrderTransitionError`` mid-adoption and gets
+        stuck half-applied).
+        """
+        # WP11-A-08: the exchange balance just changed (funds locked or
+        # spent); drop the cache so the next read (e.g. a same-bar
+        # bracket SELL's cap) is not stale.
+        self._invalidate_balance_cache()
+
+        raw_id = ccxt_response.get("id")
+        exchange_order_id = str(raw_id) if raw_id not in (None, "") else ""
+
+        # Record the mapping
+        self._exchange_order_map[order.order_id] = exchange_order_id
+        self._reverse_order_map[exchange_order_id] = order.order_id
+
+        # Update order with exchange info (do NOT store yet -- wait for fill data)
+        order = order.model_copy(update={
+            "exchange_order_id": exchange_order_id,
+            "updated_at": datetime.now(tz=UTC),
+        })
+
+        # Determine initial status from exchange response
+        ccxt_status = ccxt_response.get("status", "open")
+        mapped_status = self._map_ccxt_order_status(ccxt_status)
+
+        # PENDING_SUBMIT -> OPEN (or directly to FILLED/EXPIRED for an
+        # instant terminal reply).
+        #
+        # Coinbase returns None for "filled" and "average" on market orders
+        # that are still processing. Guard with _safe_decimal() to prevent
+        # decimal.InvalidOperation on None/non-numeric values.
+        if mapped_status == OrderStatus.FILLED:
+            order = self._transition(order, OrderStatus.OPEN)
+
+            # Extract fill data from response
+            filled_qty = _safe_decimal(
+                ccxt_response.get("filled"), order.quantity
+            )
+            avg_price = _safe_decimal(
+                ccxt_response.get("average")
+            ) or _safe_decimal(ccxt_response.get("price"), Decimal("0"))
+
+            # Apply fill data and store atomically before terminal transition
+            order = order.model_copy(update={
+                "filled_quantity": filled_qty,
+                "average_fill_price": avg_price,
+                "updated_at": datetime.now(tz=UTC),
+            })
+            self._orders[order.order_id] = order
+
+            order = self._transition(order, OrderStatus.FILLED)
+        elif mapped_status == OrderStatus.EXPIRED:
+            # WP1.4b round 2 (S-05): route through OPEN first, exactly
+            # like FILLED above -- ORDER_STATE_MACHINE has no
+            # PENDING_SUBMIT -> EXPIRED edge (only OPEN/PARTIAL -> EXPIRED
+            # is legal).
+            order = self._transition(order, OrderStatus.OPEN)
+
+            filled_qty = _safe_decimal(ccxt_response.get("filled"), Decimal("0"))
+            if filled_qty > Decimal("0"):
+                avg_price = _safe_decimal(ccxt_response.get("average"), Decimal("0"))
+                order = order.model_copy(update={
+                    "filled_quantity": filled_qty,
+                    "average_fill_price": avg_price if avg_price > 0 else None,
+                    "updated_at": datetime.now(tz=UTC),
+                })
+                self._orders[order.order_id] = order
+
+            order = self._transition(order, OrderStatus.EXPIRED)
+        else:
+            order = self._transition(order, mapped_status)
+
+            # If partially filled on creation
+            filled_qty = _safe_decimal(ccxt_response.get("filled"), Decimal("0"))
+            if filled_qty > Decimal("0"):
+                avg_price = _safe_decimal(
+                    ccxt_response.get("average"), Decimal("0")
+                )
+                order = order.model_copy(update={
+                    "filled_quantity": filled_qty,
+                    "average_fill_price": avg_price if avg_price > 0 else None,
+                    "updated_at": datetime.now(tz=UTC),
+                })
+                self._orders[order.order_id] = order
+
+        self._log.info(
+            "live.order_submitted",
+            order_id=str(order.order_id),
+            exchange_order_id=exchange_order_id,
+            symbol=order.symbol,
+            side=order.side.value,
+            type=order.order_type.value,
+            quantity=str(order.quantity),
+            status=order.status.value,
+        )
+        return order
+
+    def _try_adopt(self, order: Order, raw_order: dict[str, Any]) -> Order | None:
+        """D5: adopt a found lookup match, refusing (returning ``None``)
+        if ``_reverse_order_map`` already points that exchange id at a
+        DIFFERENT local order -- flags the symbol instead of risking two
+        local orders sharing one exchange id."""
+        raw_id = raw_order.get("id")
+        exchange_order_id = str(raw_id) if raw_id not in (None, "") else ""
+        if not exchange_order_id or exchange_order_id == "None":
+            return None
+
+        existing_owner = self._reverse_order_map.get(exchange_order_id)
+        if existing_owner is not None and existing_owner != order.order_id:
+            self._flag_reconcile(order.symbol, "submit_adoption_conflict")
+            self._log.error(
+                "live.order_adoption_conflict",
+                order_id=str(order.order_id),
+                symbol=order.symbol,
+                exchange_order_id=exchange_order_id,
+            )
+            return None
+
+        adopted = self._apply_create_response(order, raw_order)
+        self._clear_unknown_submit(order.order_id)
+        self._log.info(
+            "live.order_submit_adopted",
+            order_id=str(order.order_id),
+            symbol=order.symbol,
+            exchange_order_id=exchange_order_id,
+            cid=order.client_order_id,
+            state=adopted.status.value,
+        )
+        return adopted
+
+    def _register_unknown_submit(
+        self, order: Order, *, submit_at: datetime, exists_evidence: bool = False,
+    ) -> None:
+        """D8: record ``order`` as a still-ambiguous submit (idempotent)
+        and flag its symbol (D11) -- called once inline resolution gives
+        up (D5) and, synchronously with no await, on ``CancelledError``
+        (D15). ``exists_evidence`` (S-04) is OR'd into an existing entry,
+        never cleared here."""
+        entry = self._unknown_submits.get(order.order_id)
+        if entry is None:
+            entry = _UnknownSubmit(
+                symbol=order.symbol, side=order.side, submit_at=submit_at,
+                exists_evidence=exists_evidence,
+            )
+            self._unknown_submits[order.order_id] = entry
+        elif exists_evidence:
+            entry.exists_evidence = True
+        reason = "buy_submit_unknown" if order.side == OrderSide.BUY else "sell_submit_unknown"
+        self._flag_submit_unknown(order.symbol, reason)
+        self._log.error(
+            "live.order_submit_state_unknown",
+            order_id=str(order.order_id),
+            symbol=order.symbol,
+            side=order.side.value,
+            cid=order.client_order_id,
+            state=order.status.value,
+        )
+
+    def _clear_unknown_submit(self, order_id: UUID) -> None:
+        entry = self._unknown_submits.pop(order_id, None)
+        if entry is not None:
+            self._maybe_clear_submit_unknown(entry.symbol)
+
+    def _record_absent_lookup(
+        self, order_id: UUID, symbol: str, side: OrderSide, submit_at: datetime,
+    ) -> _UnknownSubmit:
+        """W4: only a successful "not found" lookup ever reaches here.
+
+        WP1.4b round 2 (S-01a): an absent lookup made BEFORE the settle
+        window has elapsed since ``submit_at`` is never counted at all --
+        counting it let D7's "two absents" bar be satisfied by a single
+        flaky empty reply arriving just past the settle window, since an
+        inline (pre-settle) lookup already supplied a free "first" absent.
+        """
+        now = datetime.now(tz=UTC)
+        entry = self._unknown_submits.get(order_id)
+        if entry is None:
+            entry = _UnknownSubmit(symbol=symbol, side=side, submit_at=submit_at)
+            self._unknown_submits[order_id] = entry
+        if (now - entry.submit_at).total_seconds() < self._unknown_submit_settle_s:
+            return entry
+        entry.absent_count += 1
+        if entry.first_absent_at is None:
+            entry.first_absent_at = now
+        entry.last_absent_at = now
+        return entry
+
+    def _maybe_log_stale_unknown(self, order_id: UUID, entry: _UnknownSubmit) -> None:
+        """D16: once ``entry`` has been unresolved for longer than its
+        side's stale threshold, log ``live.order_submit_state_unknown_stale``
+        at critical level -- exactly once per order (reuses the WP1.4 S-04
+        pattern). WP1.4b round 2 (R-02(b)): a SELL uses
+        ``_INFLIGHT_SELL_MAX_AGE_S`` (300s, matching R-02(a)'s run-wide BUY
+        block), not the longer BUY-oriented ``_buy_inflight_stale_after_s``
+        (900s default) -- an unresolved exit deserves an earlier alert than
+        an unresolved entry."""
+        if entry.stale_alerted:
+            return
+        threshold = (
+            _INFLIGHT_SELL_MAX_AGE_S
+            if entry.side == OrderSide.SELL
+            else self._buy_inflight_stale_after_s
+        )
+        age_s = (datetime.now(tz=UTC) - entry.submit_at).total_seconds()
+        if age_s > threshold:
+            entry.stale_alerted = True
+            self._log.critical(
+                "live.order_submit_state_unknown_stale",
+                order_id=str(order_id),
+                symbol=entry.symbol,
+                side=entry.side.value,
+                age_seconds=age_s,
+            )
+
+    def _reject_never_placed(self, order: Order) -> None:
+        """D7: confirmed not placed -- REJECTED, reason ``never_placed``.
+
+        WP1.4b round 2 (S-01c): the cid is not simply forgotten -- it goes
+        on a 24h watch list (``_resolve_never_placed_watch``) in case
+        later evidence contradicts this verdict.
+        """
+        # WP1.4b round 3 (S-R2-04): capture the ORIGINAL submit time before
+        # _clear_unknown_submit pops the entry -- the watch's own lookup
+        # must anchor on this, not on rejected_at (see _NeverPlacedWatch).
+        entry = self._unknown_submits.get(order.order_id)
+        submit_at = entry.submit_at if entry is not None else datetime.now(tz=UTC)
+
+        self._transition(order, OrderStatus.REJECTED)
+        self._log.error(
+            "live.order_submit_never_placed",
+            order_id=str(order.order_id),
+            symbol=order.symbol,
+            cid=order.client_order_id,
+            state=OrderStatus.REJECTED.value,
+        )
+        self._clear_unknown_submit(order.order_id)
+        self._never_placed_watch[order.order_id] = _NeverPlacedWatch(
+            symbol=order.symbol, side=order.side,
+            client_order_id=order.client_order_id,
+            submit_at=submit_at,
+            rejected_at=datetime.now(tz=UTC),
+        )
+        # WP1.4b round 3 (S-R2-07): evict the oldest entry once the cap is
+        # exceeded -- unresolved, logged critical, never silently dropped.
+        if len(self._never_placed_watch) > _NEVER_PLACED_WATCH_MAX_ENTRIES:
+            oldest_id = min(
+                self._never_placed_watch,
+                key=lambda oid: self._never_placed_watch[oid].rejected_at,
+            )
+            evicted = self._never_placed_watch.pop(oldest_id)
+            self._log.critical(
+                "live.never_placed_watch_evicted",
+                order_id=str(oldest_id),
+                symbol=evicted.symbol,
+                cid=evicted.client_order_id,
+            )
+
+    async def _resolve_never_placed_watch(self, symbol: str | None = None) -> None:
+        """WP1.4b round 2 (S-01c): re-check every still-watched
+        ``never_placed`` verdict for ``symbol`` (every symbol when
+        ``None``). A cid the exchange NOW shows is a serious integrity
+        break (our own "never placed" conclusion was wrong) -- flags the
+        symbol, halts every future BUY run-wide (the existing
+        ``_run_buy_block`` mechanism, permanent for the life of the run,
+        exactly like a quote-currency mismatch), and logs at critical.
+        Entries older than ``_NEVER_PLACED_WATCH_S`` (24h) are dropped
+        unresolved."""
+        now = datetime.now(tz=UTC)
+        watch_ids = [
+            order_id
+            for order_id, watch in self._never_placed_watch.items()
+            if symbol is None or watch.symbol == symbol
+        ]
+        for order_id in watch_ids:
+            watch = self._never_placed_watch.get(order_id)
+            if watch is None:
+                continue
+            if (now - watch.rejected_at).total_seconds() > _NEVER_PLACED_WATCH_S:
+                del self._never_placed_watch[order_id]
+                continue
+
+            # WP1.4b round 3 (S-R2-04): anchor on the ORIGINAL submit
+            # time, not rejected_at -- rejected_at is always LATER than
+            # submit_at (by at least the settle window), so anchoring
+            # there could put "since" AFTER the order's own creation time,
+            # making the watch blind to an order placed just before a long
+            # lookup outage.
+            since_ms = int(watch.submit_at.timestamp() * 1000)
+            outcome, raw = await self._lookup_by_cid(
+                watch.symbol, watch.client_order_id, since_ms, watch.side,
+            )
+            if outcome != "found":
+                continue
+
+            assert raw is not None
+            del self._never_placed_watch[order_id]
+            found_exchange_id = raw.get("id")
+            self._flag_reconcile(watch.symbol, "never_placed_contradicted")
+            if self._run_buy_block is None:
+                self._run_buy_block = "never_placed_contradicted"
+            if watch.side == OrderSide.SELL:
+                # WP1.4b round 3 (S-R2-05): the run-wide BUY block alone
+                # does not stop a SELL from re-selling this same,
+                # already-executed quantity -- the run ledger was never
+                # reduced for it. Reserve it explicitly, persisting for the
+                # engine's lifetime (an operator, or a resume's WP1.8b
+                # import of this now-known order, is what actually clears
+                # it -- never a timer, I5).
+                watched_order = self._orders.get(order_id)
+                if watched_order is not None:
+                    self._contradicted_sell_reserve[watch.symbol] = (
+                        self._contradicted_sell_reserve.get(watch.symbol, Decimal("0"))
+                        + watched_order.quantity
+                    )
+            self._log.critical(
+                "live.order_never_placed_found_later",
+                order_id=str(order_id),
+                symbol=watch.symbol,
+                cid=watch.client_order_id,
+                exchange_order_id=(
+                    str(found_exchange_id) if found_exchange_id is not None else None
+                ),
+            )
+
+    async def _resolve_ambiguous_submit(
+        self,
+        order: Order,
+        *,
+        submit_ms: int,
+        submit_at: datetime,
+        exists_evidence: bool = False,
+    ) -> Order:
+        """D5: up to 3 inline lookups (1s/2s/4s after submit), for
+        adoption only. A failed lookup (W4) is never counted as absent and
+        is simply retried at the next delay. If nothing resolves inline,
+        the order is registered as an unknown submit (D8) and stays
+        PENDING_SUBMIT with no exchange id -- ``_resolve_unknown_submits``
+        (called every bar) takes over from there (D7).
+
+        WP1.4b round 2 (S-03): a ``CancelledError`` during one of the
+        inline sleeps (D15 only covered the ``create_order`` call itself)
+        is registered as unknown, synchronously, before propagating --
+        this window (up to ~7s) is otherwise long enough to lose an order
+        entirely on shutdown.
+        """
+        try:
+            for delay in _INLINE_LOOKUP_DELAYS_S:
+                await asyncio.sleep(delay)
+                outcome, raw = await self._lookup_by_cid(
+                    order.symbol, order.client_order_id, submit_ms, order.side,
+                )
+                if outcome == "found":
+                    assert raw is not None
+                    adopted = self._try_adopt(order, raw)
+                    if adopted is not None:
+                        return adopted
+                    break
+                if outcome == "absent":
+                    self._record_absent_lookup(
+                        order.order_id, order.symbol, order.side, submit_at,
+                    )
+                # "failed": W4 -- no bookkeeping change, just retry at the
+                # next delay (or fall through to registration below).
+
+            self._register_unknown_submit(
+                order, submit_at=submit_at, exists_evidence=exists_evidence,
+            )
+            # R-03 (defensive): a no-op at this age, but keeps the "log
+            # stale whenever we give up on an outcome" contract uniform
+            # with the per-bar resolver below.
+            entry = self._unknown_submits.get(order.order_id)
+            if entry is not None:
+                self._maybe_log_stale_unknown(order.order_id, entry)
+            return self._orders[order.order_id]
+        except asyncio.CancelledError:
+            self._register_unknown_submit(
+                order, submit_at=submit_at, exists_evidence=exists_evidence,
+            )
+            raise
+
+    async def _resolve_one_unknown_submit(self, order_id: UUID) -> None:
+        entry = self._unknown_submits.get(order_id)
+        order = self._orders.get(order_id)
+        if entry is None or order is None:
+            self._unknown_submits.pop(order_id, None)
+            return
+        if order.status != OrderStatus.PENDING_SUBMIT:
+            # Resolved through some other path already (defensive).
+            self._clear_unknown_submit(order_id)
+            return
+        if order_id in self._exchange_order_map:
+            # WP1.4b round 2 (S-05): the exchange id WAS recorded (adoption
+            # got that far) but the order never left PENDING_SUBMIT -- some
+            # later step in ``_apply_create_response`` must have failed.
+            # Clearing the entry here would silently abandon it (fills
+            # never routed, D16 never fires); keep it and demand an
+            # operator instead.
+            self._flag_reconcile(entry.symbol, "submit_adoption_failed")
+            # WP1.4b round 3 (S-R2-08): critical, once per order -- every
+            # OTHER resolver pass would otherwise re-log this at critical
+            # forever for as long as the entry stays half-applied.
+            if not entry.adoption_failed_alerted:
+                entry.adoption_failed_alerted = True
+                self._log.critical(
+                    "live.order_submit_adoption_failed",
+                    order_id=str(order_id),
+                    symbol=entry.symbol,
+                    exchange_order_id=self._exchange_order_map.get(order_id),
+                )
+            return
+
+        reason = "buy_submit_unknown" if entry.side == OrderSide.BUY else "sell_submit_unknown"
+
+        submit_ms = int(entry.submit_at.timestamp() * 1000)
+        outcome, raw = await self._lookup_by_cid(
+            entry.symbol, order.client_order_id, submit_ms, entry.side,
+        )
+
+        if outcome == "found":
+            assert raw is not None
+            adopted = self._try_adopt(order, raw)
+            if adopted is None:
+                # R-03: adoption refused (reverse-map conflict) -- still
+                # unresolved, so the stale alert must still get a chance to
+                # fire, and R-01's flag must still be re-asserted.
+                self._maybe_log_stale_unknown(order_id, entry)
+                self._flag_submit_unknown(entry.symbol, reason)
+            return
+        if outcome == "failed":
+            self._maybe_log_stale_unknown(order_id, entry)
+            # R-01: re-assert (never overwrite) on every non-resolving
+            # outcome -- a balance_unavailable/I8 cycle elsewhere must
+            # never leave a genuinely-unresolved submit unflagged.
+            self._flag_submit_unknown(entry.symbol, reason)
+            return
+
+        # absent (W4: the only outcome that ever counts as evidence)
+        entry = self._record_absent_lookup(order_id, entry.symbol, entry.side, entry.submit_at)
+        settle_ok = (
+            entry.absent_count >= 2
+            and not entry.exists_evidence
+            and entry.first_absent_at is not None
+            and entry.last_absent_at is not None
+            and (entry.last_absent_at - entry.first_absent_at).total_seconds()
+            >= _UNKNOWN_ABSENT_MIN_GAP_S
+            and (entry.last_absent_at - entry.submit_at).total_seconds()
+            >= self._unknown_submit_settle_s
+        )
+        if settle_ok:
+            self._reject_never_placed(order)
+        else:
+            self._maybe_log_stale_unknown(order_id, entry)
+            self._flag_submit_unknown(entry.symbol, reason)  # R-01
+
+    async def _resolve_unknown_submits(self, symbol: str | None = None) -> None:
+        """D8: resolve every still-unresolved ambiguous submit for
+        ``symbol`` (every symbol when ``None``) via a fresh cid lookup.
+        Called at the start of both ``check_resting_orders`` and
+        ``reconcile_open_orders``, and once (with no sleeps) at the start
+        of ``on_stop`` (D14), so an unknown order can resolve between two
+        calls to whichever of those the caller doesn't reach this bar.
+        Also re-checks the S-01c never-placed watch list for ``symbol``.
+        """
+        order_ids = [
+            order_id
+            for order_id, entry in self._unknown_submits.items()
+            if symbol is None or entry.symbol == symbol
+        ]
+        for order_id in order_ids:
+            await self._resolve_one_unknown_submit(order_id)
+        await self._resolve_never_placed_watch(symbol)
+
+    # ------------------------------------------------------------------
     # Abstract interface implementation
     # ------------------------------------------------------------------
 
@@ -1161,12 +1923,28 @@ class LiveExecutionEngine(BaseExecutionEngine):
         """
         Submit an order to the live exchange via CCXT.
 
-        The full flow:
+        WP1.4b (D1-D16, idempotent-submit spec): the full flow is now:
+
         1. Enforce the live-trading safety gate.
         2. Transition NEW -> PENDING_SUBMIT.
-        3. Call exchange.create_order() via CCXT.
-        4. On success: transition to OPEN and record exchange_order_id.
-        5. On failure: transition to REJECTED with error details.
+        3. Call ``exchange.create_order()`` EXACTLY ONCE (W1/D2 -- no
+           ``ccxt_retry``, which would silently resend under our own
+           ``client_order_id`` on a transient failure, defeating D6's "no
+           resend, ever").
+        4. On a genuine success (an ``id`` in the response): transition to
+           OPEN/FILLED and record ``exchange_order_id``
+           (:meth:`_apply_create_response`).
+        5. On any exception, or a success response with NO usable ``id``:
+           classify the outcome (:meth:`_classify_submit_error`, D3) as
+           either "not_placed" (REJECTED immediately -- the exchange body
+           itself said no, no lookup) or "ambiguous" (the order may have
+           executed anyway -- resolved by an exact client-order-id lookup,
+           D4/D5). An order that resolves neither way inline stays
+           PENDING_SUBMIT with no exchange id ("unknown submit", D8); the
+           per-bar resolver (:meth:`_resolve_unknown_submits`) takes over
+           from there (D7).
+        6. On ``asyncio.CancelledError``: register the order as an unknown
+           submit synchronously (no await) and re-raise (D15).
 
         Parameters
         ----------
@@ -1176,12 +1954,15 @@ class LiveExecutionEngine(BaseExecutionEngine):
         Returns
         -------
         Order:
-            Updated order reflecting the submission outcome.
+            Updated order reflecting the submission outcome -- possibly
+            still PENDING_SUBMIT (an unknown submit, D8).
 
         Raises
         ------
         RuntimeError:
             If live trading is not enabled.
+        asyncio.CancelledError:
+            Always re-raised, after D15's synchronous bookkeeping.
         """
         self._enforce_live_gate()
 
@@ -1191,190 +1972,142 @@ class LiveExecutionEngine(BaseExecutionEngine):
         # NEW -> PENDING_SUBMIT
         order = self._transition(order, OrderStatus.PENDING_SUBMIT)
 
+        # WP14-S-10 / A-12: pop the sizing-price hint unconditionally,
+        # before anything below can raise -- a hint recorded for a BUY
+        # that never reaches (or fails before) the Coinbase branch below
+        # must never leak in ``_buy_sizing_price`` for the life of the run.
+        sizing_price_hint = self._buy_sizing_price.pop(order.order_id, None)
+
+        # Build CCXT order parameters
+        ccxt_order_type = order.order_type.value  # 'market' or 'limit'
+        ccxt_side = order.side.value  # 'buy' or 'sell'
+        price_param = str(order.price) if order.price is not None else None
+
+        # Coinbase requires a price for market BUY orders on spot markets
+        # to calculate total cost (amount * price). Fetch last price if needed.
+        if (
+            price_param is None
+            and ccxt_order_type == "market"
+            and ccxt_side == "buy"
+            and self._exchange.id == "coinbase"
+        ):
+            # WP14-S-01 (security round 2): reuse the SAME price
+            # process_signal's affordability cap already sized this
+            # BUY against, instead of fetching a second, later ticker
+            # -- a rising price between the two fetches let the order
+            # spend more than run cash allowed (amount * this second
+            # price > the cap that was actually enforced).
+            if sizing_price_hint is not None:
+                price_param = str(sizing_price_hint)
+            else:
+                try:
+                    ticker = await ccxt_retry(
+                        self._exchange.fetch_ticker, order.symbol,
+                        max_retries=1, base_delay=0.5, operation=f"fetch_ticker_for_buy({order.symbol})",
+                    )
+                    price_param = str(ticker.get("last", "0"))
+                except Exception:
+                    self._log.warning(
+                        "live.market_buy_price_fallback_failed",
+                        symbol=order.symbol,
+                    )
+
+        # WP1.4b round 2 (S-06): ccxt's OWN retry-on-failure logic
+        # (``fetch2``) defaults to 0 retries, but an operator (or a future
+        # ccxt config change) setting ``exchange.options["maxRetriesOnFailure"]``
+        # non-zero would let a single ``create_order`` call become several
+        # real HTTP POSTs under the hood -- silently defeating W1/D2 no
+        # matter how carefully THIS method itself avoids resubmitting. A
+        # per-call ``params`` value always wins over the exchange-wide
+        # option (ccxt's ``handle_option_and_params``), and ``fetch2``
+        # strips the key before signing, so it never reaches the wire.
+        params: dict[str, Any] = {"maxRetriesOnFailure": 0}
+        if order.client_order_id:
+            params["clientOrderId"] = order.client_order_id
+            if self._exchange.id == "coinbase":
+                # D1/W2: ccxt's Coinbase adapter (async_support/coinbase.py)
+                # mints its OWN ``client_order_id = "ccxt-" + uuid()`` and
+                # strips ``clientOrderId`` from params unless the
+                # snake_case ``client_order_id`` is ALSO present -- without
+                # this, our cid never reaches Coinbase and the WP1.8b
+                # resume scan can never match this order.
+                params["client_order_id"] = order.client_order_id
+
+        submit_at = datetime.now(tz=UTC)
+        submit_ms = int(submit_at.timestamp() * 1000)
+
         try:
-            # WP14-S-10 (security round 2 follow-up): pop the sizing-price
-            # hint unconditionally, before anything else in this block can
-            # raise. Previously this only happened inside the Coinbase
-            # branch below, so a hint recorded for a BUY on any OTHER
-            # exchange (or one that fails before reaching that branch)
-            # was never removed and leaked in _buy_sizing_price for the
-            # life of the run. Harmless (order ids are unique, so a stale
-            # hint can never be reused for a different order), but worth
-            # cleaning up rather than deferring to the WP14-S-06 rewrite.
-            sizing_price_hint = self._buy_sizing_price.pop(order.order_id, None)
-
-            # Build CCXT order parameters
-            ccxt_order_type = order.order_type.value  # 'market' or 'limit'
-            ccxt_side = order.side.value  # 'buy' or 'sell'
-            price_param = str(order.price) if order.price is not None else None
-
-            # Coinbase requires a price for market BUY orders on spot markets
-            # to calculate total cost (amount * price). Fetch last price if needed.
-            if (
-                price_param is None
-                and ccxt_order_type == "market"
-                and ccxt_side == "buy"
-                and self._exchange.id == "coinbase"
-            ):
-                # WP14-S-01 (security round 2): reuse the SAME price
-                # process_signal's affordability cap already sized this
-                # BUY against, instead of fetching a second, later ticker
-                # -- a rising price between the two fetches let the order
-                # spend more than run cash allowed (amount * this second
-                # price > the cap that was actually enforced).
-                if sizing_price_hint is not None:
-                    price_param = str(sizing_price_hint)
-                else:
-                    try:
-                        ticker = await ccxt_retry(
-                            self._exchange.fetch_ticker, order.symbol,
-                            max_retries=1, base_delay=0.5, operation=f"fetch_ticker_for_buy({order.symbol})",
-                        )
-                        price_param = str(ticker.get("last", "0"))
-                    except Exception:
-                        self._log.warning(
-                            "live.market_buy_price_fallback_failed",
-                            symbol=order.symbol,
-                        )
-
-            params: dict[str, Any] = {}
-            if order.client_order_id:
-                params["clientOrderId"] = order.client_order_id
-
-            ccxt_response = await ccxt_retry(
-                self._exchange.create_order,
+            # W1/D2: exactly one create_order call, ever, for this local
+            # order -- no ccxt_retry (D6: no automatic resend).
+            ccxt_response = await self._exchange.create_order(
                 order.symbol,
                 ccxt_order_type,
                 ccxt_side,
                 str(order.quantity),
                 price_param,
-                max_retries=2, base_delay=1.0, operation=f"create_order({order.symbol})",
                 params=params,
             )
-
-            # WP11-A-08: the exchange balance just changed (funds locked or
-            # spent); drop the cache so the next read (e.g. a same-bar
-            # bracket SELL's cap) is not stale.
-            self._invalidate_balance_cache()
-
-            # Extract exchange order ID
-            exchange_order_id = str(ccxt_response.get("id", ""))
-
-            # Record the mapping
-            self._exchange_order_map[order.order_id] = exchange_order_id
-            self._reverse_order_map[exchange_order_id] = order.order_id
-
-            # Update order with exchange info (do NOT store yet -- wait for fill data)
-            order = order.model_copy(update={
-                "exchange_order_id": exchange_order_id,
-                "updated_at": datetime.now(tz=UTC),
-            })
-
-            # Determine initial status from exchange response
-            ccxt_status = ccxt_response.get("status", "open")
-            mapped_status = self._map_ccxt_order_status(ccxt_status)
-
-            # PENDING_SUBMIT -> OPEN (or directly to FILLED for instant fills)
-            #
-            # Coinbase returns None for "filled" and "average" on market orders
-            # that are still processing. Guard with _safe_decimal() to prevent
-            # decimal.InvalidOperation on None/non-numeric values.
-            if mapped_status == OrderStatus.FILLED:
-                order = self._transition(order, OrderStatus.OPEN)
-
-                # Extract fill data from response
-                filled_qty = _safe_decimal(
-                    ccxt_response.get("filled"), order.quantity
-                )
-                avg_price = _safe_decimal(
-                    ccxt_response.get("average")
-                ) or _safe_decimal(ccxt_response.get("price"), Decimal("0"))
-
-                # Apply fill data and store atomically before terminal transition
-                order = order.model_copy(update={
-                    "filled_quantity": filled_qty,
-                    "average_fill_price": avg_price,
-                    "updated_at": datetime.now(tz=UTC),
-                })
-                self._orders[order.order_id] = order
-
-                order = self._transition(order, OrderStatus.FILLED)
-            else:
-                order = self._transition(order, mapped_status)
-
-                # If partially filled on creation
-                filled_qty = _safe_decimal(ccxt_response.get("filled"), Decimal("0"))
-                if filled_qty > Decimal("0"):
-                    avg_price = _safe_decimal(
-                        ccxt_response.get("average"), Decimal("0")
-                    )
-                    order = order.model_copy(update={
-                        "filled_quantity": filled_qty,
-                        "average_fill_price": avg_price if avg_price > 0 else None,
-                        "updated_at": datetime.now(tz=UTC),
-                    })
-                    self._orders[order.order_id] = order
-
-            self._log.info(
-                "live.order_submitted",
-                order_id=str(order.order_id),
-                exchange_order_id=exchange_order_id,
-                symbol=order.symbol,
-                side=order.side.value,
-                type=order.order_type.value,
-                quantity=str(order.quantity),
-                status=order.status.value,
-            )
-
-        except ccxt_async.NetworkError as exc:
-            # Transient network error — order rejected (submit already uses ccxt_retry)
-            self._log.error(
-                "live.order_submission_network_error",
-                order_id=str(order.order_id),
-                symbol=order.symbol,
-                error=str(exc),
-                user_message=translate_ccxt_error(exc),
-            )
-            order = self._transition(order, OrderStatus.REJECTED)
-        except ccxt_async.AuthenticationError as exc:
-            self._log.error(
-                "live.order_submission_auth_error",
-                order_id=str(order.order_id),
-                symbol=order.symbol,
-                error=str(exc),
-                user_message=translate_ccxt_error(exc),
-            )
-            order = self._transition(order, OrderStatus.REJECTED)
-        except ccxt_async.InsufficientFunds as exc:
-            self._log.error(
-                "live.order_submission_insufficient_funds",
-                order_id=str(order.order_id),
-                symbol=order.symbol,
-                error=str(exc),
-                user_message=translate_ccxt_error(exc),
-            )
-            order = self._transition(order, OrderStatus.REJECTED)
-        except ccxt_async.ExchangeError as exc:
-            self._log.error(
-                "live.order_submission_exchange_error",
-                order_id=str(order.order_id),
-                symbol=order.symbol,
-                error=str(exc),
-                user_message=translate_ccxt_error(exc),
-            )
-            order = self._transition(order, OrderStatus.REJECTED)
-        except Exception as exc:
-            # Unexpected error -- do NOT silently absorb. Log and re-raise.
-            self._log.critical(
-                "live.order_submission_unexpected_error",
-                order_id=str(order.order_id),
-                symbol=order.symbol,
-                error=str(exc),
-                error_type=type(exc).__name__,
-            )
+        except asyncio.CancelledError:
+            # D15: mark the order unknown SYNCHRONOUSLY (no await between
+            # catching this and re-raising it), then propagate.
+            self._register_unknown_submit(order, submit_at=submit_at)
             raise
+        except Exception as exc:
+            classification = self._classify_submit_error(exc)
+            if classification == "not_placed":
+                # W7: bounded fields only -- never the raw response/params.
+                self._log.error(
+                    "live.order_submission_rejected",
+                    order_id=str(order.order_id),
+                    symbol=order.symbol,
+                    error_type=type(exc).__name__,
+                    error=str(exc)[:200],
+                    cid=order.client_order_id,
+                    state=OrderStatus.REJECTED.value,
+                )
+                return self._transition(order, OrderStatus.REJECTED)
 
-        return order
+            # WP1.4b round 2 (S-04): a DuplicateOrderId reply is POSITIVE
+            # evidence the cid exists on the exchange -- if this order is
+            # still unresolved after the inline attempts below, it must
+            # never later be concluded "never placed" no matter how many
+            # absent lookups follow (only adoption, or an operator via
+            # D16, can resolve it).
+            exists_evidence = isinstance(exc, ccxt_async.DuplicateOrderId)
+            self._log.error(
+                "live.order_submission_ambiguous",
+                order_id=str(order.order_id),
+                symbol=order.symbol,
+                error_type=type(exc).__name__,
+                error=str(exc)[:200],
+                cid=order.client_order_id,
+                state=order.status.value,
+            )
+            return await self._resolve_ambiguous_submit(
+                order, submit_ms=submit_ms, submit_at=submit_at,
+                exists_evidence=exists_evidence,
+            )
+
+        raw_id = ccxt_response.get("id")
+        exchange_order_id = str(raw_id) if raw_id not in (None, "") else ""
+        if not exchange_order_id or exchange_order_id == "None":
+            # D3/W6: a success response with no usable id is exactly as
+            # ambiguous as any other unresolved outcome -- never store ""
+            # or "None" as an exchange id (live.py historically did,
+            # via ``str(ccxt_response.get("id", ""))``).
+            self._log.error(
+                "live.order_submission_ambiguous",
+                order_id=str(order.order_id),
+                symbol=order.symbol,
+                error_type="NoExchangeId",
+                cid=order.client_order_id,
+                state=order.status.value,
+            )
+            return await self._resolve_ambiguous_submit(
+                order, submit_ms=submit_ms, submit_at=submit_at,
+            )
+
+        return self._apply_create_response(order, ccxt_response)
 
     async def cancel_order(self, order_id: UUID) -> Order:
         """
@@ -1564,11 +2297,29 @@ class LiveExecutionEngine(BaseExecutionEngine):
                 # currency never sizes/caps a BUY off the right balance --
                 # blocked once at on_start, never healed mid-run.
                 if self._run_buy_block is not None:
+                    # WP1.4b round 3 (S-R2-05): renamed from
+                    # "live.buy_blocked_quote_mismatch" -- this run-wide
+                    # halt now also covers "never_placed_contradicted"
+                    # (S-01c), not just the original quote-mismatch case;
+                    # ``reason`` still distinguishes them.
                     self._log.warning(
-                        "live.buy_blocked_quote_mismatch",
+                        "live.buy_blocked_run_block",
                         strategy_id=signal.strategy_id,
                         symbol=signal.symbol,
                         reason=self._run_buy_block,
+                    )
+                    return []
+                # WP1.4b round 2 (R-02(a)): a stale unknown SELL (>= 300s
+                # unresolved) blocks every new BUY, run-wide, until it
+                # resolves on evidence -- checked BEFORE the in-flight-BUY
+                # check below.
+                stale_sell = self._stale_unknown_sell()
+                if stale_sell is not None:
+                    self._log.warning(
+                        "live.buy_blocked_stale_unknown_sell",
+                        strategy_id=signal.strategy_id,
+                        symbol=signal.symbol,
+                        blocked_symbol=stale_sell.symbol,
                     )
                     return []
                 # WP1.4 (S-02/A-04): a BUY still in flight anywhere in the
@@ -2216,6 +2967,10 @@ class LiveExecutionEngine(BaseExecutionEngine):
 
         Returns the number of orders that transitioned to a terminal state.
         """
+        # WP1.4b (D8): give every still-ambiguous submit a fresh cid lookup
+        # before reconciling anything already acknowledged by the exchange.
+        await self._resolve_unknown_submits()
+
         open_orders = self.get_open_orders()
         if not open_orders:
             return 0
@@ -2268,6 +3023,11 @@ class LiveExecutionEngine(BaseExecutionEngine):
           gains a second real trade record, or a CANCELED order that
           carries a partial fill.
         """
+        # WP1.4b (D8): resolve this symbol's still-ambiguous submits first
+        # -- a lookup here can adopt/reject an order this same call would
+        # otherwise skip (it is neither OPEN/PARTIAL nor terminal yet).
+        await self._resolve_unknown_submits(symbol)
+
         candidates: list[Order] = []
         for order in list(self._orders.values()):
             if order.symbol != symbol:
@@ -2652,11 +3412,42 @@ class LiveExecutionEngine(BaseExecutionEngine):
         Shut down the live trading engine.
 
         Cancels open orders and closes the exchange connection.
+
+        WP1.4b (D14): runs ONE resolver pass (no sleeps -- unlike the
+        inline 1/2/4s schedule ``_resolve_ambiguous_submit`` uses during a
+        live submit) before the cancel loop, so an order that resolves
+        immediately (found or confirmed never-placed) is handled like any
+        other order below. Anything still unresolved afterwards (still
+        PENDING_SUBMIT with no exchange id) is left exactly as-is -- W3
+        forbids leaving PENDING_SUBMIT on cancellation, so it must NEVER be
+        locally CANCELED here on the strength of a shutdown alone (its
+        exchange-side fate, if any, is still unknown).
         """
+        await self._resolve_unknown_submits()
+
         # Cancel all open orders directly via exchange (bypass live gate for shutdown)
         open_orders = self.get_open_orders()
         cancel_count = 0
         for order in open_orders:
+            if (
+                order.status == OrderStatus.PENDING_SUBMIT
+                and order.order_id not in self._exchange_order_map
+            ):
+                # D14/W3: still an unknown submit after the resolver pass
+                # above -- never cancelled locally, stays PENDING_SUBMIT.
+                # WP1.4b round 2 (S-07): critical, not warning -- a
+                # user-initiated stop means the run becomes `stopped`, so
+                # no resume scan will ever reconcile this order; its fill
+                # (if any) can become an invisible "external" holding.
+                self._log.critical(
+                    "live.unresolved_submit_left_pending_on_stop",
+                    order_id=str(order.order_id),
+                    symbol=order.symbol,
+                    cid=order.client_order_id,
+                    side=order.side.value,
+                    quantity=str(order.quantity),
+                )
+                continue
             try:
                 exchange_order_id = self._exchange_order_map.get(order.order_id)
                 if exchange_order_id:

@@ -37,6 +37,7 @@ Design notes
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -112,6 +113,9 @@ def _make_mock_exchange(
     exchange.has = {"fetchOrderTrades": False, "fetchMyTrades": True}
     exchange.fetch_order_trades = AsyncMock(return_value=[])
     exchange.fetch_my_trades = AsyncMock(return_value=[])
+    # WP1.4b: the idempotent-submit cid lookup calls fetch_orders whenever
+    # create_order's outcome is ambiguous -- default to "nothing found".
+    exchange.fetch_orders = AsyncMock(return_value=[])
     return exchange
 
 
@@ -665,11 +669,16 @@ async def test_s04_stale_inflight_block_alert_fires_once() -> None:
 
 
 @pytest.mark.asyncio
-async def test_s05_pending_submit_no_exchange_id_flags_reconcile_sell_still_passes() -> None:
-    """WP14-S-05 (Probe PF): a PENDING_SUBMIT BUY with no exchange id
-    (create_order raised before the exchange ever acknowledged it) keeps
-    blocking new BUYs AND flags reconcile_required[symbol] =
-    'buy_order_state_unknown'; a SELL still goes out unaffected."""
+async def test_s05_pending_submit_no_exchange_id_flags_reconcile_sell_still_passes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """WP14-S-05 / WP1.4b (D11): a PENDING_SUBMIT BUY whose create_order
+    outcome is still AMBIGUOUS (here, a ValueError with no matching order
+    ever found by the cid lookup) keeps blocking new BUYs AND flags
+    reconcile_required[symbol] = 'buy_submit_unknown' (renamed from
+    'buy_order_state_unknown', D11 -- this WP's self-clearing reason code
+    for the same underlying condition); a SELL still goes out unaffected."""
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
     symbols = ["BTC/EUR", "ETH/EUR"]
     markets = {s: _market(s.split("/")[0]) for s in symbols}
     engine, portfolio, ex = _make_engine(
@@ -681,20 +690,22 @@ async def test_s05_pending_submit_no_exchange_id_flags_reconcile_sell_still_pass
     )
 
     ex.create_order.side_effect = ValueError("exchange rejected the order shape")
-    with pytest.raises(ValueError):
-        await engine.submit_order(_make_order(symbol="BTC/EUR", side=OrderSide.BUY))
-
-    stuck = [o for o in engine._orders.values() if o.status == OrderStatus.PENDING_SUBMIT]
-    assert len(stuck) == 1
-    assert stuck[0].order_id not in engine._exchange_order_map
+    stuck_order = await engine.submit_order(_make_order(symbol="BTC/EUR", side=OrderSide.BUY))
+    assert stuck_order.status == OrderStatus.PENDING_SUBMIT
+    assert stuck_order.order_id not in engine._exchange_order_map
 
     with capture_logs() as cap:
         buy_orders = await engine.process_signal(
             _make_signal(symbol="BTC/EUR", direction=SignalDirection.BUY, target=Decimal("100"))
         )
     assert buy_orders == []
-    assert any(e.get("event") == "live.buy_blocked_inflight_buy" for e in cap)
-    assert engine.reconcile_required.get("BTC/EUR") == "buy_order_state_unknown"
+    # D8 registers the symbol's flag at submit time (before process_signal
+    # even runs), so the I4 reconcile_required check -- which runs first
+    # -- is what actually blocks this same-symbol BUY; a DIFFERENT
+    # (unflagged) symbol would instead hit the run-wide in-flight check
+    # (see test_s04_* above), still because of this same stuck order.
+    assert any(e.get("event") == "live.buy_blocked_reconcile_required" for e in cap)
+    assert engine.reconcile_required.get("BTC/EUR") == "buy_submit_unknown"
 
     ex.create_order.side_effect = None  # the SELL's own submit reaches the exchange normally
     sell_orders = await engine.process_signal(

@@ -52,6 +52,7 @@ Design notes
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -147,6 +148,11 @@ def _make_mock_exchange(
     exchange.fetch_my_trades = AsyncMock(
         return_value=fetch_my_trades_response if fetch_my_trades_response is not None else []
     )
+    # WP1.4b: the idempotent-submit cid lookup (``_lookup_by_cid``) calls
+    # ``fetch_orders`` whenever create_order's outcome is ambiguous --
+    # default to "nothing found" so a test that doesn't care about this
+    # path doesn't have to configure it explicitly.
+    exchange.fetch_orders = AsyncMock(return_value=[])
 
     return exchange
 
@@ -512,13 +518,26 @@ class TestSubmitOrder:
         assert result.average_fill_price == Decimal("49500")
 
     @pytest.mark.asyncio
-    async def test_network_error_transitions_to_rejected(self) -> None:
-        """A ccxt NetworkError during create_order transitions the order to REJECTED."""
+    async def test_network_error_is_ambiguous_not_rejected(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """WP1.4b (D3): a ccxt NetworkError during create_order is
+        AMBIGUOUS (the order may have executed anyway on the exchange
+        side), never "not placed" -- it is resolved via an exact
+        client-order-id lookup (D4/D5), not rejected outright. With no
+        matching order found (the mock's default ``fetch_orders`` returns
+        ``[]``), the order stays PENDING_SUBMIT as an unknown submit and
+        its symbol is flagged ``buy_submit_unknown`` (W1: still only ONE
+        create_order call, ever)."""
+        monkeypatch.setattr(asyncio, "sleep", AsyncMock())
         engine, _, ex = _make_engine()
         ex.create_order.side_effect = ccxt_async.NetworkError("connection refused")
         order = _make_market_order()
         result = await engine.submit_order(order)
-        assert result.status == OrderStatus.REJECTED
+        assert result.status == OrderStatus.PENDING_SUBMIT
+        assert result.exchange_order_id is None
+        assert engine.reconcile_required.get(_SYMBOL) == "buy_submit_unknown"
+        ex.create_order.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_authentication_error_transitions_to_rejected(self) -> None:
@@ -539,22 +558,40 @@ class TestSubmitOrder:
         assert result.status == OrderStatus.REJECTED
 
     @pytest.mark.asyncio
-    async def test_exchange_error_transitions_to_rejected(self) -> None:
-        """A generic ccxt ExchangeError during create_order transitions the order to REJECTED."""
+    async def test_exact_class_exchange_error_is_ambiguous_not_rejected(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """WP1.4b (D3): an exact-class ``ccxt.ExchangeError`` (Coinbase's
+        fallback for ``internal_server_error``/an unmapped error body) is
+        AMBIGUOUS, not "not placed" -- unlike every named ``ExchangeError``
+        subclass this module tests separately (AuthenticationError,
+        InsufficientFunds, ...), which stay "not placed" -> REJECTED."""
+        monkeypatch.setattr(asyncio, "sleep", AsyncMock())
         engine, _, ex = _make_engine()
         ex.create_order.side_effect = ccxt_async.ExchangeError("order rejected by exchange")
         order = _make_market_order()
         result = await engine.submit_order(order)
-        assert result.status == OrderStatus.REJECTED
+        assert result.status == OrderStatus.PENDING_SUBMIT
+        assert engine.reconcile_required.get(_SYMBOL) == "buy_submit_unknown"
 
     @pytest.mark.asyncio
-    async def test_unexpected_error_reraises(self) -> None:
-        """An unexpected exception (not a ccxt error) is re-raised without being absorbed."""
+    async def test_unexpected_error_is_ambiguous_not_reraised(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """WP1.4b (D3): a non-ccxt exception (e.g. a parse failure after
+        the exchange actually accepted the order) is AMBIGUOUS too -- it
+        is classified and resolved via the cid lookup exactly like any
+        ccxt error, never bare-re-raised past submit_order (the pre-WP1.4b
+        behaviour, which risked a caller resubmitting under a NEW cid on
+        top of an order that may have already been placed)."""
+        monkeypatch.setattr(asyncio, "sleep", AsyncMock())
         engine, _, ex = _make_engine()
         ex.create_order.side_effect = RuntimeError("unexpected internal failure")
         order = _make_market_order()
-        with pytest.raises(RuntimeError, match="unexpected internal failure"):
-            await engine.submit_order(order)
+        result = await engine.submit_order(order)
+        assert result.status == OrderStatus.PENDING_SUBMIT
+        assert engine.reconcile_required.get(_SYMBOL) == "buy_submit_unknown"
+        ex.create_order.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_create_order_called_with_correct_parameters(self) -> None:
@@ -569,7 +606,11 @@ class TestSubmitOrder:
             "buy",
             str(qty),
             None,
-            params={"clientOrderId": order.client_order_id},
+            # WP1.4b round 2 (S-06): every call also carries
+            # maxRetriesOnFailure=0 -- ccxt's fetch2 strips it before
+            # signing, so it never reaches the wire, but it IS part of the
+            # params dict create_order itself receives.
+            params={"maxRetriesOnFailure": 0, "clientOrderId": order.client_order_id},
         )
 
 

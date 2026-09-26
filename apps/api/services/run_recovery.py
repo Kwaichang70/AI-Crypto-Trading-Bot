@@ -117,6 +117,28 @@ CANCEL_POLL_INTERVAL_SECONDS: float = 0.5
 #: process and the exchange.
 _SCAN_CLOCK_SKEW_MARGIN = timedelta(minutes=5)
 
+#: WP1.4b (D13): a persisted PENDING_SUBMIT/CANCELED row with a NULL
+#: exchange id that the scan does not find is "settling" (its create_order
+#: outcome was still ambiguous when this process died) until it is at least
+#: this old -- matches ``LiveExecutionEngine``'s own
+#: ``unknown_submit_settle_s`` default (D7). At resume, in-memory lookup
+#: history (the inline/per-bar absent-lookup count) is lost, so one
+#: successful scan pass plus this age test stands in for D7's "two absent
+#: lookups >= 10s apart" evidence bar.
+_UNKNOWN_SUBMIT_SETTLE_S = 120.0
+
+#: WP1.4b round 2 (S-02c): the resume-specific settle window is longer than
+#: the live engine's own 120s -- at resume there is only ONE scan pass (no
+#: per-bar re-checks accumulating independent evidence), so a single miss
+#: needs a wider age margin before it is trusted as "never placed".
+_UNKNOWN_SUBMIT_SETTLE_RESUME_S = 900.0
+
+#: WP1.4b round 2 (S-02a): the targeted, single-cid lookup run for a
+#: never-placed CANDIDATE widens its window by this much either side of the
+#: row's own ``created_at`` -- generous enough to absorb both clock skew and
+#: exchange listing lag that the primary since-anchored scan already missed.
+_TARGETED_LOOKUP_MARGIN_MS = 3_600_000
+
 #: Same fallback tolerance convention as ``trading.recovery`` (one
 #: satoshi-scale unit when the market's own amount step is unavailable).
 _DEFAULT_TOLERANCE = Decimal("0.00000001")
@@ -173,6 +195,142 @@ def _decimal_or_zero(value: Any) -> Decimal:  # noqa: ANN401
         return Decimal("0")
 
 
+def _scan_pagination_cap(exchange: Any) -> int:  # noqa: ANN401
+    """WP1.4b round 2 (S-02b): the max number of entries
+    ``fetch_orders(params={"paginate": True})`` can return before ccxt's
+    OWN pagination cap makes "no more matches" indistinguishable from
+    "silently truncated". WP1.4b round 3 (S-R2-02): reads the PER-METHOD
+    ccxt option first (``options["fetchOrders"]["paginationCalls"]``,
+    which a real exchange config can set to override the exchange-wide
+    default), falling back to the exchange-wide ``options["paginationCalls"]``,
+    then Coinbase's real defaults (10 and 1000, product 10,000)."""
+    options = getattr(exchange, "options", None) or {}
+    fetch_orders_options = options.get("fetchOrders") or {}
+    pagination_calls = fetch_orders_options.get(
+        "paginationCalls", options.get("paginationCalls", 10)
+    )
+    max_entries = options.get("maxEntriesPerRequest", 1000)
+    try:
+        return int(pagination_calls) * int(max_entries)
+    except (TypeError, ValueError):
+        return 10_000
+
+
+async def _raise_if_scan_truncated(
+    raw_orders: list[dict[str, Any]] | None,
+    exchange: Any,  # noqa: ANN401
+    *,
+    log: Any,  # noqa: ANN401
+    symbol: str,
+    since_ms: int,
+) -> None:
+    """WP1.4b round 2 (S-02b) + round 3 (S-R2-02): a scan result at or
+    above the exchange's own pagination cap cannot be trusted as complete
+    (the count check) -- fail closed rather than silently treat a
+    truncated page as "nothing more to find".
+
+    The count check alone trusts a page size (``maxEntriesPerRequest``)
+    the server may not actually honour -- if Coinbase serves fewer entries
+    per page than assumed, the real cap is lower and truncation can go
+    undetected. WP1.4b round 3 adds a STRUCTURAL check: when the result is
+    non-empty, ask (via a single, non-paginated call) whether anything
+    exists strictly OLDER than the oldest entry we got, still inside our
+    own ``since_ms`` window. If so, our paginated fetch never reached it --
+    definite truncation, regardless of what the assumed page size was.
+    """
+    cap = _scan_pagination_cap(exchange)
+    count = len(raw_orders) if raw_orders is not None else 0
+    if count >= cap:
+        log.error(
+            "recovery.scan_result_truncated",
+            symbol=symbol,
+            count=count,
+            cap=cap,
+        )
+        raise ResumeRejected("exchange_scan_truncated")
+
+    if not raw_orders:
+        return
+
+    timestamps: list[int] = [
+        int(o["timestamp"]) for o in raw_orders if o.get("timestamp") is not None
+    ]
+    if not timestamps:
+        return
+    min_ts = min(timestamps)
+
+    try:
+        probe = await exchange.fetch_orders(
+            symbol, since=since_ms, limit=1, params={"until": min_ts - 1},
+        )
+    except Exception as exc:
+        _log_exc(log, "recovery.scan_truncation_probe_failed", exc, symbol=symbol)
+        raise ResumeRejected("exchange_scan_failed") from exc
+
+    if probe:
+        log.error(
+            "recovery.scan_result_truncated_structural",
+            symbol=symbol,
+            min_ts=min_ts,
+        )
+        raise ResumeRejected("exchange_scan_truncated")
+
+
+async def _targeted_cid_lookup(
+    exchange: Any,  # noqa: ANN401
+    symbol: str,
+    client_order_id: str,
+    *,
+    created_at: datetime,
+    log: Any,  # noqa: ANN401
+) -> dict[str, Any] | None:
+    """WP1.4b round 2 (S-02a): one more targeted, narrowly-windowed
+    ``fetch_orders`` call for a SINGLE candidate cid before concluding
+    "never placed" -- the primary (run-start-anchored) scan can silently
+    miss an order the exchange's own listing lagged on, or that fell off a
+    truncated page (S-02b), even though a fresh, tightly-scoped lookup
+    finds it immediately. Returns the matched raw order dict, or ``None``
+    if genuinely not found.
+
+    WP1.4b round 3 (S-R2-03): a FAILED lookup here is never treated as
+    "not found" -- unlike the live engine's own D4 lookup (which has a
+    per-bar resolver to retry later, W4), this is the ONE lookup resume
+    gets. Silently returning ``None`` on failure let a genuinely-existing
+    order be wrongly marked ``never_placed`` on nothing more than a
+    transient error; raise ``ResumeRejected("exchange_scan_failed")``
+    instead, fail-closed, exactly like every other scan failure in this
+    module.
+    """
+    created_ms = int(created_at.timestamp() * 1000)
+    try:
+        raw_orders: list[dict[str, Any]] | None = await exchange.fetch_orders(
+            symbol,
+            since=created_ms - _TARGETED_LOOKUP_MARGIN_MS,
+            limit=None,
+            params={
+                "paginate": True,
+                "until": created_ms + _TARGETED_LOOKUP_MARGIN_MS,
+            },
+        )
+    except Exception as exc:
+        _log_exc(
+            log, "recovery.scan_targeted_lookup_failed", exc,
+            symbol=symbol, client_order_id=client_order_id,
+        )
+        raise ResumeRejected("exchange_scan_failed") from exc
+
+    await _raise_if_scan_truncated(
+        raw_orders, exchange, log=log, symbol=symbol,
+        since_ms=created_ms - _TARGETED_LOOKUP_MARGIN_MS,
+    )
+
+    for raw in raw_orders or []:
+        raw_cid = raw.get("clientOrderId")
+        if raw_cid and str(raw_cid) == client_order_id:
+            return raw
+    return None
+
+
 async def _fetch_prefixed_orders(
     exchange: Any,  # noqa: ANN401
     symbol: str,
@@ -192,10 +350,17 @@ async def _fetch_prefixed_orders(
     every other foreign order.
     """
     try:
-        raw_orders = await exchange.fetch_orders(symbol, since=since_ms, params={"paginate": True})
+        raw_orders = await exchange.fetch_orders(
+            symbol, since=since_ms, limit=None, params={"paginate": True},
+        )
     except Exception as exc:
         _log_exc(log, "recovery.scan_fetch_orders_failed", exc, symbol=symbol)
         raise ResumeRejected("exchange_scan_failed") from exc
+
+    # WP1.4b round 2 (S-02b) / round 3 (S-R2-02): a page at/above ccxt's
+    # own pagination cap, or a structural gap, cannot be trusted as
+    # complete.
+    await _raise_if_scan_truncated(raw_orders, exchange, log=log, symbol=symbol, since_ms=since_ms)
 
     pattern = _client_order_id_pattern(prefix)
     matched: dict[str, dict[str, Any]] = {}
@@ -432,7 +597,7 @@ async def scan_and_import(
     # down (never trusted from this snapshot).
     order_rows_result = await db.execute(select(OrderORM).where(OrderORM.run_id == run.id))
     persisted_orders = list(order_rows_result.scalars().all())
-    persisted_client_order_ids = {o.client_order_id for o in persisted_orders}
+    persisted_orders_by_cid = {o.client_order_id: o for o in persisted_orders}
 
     # WP18b-S-06: a supplementary fetch anchored on the latest persisted
     # order's own timestamp, to guard against ccxt's `paginate` cap
@@ -462,12 +627,113 @@ async def scan_and_import(
     if foreign_count:
         log.info("recovery.scan_foreign_orders_untouched", count=foreign_count)
 
-    # S3: a persisted order missing from the scan entirely -> fail closed
-    # BEFORE acting on anything else in this pass.
-    for client_order_id in persisted_client_order_ids:
-        if client_order_id not in scanned_by_client_id:
+    # S3/D13: a persisted order missing from the scan entirely -> fail
+    # closed BEFORE acting on anything else in this pass -- UNLESS it is
+    # one of the two shapes WP1.4b's idempotent-submit spec anticipates
+    # (both only possible for a row with a NULL exchange id; anything that
+    # already has one and is still missing is exactly the original,
+    # unconditional failure):
+    #   - a REJECTED row: this local engine already concluded
+    #     ``never_placed`` itself (or the not-placed error path) --
+    #     nothing on the exchange will ever match it, by definition, so it
+    #     is skipped rather than failing the whole resume;
+    #   - a PENDING_SUBMIT/CANCELED row: its create_order outcome was
+    #     still ambiguous when this process died. Resolved with the same
+    #     age test the live engine's own resolver uses (D7) -- old enough
+    #     (``_UNKNOWN_SUBMIT_SETTLE_S``) is marked REJECTED
+    #     (``never_placed``) below; too young settles first, via 409
+    #     ``unknown_submit_settling`` (the operator retries the resume
+    #     shortly after).
+    now = datetime.now(tz=UTC)
+    never_placed_client_order_ids: list[str] = []
+    for client_order_id, order_row in persisted_orders_by_cid.items():
+        if client_order_id in scanned_by_client_id:
+            continue
+        if order_row.exchange_order_id is not None:
             log.error("recovery.scan_persisted_order_missing", client_order_id=client_order_id)
             raise ResumeRejected("exchange_scan_incomplete")
+        if order_row.status == OrderStatus.REJECTED.value:
+            continue
+        if order_row.status not in (
+            OrderStatus.PENDING_SUBMIT.value,
+            OrderStatus.CANCELED.value,
+        ):
+            log.error("recovery.scan_persisted_order_missing", client_order_id=client_order_id)
+            raise ResumeRejected("exchange_scan_incomplete")
+
+        # WP1.4b round 2 (S-02a): one more targeted, narrowly-windowed
+        # lookup for THIS cid before concluding "never placed" -- the
+        # primary scan can miss an order that a fresh, tightly-scoped
+        # fetch still finds (listing lag, S-02b's truncation, or clock
+        # skew wider than the primary scan's margin). A match here is
+        # merged into ``scanned_by_client_id`` so it flows through the
+        # normal import/update branch below, exactly like a primary-scan
+        # match would.
+        targeted_match = await _targeted_cid_lookup(
+            exchange, order_row.symbol, client_order_id,
+            created_at=order_row.created_at, log=log,
+        )
+        if targeted_match is not None:
+            scanned_by_client_id[client_order_id] = targeted_match
+            continue
+
+        # WP1.4b round 2 (S-02c): the resume-specific settle window (900s)
+        # is wider than the live engine's own 120s -- resume gets only ONE
+        # lookup pass, not the per-bar accumulation of independent evidence
+        # D7 relies on.
+        age_s = (now - order_row.created_at).total_seconds()
+        if age_s <= _UNKNOWN_SUBMIT_SETTLE_RESUME_S:
+            log.warning(
+                "recovery.scan_unknown_submit_settling",
+                client_order_id=client_order_id,
+                age_seconds=age_s,
+            )
+            raise ResumeRejected("unknown_submit_settling")
+        never_placed_client_order_ids.append(client_order_id)
+
+    for client_order_id in never_placed_client_order_ids:
+        try:
+            fence_row = await db.execute(
+                select(RunORM.id)
+                .where(
+                    RunORM.id == run.id,
+                    RunORM.status == "resuming",
+                    RunORM.config["resume_attempt_id"].astext == fence,
+                )
+                .with_for_update(read=True)
+            )
+            if fence_row.scalar_one_or_none() is None:
+                raise ResumeRejected("resume_state_lost")
+
+            fresh_order_result = await db.execute(
+                select(OrderORM).where(
+                    OrderORM.run_id == run.id, OrderORM.client_order_id == client_order_id
+                )
+            )
+            fresh_persisted_order = fresh_order_result.scalar_one_or_none()
+            if (
+                fresh_persisted_order is not None
+                and fresh_persisted_order.status != OrderStatus.REJECTED.value
+            ):
+                fresh_persisted_order.status = OrderStatus.REJECTED.value
+                fresh_persisted_order.updated_at = datetime.now(tz=UTC)
+                log.error(
+                    "recovery.scan_never_placed",
+                    client_order_id=client_order_id,
+                )
+            await db.commit()
+        except ResumeRejected:
+            await db.rollback()
+            raise
+        except SQLAlchemyError as exc:
+            await db.rollback()
+            _log_exc(
+                log,
+                "recovery.scan_never_placed_db_error",
+                exc,
+                client_order_id=client_order_id,
+            )
+            raise ResumeRejected("order_import_failed") from exc
 
     orders_cancelled = 0
     orders_imported = 0
@@ -581,6 +847,12 @@ async def scan_and_import(
                     order_row.status = pseudo_order.status.value
                     order_row.filled_quantity = pseudo_order.filled_quantity
                     order_row.average_fill_price = pseudo_order.average_fill_price
+                    # WP1.4b (D13): backfill the exchange id for a row that
+                    # was persisted before the exchange ever acknowledged
+                    # it (an unknown submit at crash time) -- without this,
+                    # such a row stays NULL forever even once matched here.
+                    if order_row.exchange_order_id is None:
+                        order_row.exchange_order_id = pseudo_order.exchange_order_id
                     order_row.updated_at = pseudo_order.updated_at
 
                 fill_rows = [
