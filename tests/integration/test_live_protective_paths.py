@@ -31,7 +31,7 @@ exits (and strategy SELLs) keep running while it is active:
     kill_switch_blocks_new_buy                PASSES (WP1.2)
     kill_switch_strategy_sell_passes          PASSES (WP1.2)
     buy_then_max_open_positions_stop_loss     PASSES (WP1.2, S2/G2)
-    buy_restart_reconcile_stop_loss           xfail -- I2/D15 by design (WP1.8)
+    buy_restart_reconcile_stop_loss           PASSES (WP1.8a, S6/S7 -- from_fills rebuild)
     external_holdings_not_sold                PASSES (WP1.1, R-21)
 
 Two new WP1.1 scenarios cover R-22 (startup sync with an external balance
@@ -59,6 +59,7 @@ from tests.integration.fakes.fake_ccxt_exchange import FakeCCXTExchange
 from tests.integration.fakes.live_harness import (
     LiveStack,
     build_live_stack,
+    build_resumed_live_stack,
     patch_exchange_factory,
     start_and_warmup,
     step_bar,
@@ -560,41 +561,21 @@ async def test_buy_then_max_open_positions_stop_loss(exchange: FakeCCXTExchange)
 
 
 # ---------------------------------------------------------------------------
-# buy_restart_reconcile_stop_loss -- still xfail, but the reason has
-# changed: sync_positions() now runs on boot (WP11-A-07), but by design
-# (I2/D15) it NEVER creates a Position from the exchange balance -- own
-# quantity comes only from the run's own fills. So a restarted run's
-# portfolio stays empty (the pre-restart position now looks identical to an
-# external holding) until WP1.8 rebuilds it from persisted fill history.
+# buy_restart_reconcile_stop_loss -- WP1.8a fixes I2/D15: the SAME run_id
+# resumes with its portfolio rebuilt from persisted fill history via
+# PortfolioAccounting.from_fills, so the pre-restart position (and its
+# stop-loss protection) survives a restart instead of looking external.
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "I2/D15 (Verbeterplan v2 WP1.1 design, deferred to WP1.8): "
-        "sync_positions() now runs on every engine boot (WP11-A-07), but it "
-        "deliberately never creates a Position from the exchange balance -- "
-        "own quantity comes only from fills routed into THIS run's own "
-        "PortfolioAccounting (I2). A brand-new engine stack (orphan-recovery "
-        "restart) therefore has an empty portfolio even though the exchange "
-        "still holds the bot's own BTC from before the restart -- "
-        "sync_positions logs live.external_holdings_ignored for it (it is "
-        "now indistinguishable from a genuinely external holding) instead "
-        "of fabricating a Position with a fake entry price (which is what "
-        "the pre-WP1.1 code would have done, immediately mis-triggering a "
-        "bracket exit at entry=0). No SELL is even attempted: safe (no "
-        "false exit), but there is no protective stop until WP1.8 rebuilds "
-        "the portfolio from persisted fill history on resume."
-    ),
-)
 async def test_buy_restart_reconcile_stop_loss(exchange: FakeCCXTExchange) -> None:
+    run_id = "wp10-restart-same-id"
     strategy_before = ScriptedSignalStrategy("buy-restart-entry", _buy_params())
     stack_before = await _build_and_warm(
         exchange,
         strategy_before,
         engine_config={"bracket_stop_loss_pct": 0.05},
-        run_id="wp10-restart-before",
+        run_id=run_id,
     )
 
     await step_bar(stack_before, SYMBOL, START_PRICE, timeframe=TIMEFRAME_STR)
@@ -603,29 +584,37 @@ async def test_buy_restart_reconcile_stop_loss(exchange: FakeCCXTExchange) -> No
     bought_qty = exchange.order_log[-1]["amount"]
     assert exchange.balance_of(BASE) == bought_qty  # the bot's BTC really sits on the exchange
 
-    # --- Simulate an API restart: a brand-new engine stack against the
-    # SAME exchange (same balances, same price history), exactly as
-    # orphan-recovery does *today* -- a fresh PortfolioAccounting, a fresh
-    # LiveExecutionEngine. stack_before is deliberately never stopped: a
-    # real process restart does not get a graceful shutdown either.
+    # --- Simulate an API restart: a SECOND engine stack under the SAME
+    # run_id (WP1.8a S6), portfolio rebuilt from stack_before's own routed
+    # fills via the production from_fills classmethod -- exactly what
+    # prepare_live_resume/run_live_engine(resume=...) does in production.
+    # stack_before is deliberately never stopped: a real process restart
+    # does not get a graceful shutdown either.
+    persisted_fills = stack_before.execution.get_all_fills()
     strategy_after = ScriptedSignalStrategy(
         "buy-restart-noop", {"direction": "buy", "call_index": 999}
     )
-    stack_after = await _build_and_warm(
-        exchange,
-        strategy_after,
+    stack_after = await build_resumed_live_stack(
+        exchange=exchange,
+        strategy=strategy_after,
+        symbol=SYMBOL,
+        timeframe=TIMEFRAME,
+        initial_capital=INITIAL_CAPITAL,
+        run_id=run_id,
+        fills=persisted_fills,
         engine_config={"bracket_stop_loss_pct": 0.05},
-        run_id="wp10-restart-after",
     )
+    await start_and_warmup(stack_after, run_id)
 
     position_after_restart = stack_after.portfolio.get_position(SYMBOL)
     assert position_after_restart is not None and not position_after_restart.is_flat, (
-        "the entry recorded before the simulated restart should still be "
-        "known to the new engine stack; today it is NOT (I2/D15): "
-        "PortfolioAccounting is rebuilt empty and sync_positions() "
-        "deliberately never fabricates a Position from the balance, so the "
-        "bot's own pre-restart holding now looks external."
+        "WP1.8a: the entry recorded before the simulated restart must "
+        "survive it -- from_fills rebuilds the position from the run's own "
+        "persisted fills, so it is no longer indistinguishable from an "
+        "external holding."
     )
+    assert position_after_restart.average_entry_price == position_before_restart.average_entry_price
+    assert position_after_restart.quantity == position_before_restart.quantity
 
     breach_price = START_PRICE * Decimal("0.80")
     with capture_logs() as cap:
@@ -633,12 +622,212 @@ async def test_buy_restart_reconcile_stop_loss(exchange: FakeCCXTExchange) -> No
 
     sell_orders = [o for o in exchange.order_log if o["side"] == "sell"]
     assert sell_orders, (
-        "expected the stop-loss to fire against the entry price recorded "
-        f"before the restart; today no SELL is even attempted because the "
-        f"new engine's bracket manager sees position=None (I2/D15); "
+        "expected the stop-loss to fire against the rebuilt entry price; "
         f"captured log events: {cap!r}"
     )
     assert sell_orders[-1]["amount"] == bought_qty
+
+    await stack_after.engine.stop()
+
+
+# ---------------------------------------------------------------------------
+# WP1.8a: mismatch after the rebuild -- own > total (an operator sold part
+# of the position directly on the exchange between the crash and the
+# resume).  The WP1.1 D2 flag fires: BUYs blocked, SELLs capped (U1).
+# ---------------------------------------------------------------------------
+
+
+async def test_resume_mismatch_flags_blocks_buy_caps_sell(exchange: FakeCCXTExchange) -> None:
+    run_id = "wp10-restart-mismatch"
+    strategy_before = ScriptedSignalStrategy("buy-restart-entry", _buy_params())
+    stack_before = await _build_and_warm(
+        exchange,
+        strategy_before,
+        engine_config={"bracket_stop_loss_pct": 0.05},
+        run_id=run_id,
+    )
+    await step_bar(stack_before, SYMBOL, START_PRICE, timeframe=TIMEFRAME_STR)
+    bought_qty = exchange.order_log[-1]["amount"]
+    persisted_fills = stack_before.execution.get_all_fills()
+
+    # An operator sells HALF the bot's own BTC directly on the exchange
+    # while it was orphaned -- own (from persisted fills) now exceeds total.
+    remaining = (bought_qty / Decimal("2")).quantize(Decimal("0.00000001"))
+    exchange.set_balance(BASE, remaining)
+
+    strategy_after = _ScriptedSequenceStrategy(
+        "resume-mismatch",
+        {"schedule": [(0, "buy", str(TARGET_NOTIONAL))]},
+    )
+    stack_after = await build_resumed_live_stack(
+        exchange=exchange,
+        strategy=strategy_after,
+        symbol=SYMBOL,
+        timeframe=TIMEFRAME,
+        initial_capital=INITIAL_CAPITAL,
+        run_id=run_id,
+        fills=persisted_fills,
+        engine_config={"bracket_stop_loss_pct": 0.05},
+    )
+    await start_and_warmup(stack_after, run_id)
+
+    assert stack_after.execution.reconcile_required, (
+        "own (from persisted fills) > total (exchange) must flag the "
+        "symbol on the post-resume sync (WP1.1 D2/I8, applied per U1)"
+    )
+
+    orders_before_resume = len(exchange.order_log)
+    with capture_logs() as cap:
+        await step_bar(stack_after, SYMBOL, START_PRICE, timeframe=TIMEFRAME_STR)
+
+    new_orders = exchange.order_log[orders_before_resume:]
+    buy_orders = [o for o in new_orders if o["side"] == "buy"]
+    assert not buy_orders, f"BUY must be blocked while flagged; logs={cap!r}"
+
+    breach_price = START_PRICE * Decimal("0.80")
+    await step_bar(stack_after, SYMBOL, breach_price, timeframe=TIMEFRAME_STR)
+    new_orders = exchange.order_log[orders_before_resume:]
+    sell_orders = [o for o in new_orders if o["side"] == "sell"]
+    assert sell_orders, "the stop-loss SELL must still fire while flagged (D2 exits keep running)"
+    assert sell_orders[-1]["amount"] == remaining, (
+        f"the capped SELL must equal min(own, free) == {remaining}, got {sell_orders[-1]['amount']}"
+    )
+
+    await stack_after.engine.stop()
+
+
+# ---------------------------------------------------------------------------
+# WP1.8a: no persisted fills + an external balance -> empty portfolio (I2
+# holds even after a resume: an exchange balance alone never becomes a
+# position; only this run's own fills can).
+# ---------------------------------------------------------------------------
+
+
+async def test_resume_with_no_fills_and_external_balance_stays_empty(
+    exchange: FakeCCXTExchange,
+) -> None:
+    exchange.set_balance(BASE, Decimal("0.5"))  # pre-existing external holding
+
+    strategy = ScriptedSignalStrategy("resume-no-fills", {"direction": "buy", "call_index": 999})
+    stack = await build_resumed_live_stack(
+        exchange=exchange,
+        strategy=strategy,
+        symbol=SYMBOL,
+        timeframe=TIMEFRAME,
+        initial_capital=INITIAL_CAPITAL,
+        run_id="wp10-restart-no-fills",
+        fills=[],
+        engine_config={"bracket_take_profit_pct": 0.05},
+    )
+    await start_and_warmup(stack, "wp10-restart-no-fills")
+
+    assert stack.portfolio.get_position(SYMBOL) is None, (
+        "from_fills([]) must produce an empty portfolio -- an external "
+        "balance never becomes a position (I2), resume or not"
+    )
+    assert not stack.execution.reconcile_required
+
+    with capture_logs() as cap:
+        await step_bar(stack, SYMBOL, START_PRICE, timeframe=TIMEFRAME_STR)
+
+    assert exchange.order_log == []
+    tp_events = [e for e in cap if e.get("event") == "bracket_exit.take_profit"]
+    assert not tp_events, f"unexpected false take-profit: {cap!r}"
+
+    await stack.engine.stop()
+
+
+# ---------------------------------------------------------------------------
+# WP1.8a: mode=protective (S10/O9) -- the stop-loss still fires (exits keep
+# running) but a scripted BUY on the very next bar is dropped.
+# ---------------------------------------------------------------------------
+
+
+async def test_resume_protective_mode_drops_buy_but_stop_loss_fires(
+    exchange: FakeCCXTExchange,
+) -> None:
+    run_id = "wp10-restart-protective"
+    strategy_before = ScriptedSignalStrategy("buy-restart-entry", _buy_params())
+    stack_before = await _build_and_warm(
+        exchange,
+        strategy_before,
+        engine_config={"bracket_stop_loss_pct": 0.05},
+        run_id=run_id,
+    )
+    await step_bar(stack_before, SYMBOL, START_PRICE, timeframe=TIMEFRAME_STR)
+    bought_qty = exchange.order_log[-1]["amount"]
+    persisted_fills = stack_before.execution.get_all_fills()
+
+    # A BUY scripted for call_index 0 -- must be dropped in protective mode.
+    strategy_after = _ScriptedSequenceStrategy(
+        "resume-protective", {"schedule": [(0, "buy", str(TARGET_NOTIONAL))]}
+    )
+    stack_after = await build_resumed_live_stack(
+        exchange=exchange,
+        strategy=strategy_after,
+        symbol=SYMBOL,
+        timeframe=TIMEFRAME,
+        initial_capital=INITIAL_CAPITAL,
+        run_id=run_id,
+        fills=persisted_fills,
+        engine_config={"bracket_stop_loss_pct": 0.05},
+        protective_mode=True,
+    )
+    await start_and_warmup(stack_after, run_id)
+
+    orders_before_resume = len(exchange.order_log)
+    breach_price = START_PRICE * Decimal("0.80")
+    with capture_logs() as cap:
+        await step_bar(stack_after, SYMBOL, breach_price, timeframe=TIMEFRAME_STR)
+
+    new_orders = exchange.order_log[orders_before_resume:]
+    buy_orders = [o for o in new_orders if o["side"] == "buy"]
+    sell_orders = [o for o in new_orders if o["side"] == "sell"]
+    assert not buy_orders, f"protective mode must drop the scripted BUY; logs={cap!r}"
+    assert sell_orders, "the stop-loss exit must still fire in protective mode (O9)"
+    assert sell_orders[-1]["amount"] == bought_qty
+
+    await stack_after.engine.stop()
+
+
+# ---------------------------------------------------------------------------
+# WP1.8a: the resumed trailing-stop peak is seeded from the rebuilt bar
+# history and is never below the (rebuilt) entry price (A-09/R§3).
+# ---------------------------------------------------------------------------
+
+
+async def test_resume_trailing_peak_is_at_least_the_entry(exchange: FakeCCXTExchange) -> None:
+    run_id = "wp10-restart-trailing"
+    strategy_before = ScriptedSignalStrategy("buy-restart-entry", _buy_params())
+    stack_before = await _build_and_warm(
+        exchange,
+        strategy_before,
+        engine_config={"trailing_stop_pct": 0.05},
+        run_id=run_id,
+    )
+    await step_bar(stack_before, SYMBOL, START_PRICE, timeframe=TIMEFRAME_STR)
+    persisted_fills = stack_before.execution.get_all_fills()
+    entry_price = stack_before.portfolio.get_position(SYMBOL).average_entry_price
+
+    strategy_after = ScriptedSignalStrategy(
+        "resume-trailing-noop", {"direction": "buy", "call_index": 999}
+    )
+    stack_after = await build_resumed_live_stack(
+        exchange=exchange,
+        strategy=strategy_after,
+        symbol=SYMBOL,
+        timeframe=TIMEFRAME,
+        initial_capital=INITIAL_CAPITAL,
+        run_id=run_id,
+        fills=persisted_fills,
+        engine_config={"trailing_stop_pct": 0.05},
+    )
+    await start_and_warmup(stack_after, run_id)
+
+    assert stack_after.engine._trailing_stop is not None
+    seeded_peak = stack_after.engine._trailing_stop.peak_prices.get(SYMBOL)
+    assert seeded_peak is not None
+    assert seeded_peak >= entry_price
 
     await stack_after.engine.stop()
 

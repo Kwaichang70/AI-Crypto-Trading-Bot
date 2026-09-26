@@ -763,6 +763,43 @@ class TestTrailingStopReset:
 
 
 # ===========================================================================
+# TestSeedPeak (WP1.8a A-09/R§3 -- resume peak seeding)
+# ===========================================================================
+
+
+class TestSeedPeak:
+    """Unit tests for TrailingStopManager.seed_peak (WP1.8a)."""
+
+    def test_seed_peak_sets_peak_for_unseen_symbol(self) -> None:
+        mgr = TrailingStopManager(trailing_stop_pct=0.05)
+        mgr.seed_peak("BTC/USD", Decimal("51000"))
+        assert mgr.peak_prices["BTC/USD"] == Decimal("51000")
+
+    def test_seed_peak_never_lowers_an_existing_peak(self) -> None:
+        mgr = TrailingStopManager(trailing_stop_pct=0.05)
+        pos = Position(
+            symbol="BTC/USD",
+            run_id="test",
+            quantity=Decimal("1"),
+            average_entry_price=Decimal("50000"),
+            current_price=Decimal("60000"),
+        )
+        mgr.check("BTC/USD", Decimal("60000"), pos)
+        assert mgr.peak_prices["BTC/USD"] == Decimal("60000")
+
+        mgr.seed_peak("BTC/USD", Decimal("55000"))
+        assert mgr.peak_prices["BTC/USD"] == Decimal("60000"), (
+            "seed_peak must never lower an already-tracked peak"
+        )
+
+    def test_seed_peak_raises_an_existing_lower_peak(self) -> None:
+        mgr = TrailingStopManager(trailing_stop_pct=0.05)
+        mgr.seed_peak("BTC/USD", Decimal("50000"))
+        mgr.seed_peak("BTC/USD", Decimal("52000"))
+        assert mgr.peak_prices["BTC/USD"] == Decimal("52000")
+
+
+# ===========================================================================
 # TestTrailingStopInStrategyEngine
 # ===========================================================================
 

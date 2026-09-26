@@ -23,6 +23,7 @@ Design notes
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 from typing import Any
@@ -364,10 +365,50 @@ class PaperExecutionEngine(BaseExecutionEngine):
         return fill
 
     # ------------------------------------------------------------------
+    # Resume rebuild (WP1.8a S6)
+    # ------------------------------------------------------------------
+
+    def restore_from_fills(self, fills: Sequence[Fill]) -> None:
+        """
+        Rebuild in-memory cash and positions from persisted fill history.
+
+        Called once, before the engine starts processing new bars, when a
+        paper run resumes in place under the same ``run_id`` after an API
+        restart (WP1.8a S6).  Replays each fill through
+        :meth:`_update_position` in execution order (``executed_at``,
+        ``fill_id`` for a stable tie-break) so the running cash balance and
+        per-symbol ``Position`` match the state before the restart -- the
+        exact same accounting path a live fill takes, just fed from the DB
+        instead of a fresh execution.
+
+        Deliberately read-only w.r.t. history: does not touch ``self._fills``
+        (the fill registry keyed by order) and never emits a new order or
+        fill event.  ``PortfolioAccounting.from_fills`` (the run's real
+        source of truth for the risk manager and the UI) is rebuilt
+        separately from the same fills; this method only keeps this
+        engine's own internal ``_cash``/``_positions`` cache consistent with
+        it so a later BUY's cash check or a SELL's position check is not
+        computed against an empty state.
+
+        Parameters
+        ----------
+        fills:
+            Every persisted fill for this run, in any order.
+        """
+        ordered = sorted(fills, key=lambda f: (f.executed_at, str(f.fill_id)))
+        for fill in ordered:
+            self._update_position(fill, at=fill.executed_at)
+        self._log.info(
+            "paper.positions_restored_from_fills",
+            fill_count=len(ordered),
+            cash=str(self._cash),
+        )
+
+    # ------------------------------------------------------------------
     # Position update
     # ------------------------------------------------------------------
 
-    def _update_position(self, fill: Fill) -> None:
+    def _update_position(self, fill: Fill, *, at: datetime | None = None) -> None:
         """
         Update the position tracker and cash balance after a fill.
 
@@ -379,12 +420,19 @@ class PaperExecutionEngine(BaseExecutionEngine):
         ----------
         fill:
             The fill event to process.
+        at:
+            Timestamp to stamp on the position's ``opened_at``/``updated_at``.
+            Defaults to ``datetime.now(tz=UTC)`` for a live fill during
+            normal processing; ``restore_from_fills`` (WP1.8a C-07) passes
+            ``fill.executed_at`` so a resumed run's own position cache is
+            stamped with the real historical fill time, not the wall-clock
+            time of the restart/rebuild.
         """
         symbol = fill.symbol
         current_price = fill.price
 
         position = self._positions.get(symbol)
-        now = datetime.now(tz=UTC)
+        now = at if at is not None else datetime.now(tz=UTC)
 
         if fill.side == OrderSide.BUY:
             # Decrease cash by (quantity * price + fee)

@@ -192,6 +192,7 @@ class StrategyEngine:
         run_mode: RunMode,
         config: dict[str, Any] | None = None,
         circuit_breaker: CircuitBreaker | None = None,
+        protective_mode: bool = False,
     ) -> None:
         if not strategies:
             raise ValueError("At least one strategy is required")
@@ -208,6 +209,12 @@ class StrategyEngine:
         self._timeframe = timeframe
         self._run_mode = run_mode
         self._config: dict[str, Any] = config or {}
+        # WP1.8a (S10/O9): a live run resumed with mode=protective drops
+        # every BUY signal (via _drop_entry_signals below) so a rebuilt
+        # position can only shrink -- exits (strategy SELL, bracket,
+        # trailing) keep running exactly as under the kill switch (D3).
+        # Never set outside a resume; always False for a fresh run.
+        self._protective_mode = protective_mode
 
         # WP1.1 (Verbeterplan v2, C1/C22): attach the portfolio as the
         # execution engine's live position source. Duck-typed -- only
@@ -869,7 +876,8 @@ class StrategyEngine:
         # trailing stops (5b) and resting orders (6) are unaffected. `is
         # True` guards against a MagicMock risk manager in tests -- a mock
         # attribute is truthy even when a test never sets it explicitly.
-        entries_blocked = self._risk_manager.kill_switch_active is True
+        _kill_switch_engaged = self._risk_manager.kill_switch_active is True
+        entries_blocked = _kill_switch_engaged or self._protective_mode
 
         # Count only bars that reach strategy processing
         self._bar_count += 1
@@ -957,8 +965,11 @@ class StrategyEngine:
         # separate, still BUY+SELL-suppressing legacy behaviour for
         # HALT/DAILY_LIMIT (C23, out of scope for WP1.2 -- see WP1.6).
         if entries_blocked:
+            _entry_skip_reason = (
+                "kill_switch" if _kill_switch_engaged else "protective_mode"
+            )
             bar_signals = self._drop_entry_signals(
-                bar_signals, current_bars, skip_reason="kill_switch"
+                bar_signals, current_bars, skip_reason=_entry_skip_reason
             )
 
         # C2 (cont.): filter/reduce signals based on graduated CB response
@@ -1757,6 +1768,28 @@ class StrategyEngine:
                 self._log.exception(
                     "engine.warmup_unexpected_error",
                     symbol=symbol,
+                )
+
+        # WP1.8a (A-09/R§3): after a resume, seed the trailing-stop peak for
+        # every symbol with an open position -- the in-memory peak is always
+        # lost on restart, and seeding from the current price alone would
+        # loosen the stop.  Uses the just-loaded warmup window to find the
+        # highest close since the (rebuilt) position's opened_at; falls back
+        # to the entry price when no bar in the window is new enough (or the
+        # window is empty).  No-op when no trailing stop is configured or no
+        # symbol has an open position (a fresh run never reaches the `if`).
+        if self._trailing_stop is not None:
+            for symbol in self._symbols:
+                position = self._portfolio.get_position(symbol)
+                if position is None or position.is_flat:
+                    continue
+                bars = self._bar_windows.get(symbol, [])
+                closes_since_open = [
+                    bar.close for bar in bars if bar.timestamp >= position.opened_at
+                ]
+                highest_close = max(closes_since_open, default=position.average_entry_price)
+                self._trailing_stop.seed_peak(
+                    symbol, max(position.average_entry_price, highest_close)
                 )
 
     async def _poll_and_process(self) -> None:

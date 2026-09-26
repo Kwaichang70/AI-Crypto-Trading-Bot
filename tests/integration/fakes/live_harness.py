@@ -47,6 +47,7 @@ for the full rationale of each):
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
@@ -58,6 +59,7 @@ from common.types import RunMode, TimeFrame
 from data.services.ccxt_market_data import CCXTMarketDataService
 from tests.integration.fakes.fake_ccxt_exchange import FakeCCXTExchange
 from trading.engines.live import LiveExecutionEngine
+from trading.models import Fill
 from trading.portfolio import PortfolioAccounting
 from trading.risk import RiskParameters
 from trading.risk_manager import DefaultRiskManager
@@ -68,6 +70,7 @@ __all__ = [
     "EXCHANGE_ATTR",
     "LiveStack",
     "build_live_stack",
+    "build_resumed_live_stack",
     "patch_exchange_factory",
     "start_and_warmup",
     "step_bar",
@@ -156,6 +159,81 @@ async def build_live_stack(
         # circuit_breaker intentionally omitted: production never
         # instantiates one either (finding C2) -- passing None here is
         # therefore high-fidelity, not a simplification.
+    )
+
+    return LiveStack(
+        engine=engine,
+        execution=execution,
+        portfolio=portfolio,
+        risk_manager=risk_manager,
+        market_data=market_data,
+        exchange=exchange,
+    )
+
+
+async def build_resumed_live_stack(
+    *,
+    exchange: FakeCCXTExchange,
+    strategy: BaseStrategy,
+    symbol: str,
+    timeframe: TimeFrame,
+    initial_capital: Decimal,
+    run_id: str,
+    fills: Sequence[Fill],
+    engine_config: dict[str, object] | None = None,
+    risk_params: RiskParameters | None = None,
+    protective_mode: bool = False,
+) -> LiveStack:
+    """Build a SECOND engine stack under the SAME ``run_id``, with its
+    portfolio rebuilt from ``fills`` via the production
+    ``PortfolioAccounting.from_fills`` (WP1.8a S6/S7) -- the in-memory
+    equivalent of a live resume after an API restart.
+
+    Mirrors ``build_live_stack`` in every other respect: a fresh
+    ``LiveExecutionEngine`` against the SAME exchange instance (same
+    balances, same price history -- a real process restart does not
+    reset either), no order adoption (WP1.8b scope, out here by design:
+    the 1.8a ``scan_and_import`` stub never runs in this harness either).
+
+    ``StrategyEngine.__init__`` wires the rebuilt ``portfolio`` in as the
+    execution engine's ``LivePositionSource`` (WP1.1), so
+    ``on_start()``'s ``sync_positions()`` call inside :func:`start_and_warmup`
+    naturally compares the correctly-rebuilt "own" quantity against the
+    exchange balance -- a genuine mismatch flags per WP1.1 D2 (S9), exactly
+    as it would in production.
+    """
+    risk_manager = DefaultRiskManager(run_id=run_id, params=risk_params)
+
+    # Mirrors run_orchestrator.py:1111-1123 (a fresh exchange handle, same
+    # FakeCCXTExchange instance behind it via patch_exchange_factory).
+    live_exchange_handle = getattr(ccxt_async, EXCHANGE_ATTR)({"enableRateLimit": True})
+
+    execution = LiveExecutionEngine(
+        run_id=run_id,
+        risk_manager=risk_manager,
+        exchange=live_exchange_handle,
+        enable_live_trading=True,
+    )
+
+    market_data = CCXTMarketDataService(exchange_id=EXCHANGE_ATTR, cache_ttl_seconds=0)
+
+    portfolio = PortfolioAccounting.from_fills(
+        run_id=run_id,
+        initial_cash=initial_capital,
+        fills=fills,
+    )
+
+    engine = StrategyEngine(
+        strategies=[strategy],
+        execution_engine=execution,
+        risk_manager=risk_manager,
+        market_data=market_data,
+        portfolio=portfolio,
+        symbols=[symbol],
+        timeframe=timeframe,
+        run_mode=RunMode.LIVE,
+        config=engine_config,
+        protective_mode=protective_mode,
     )
 
     return LiveStack(

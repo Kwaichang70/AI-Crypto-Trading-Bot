@@ -17,7 +17,13 @@
 // ---------------------------------------------------------------------------
 
 export type RunMode = "backtest" | "paper" | "live";
-export type RunStatus = "running" | "stopped" | "error" | "archived";
+export type RunStatus =
+  | "running"
+  | "stopped"
+  | "error"
+  | "archived"
+  | "orphaned" // WP1.8a: engine task gone (API restart / graceful shutdown); needs an operator resume
+  | "resuming"; // WP1.8a: short-lived compare-and-set lock held while POST /runs/{id}/resume is in flight
 
 export interface RunConfig {
   strategy_name: string;

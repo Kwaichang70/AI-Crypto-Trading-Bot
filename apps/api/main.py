@@ -343,6 +343,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
 
     # ------------------------------------------------------------------
+    # 6b. Orphan-holding alert repeater (WP1.8a S8)
+    # ------------------------------------------------------------------
+    from api.services.run_recovery import orphan_holding_repeater
+
+    _orphan_repeater_task = _asyncio.create_task(
+        orphan_holding_repeater(), name="orphan_holding_repeater"
+    )
+    container.background_tasks.orphan_repeater_task = _orphan_repeater_task  # LS-003
+    log.info("orphan_repeater.scheduled")
+
+    # ------------------------------------------------------------------
     # 7. Telegram notifier (optional)
     # ------------------------------------------------------------------
     if settings.telegram_bot_token and settings.telegram_chat_id:
@@ -474,6 +485,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     #    first.  The explicit loops beneath are belt-and-suspenders during
     #    the Stap 1c transition period.
     # ------------------------------------------------------------------
+    from api.services.run_orchestrator import mark_shutdown_requested
+
+    # WP1.8a (S5): set BEFORE container.shutdown() cancels the run-registry
+    # tasks below, so each run's `except asyncio.CancelledError` branch can
+    # tell this graceful shutdown apart from a user-initiated stop_run and
+    # write status='orphaned' instead of 'stopped'.
+    mark_shutdown_requested()
+
     await container.shutdown()
 
     # Cancel all active paper/live trading engine tasks

@@ -35,6 +35,8 @@ from decimal import Decimal
 from typing import Any
 
 import structlog
+from pydantic import ValidationError
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.db.models import (
@@ -53,9 +55,13 @@ from api.schemas import (
     RunDetailResponse,
     RunResponse,
 )
+from common.types import OrderSide, OrderStatus, OrderType
+from trading.models import Fill, Order
+from trading.recovery import ResumeRejected, ResumeSnapshot
 
 __all__ = [
     "build_backtest_metrics",
+    "load_resume_snapshot",
     "persist_backtest_results",
     "persist_paper_results",
     "run_orm_to_detail_response",
@@ -619,4 +625,117 @@ async def persist_backtest_results(
         equity_points=len(equity_orms),
         total_return=f"{result.total_return_pct:.4%}",
         sharpe=f"{result.sharpe_ratio:.3f}",
+    )
+
+
+# ---------------------------------------------------------------------------
+# WP1.8a: load a resume snapshot from persisted fills/orders
+# ---------------------------------------------------------------------------
+
+
+def _order_orm_to_model(order: OrderORM) -> Order:
+    """Convert a persisted ``OrderORM`` row back to the pure ``Order`` model."""
+    return Order(
+        order_id=order.id,
+        client_order_id=order.client_order_id,
+        run_id=str(order.run_id),
+        symbol=order.symbol,
+        side=OrderSide(order.side),
+        order_type=OrderType(order.order_type),
+        quantity=order.quantity,
+        price=order.price,
+        status=OrderStatus(order.status),
+        filled_quantity=order.filled_quantity,
+        average_fill_price=order.average_fill_price,
+        exchange_order_id=order.exchange_order_id,
+        created_at=order.created_at,
+        updated_at=order.updated_at,
+    )
+
+
+def _fill_orm_to_model(fill: FillORM) -> Fill:
+    """Convert a persisted ``FillORM`` row back to the pure ``Fill`` model."""
+    return Fill(
+        fill_id=fill.id,
+        order_id=fill.order_id,
+        symbol=fill.symbol,
+        side=OrderSide(fill.side),
+        quantity=fill.quantity,
+        price=fill.price,
+        fee=fill.fee,
+        fee_currency=fill.fee_currency,
+        is_maker=fill.is_maker,
+        executed_at=fill.executed_at,
+        expected_price=fill.expected_price,
+        slippage_bps_realized=fill.slippage_bps_realized,
+    )
+
+
+async def load_resume_snapshot(db: AsyncSession, run: RunORM) -> ResumeSnapshot:
+    """Load every persisted fill/order for ``run`` into a pure ``ResumeSnapshot``.
+
+    Used by both the paper boot-resume path (``recover_orphaned_runs``) and
+    the live resume path (``run_recovery.prepare_live_resume``) to rebuild
+    ``PortfolioAccounting.from_fills`` (WP1.8a S6/S7). Read-only -- issues
+    no writes.
+
+    Parameters
+    ----------
+    db:
+        Active async session (reused, not opened here, so callers control
+        the transaction boundary).
+    run:
+        The run being resumed.  ``run.config["initial_capital"]`` supplies
+        the starting cash the replay is anchored to.
+
+    Returns
+    -------
+    ResumeSnapshot
+        ``peak_equity_hint`` is the highest persisted equity snapshot (or
+        ``None`` if the run never flushed one).  ``max_bar_index`` is the
+        highest persisted ``bar_index`` (or ``-1`` if none), so callers can
+        seed ``bar_index_offset = max_bar_index + 1`` (O2: equity
+        ``bar_index`` continues, never restarts, across a resume).
+    """
+    order_result = await db.execute(select(OrderORM).where(OrderORM.run_id == run.id))
+    order_rows = list(order_result.scalars().all())
+
+    fills: list[Fill] = []
+    order_ids = [o.id for o in order_rows]
+    try:
+        # WP1.8a-round2 (S-06/C-04): a persisted row that fails to
+        # round-trip back through the pure ``Order``/``Fill`` Pydantic
+        # models (corrupt enum value, a Decimal field that no longer
+        # satisfies its ``gt=0``/``ge=0`` constraint, an out-of-range
+        # value that blows up an arithmetic conversion, etc.) is exactly
+        # the same "fail-closed, never guess" failure mode as a fill/order
+        # mismatch caught by ``check_fill_integrity`` -- map it to the same
+        # ``ResumeRejected`` reason so every caller's existing 409/orphan
+        # handling covers it, instead of leaking a raw exception type.
+        orders = [_order_orm_to_model(o) for o in order_rows]
+        if order_ids:
+            fill_result = await db.execute(select(FillORM).where(FillORM.order_id.in_(order_ids)))
+            fills = [_fill_orm_to_model(f) for f in fill_result.scalars().all()]
+    except (ValidationError, ValueError, ArithmeticError) as exc:
+        raise ResumeRejected("fill_history_corrupt") from exc
+
+    peak_result = await db.execute(
+        select(func.max(EquitySnapshotORM.equity)).where(EquitySnapshotORM.run_id == run.id)
+    )
+    peak_equity_hint = peak_result.scalar()
+
+    max_bar_result = await db.execute(
+        select(func.max(EquitySnapshotORM.bar_index)).where(EquitySnapshotORM.run_id == run.id)
+    )
+    max_bar_index_raw = max_bar_result.scalar()
+
+    initial_cash = Decimal(str((run.config or {}).get("initial_capital", "10000")))
+
+    return ResumeSnapshot(
+        run_id=str(run.id),
+        initial_cash=initial_cash,
+        fills=fills,
+        orders=orders,
+        peak_equity_hint=peak_equity_hint,
+        max_bar_index=int(max_bar_index_raw) if max_bar_index_raw is not None else -1,
     )

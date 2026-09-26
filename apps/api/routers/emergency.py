@@ -37,12 +37,11 @@ Design decisions
 from __future__ import annotations
 
 import hashlib
-import uuid
 from datetime import UTC, datetime
-from typing import Annotated, Any
+from typing import Annotated
 
 import structlog
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -179,28 +178,50 @@ async def kill_switch(
     log.warning("emergency.kill_switch_requested", reason=_sanitise_reason(reason))
 
     # ------------------------------------------------------------------
-    # 1. Query all running runs BEFORE writing the audit row so the payload
-    #    contains the full scope of what will be attempted.
+    # 1. Query all running runs, AND every orphaned live run, BEFORE
+    #    writing the audit row (WP1.8a S4/V3) so the payload contains the
+    #    full scope of what is being attempted/recorded.  An orphaned live
+    #    run has no task to cancel and its status is deliberately left
+    #    untouched (it stays 'orphaned' -- the kill switch is not a resume
+    #    override), but a kill switch pressed while it sits unprotected
+    #    must still leave a trace: at HEAD, pressing kill-switch with only
+    #    orphaned runs returned before writing any audit row at all.
     # ------------------------------------------------------------------
+    # WP1.8a-round2 (S-01 item 3/C-01): a single locking SELECT instead of
+    # two independent, non-locking SELECTs.  With two separate queries, a
+    # concurrent resume_run's own row lock (orphaned->resuming) could
+    # commit in the gap between these two SELECTs -- e.g. this kill-switch
+    # would see the row as still 'orphaned' in the second query (correctly
+    # excluded from mutation, as designed) but that same row could reach
+    # 'running' moments later with a live position and outrun the audit
+    # snapshot the operator is relying on.  Locking both statuses in one
+    # go and splitting them in Python (no further DB round-trip needed to
+    # decide which are running vs. orphaned) closes that gap: any
+    # concurrent resume_run's own FOR UPDATE reads on these rows now
+    # queue behind this transaction instead of interleaving with it.
+    # WP1.8a-round3 (C-11): an explicit ORDER BY makes the row-lock
+    # acquisition order deterministic across concurrent multi-row lockers
+    # (this query and any future one taking FOR UPDATE across more than
+    # one row) -- without it, Postgres is free to lock matching rows in
+    # whatever order it finds them, which is the classic precondition for
+    # a lock-ordering deadlock once a second multi-row locker exists.
     result = await db.execute(
-        select(RunORM).where(RunORM.status == "running")
+        select(RunORM)
+        .where(RunORM.status.in_(["running", "orphaned"]))
+        .order_by(RunORM.id)
+        .with_for_update()
     )
-    running_runs: list[RunORM] = list(result.scalars().all())
-
-    if not running_runs:
-        log.info("emergency.kill_switch_no_active_runs")
-        return KillSwitchResponse(
-            runs_stopped=[],
-            tasks_cancelled=0,
-            engines_removed=0,
-            errors=[],
-            note="no active runs to stop",
-        )
+    candidate_runs: list[RunORM] = list(result.scalars().all())
+    running_runs: list[RunORM] = [r for r in candidate_runs if r.status == "running"]
+    orphaned_live_run_ids = [
+        str(r.id) for r in candidate_runs if r.status == "orphaned" and r.run_mode == "live"
+    ]
 
     run_ids_attempted = [str(r.id) for r in running_runs]
 
     # ------------------------------------------------------------------
-    # 2. Audit BEFORE mutation (Sprint 41 SEC-002 invariant).
+    # 2. Audit BEFORE mutation (Sprint 41 SEC-002 invariant), and ALWAYS --
+    #    even when there is nothing running to stop (WP1.8a S4).
     #    Wrapped in a SAVEPOINT so the audit row commits independently
     #    if a subsequent per-run flush fails inside the loop below.
     # ------------------------------------------------------------------
@@ -219,12 +240,34 @@ async def kill_switch(
             payload={
                 "runs_attempted": run_ids_attempted,
                 "runs_count": len(run_ids_attempted),
+                "orphaned_live_run_ids": orphaned_live_run_ids,
                 "reason": _sanitise_reason(reason),
                 "admin_key_prefix": admin_key_prefix,
             },
         )
     # SAVEPOINT released: audit row is now independently committed.
     # The outer transaction continues for per-run status mutations below.
+
+    if not running_runs:
+        log.info(
+            "emergency.kill_switch_no_active_runs",
+            orphaned_live_count=len(orphaned_live_run_ids),
+        )
+        return KillSwitchResponse(
+            runs_stopped=[],
+            tasks_cancelled=0,
+            engines_removed=0,
+            errors=[],
+            note=(
+                "no active runs to stop"
+                if not orphaned_live_run_ids
+                else (
+                    "no active runs to stop; "
+                    f"{len(orphaned_live_run_ids)} orphaned live run(s) recorded, "
+                    "status unchanged"
+                )
+            ),
+        )
 
     # ------------------------------------------------------------------
     # 3. Best-effort sequential stop — collect errors, never abort early.

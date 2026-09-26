@@ -69,6 +69,11 @@ _VALID_EVENT_TYPES: frozenset[str] = frozenset(
         # Sprint 50 Cycle 5 Sub-scope B: OOS gate bypassed by admin.
         # Written before is_active is flipped.
         "model_oos_gate_bypassed",
+        # WP1.8a (Verbeterplan v2): orphan-recovery / resume lifecycle events.
+        "run_orphaned",
+        "run_resumed",
+        "run_resume_rejected",
+        "resume_orders_imported",
     }
 )
 

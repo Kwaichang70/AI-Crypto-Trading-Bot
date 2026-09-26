@@ -113,7 +113,7 @@ class RunORM(Base):
             name="ck_runs_run_mode",
         ),
         CheckConstraint(
-            "status IN ('running', 'stopped', 'error', 'archived')",
+            "status IN ('running', 'stopped', 'error', 'archived', 'orphaned', 'resuming')",
             name="ck_runs_status",
         ),
         CheckConstraint(
@@ -141,7 +141,13 @@ class RunORM(Base):
         String(16),
         nullable=False,
         default="running",
-        comment="Current run state: running | stopped | error | archived",
+        comment=(
+            "Current run state: running | stopped | error | archived | "
+            "orphaned | resuming (WP1.8a: 'orphaned' = the engine task is "
+            "gone -- API restart or graceful shutdown -- and needs an "
+            "operator resume; 'resuming' is the short-lived compare-and-set "
+            "lock held while POST /runs/{id}/resume is in flight)"
+        ),
     )
 
     # Strategy configuration snapshot  -- stored at run creation time.
@@ -1489,7 +1495,9 @@ class AuditEventORM(Base):
             "'circuit_breaker_reset', 'emergency_stop', 'kill_switch', "
             "'circuit_breaker_halt_auto_stop', "
             "'paper_promoted_to_live', "
-            "'model_oos_gate_bypassed'"
+            "'model_oos_gate_bypassed', "
+            "'run_orphaned', 'run_resumed', 'run_resume_rejected', "
+            "'resume_orders_imported'"
             ")",
             name="ck_audit_events_event_type",
         ),

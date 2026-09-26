@@ -64,14 +64,25 @@ def client_admin(app_with_admin: Any) -> Generator[TestClient, None, None]:
 
 @pytest.fixture()
 def mock_db_session() -> AsyncMock:
-    """Mock AsyncSession that returns an empty scalars result by default."""
+    """Mock AsyncSession that returns an empty scalars result by default.
+
+    WP1.8a (S4): the audit row is now written unconditionally, even on the
+    0-running-runs early-return path, so begin_nested() must always be
+    mocked as an async context manager here (previously only needed by
+    the >=1-running-run tests).
+    """
     session = AsyncMock()
     session.add = MagicMock()
     session.flush = AsyncMock()
     session.commit = AsyncMock()
     session.rollback = AsyncMock()
 
-    # Default: no running runs
+    nested_cm = MagicMock()
+    nested_cm.__aenter__ = AsyncMock(return_value=None)
+    nested_cm.__aexit__ = AsyncMock(return_value=False)
+    session.begin_nested = MagicMock(return_value=nested_cm)
+
+    # Default: no running runs, no orphaned live runs either
     mock_result = MagicMock()
     mock_result.scalars.return_value.all.return_value = []
     session.execute = AsyncMock(return_value=mock_result)
@@ -128,10 +139,11 @@ class TestKillSwitchAuth:
     ) -> None:
         """Correct X-Admin-Key + 0 running runs returns 200 with idempotent note.
 
-        Covers the 0-runs early-return path: no audit row is written (no running
-        runs means no scope to record), response contains note='no active runs to
-        stop', and all numeric fields are zero.  Audit-written-before-stop coverage
-        is handled by the unit test test_kill_switch_audit_written_before_stop.
+        WP1.8a (S4): the audit row IS now written even on the 0-running-runs
+        early-return path (V3 fix -- HEAD returned early with no audit write
+        at all, leaving no trace of a kill-switch press while a run sat
+        orphaned).  Response still contains note='no active runs to stop'
+        and all numeric fields are zero.
         """
         with patch("api.routers.emergency.record_audit_event", new=AsyncMock()) as mock_audit:
             response = client_admin_with_db.post(
@@ -146,5 +158,4 @@ class TestKillSwitchAuth:
         assert body["engines_removed"] == 0
         assert body["errors"] == []
         assert body["note"] == "no active runs to stop"
-        # Audit must NOT be called when there are no running runs (early-return path)
-        mock_audit.assert_not_called()
+        mock_audit.assert_awaited_once()

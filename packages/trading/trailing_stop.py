@@ -210,6 +210,41 @@ class TrailingStopManager:
 
         return None
 
+    def seed_peak(self, symbol: str, peak: Decimal) -> None:
+        """
+        Seed the trailing high-water mark for ``symbol`` after a resume
+        rebuild (WP1.8a A-09/R§3).
+
+        Called once, at the end of ``StrategyEngine._warmup_bar_windows``,
+        for every symbol with an open position restored via
+        ``PortfolioAccounting.from_fills``.  The in-memory peak is always
+        lost on restart; seeding it from the current price alone would
+        loosen the stop (a resumed position could sit further from its
+        true historical peak than before the restart).  The caller passes
+        ``max(entry_price, max close since opened_at)`` so the seeded peak
+        is never below the entry.
+
+        Never lowers an already-tracked peak -- idempotent/safe to call
+        more than once for the same symbol.
+
+        Parameters
+        ----------
+        symbol:
+            The trading pair being seeded.
+        peak:
+            The peak price to seed, typically
+            ``max(entry_price, max close since opened_at)``.
+        """
+        current = self._peak_prices.get(symbol)
+        if current is None or peak > current:
+            self._peak_prices[symbol] = peak
+        self._log.info(
+            "trailing_stop.peak_seeded",
+            symbol=symbol,
+            seeded_peak=str(peak),
+            effective_peak=str(self._peak_prices[symbol]),
+        )
+
     def _clear_pending(self, symbol: str) -> None:
         """Drop all pending-stop tracking for ``symbol``."""
         self._pending_stop_symbols.discard(symbol)

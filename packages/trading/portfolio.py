@@ -22,6 +22,7 @@ Design notes
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import UTC, datetime, date
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Callable
@@ -209,8 +210,48 @@ class PortfolioAccounting:
         current_price:
             Current market price of the asset (for unrealised PnL).
         """
+        self._apply_fill(fill, current_price, at=datetime.now(tz=UTC))
+
+    def _apply_fill(
+        self,
+        fill: Fill,
+        current_price: Decimal,
+        *,
+        at: datetime,
+        record_curve_point: bool = True,
+    ) -> None:
+        """
+        Shared body for :meth:`update_position` and :meth:`from_fills` (WP1.8
+        S6/A-06).
+
+        Identical accounting to the original ``update_position`` body, with
+        two parameterisations needed for a resume replay:
+
+        - ``at`` replaces the implicit ``datetime.now(tz=UTC)`` so a replayed
+          fill's ``opened_at``/``updated_at``/daily-PnL date come from the
+          fill's own ``executed_at`` (O2), not wall-clock "now".
+        - ``record_curve_point`` suppresses the equity-curve append (O6: a
+          replay has no side effects on the equity curve -- ``from_fills``
+          seeds a single accurate point *after* the full replay instead).
+
+        Parameters
+        ----------
+        fill:
+            The fill event to process.
+        current_price:
+            Market price used for unrealised PnL (the live/paper caller
+            passes the latest bar close; the replay passes the fill's own
+            price -- there is no other price available for a past fill).
+        at:
+            Timestamp to stamp on new/updated positions and to resolve the
+            daily-PnL day boundary.
+        record_curve_point:
+            When ``True`` (the default, used by ``update_position``), append
+            ``(at, equity)`` to the equity curve.  ``from_fills`` passes
+            ``False`` for every replayed fill.
+        """
         # Auto-reset daily PnL if day boundary has been crossed
-        self._ensure_daily_pnl_date()
+        self._ensure_daily_pnl_date(at)
 
         # Track fees
         self._total_fees_paid += fill.fee
@@ -227,7 +268,7 @@ class PortfolioAccounting:
 
         # Update position snapshot
         position = self._position_snapshots.get(fill.symbol)
-        now = datetime.now(tz=UTC)
+        now = at
 
         if fill.side == OrderSide.BUY:
             if position is None or position.is_flat:
@@ -312,7 +353,8 @@ class PortfolioAccounting:
         current_equity = self.get_equity(
             list(self._position_snapshots.values())
         )
-        self._equity_curve.append((now, current_equity))
+        if record_curve_point:
+            self._equity_curve.append((now, current_equity))
 
         # Update peak equity
         if current_equity > self._peak_equity:
@@ -328,6 +370,93 @@ class PortfolioAccounting:
             cash=str(self._cash),
             equity=str(current_equity),
         )
+
+    @classmethod
+    def from_fills(
+        cls,
+        run_id: str,
+        initial_cash: Decimal,
+        fills: Sequence[Fill],
+        *,
+        peak_equity_hint: Decimal | None = None,
+        now: datetime | None = None,
+    ) -> PortfolioAccounting:
+        """
+        Rebuild a :class:`PortfolioAccounting` from persisted fill history
+        (WP1.8a S6/A-06 -- the orphan-resume replay).
+
+        Replays ``fills`` in ``(executed_at, fill_id)`` order through the
+        same accounting path as :meth:`update_position` (``_apply_fill``),
+        so the rebuilt cash/position/realised-PnL state is *identical* to
+        what incremental application would have produced -- input order
+        never changes the result (sorting is stable and total).
+
+        Differences from live incremental application (O6):
+        - No equity-curve point is recorded per fill; a single accurate
+          point, timestamped ``now``, is seeded once after the full replay
+          instead of the constructor's ``initial_cash``-only placeholder.
+        - No ``TradeResult`` is recorded and ``on_trade_recorded`` never
+          fires -- ``_apply_fill`` never calls ``record_trade`` itself, so
+          this holds automatically.
+        - ``peak_equity_hint`` (typically the highest persisted equity
+          snapshot) raises the peak but never lowers it (drawdown must
+          never be erased by a resume).
+        - Daily PnL from fills whose day differs from ``now`` is excluded:
+          the final :meth:`_ensure_daily_pnl_date` call resets the
+          accumulator if the last replayed day has rolled over relative to
+          ``now`` (yesterday's realised losses/gains never count against
+          today's daily-loss gate after a resume).
+
+        Parameters
+        ----------
+        run_id:
+            The run being rebuilt (same id -- a resume never changes it).
+        initial_cash:
+            The run's original starting capital.
+        fills:
+            Every persisted fill for this run, in any order.
+        peak_equity_hint:
+            The highest known equity value before the replay (e.g. the max
+            persisted equity snapshot).  Never lowers the computed peak.
+        now:
+            Injectable clock for deterministic tests; defaults to
+            ``datetime.now(tz=UTC)``.
+
+        Returns
+        -------
+        PortfolioAccounting
+            A new instance whose cash/position/realised-PnL/peak state
+            matches sequential ``update_position`` application of the same
+            fills.
+        """
+        portfolio = cls(run_id=run_id, initial_cash=initial_cash)
+        resolved_now = now if now is not None else datetime.now(tz=UTC)
+
+        ordered_fills = sorted(fills, key=lambda f: (f.executed_at, str(f.fill_id)))
+        for fill in ordered_fills:
+            portfolio._apply_fill(fill, fill.price, at=fill.executed_at, record_curve_point=False)
+
+        if peak_equity_hint is not None and peak_equity_hint > portfolio._peak_equity:
+            portfolio._peak_equity = peak_equity_hint
+
+        # Roll the daily-PnL accumulator forward to "now" -- if the last
+        # replayed fill is from a prior UTC day, this resets it to 0 so
+        # yesterday's realised PnL never counts as today's.
+        portfolio._ensure_daily_pnl_date(resolved_now)
+
+        rebuilt_equity = portfolio.get_equity(list(portfolio._position_snapshots.values()))
+        portfolio._equity_curve = [(resolved_now, rebuilt_equity)]
+        if rebuilt_equity > portfolio._peak_equity:
+            portfolio._peak_equity = rebuilt_equity
+
+        portfolio._log.info(
+            "portfolio.rebuilt_from_fills",
+            fill_count=len(ordered_fills),
+            cash=str(portfolio._cash),
+            equity=str(rebuilt_equity),
+            peak_equity=str(portfolio._peak_equity),
+        )
+        return portfolio
 
     def update_market_prices(
         self,
@@ -566,14 +695,22 @@ class PortfolioAccounting:
         self._daily_pnl = Decimal("0")
         self._daily_pnl_date = datetime.now(tz=UTC).date()
 
-    def _ensure_daily_pnl_date(self) -> None:
+    def _ensure_daily_pnl_date(self, at: datetime | None = None) -> None:
         """
         Auto-reset daily PnL if the date has rolled over.
 
         This provides automatic day-boundary handling even if
         reset_daily_pnl() is not explicitly called.
+
+        Parameters
+        ----------
+        at:
+            The timestamp to resolve "today" from.  Defaults to
+            ``datetime.now(tz=UTC)``.  ``from_fills`` (WP1.8a) passes each
+            fill's own ``executed_at`` during replay so day-boundary resets
+            follow the fills' own chronology, not wall-clock time.
         """
-        today = datetime.now(tz=UTC).date()
+        today = (at if at is not None else datetime.now(tz=UTC)).date()
         if self._daily_pnl_date is None:
             self._daily_pnl_date = today
         elif self._daily_pnl_date != today:

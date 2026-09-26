@@ -79,6 +79,9 @@ class BackgroundTaskRegistry:
     history_cache_warmer: Any | None = None
     # M6 (Sprint 49): FX rate cache warmer stub.  Real fetching in M6b.
     fx_cache_warmer: Any | None = None
+    # WP1.8a (S8): repeats a critical alert every 15 min while a live run
+    # sits orphaned with an unprotected open position.
+    orphan_repeater_task: asyncio.Task[Any] | None = None
     # Reserved for future named long-lived tasks.
 
     async def cancel_all(self, timeout: float = 5.0) -> None:
@@ -90,6 +93,9 @@ class BackgroundTaskRegistry:
         if self.equity_prune_task is not None and not self.equity_prune_task.done():
             self.equity_prune_task.cancel()
             tasks.append(self.equity_prune_task)
+        if self.orphan_repeater_task is not None and not self.orphan_repeater_task.done():
+            self.orphan_repeater_task.cancel()
+            tasks.append(self.orphan_repeater_task)
 
         # S47-1: HistoryCacheWarmer owns its own task and has its own
         # cancel coroutine.  Drive it via stop() so the warmer logs its

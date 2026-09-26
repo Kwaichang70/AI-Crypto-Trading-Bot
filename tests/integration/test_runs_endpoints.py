@@ -689,6 +689,21 @@ class TestStopRun:
 
         assert resp.status_code == 404
 
+    def test_orphaned_run_is_stopped_returns_200(
+        self, client_dev_with_db: TestClient, mock_db_session: AsyncMock
+    ) -> None:
+        """WP1.8a: an 'orphaned' run (no background task -- O1) must also be
+        stoppable via DELETE /runs/{id}, transitioning to 'stopped'."""
+        run_orm = _make_run_orm(status="orphaned")
+        mock_db_session.execute.return_value = _make_scalar_one_or_none_result(run_orm)
+
+        resp = client_dev_with_db.delete(f"/api/v1/runs/{_FIXED_UUID}")
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "stopped"
+        mock_db_session.flush.assert_called()
+
 
 # ---------------------------------------------------------------------------
 # Authentication tests (production mode — require_api_auth=True)

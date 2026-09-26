@@ -1,65 +1,60 @@
 """
 tests/unit/test_sprint24_run_recovery.py
 -----------------------------------------
-Unit tests for Sprint 24 Run-Recovery feature.
+Unit tests for boot-time orphan recovery (`recover_orphaned_runs`).
+
+WP1.8a note
+-----------
+This file originally covered Sprint 24's "copy to a new run_id, linked via
+recovered_from_run_id" recovery chain.  WP1.8a (Verbeterplan v2 synthesis
+spec S5/S6) replaces that behaviour entirely:
+
+- LIVE runs (`status IN ('running', 'orphaned')`) are left/transitioned to
+  `'orphaned'` with NO engine task started (O1) -- an operator must call
+  `POST /runs/{id}/resume`.  No strategy/gate validation happens at boot
+  for live any more, because boot never starts a live task either way.
+- PAPER runs (`status IN ('running', 'orphaned')`) are rebuilt IN PLACE
+  under the SAME `run_id` from persisted fill history and their task
+  restarts immediately, subject to a bounded `config["resume_count"]`
+  budget (> 3 -> `'error'`) and a fill/order integrity check
+  (`check_fill_integrity`, O10/WP18-R-06).
+- The Sprint 24 `recovered_from_run_id IS NULL` filter is dropped for both
+  modes (S6) -- the query now keys off `status` alone.
+
+Kept in this file (same name) so the historical Sprint 24 test-count
+context survives in git history; the test bodies below are new.
 
 Modules under test
-------------------
-- apps/api/routers/runs.py  -- recover_orphaned_runs(), _mark_orphan_error()
+-------------------
+- apps/api/routers/runs.py -- recover_orphaned_runs(), _mark_run_error()
+  (`_mark_orphan_error` is kept as a backwards-compat alias),
+  `_orphan_live_run()`.
 
-Test classes
-------------
-1. TestMarkOrphanError          (~3 tests) -- status transition, stopped_at written, silent on missing run
-2. TestRecoverNoOrphans         (~2 tests) -- empty result, returns 0
-3. TestRecoverPaperOrphan       (~4 tests) -- happy path, new run created, task started, _RUN_TASKS populated
-4. TestRecoverLiveOrphan        (~3 tests) -- happy path with gate pass, gate fail (env), gate fail (keys)
-5. TestRecoverValidationSkips   (~5 tests) -- missing strategy_name, unknown strategy, empty symbols,
-                                              invalid timeframe, recovery-chain prevention
-6. TestRecoverPerOrphanIsolation (~2 tests) -- one bad orphan does not block valid neighbour
-7. TestRecoverStrategyAvailabilityLockdown (Sprint 51 C2) -- demoted orphan marked error + not restarted;
-                                              active orphan still recovers.
-
-Sprint 51 Cycle 2 note
-----------------------
-ma_crossover, breakout and model_strategy are now DEMOTED -> backtest-only.
-The orphan-recovery path applies the same strategy-availability lockdown as
-create_run: a demoted paper/live orphan is marked error and NOT auto-restarted.
-The happy-path recovery/wiring tests (strategy-agnostic intent: orphan
-recovery + task registration) were re-targeted from the now-demoted
-``ma_crossover`` to the ACTIVE ``grid_trading`` so they keep verifying their
-ORIGINAL behaviour on a strategy the lockdown permits in paper/live.
-
-Design notes
-------------
-- All async tests use @pytest.mark.asyncio.  asyncio_mode = "auto" in pyproject.toml
-  means the decorator is technically optional but is kept for explicitness.
-- recover_orphaned_runs() imports get_session_factory, get_settings, and RunORM
-  lazily INSIDE the function body, so the patch targets are the source modules:
+Design notes (mocking pattern, unchanged from Sprint 24)
+---------------------------------------------------------
+- recover_orphaned_runs() imports get_session_factory and RunORM lazily
+  INSIDE the function body, so patch targets are the source modules:
     * "api.db.session.get_session_factory"
-    * "api.config.get_settings"
-  _get_strategy_registry is a module-level function in api.routers.runs so we patch:
+  _get_strategy_registry / _load_resume_snapshot / _run_paper_engine /
+  _run_live_engine are module-level names in api.routers.runs:
     * "api.routers.runs._get_strategy_registry"
-  _run_paper_engine and _run_live_engine are module-level coroutine functions:
+    * "api.routers.runs._load_resume_snapshot"
     * "api.routers.runs._run_paper_engine"
     * "api.routers.runs._run_live_engine"
-- The DB interaction pattern inside recover_orphaned_runs() is:
-    1. One factory() context for the initial SELECT (returns orphan list).
-    2. One factory() context per orphan for _mark_orphan_error() (returns same orphan
-       via scalar_one_or_none).
-    3. One factory() context per recovered orphan for the atomic UPDATE + INSERT.
-  _make_session_factory() below handles this by using a side_effect that alternates
-  between query-type sessions (scalars().all()) and write-type sessions
-  (scalar_one_or_none()).
-- _mark_orphan_error() is also tested in isolation by patching get_session_factory
-  directly and passing the returned factory.
-- asyncio.create_task is NOT patched -- the real event loop is used so that
-  _RUN_TASKS receives a real asyncio.Task object.  The coroutines themselves are
-  replaced with AsyncMock coroutine functions so they resolve immediately (no I/O).
-- _STRATEGY_REGISTRY is reset to None before each test via the autouse fixture to
-  prevent cross-test contamination from lazy-load caching.
-- SimpleNamespace mimics RunORM read-only fields used by recover_orphaned_runs().
-  Write-path sessions (used for _mark_orphan_error and the atomic update block) use
-  full AsyncMock sessions with configurable scalar_one_or_none returns.
+- `_load_resume_snapshot` is mocked to return a canned `ResumeSnapshot`
+  directly -- its own DB-query correctness is covered by
+  `tests/unit/test_wp18a_recovery.py` (check_fill_integrity) and the
+  integration/migration tests, not re-derived here via mock plumbing.
+  An EMPTY snapshot (`fills=[], orders=[]`) trivially passes
+  `check_fill_integrity`, so most tests below never need to think about it.
+- `_build_factory` returns successive sessions per `factory()` call
+  (reusing the last one if more calls happen than sessions supplied); each
+  session's `scalar_one_or_none()` returns the SAME orphan `SimpleNamespace`
+  so in-place mutations across sessions accumulate correctly, exactly as a
+  real ORM object attached across statements in one logical flow would.
+- asyncio.create_task is NOT patched -- the real event loop is used so
+  _RUN_TASKS receives a real asyncio.Task; the coroutines themselves are
+  AsyncMock so they resolve immediately (no I/O).
 """
 
 from __future__ import annotations
@@ -67,14 +62,17 @@ from __future__ import annotations
 import asyncio
 import uuid
 from datetime import UTC, datetime
+from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 import api.routers.runs as runs_module
-from api.routers.runs import _mark_orphan_error, recover_orphaned_runs
-
+from api.routers.runs import _mark_orphan_error, _orphan_live_run, recover_orphaned_runs
+from common.types import OrderSide, OrderStatus, OrderType
+from trading.models import Fill, Order
+from trading.recovery import ResumeSnapshot
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -84,23 +82,14 @@ from api.routers.runs import _mark_orphan_error, recover_orphaned_runs
 def _make_orphan(
     run_mode: str = "paper",
     config: dict | None = None,
-    recovered_from_run_id: uuid.UUID | None = None,
+    status: str = "running",
     strategy_name: str = "grid_trading",
 ) -> SimpleNamespace:
-    """Build a SimpleNamespace that mimics a RunORM orphan row.
-
-    Only attributes consumed by recover_orphaned_runs() are set; the rest are
-    left absent so any accidental access raises AttributeError immediately.
-
-    Sprint 51 C2: the default strategy is the ACTIVE ``grid_trading`` (was the
-    now-demoted ``ma_crossover``) so the strategy-agnostic happy-path recovery
-    tests exercise their original intent on a strategy the lockdown permits in
-    paper/live.  Tests that supply an explicit ``config`` override this.
-    """
+    """Build a SimpleNamespace that mimics a RunORM orphan/candidate row."""
     return SimpleNamespace(
         id=uuid.uuid4(),
         run_mode=run_mode,
-        status="running",
+        status=status,
         config=config
         or {
             "strategy_name": strategy_name,
@@ -112,29 +101,54 @@ def _make_orphan(
         },
         started_at=datetime.now(UTC),
         stopped_at=None,
-        recovered_from_run_id=recovered_from_run_id,
+        updated_at=datetime.now(UTC),
     )
 
 
-def _make_settings(
-    *,
-    enable_live_trading: bool = False,
-    api_key: str = "key123",
-    api_secret: str = "secret123",
-) -> MagicMock:
-    """Build a mock Settings object with live-trading fields pre-configured."""
-    settings = MagicMock()
-    settings.enable_live_trading = enable_live_trading
+_EMPTY_SNAPSHOT = ResumeSnapshot(
+    run_id="unused",
+    initial_cash=Decimal("10000"),
+    fills=[],
+    orders=[],
+    peak_equity_hint=None,
+    max_bar_index=-1,
+)
 
-    key_mock = MagicMock()
-    key_mock.get_secret_value.return_value = api_key
 
-    secret_mock = MagicMock()
-    secret_mock.get_secret_value.return_value = api_secret
+def _mismatched_snapshot() -> ResumeSnapshot:
+    """A ResumeSnapshot whose fill/order history fails check_fill_integrity.
 
-    settings.exchange_api_key = key_mock
-    settings.exchange_api_secret = secret_mock
-    return settings
+    filled_quantity (0.02) does not match the single persisted fill's
+    quantity (0.01) within tolerance -- 'fill_history_partial' (S6/R-06:
+    a lost fill in the 30s flush window).
+    """
+    order = Order(
+        client_order_id=f"wp18a-{uuid.uuid4().hex[:12]}",
+        run_id="mismatched",
+        symbol="BTC/USD",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        quantity=Decimal("0.02"),
+        status=OrderStatus.FILLED,
+        filled_quantity=Decimal("0.02"),
+    )
+    fill = Fill(
+        order_id=order.order_id,
+        symbol="BTC/USD",
+        side=OrderSide.BUY,
+        quantity=Decimal("0.01"),
+        price=Decimal("50000"),
+        fee=Decimal("0.5"),
+        fee_currency="USD",
+    )
+    return ResumeSnapshot(
+        run_id="mismatched",
+        initial_cash=Decimal("10000"),
+        fills=[fill],
+        orders=[order],
+        peak_equity_hint=None,
+        max_bar_index=-1,
+    )
 
 
 def _make_session_for_select(orphans: list) -> AsyncMock:
@@ -152,8 +166,8 @@ def _make_session_for_select(orphans: list) -> AsyncMock:
 def _make_session_for_write(orphan: SimpleNamespace | None) -> AsyncMock:
     """Return a mock async session for write operations.
 
-    scalar_one_or_none() returns *orphan* (used by both _mark_orphan_error and
-    the atomic update block inside recover_orphaned_runs).
+    scalar_one_or_none() returns *orphan* (used by _mark_run_error,
+    _orphan_live_run, and the final paper-resume commit block).
     """
     session = AsyncMock()
     session.__aenter__ = AsyncMock(return_value=session)
@@ -170,9 +184,8 @@ def _make_session_for_write(orphan: SimpleNamespace | None) -> AsyncMock:
 def _build_factory(*sessions: AsyncMock) -> MagicMock:
     """Build a factory mock whose successive calls return successive sessions.
 
-    Wraps each session in a context-manager shim so the ``async with factory()``
-    pattern works.  If more calls are made than sessions are provided the last
-    session is reused.
+    If more calls are made than sessions are provided, the last session is
+    reused.
     """
     contexts = []
     for s in sessions:
@@ -188,18 +201,16 @@ def _build_factory(*sessions: AsyncMock) -> MagicMock:
         idx = min(call_count[0], len(contexts) - 1)
         return contexts[idx]
 
-    factory = MagicMock(side_effect=_factory)
-    return factory
+    return MagicMock(side_effect=_factory)
 
 
 # ---------------------------------------------------------------------------
-# Autouse fixture: reset module-level cache between tests
+# Autouse fixtures
 # ---------------------------------------------------------------------------
 
 
 @pytest.fixture(autouse=True)
 def _reset_strategy_registry():
-    """Reset _STRATEGY_REGISTRY so lazy-load does not persist between tests."""
     original = runs_module._STRATEGY_REGISTRY
     runs_module._STRATEGY_REGISTRY = None
     yield
@@ -208,730 +219,642 @@ def _reset_strategy_registry():
 
 @pytest.fixture(autouse=True)
 def _clean_run_tasks():
-    """Clear _RUN_TASKS before and after each test to prevent cross-test leakage."""
     runs_module._RUN_TASKS.clear()
     yield
-    # Cancel any tasks started by the test to avoid asyncio warnings.
     for task in list(runs_module._RUN_TASKS.values()):
         if not task.done():
             task.cancel()
     runs_module._RUN_TASKS.clear()
 
 
+def _patched_registry(*names: str):
+    return patch(
+        "api.routers.runs._get_strategy_registry",
+        return_value={name: MagicMock() for name in names},
+    )
+
+
 # ---------------------------------------------------------------------------
-# Class 1: TestMarkOrphanError
+# TestMarkRunError
 # ---------------------------------------------------------------------------
 
 
-class TestMarkOrphanError:
-    """Verify _mark_orphan_error() marks a running run as error with timestamps."""
+class TestMarkRunError:
+    """_mark_orphan_error (alias of _mark_run_error) marks a non-terminal run 'error'."""
 
     @pytest.mark.asyncio
     async def test_running_run_is_marked_error(self) -> None:
-        """A run with status='running' must be transitioned to status='error'.
-
-        The session must receive a commit() call after the mutation.
-        """
-        orphan = _make_orphan()
-        # Give it a real-looking status that the function checks
-        orphan.status = "running"
-
+        orphan = _make_orphan(status="running")
         write_session = _make_session_for_write(orphan)
         factory = _build_factory(write_session)
         log = MagicMock()
 
-        await _mark_orphan_error(factory, orphan.id, log)
+        await _mark_orphan_error(factory, orphan.id, log, reason="test")
 
-        assert orphan.status == "error", (
-            f"status must be 'error' after _mark_orphan_error, got {orphan.status!r}"
-        )
-        assert orphan.stopped_at is not None, "stopped_at must be set"
-        assert orphan.updated_at is not None, "updated_at must be set"
+        assert orphan.status == "error"
+        assert orphan.stopped_at is not None
         write_session.commit.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_already_stopped_run_is_not_modified(self) -> None:
-        """A run with status != 'running' must not be touched.
-
-        _mark_orphan_error guards on `stale.status == 'running'` so a run that
-        has already been stopped by another process must not be mutated.
-        """
-        orphan = _make_orphan()
-        orphan.status = "stopped"  # not 'running'
-
+    async def test_orphaned_run_is_also_marked_error(self) -> None:
+        """WP1.8a: 'orphaned' (not just 'running') is a valid source status."""
+        orphan = _make_orphan(status="orphaned")
         write_session = _make_session_for_write(orphan)
         factory = _build_factory(write_session)
         log = MagicMock()
 
-        await _mark_orphan_error(factory, orphan.id, log)
+        await _mark_orphan_error(factory, orphan.id, log, reason="test")
 
-        # Status must remain 'stopped' — the guard clause must have fired
-        assert orphan.status == "stopped", (
-            f"Non-running run must not be mutated, got status={orphan.status!r}"
-        )
+        assert orphan.status == "error"
+        write_session.commit.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_terminal_run_is_not_modified(self) -> None:
+        orphan = _make_orphan(status="stopped")
+        write_session = _make_session_for_write(orphan)
+        factory = _build_factory(write_session)
+        log = MagicMock()
+
+        await _mark_orphan_error(factory, orphan.id, log, reason="test")
+
+        assert orphan.status == "stopped"
         write_session.commit.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_missing_run_is_a_no_op(self) -> None:
-        """When scalar_one_or_none() returns None the function must not raise.
-
-        This covers the case where a run was already deleted between discovery
-        and the mark-error write.
-        """
         write_session = _make_session_for_write(None)
         factory = _build_factory(write_session)
         log = MagicMock()
 
-        # Must complete without raising
-        await _mark_orphan_error(factory, uuid.uuid4(), log)
+        await _mark_orphan_error(factory, uuid.uuid4(), log, reason="test")
 
         write_session.commit.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
-# Class 2: TestRecoverNoOrphans
+# TestOrphanLiveRun
+# ---------------------------------------------------------------------------
+
+
+class TestOrphanLiveRun:
+    """_orphan_live_run transitions a running live row to 'orphaned' + audits."""
+
+    @pytest.mark.asyncio
+    async def test_running_live_run_becomes_orphaned(self) -> None:
+        run = _make_orphan(run_mode="live", status="running")
+        write_session = _make_session_for_write(run)
+        factory = _build_factory(write_session)
+        log = MagicMock()
+
+        with patch("api.services.audit_log.record_audit_event", AsyncMock()) as audit:
+            transitioned = await _orphan_live_run(factory, run.id, log)
+
+        assert transitioned is True
+        assert run.status == "orphaned"
+        write_session.commit.assert_awaited_once()
+        audit.assert_awaited_once()
+        assert audit.call_args.kwargs["event_type"] == "run_orphaned"
+
+    @pytest.mark.asyncio
+    async def test_already_orphaned_run_is_left_alone(self) -> None:
+        run = _make_orphan(run_mode="live", status="orphaned")
+        write_session = _make_session_for_write(run)
+        factory = _build_factory(write_session)
+        log = MagicMock()
+
+        with patch("api.services.audit_log.record_audit_event", AsyncMock()) as audit:
+            transitioned = await _orphan_live_run(factory, run.id, log)
+
+        assert transitioned is False
+        assert run.status == "orphaned"
+        write_session.commit.assert_not_awaited()
+        audit.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_resuming_live_run_becomes_orphaned(self) -> None:
+        """WP1.8a-round2 (S-04/C-06): a hard kill mid-resume leaves the row
+        'resuming' (it never reached the final CAS to 'running'). Boot
+        recovery must treat that exactly like a plain 'running' row -- no
+        task, no exchange session survives a process restart either way --
+        and the audit payload must record the pre-transition status so an
+        operator can tell a mid-resume kill apart from a plain hard-kill.
+        """
+        run = _make_orphan(run_mode="live", status="resuming")
+        write_session = _make_session_for_write(run)
+        factory = _build_factory(write_session)
+        log = MagicMock()
+
+        with patch("api.services.audit_log.record_audit_event", AsyncMock()) as audit:
+            transitioned = await _orphan_live_run(factory, run.id, log)
+
+        assert transitioned is True
+        assert run.status == "orphaned"
+        write_session.commit.assert_awaited_once()
+        audit.assert_awaited_once()
+        assert audit.call_args.kwargs["event_type"] == "run_orphaned"
+        assert audit.call_args.kwargs["payload"]["previous_status"] == "resuming"
+
+
+# ---------------------------------------------------------------------------
+# TestRecoverNoOrphans
 # ---------------------------------------------------------------------------
 
 
 class TestRecoverNoOrphans:
-    """Verify recover_orphaned_runs() returns 0 and starts no tasks when DB is empty."""
-
     @pytest.mark.asyncio
     async def test_empty_db_returns_zero(self) -> None:
-        """recover_orphaned_runs() on an empty DB must return 0 immediately."""
         select_session = _make_session_for_select([])
         factory = _build_factory(select_session)
 
-        with (
-            patch("api.db.session.get_session_factory", return_value=factory),
-            patch("api.config.get_settings", return_value=_make_settings()),
-            patch("api.routers.runs._get_strategy_registry", return_value={"grid_trading": MagicMock()}),
-        ):
+        with patch("api.db.session.get_session_factory", return_value=factory):
             result = await recover_orphaned_runs()
 
-        assert result == 0, f"Expected 0 recovered runs, got {result}"
+        assert result == 0
 
     @pytest.mark.asyncio
     async def test_empty_db_starts_no_tasks(self) -> None:
-        """No entries must be added to _RUN_TASKS when there are no orphans."""
         select_session = _make_session_for_select([])
         factory = _build_factory(select_session)
 
-        with (
-            patch("api.db.session.get_session_factory", return_value=factory),
-            patch("api.config.get_settings", return_value=_make_settings()),
-        ):
+        with patch("api.db.session.get_session_factory", return_value=factory):
             await recover_orphaned_runs()
 
-        assert runs_module._RUN_TASKS == {}, (
-            "_RUN_TASKS must remain empty when no orphans are found"
-        )
+        assert runs_module._RUN_TASKS == {}
 
 
 # ---------------------------------------------------------------------------
-# Class 3: TestRecoverPaperOrphan
-# ---------------------------------------------------------------------------
-
-
-class TestRecoverPaperOrphan:
-    """Verify the full recovery flow for a single paper-mode orphan.
-
-    Sprint 51 C2: re-targeted to the ACTIVE ``grid_trading`` (was the
-    now-demoted ``ma_crossover``).  The recovery + task-registration behaviour
-    being verified is strategy-agnostic; ``grid_trading`` is permitted in
-    paper/live by the lockdown so the original happy-path is preserved.
-    """
-
-    @pytest.mark.asyncio
-    async def test_paper_orphan_returns_one(self) -> None:
-        """A single valid paper orphan must result in a return value of 1."""
-        orphan = _make_orphan(run_mode="paper")  # default strategy: grid_trading
-        select_session = _make_session_for_select([orphan])
-        write_session = _make_session_for_write(orphan)
-        factory = _build_factory(select_session, write_session, write_session)
-
-        dummy_coro = AsyncMock()
-
-        with (
-            patch("api.db.session.get_session_factory", return_value=factory),
-            patch("api.config.get_settings", return_value=_make_settings()),
-            patch("api.routers.runs._get_strategy_registry", return_value={"grid_trading": MagicMock()}),
-            patch("api.routers.runs._run_paper_engine", dummy_coro),
-            patch("api.routers.runs._run_live_engine", AsyncMock()),
-        ):
-            result = await recover_orphaned_runs()
-
-        assert result == 1, f"Expected 1 recovered run, got {result}"
-
-    @pytest.mark.asyncio
-    async def test_paper_orphan_marked_error_in_db(self) -> None:
-        """The original orphan row must be mutated to status='error' and stopped_at set.
-
-        The write session's execute returns the orphan as scalar_one_or_none,
-        after which the in-place mutation is committed.
-        """
-        orphan = _make_orphan(run_mode="paper")
-        orphan.status = "running"
-
-        select_session = _make_session_for_select([orphan])
-        write_session = _make_session_for_write(orphan)
-        factory = _build_factory(select_session, write_session, write_session)
-
-        with (
-            patch("api.db.session.get_session_factory", return_value=factory),
-            patch("api.config.get_settings", return_value=_make_settings()),
-            patch("api.routers.runs._get_strategy_registry", return_value={"grid_trading": MagicMock()}),
-            patch("api.routers.runs._run_paper_engine", AsyncMock()),
-            patch("api.routers.runs._run_live_engine", AsyncMock()),
-        ):
-            await recover_orphaned_runs()
-
-        assert orphan.status == "error", (
-            f"Original orphan must be marked 'error', got {orphan.status!r}"
-        )
-        assert orphan.stopped_at is not None, "stopped_at must be stamped on original orphan"
-
-    @pytest.mark.asyncio
-    async def test_paper_orphan_new_run_added_to_db(self) -> None:
-        """A new RunORM must be session.add()-ed with recovered_from_run_id set.
-
-        The write session's add() call must receive an object whose
-        recovered_from_run_id matches the original orphan's id.
-        """
-        orphan = _make_orphan(run_mode="paper")
-        select_session = _make_session_for_select([orphan])
-        write_session = _make_session_for_write(orphan)
-        factory = _build_factory(select_session, write_session, write_session)
-
-        with (
-            patch("api.db.session.get_session_factory", return_value=factory),
-            patch("api.config.get_settings", return_value=_make_settings()),
-            patch("api.routers.runs._get_strategy_registry", return_value={"grid_trading": MagicMock()}),
-            patch("api.routers.runs._run_paper_engine", AsyncMock()),
-            patch("api.routers.runs._run_live_engine", AsyncMock()),
-        ):
-            await recover_orphaned_runs()
-
-        assert write_session.add.called, "session.add() must be called to persist the new run"
-        added = write_session.add.call_args[0][0]
-        assert added.recovered_from_run_id == orphan.id, (
-            f"New run's recovered_from_run_id must be {orphan.id}, "
-            f"got {added.recovered_from_run_id}"
-        )
-        assert added.status == "running", (
-            f"New run must start with status='running', got {added.status!r}"
-        )
-
-    @pytest.mark.asyncio
-    async def test_paper_orphan_task_registered_in_run_tasks(self) -> None:
-        """After recovery the new run's task must appear in _RUN_TASKS.
-
-        The key is the string form of the newly-created run_id.  The value
-        must be an asyncio.Task instance.
-        """
-        orphan = _make_orphan(run_mode="paper")
-        select_session = _make_session_for_select([orphan])
-        write_session = _make_session_for_write(orphan)
-        factory = _build_factory(select_session, write_session, write_session)
-
-        with (
-            patch("api.db.session.get_session_factory", return_value=factory),
-            patch("api.config.get_settings", return_value=_make_settings()),
-            patch("api.routers.runs._get_strategy_registry", return_value={"grid_trading": MagicMock()}),
-            patch("api.routers.runs._run_paper_engine", AsyncMock()),
-            patch("api.routers.runs._run_live_engine", AsyncMock()),
-        ):
-            await recover_orphaned_runs()
-
-        assert len(runs_module._RUN_TASKS) == 1, (
-            f"Exactly one task must be registered, found {len(runs_module._RUN_TASKS)}"
-        )
-        task = next(iter(runs_module._RUN_TASKS.values()))
-        assert isinstance(task, asyncio.Task), (
-            f"_RUN_TASKS value must be an asyncio.Task, got {type(task)}"
-        )
-
-
-# ---------------------------------------------------------------------------
-# Class 4: TestRecoverLiveOrphan
+# TestRecoverLiveOrphan (WP1.8a: orphan in place, never start a task)
 # ---------------------------------------------------------------------------
 
 
 class TestRecoverLiveOrphan:
-    """Verify live-mode recovery: gate-pass creates task, gate-fail skips and marks error."""
-
     @pytest.mark.asyncio
-    async def test_live_orphan_gate_pass_recovered(self) -> None:
-        """Live orphan with enable_live_trading=True and valid keys must be recovered.
-
-        Sprint 51 C2: re-targeted to the ACTIVE ``grid_trading`` (live-eligible)
-        so the strategy-agnostic gate-pass recovery intent is preserved.
-
-        Expected outcome: return value 1, one entry in _RUN_TASKS, _run_live_engine
-        coroutine was started (not _run_paper_engine).
-        """
-        orphan = _make_orphan(run_mode="live")  # default strategy: grid_trading
+    async def test_live_running_orphan_is_transitioned_with_no_task(self) -> None:
+        orphan = _make_orphan(run_mode="live", status="running")
         select_session = _make_session_for_select([orphan])
-        write_session = _make_session_for_write(orphan)
-        factory = _build_factory(select_session, write_session, write_session)
-
-        settings = _make_settings(
-            enable_live_trading=True,
-            api_key="live_key",
-            api_secret="live_secret",
-        )
-        live_coro = AsyncMock()
-
-        with (
-            patch("api.db.session.get_session_factory", return_value=factory),
-            patch("api.config.get_settings", return_value=settings),
-            patch("api.routers.runs._get_strategy_registry", return_value={"grid_trading": MagicMock()}),
-            patch("api.routers.runs._run_paper_engine", AsyncMock()),
-            patch("api.routers.runs._run_live_engine", live_coro),
-        ):
-            result = await recover_orphaned_runs()
-
-        assert result == 1, f"Expected 1 recovered live run, got {result}"
-        assert len(runs_module._RUN_TASKS) == 1
-
-    @pytest.mark.asyncio
-    async def test_live_orphan_gate_fail_env_flag_returns_zero(self) -> None:
-        """Live orphan with enable_live_trading=False must be skipped (returns 0).
-
-        The original run must still be marked error; no new run or task is created.
-        """
-        orphan = _make_orphan(run_mode="live")
-        orphan.status = "running"
-
-        select_session = _make_session_for_select([orphan])
-        # _mark_orphan_error will use a separate session; provide one here
         write_session = _make_session_for_write(orphan)
         factory = _build_factory(select_session, write_session)
 
-        settings = _make_settings(enable_live_trading=False)
-
         with (
             patch("api.db.session.get_session_factory", return_value=factory),
-            patch("api.config.get_settings", return_value=settings),
-            patch("api.routers.runs._get_strategy_registry", return_value={"grid_trading": MagicMock()}),
-            patch("api.routers.runs._run_paper_engine", AsyncMock()),
+            patch("api.services.audit_log.record_audit_event", AsyncMock()) as audit,
             patch("api.routers.runs._run_live_engine", AsyncMock()),
         ):
             result = await recover_orphaned_runs()
 
-        assert result == 0, f"Expected 0 when live gate fails, got {result}"
-        assert runs_module._RUN_TASKS == {}, "_RUN_TASKS must remain empty"
-        assert orphan.status == "error", (
-            "Original live orphan must be marked error when gate fails"
-        )
+        # Live orphaning does not count toward the (paper-only) return value.
+        assert result == 0
+        assert orphan.status == "orphaned"
+        assert runs_module._RUN_TASKS == {}, "O1: a live run never gets a task at boot"
+        audit.assert_awaited_once()
+        assert audit.call_args.kwargs["event_type"] == "run_orphaned"
 
     @pytest.mark.asyncio
-    async def test_live_orphan_gate_fail_empty_keys_returns_zero(self) -> None:
-        """Live orphan with empty API keys must be skipped even if env flag is True."""
-        orphan = _make_orphan(run_mode="live")
-        orphan.status = "running"
-
-        select_session = _make_session_for_select([orphan])
-        write_session = _make_session_for_write(orphan)
-        factory = _build_factory(select_session, write_session)
-
-        # enable_live_trading=True but keys are empty strings
-        settings = _make_settings(
-            enable_live_trading=True,
-            api_key="",
-            api_secret="",
-        )
-
-        with (
-            patch("api.db.session.get_session_factory", return_value=factory),
-            patch("api.config.get_settings", return_value=settings),
-            patch("api.routers.runs._get_strategy_registry", return_value={"grid_trading": MagicMock()}),
-            patch("api.routers.runs._run_paper_engine", AsyncMock()),
-            patch("api.routers.runs._run_live_engine", AsyncMock()),
-        ):
-            result = await recover_orphaned_runs()
-
-        assert result == 0, f"Expected 0 when API keys are empty, got {result}"
-        assert runs_module._RUN_TASKS == {}
-        assert orphan.status == "error"
-
-
-# ---------------------------------------------------------------------------
-# Class 5: TestRecoverValidationSkips
-# ---------------------------------------------------------------------------
-
-
-class TestRecoverValidationSkips:
-    """Verify each config-validation guard marks the orphan error and continues.
-
-    Note: these guards (missing_strategy_name / unknown_strategy / empty_symbols /
-    invalid_timeframe) fire BEFORE the Sprint 51 C2 availability lockdown, so the
-    legacy ``ma_crossover`` references here remain valid — the orphan never
-    reaches the availability check.
-    """
-
-    @pytest.mark.asyncio
-    async def test_missing_strategy_name_marks_error_and_skips(self) -> None:
-        """An orphan whose config has no 'strategy_name' key must be skipped.
-
-        The original must be marked error, no new task must be started.
-        """
-        orphan = _make_orphan(
-            config={
-                "symbols": ["BTC/USD"],
-                "timeframe": "1h",
-                "initial_capital": "10000",
-                "strategy_params": {},
-                "mode": "paper",
-                # 'strategy_name' deliberately absent
-            }
-        )
-        orphan.status = "running"
-
+    async def test_live_already_orphaned_is_left_alone_no_duplicate_audit(self) -> None:
+        orphan = _make_orphan(run_mode="live", status="orphaned")
         select_session = _make_session_for_select([orphan])
         write_session = _make_session_for_write(orphan)
         factory = _build_factory(select_session, write_session)
 
         with (
             patch("api.db.session.get_session_factory", return_value=factory),
-            patch("api.config.get_settings", return_value=_make_settings()),
-            patch("api.routers.runs._get_strategy_registry", return_value={"grid_trading": MagicMock()}),
+            patch("api.services.audit_log.record_audit_event", AsyncMock()) as audit,
         ):
             result = await recover_orphaned_runs()
 
         assert result == 0
+        assert orphan.status == "orphaned"
         assert runs_module._RUN_TASKS == {}
+        audit.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_live_resuming_orphan_is_transitioned(self) -> None:
+        """WP1.8a-round2 (S-04/C-06): boot's candidate query must include
+        'resuming' (not just 'running'/'orphaned') so a hard kill mid-resume
+        is picked back up, not left invisibly stuck forever."""
+        orphan = _make_orphan(run_mode="live", status="resuming")
+        select_session = _make_session_for_select([orphan])
+        write_session = _make_session_for_write(orphan)
+        factory = _build_factory(select_session, write_session)
+
+        with (
+            patch("api.db.session.get_session_factory", return_value=factory),
+            patch("api.services.audit_log.record_audit_event", AsyncMock()) as audit,
+        ):
+            result = await recover_orphaned_runs()
+
+        assert result == 0
+        assert orphan.status == "orphaned"
+        assert runs_module._RUN_TASKS == {}
+        audit.assert_awaited_once()
+        assert audit.call_args.kwargs["payload"]["previous_status"] == "resuming"
+
+    @pytest.mark.asyncio
+    async def test_live_orphan_never_gate_checked_or_strategy_validated(self) -> None:
+        """Boot never starts a live task, so it never needs the safety gate or
+        strategy-availability lockdown any more -- ANY live candidate, even one
+        with an unregistered/demoted strategy, is simply orphaned."""
+        orphan = _make_orphan(
+            run_mode="live",
+            status="running",
+            config={
+                "strategy_name": "totally_unregistered_strategy",
+                "symbols": [],
+                "timeframe": "not-a-timeframe",
+            },
+        )
+        select_session = _make_session_for_select([orphan])
+        write_session = _make_session_for_write(orphan)
+        factory = _build_factory(select_session, write_session)
+
+        with (
+            patch("api.db.session.get_session_factory", return_value=factory),
+            patch("api.services.audit_log.record_audit_event", AsyncMock()),
+        ):
+            result = await recover_orphaned_runs()
+
+        assert result == 0
+        assert orphan.status == "orphaned"
+        assert runs_module._RUN_TASKS == {}
+
+
+# ---------------------------------------------------------------------------
+# TestRecoverPaperOrphan (WP1.8a: rebuild in place, same run_id)
+# ---------------------------------------------------------------------------
+
+
+class TestRecoverPaperOrphan:
+    @pytest.mark.asyncio
+    async def test_paper_orphan_resumes_under_the_same_run_id(self) -> None:
+        orphan = _make_orphan(run_mode="paper", status="running")
+        select_session = _make_session_for_select([orphan])
+        write_session = _make_session_for_write(orphan)
+        factory = _build_factory(select_session, write_session, write_session)
+
+        with (
+            patch("api.db.session.get_session_factory", return_value=factory),
+            _patched_registry("grid_trading"),
+            patch(
+                "api.routers.runs._load_resume_snapshot",
+                AsyncMock(return_value=_EMPTY_SNAPSHOT),
+            ),
+            patch("api.routers.runs._run_paper_engine", AsyncMock()) as run_paper,
+        ):
+            result = await recover_orphaned_runs()
+
+        assert result == 1
+        assert orphan.status == "running", "the SAME row resumes -- no new run is created"
+        assert str(orphan.id) in runs_module._RUN_TASKS
+        assert run_paper.call_args.kwargs["run_id_str"] == str(orphan.id)
+        assert run_paper.call_args.kwargs["resume"] is _EMPTY_SNAPSHOT
+
+    @pytest.mark.asyncio
+    async def test_paper_orphan_config_resume_count_increments(self) -> None:
+        orphan = _make_orphan(
+            run_mode="paper",
+            status="orphaned",
+            config={
+                "strategy_name": "grid_trading",
+                "symbols": ["BTC/USD"],
+                "timeframe": "1h",
+                "initial_capital": "10000",
+                "strategy_params": {},
+                "resume_count": 1,
+            },
+        )
+        select_session = _make_session_for_select([orphan])
+        write_session = _make_session_for_write(orphan)
+        factory = _build_factory(select_session, write_session, write_session)
+
+        with (
+            patch("api.db.session.get_session_factory", return_value=factory),
+            _patched_registry("grid_trading"),
+            patch(
+                "api.routers.runs._load_resume_snapshot",
+                AsyncMock(return_value=_EMPTY_SNAPSHOT),
+            ),
+            patch("api.routers.runs._run_paper_engine", AsyncMock()),
+        ):
+            result = await recover_orphaned_runs()
+
+        assert result == 1
+        assert orphan.config["resume_count"] == 2
+
+    @pytest.mark.asyncio
+    async def test_paper_orphan_resume_count_exceeded_marks_error(self) -> None:
+        orphan = _make_orphan(
+            run_mode="paper",
+            status="running",
+            config={
+                "strategy_name": "grid_trading",
+                "symbols": ["BTC/USD"],
+                "timeframe": "1h",
+                "initial_capital": "10000",
+                "strategy_params": {},
+                "resume_count": 3,  # next attempt is 4 -> exceeds the budget
+            },
+        )
+        select_session = _make_session_for_select([orphan])
+        write_session = _make_session_for_write(orphan)
+        factory = _build_factory(select_session, write_session)
+
+        with (
+            patch("api.db.session.get_session_factory", return_value=factory),
+            _patched_registry("grid_trading"),
+            patch("api.routers.runs._run_paper_engine", AsyncMock()),
+        ):
+            result = await recover_orphaned_runs()
+
+        assert result == 0
+        assert orphan.status == "error"
+        assert runs_module._RUN_TASKS == {}
+
+    @pytest.mark.asyncio
+    async def test_paper_fill_mismatch_marks_error(self) -> None:
+        orphan = _make_orphan(run_mode="paper", status="running")
+        select_session = _make_session_for_select([orphan])
+        write_session = _make_session_for_write(orphan)
+        factory = _build_factory(select_session, write_session)
+
+        with (
+            patch("api.db.session.get_session_factory", return_value=factory),
+            _patched_registry("grid_trading"),
+            patch(
+                "api.routers.runs._load_resume_snapshot",
+                AsyncMock(return_value=_mismatched_snapshot()),
+            ),
+            patch("api.routers.runs._run_paper_engine", AsyncMock()),
+        ):
+            result = await recover_orphaned_runs()
+
+        assert result == 0
+        assert orphan.status == "error"
+        assert runs_module._RUN_TASKS == {}
+
+    @pytest.mark.asyncio
+    async def test_paper_snapshot_load_exception_marks_error(self) -> None:
+        """WP1.8a-round2 (S-06/C-04): a snapshot-load failure (e.g. a
+        persisted row that fails to round-trip back through the pure
+        Order/Fill Pydantic models) must fail this candidate closed with
+        reason='snapshot_load_failed', not propagate up into the outer
+        per-candidate except-Exception (which would only log it and leave
+        the row stuck)."""
+        orphan = _make_orphan(run_mode="paper", status="running")
+        select_session = _make_session_for_select([orphan])
+        write_session = _make_session_for_write(orphan)
+        factory = _build_factory(select_session, write_session)
+
+        with (
+            patch("api.db.session.get_session_factory", return_value=factory),
+            _patched_registry("grid_trading"),
+            patch(
+                "api.routers.runs._load_resume_snapshot",
+                AsyncMock(side_effect=ValueError("corrupt row")),
+            ),
+            patch("api.routers.runs._run_paper_engine", AsyncMock()),
+        ):
+            result = await recover_orphaned_runs()
+
+        assert result == 0
+        assert orphan.status == "error"
+        assert runs_module._RUN_TASKS == {}
+
+    @pytest.mark.asyncio
+    async def test_paper_orphan_task_registered_in_run_tasks(self) -> None:
+        orphan = _make_orphan(run_mode="paper", status="running")
+        select_session = _make_session_for_select([orphan])
+        write_session = _make_session_for_write(orphan)
+        factory = _build_factory(select_session, write_session, write_session)
+
+        with (
+            patch("api.db.session.get_session_factory", return_value=factory),
+            _patched_registry("grid_trading"),
+            patch(
+                "api.routers.runs._load_resume_snapshot",
+                AsyncMock(return_value=_EMPTY_SNAPSHOT),
+            ),
+            patch("api.routers.runs._run_paper_engine", AsyncMock()),
+        ):
+            await recover_orphaned_runs()
+
+        assert len(runs_module._RUN_TASKS) == 1
+        task = next(iter(runs_module._RUN_TASKS.values()))
+        assert isinstance(task, asyncio.Task)
+
+
+# ---------------------------------------------------------------------------
+# TestRecoverValidationSkips
+# ---------------------------------------------------------------------------
+
+
+class TestRecoverValidationSkips:
+    @pytest.mark.asyncio
+    async def test_missing_strategy_name_marks_error_and_skips(self) -> None:
+        orphan = _make_orphan(
+            run_mode="paper",
+            status="running",
+            config={"symbols": ["BTC/USD"], "timeframe": "1h", "initial_capital": "10000"},
+        )
+        select_session = _make_session_for_select([orphan])
+        write_session = _make_session_for_write(orphan)
+        factory = _build_factory(select_session, write_session)
+
+        with (
+            patch("api.db.session.get_session_factory", return_value=factory),
+            _patched_registry("grid_trading"),
+        ):
+            result = await recover_orphaned_runs()
+
+        assert result == 0
         assert orphan.status == "error"
 
     @pytest.mark.asyncio
     async def test_unknown_strategy_marks_error_and_skips(self) -> None:
-        """An orphan referencing a strategy not in the registry must be skipped."""
         orphan = _make_orphan(
+            run_mode="paper",
+            status="running",
             config={
                 "strategy_name": "nonexistent_strategy",
                 "symbols": ["BTC/USD"],
                 "timeframe": "1h",
                 "initial_capital": "10000",
-                "strategy_params": {},
-                "mode": "paper",
-            }
+            },
         )
-        orphan.status = "running"
-
         select_session = _make_session_for_select([orphan])
         write_session = _make_session_for_write(orphan)
         factory = _build_factory(select_session, write_session)
 
         with (
             patch("api.db.session.get_session_factory", return_value=factory),
-            patch("api.config.get_settings", return_value=_make_settings()),
-            patch("api.routers.runs._get_strategy_registry", return_value={"grid_trading": MagicMock()}),
+            _patched_registry("grid_trading"),
         ):
             result = await recover_orphaned_runs()
 
         assert result == 0
-        assert runs_module._RUN_TASKS == {}
         assert orphan.status == "error"
 
     @pytest.mark.asyncio
     async def test_empty_symbols_marks_error_and_skips(self) -> None:
-        """An orphan with an empty 'symbols' list must be skipped."""
         orphan = _make_orphan(
+            run_mode="paper",
+            status="running",
             config={
                 "strategy_name": "grid_trading",
                 "symbols": [],
                 "timeframe": "1h",
                 "initial_capital": "10000",
-                "strategy_params": {},
-                "mode": "paper",
-            }
+            },
         )
-        orphan.status = "running"
-
         select_session = _make_session_for_select([orphan])
         write_session = _make_session_for_write(orphan)
         factory = _build_factory(select_session, write_session)
 
         with (
             patch("api.db.session.get_session_factory", return_value=factory),
-            patch("api.config.get_settings", return_value=_make_settings()),
-            patch("api.routers.runs._get_strategy_registry", return_value={"grid_trading": MagicMock()}),
+            _patched_registry("grid_trading"),
         ):
             result = await recover_orphaned_runs()
 
         assert result == 0
-        assert runs_module._RUN_TASKS == {}
         assert orphan.status == "error"
 
     @pytest.mark.asyncio
     async def test_invalid_timeframe_marks_error_and_skips(self) -> None:
-        """An orphan with an unrecognised timeframe string must be skipped.
-
-        TimeFrame("3h") raises ValueError; the guard must catch it and mark
-        the orphan as error before continuing to the next orphan.
-        """
         orphan = _make_orphan(
+            run_mode="paper",
+            status="running",
             config={
                 "strategy_name": "grid_trading",
                 "symbols": ["BTC/USD"],
-                "timeframe": "3h",  # not a valid TimeFrame value
+                "timeframe": "3h",
                 "initial_capital": "10000",
-                "strategy_params": {},
-                "mode": "paper",
-            }
+            },
         )
-        orphan.status = "running"
-
         select_session = _make_session_for_select([orphan])
         write_session = _make_session_for_write(orphan)
         factory = _build_factory(select_session, write_session)
 
         with (
             patch("api.db.session.get_session_factory", return_value=factory),
-            patch("api.config.get_settings", return_value=_make_settings()),
-            patch("api.routers.runs._get_strategy_registry", return_value={"grid_trading": MagicMock()}),
+            _patched_registry("grid_trading"),
         ):
             result = await recover_orphaned_runs()
 
         assert result == 0
-        assert runs_module._RUN_TASKS == {}
         assert orphan.status == "error"
-
-    @pytest.mark.asyncio
-    async def test_recovery_chain_orphan_excluded_by_query(self) -> None:
-        """An orphan that already has recovered_from_run_id set must NOT appear in query results.
-
-        The SELECT WHERE clause filters recovered_from_run_id IS NULL so a previously
-        recovered run never re-enters the recovery loop.  We model this by returning
-        an empty list from the SELECT (simulating the DB already excluding it).
-        The function must return 0 and start no tasks.
-        """
-        # This orphan was itself created by a previous recovery pass
-        _chain_orphan = _make_orphan(recovered_from_run_id=uuid.uuid4())
-
-        # The SELECT mock returns NO results (the DB WHERE clause excludes chain orphans)
-        select_session = _make_session_for_select([])
-        factory = _build_factory(select_session)
-
-        with (
-            patch("api.db.session.get_session_factory", return_value=factory),
-            patch("api.config.get_settings", return_value=_make_settings()),
-        ):
-            result = await recover_orphaned_runs()
-
-        assert result == 0, "Chain orphan must be excluded by the query, not recovered again"
-        assert runs_module._RUN_TASKS == {}
 
 
 # ---------------------------------------------------------------------------
-# Class 6: TestRecoverPerOrphanIsolation
+# TestRecoverPerOrphanIsolation
 # ---------------------------------------------------------------------------
 
 
 class TestRecoverPerOrphanIsolation:
-    """Verify that per-orphan exception isolation works correctly.
-
-    One bad orphan in a batch must not prevent the valid one from recovering.
-
-    Sprint 51 C2: the valid neighbour uses the ACTIVE ``grid_trading`` (was the
-    now-demoted ``ma_crossover``) so the strategy-agnostic isolation intent is
-    preserved.
-    """
-
     @pytest.mark.asyncio
-    async def test_valid_orphan_recovers_even_when_neighbour_fails(self) -> None:
-        """When one orphan has an invalid config and another is valid, count == 1.
-
-        The invalid orphan is the first one returned by the SELECT so it exercises
-        the guard-clause path.  The valid orphan is the second.  The final return
-        value must be 1 (only the valid one counted).
-        """
+    async def test_valid_paper_orphan_recovers_even_when_neighbour_fails(self) -> None:
         bad_orphan = _make_orphan(
-            config={
-                "strategy_name": "does_not_exist",
-                "symbols": ["BTC/USD"],
-                "timeframe": "1h",
-                "initial_capital": "10000",
-                "strategy_params": {},
-                "mode": "paper",
-            }
+            run_mode="paper",
+            status="running",
+            config={"strategy_name": "does_not_exist", "symbols": ["BTC/USD"], "timeframe": "1h"},
         )
-        good_orphan = _make_orphan(run_mode="paper")  # default strategy: grid_trading
+        good_orphan = _make_orphan(run_mode="paper", status="running")
 
-        # SELECT returns both orphans
         select_session = _make_session_for_select([bad_orphan, good_orphan])
-        # Two write sessions: one for bad_orphan's _mark_orphan_error,
-        # then one for good_orphan's atomic UPDATE+INSERT
         bad_write = _make_session_for_write(bad_orphan)
         good_write = _make_session_for_write(good_orphan)
-        factory = _build_factory(select_session, bad_write, good_write)
+        factory = _build_factory(select_session, bad_write, good_write, good_write)
 
         with (
             patch("api.db.session.get_session_factory", return_value=factory),
-            patch("api.config.get_settings", return_value=_make_settings()),
-            patch("api.routers.runs._get_strategy_registry", return_value={"grid_trading": MagicMock()}),
+            _patched_registry("grid_trading"),
+            patch(
+                "api.routers.runs._load_resume_snapshot",
+                AsyncMock(return_value=_EMPTY_SNAPSHOT),
+            ),
             patch("api.routers.runs._run_paper_engine", AsyncMock()),
-            patch("api.routers.runs._run_live_engine", AsyncMock()),
         ):
             result = await recover_orphaned_runs()
 
-        assert result == 1, (
-            f"Only the valid orphan must be counted, got {result}"
-        )
+        assert result == 1
+        assert bad_orphan.status == "error"
+        assert good_orphan.status == "running"
         assert len(runs_module._RUN_TASKS) == 1
 
     @pytest.mark.asyncio
-    async def test_exception_in_one_orphan_does_not_crash_loop(self) -> None:
-        """An unexpected exception while processing orphan N must not stop orphan N+1.
+    async def test_live_and_paper_candidates_both_processed_independently(self) -> None:
+        live_orphan = _make_orphan(run_mode="live", status="running")
+        paper_orphan = _make_orphan(run_mode="paper", status="running")
 
-        We force a session.commit() to raise RuntimeError for the first orphan's
-        write session to simulate an unexpected DB error mid-recovery.  The second
-        valid orphan must still be recovered.
-        """
-        orphan_fail = _make_orphan(run_mode="paper")  # default strategy: grid_trading
-        orphan_ok = _make_orphan(run_mode="paper")
-
-        select_session = _make_session_for_select([orphan_fail, orphan_ok])
-
-        # First write session raises on commit so the inner try/except fires
-        fail_write = _make_session_for_write(orphan_fail)
-        fail_write.commit = AsyncMock(side_effect=RuntimeError("simulated DB error"))
-
-        ok_write = _make_session_for_write(orphan_ok)
-        factory = _build_factory(select_session, fail_write, ok_write)
+        select_session = _make_session_for_select([live_orphan, paper_orphan])
+        live_write = _make_session_for_write(live_orphan)
+        paper_write = _make_session_for_write(paper_orphan)
+        factory = _build_factory(select_session, live_write, paper_write, paper_write)
 
         with (
             patch("api.db.session.get_session_factory", return_value=factory),
-            patch("api.config.get_settings", return_value=_make_settings()),
-            patch("api.routers.runs._get_strategy_registry", return_value={"grid_trading": MagicMock()}),
+            patch("api.services.audit_log.record_audit_event", AsyncMock()),
+            _patched_registry("grid_trading"),
+            patch(
+                "api.routers.runs._load_resume_snapshot",
+                AsyncMock(return_value=_EMPTY_SNAPSHOT),
+            ),
             patch("api.routers.runs._run_paper_engine", AsyncMock()),
-            patch("api.routers.runs._run_live_engine", AsyncMock()),
         ):
             result = await recover_orphaned_runs()
 
-        # The second orphan must have been recovered despite the first failing
-        assert result == 1, (
-            f"Valid second orphan must still be recovered despite first error, got {result}"
-        )
+        assert result == 1  # only the paper resume counts
+        assert live_orphan.status == "orphaned"
+        assert paper_orphan.status == "running"
+        assert len(runs_module._RUN_TASKS) == 1
+        assert str(paper_orphan.id) in runs_module._RUN_TASKS
 
 
 # ---------------------------------------------------------------------------
-# Class 7: TestRecoverStrategyAvailabilityLockdown (Sprint 51 Cycle 2)
+# TestRecoverStrategyAvailabilityLockdown (paper-only at boot -- live never
+# reaches this check any more, see TestRecoverLiveOrphan above)
 # ---------------------------------------------------------------------------
 
 
 class TestRecoverStrategyAvailabilityLockdown:
-    """Verify the strategy-availability lockdown on the orphan-recovery path.
-
-    A DEMOTED strategy's paper/live orphan must be marked error and NOT
-    auto-restarted (no task registered).  An ACTIVE strategy's orphan still
-    recovers normally.  The demoted orphan must be REGISTERED in the strategy
-    registry (so this is NOT the unknown_strategy guard) — the lockdown is the
-    reason it is skipped.
-    """
-
     @pytest.mark.asyncio
     @pytest.mark.parametrize("strategy", ["ma_crossover", "breakout", "model_strategy"])
-    @pytest.mark.parametrize("mode", ["paper", "live"])
-    async def test_demoted_orphan_marked_error_and_not_restarted(
-        self, strategy: str, mode: str
-    ) -> None:
-        """TEST-S51C2-200: a demoted paper/live orphan is marked error, no task started."""
-        orphan = _make_orphan(run_mode=mode, strategy_name=strategy)
-        orphan.status = "running"
-
+    async def test_demoted_paper_orphan_marked_error_and_not_restarted(self, strategy: str) -> None:
+        orphan = _make_orphan(run_mode="paper", status="running", strategy_name=strategy)
         select_session = _make_session_for_select([orphan])
         write_session = _make_session_for_write(orphan)
-        # Only a SELECT + one _mark_orphan_error write are expected (no INSERT).
         factory = _build_factory(select_session, write_session)
-
-        # The demoted strategy IS registered, so the unknown_strategy guard does
-        # NOT fire — the availability lockdown is the reason it is skipped.
-        # Live gate is configured to PASS so we prove the lockdown (not the
-        # gate) is what blocks the restart.
-        settings = _make_settings(
-            enable_live_trading=True,
-            api_key="live_key",
-            api_secret="live_secret",
-        )
 
         with (
             patch("api.db.session.get_session_factory", return_value=factory),
-            patch("api.config.get_settings", return_value=settings),
             patch(
                 "api.routers.runs._get_strategy_registry",
                 return_value={strategy: MagicMock()},
             ),
             patch("api.routers.runs._run_paper_engine", AsyncMock()),
-            patch("api.routers.runs._run_live_engine", AsyncMock()),
         ):
             result = await recover_orphaned_runs()
 
-        assert result == 0, (
-            f"Demoted {strategy} {mode} orphan must NOT be recovered, got {result}"
-        )
-        assert runs_module._RUN_TASKS == {}, (
-            "No task may be registered for a demoted-strategy orphan"
-        )
-        assert orphan.status == "error", (
-            f"Demoted {strategy} {mode} orphan must be marked error, "
-            f"got {orphan.status!r}"
-        )
+        assert result == 0
+        assert runs_module._RUN_TASKS == {}
+        assert orphan.status == "error"
 
     @pytest.mark.asyncio
-    async def test_active_orphan_still_recovers_under_lockdown(self) -> None:
-        """TEST-S51C2-201: an ACTIVE strategy orphan still recovers (control case)."""
-        orphan = _make_orphan(run_mode="paper", strategy_name="grid_trading")
+    async def test_active_paper_orphan_still_recovers_under_lockdown(self) -> None:
+        orphan = _make_orphan(run_mode="paper", status="running", strategy_name="grid_trading")
         select_session = _make_session_for_select([orphan])
         write_session = _make_session_for_write(orphan)
         factory = _build_factory(select_session, write_session, write_session)
 
         with (
             patch("api.db.session.get_session_factory", return_value=factory),
-            patch("api.config.get_settings", return_value=_make_settings()),
+            _patched_registry("grid_trading"),
             patch(
-                "api.routers.runs._get_strategy_registry",
-                return_value={"grid_trading": MagicMock()},
+                "api.routers.runs._load_resume_snapshot",
+                AsyncMock(return_value=_EMPTY_SNAPSHOT),
             ),
             patch("api.routers.runs._run_paper_engine", AsyncMock()),
-            patch("api.routers.runs._run_live_engine", AsyncMock()),
         ):
             result = await recover_orphaned_runs()
 
-        assert result == 1, f"Active grid_trading orphan must recover, got {result}"
+        assert result == 1
         assert len(runs_module._RUN_TASKS) == 1
-
-    @pytest.mark.asyncio
-    async def test_demoted_orphan_among_active_neighbour_isolation(self) -> None:
-        """TEST-S51C2-202: a demoted orphan is skipped but an active neighbour recovers."""
-        demoted = _make_orphan(run_mode="paper", strategy_name="ma_crossover")
-        demoted.status = "running"
-        active = _make_orphan(run_mode="paper", strategy_name="grid_trading")
-
-        select_session = _make_session_for_select([demoted, active])
-        demoted_write = _make_session_for_write(demoted)
-        active_write = _make_session_for_write(active)
-        factory = _build_factory(
-            select_session, demoted_write, active_write, active_write
-        )
-
-        with (
-            patch("api.db.session.get_session_factory", return_value=factory),
-            patch("api.config.get_settings", return_value=_make_settings()),
-            patch(
-                "api.routers.runs._get_strategy_registry",
-                return_value={
-                    "ma_crossover": MagicMock(),
-                    "grid_trading": MagicMock(),
-                },
-            ),
-            patch("api.routers.runs._run_paper_engine", AsyncMock()),
-            patch("api.routers.runs._run_live_engine", AsyncMock()),
-        ):
-            result = await recover_orphaned_runs()
-
-        assert result == 1, (
-            f"Only the active neighbour must be recovered, got {result}"
-        )
-        assert len(runs_module._RUN_TASKS) == 1
-        assert demoted.status == "error", "Demoted orphan must be marked error"

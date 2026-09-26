@@ -33,27 +33,30 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 import structlog
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
-from sqlalchemy import String, cast, delete, func, select
+from sqlalchemy import String, cast, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import noload
 
-from api.db.models import EquitySnapshotORM, FillORM, OrderORM, PositionSnapshotORM, RunORM, SkippedTradeORM, TradeORM
+from api.db.models import (
+    AuditEventORM,
+    EquitySnapshotORM,
+    OrderORM,
+    RunORM,
+    TradeORM,
+)
 from api.db.session import get_db
+from api.deps import require_admin
 from api.schemas import (
-    BacktestMetricsResponse,
     ErrorResponse,
-    PaginationParams,
     RunCreateRequest,
     RunDetailResponse,
     RunListResponse,
-    RunResponse,
 )
 from api.services.run_orchestrator import (
     _IncrementalFlushState,
@@ -69,13 +72,14 @@ from api.services.run_orchestrator import (
     run_paper_engine as _run_paper_engine,
 )
 from api.services.run_persistence import (
-    build_backtest_metrics as _build_backtest_metrics,
+    load_resume_snapshot as _load_resume_snapshot,
     persist_backtest_results as _persist_backtest_results,
     persist_paper_results as _persist_paper_results,
     run_orm_to_detail_response as _run_orm_to_detail_response,
     run_orm_to_response as _run_orm_to_response,
 )
-from common.types import RunMode, TimeFrame
+from common.types import OrderSide, RunMode, TimeFrame
+from trading.recovery import ResumeRejected, check_fill_integrity
 from trading.strategy_availability import get_availability, is_mode_allowed
 
 __all__ = ["router", "recover_orphaned_runs"]
@@ -823,7 +827,9 @@ async def create_run(
 # ---------------------------------------------------------------------------
 
 _VALID_MODES: frozenset[str] = frozenset({"backtest", "paper", "live"})
-_VALID_STATUSES: frozenset[str] = frozenset({"running", "stopped", "error", "archived"})
+_VALID_STATUSES: frozenset[str] = frozenset(
+    {"running", "stopped", "error", "archived", "orphaned", "resuming"}
+)
 
 # M5 (Sprint 49): allowed sort column names for GET /api/v1/runs.
 # Only top-level RunORM columns are permitted — JSONB-resident fields (psr,
@@ -1187,7 +1193,10 @@ async def stop_run(
     log = logger.bind(endpoint="stop_run", run_id=str(run_id))
     log.info("runs.stop_requested")
 
-    stmt = select(RunORM).where(RunORM.id == run_id)
+    # WP1.8a-round2 (C-01/S-01 item 4): lock the row before the status guard
+    # so a concurrent resume's uncommitted orphaned->resuming->running
+    # transition is waited on (not silently missed) rather than racing us.
+    stmt = select(RunORM).where(RunORM.id == run_id).with_for_update()
     result = await db.execute(stmt)
     run = result.scalar_one_or_none()
 
@@ -1198,15 +1207,21 @@ async def stop_run(
             detail=f"Run {run_id} not found",
         )
 
-    if run.status != "running":
+    # WP1.8a: an orphaned run has no background task (O1) but is still a
+    # live, unresolved run the operator must be able to close out without
+    # first resuming it.
+    if run.status not in ("running", "orphaned"):
         log.warning("runs.not_stoppable", current_status=run.status)
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=(
                 f"Cannot stop run {run_id}: "
-                f"current status is '{run.status}'. Only 'running' runs can be stopped."
+                f"current status is '{run.status}'. Only 'running' or "
+                f"'orphaned' runs can be stopped."
             ),
         )
+
+    was_orphaned = run.status == "orphaned"
 
     now = datetime.now(tz=UTC)
     run.status = "stopped"
@@ -1215,7 +1230,24 @@ async def stop_run(
 
     await db.flush()
 
-    # Cancel the background task if one exists for this run
+    # WP1.8a-round2 (S-08): stopping an orphaned run may be closing out an
+    # unprotected position (S8) -- make that loud and durable, not a
+    # silent, unaudited transition like a normal stop.
+    if was_orphaned:
+        log.critical("runs.orphan_stopped", run_id=str(run_id), run_mode=run.run_mode)
+        from api.services.audit_log import record_audit_event
+
+        await record_audit_event(
+            db,
+            event_type="emergency_stop",
+            resource_type="run",
+            resource_id=str(run_id),
+            request=None,
+            payload={"run_mode": run.run_mode, "trigger": "stop_run_orphaned"},
+        )
+
+    # Cancel the background task if one exists for this run (an orphaned
+    # run has none -- O1 -- so this is a no-op in that case).
     task = _RUN_TASKS.pop(str(run_id), None)
     _RUN_ENGINES.pop(str(run_id), None)
     if task is not None and not task.done():
@@ -1270,7 +1302,9 @@ async def emergency_stop_run(
     log = logger.bind(endpoint="emergency_stop_run", run_id=str(run_id))
     log.warning("runs.emergency_stop_requested", reason=reason)
 
-    stmt = select(RunORM).where(RunORM.id == run_id)
+    # WP1.8a-round2 (C-01/S-01 item 4): lock the row before the status guard
+    # so a concurrent resume's uncommitted transition is waited on.
+    stmt = select(RunORM).where(RunORM.id == run_id).with_for_update()
     result = await db.execute(stmt)
     run = result.scalar_one_or_none()
 
@@ -1280,12 +1314,14 @@ async def emergency_stop_run(
             detail=f"Run {run_id} not found",
         )
 
-    if run.status != "running":
+    # WP1.8a-round2 (S-08): an orphaned run may still hold an unprotected
+    # position -- emergency-stop must be able to close it out, not 409.
+    if run.status not in ("running", "orphaned"):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=(
                 f"Cannot emergency-stop run {run_id}: status is '{run.status}'. "
-                f"Only 'running' runs can be emergency-stopped."
+                f"Only 'running' or 'orphaned' runs can be emergency-stopped."
             ),
         )
 
@@ -1388,13 +1424,17 @@ async def archive_run(
             detail=f"Run {run_id} not found",
         )
 
-    if run.status == "running":
-        log.warning("runs.archive_blocked_running", current_status=run.status)
+    # WP1.8a-round2 (C-05/S-02): the new 'orphaned'/'resuming' statuses must
+    # be guarded too -- an orphaned live run can still hold an unprotected
+    # position (S8); archiving it would silently remove it from the S8
+    # repeater, boot recovery, and the resume endpoint with zero audit trail.
+    if run.status not in ("stopped", "error"):
+        log.warning("runs.archive_blocked_not_terminal", current_status=run.status)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=(
-                f"Cannot archive run {run_id}: run is currently active. "
-                "Stop it first, then archive."
+                f"Cannot archive run {run_id}: status is '{run.status}'. "
+                "Only 'stopped' or 'error' runs can be archived."
             ),
         )
 
@@ -1716,6 +1756,420 @@ async def promote_to_live(
 
 
 # ---------------------------------------------------------------------------
+# POST /api/v1/runs/{run_id}/resume
+# WP1.8a (Verbeterplan v2 synthesis spec §5) -- resume an orphaned live run.
+# ---------------------------------------------------------------------------
+
+
+async def _kill_switch_triggered_after(db: AsyncSession, run: RunORM) -> bool:
+    """True if a global kill-switch audit row postdates ``run.started_at`` (S4).
+
+    Only the aggregate ``kill_switch`` event counts -- a per-run
+    ``emergency_stop`` is an operator closing this one run out, not the
+    global "something is on fire" signal S4 gates a normal resume on.
+    """
+    result = await db.execute(
+        select(func.count())
+        .select_from(AuditEventORM)
+        .where(
+            AuditEventORM.event_type == "kill_switch",
+            AuditEventORM.timestamp > run.started_at,
+        )
+    )
+    return (result.scalar() or 0) > 0
+
+
+@router.post(
+    "/{run_id}/resume",
+    status_code=status.HTTP_200_OK,
+    response_model=RunDetailResponse,
+    responses={
+        401: {"description": "Missing or invalid X-Admin-Key"},
+        403: {"description": "X-Admin-Key rejected, or live trading gate check failed"},
+        404: {"description": "Run not found"},
+        409: {"description": "Run is not orphaned, or the resume was rejected"},
+        422: {"description": "Strategy/config invalid, or invalid mode"},
+    },
+    summary="Resume an orphaned live run",
+    description=(
+        "Resumes an 'orphaned' live run under its EXISTING run_id (WP1.8a). "
+        "Live-only -- paper runs resume automatically at boot and never reach "
+        "this endpoint. Requires X-Admin-Key (WP1.8a-round2 S-07 -- same "
+        "mechanism as /emergency/kill-switch) IN ADDITION TO the full 3-layer "
+        "live-trading safety gate (env flag + API keys + X-Live-Confirm-Token "
+        "header), even for mode=protective (U2: protective is token-gated and "
+        "always manual). The compare-and-set orphaned->resuming transition "
+        "ensures exactly one of two concurrent resume requests succeeds. In "
+        "WP1.8a the exchange scan is a fail-closed stub -- every production "
+        "resume returns 409 'exchange_scan_not_implemented' until WP1.8b "
+        "lands (strictly safer than HEAD's silent auto-restart-with-empty-"
+        "portfolio)."
+    ),
+    dependencies=[Depends(require_admin)],
+)
+async def resume_run(
+    run_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    request: Request,
+    mode: Annotated[Literal["normal", "protective"], Query()] = "normal",
+    x_live_confirm_token: Annotated[str | None, Header()] = None,
+) -> RunDetailResponse:
+    """Resume an orphaned live run in place (WP1.8a, reworked WP1.8a-round2).
+
+    Order of steps: 404 -> gate layers 1-3 (403) -> resolve/validate ALL
+    config (strategy/symbols/timeframe/params/trailing/bracket/capital,
+    422 on any failure -- C-03/S-03, moved before the CAS so a config
+    problem never leaves a run stuck 'resuming') -> concurrency cap (503)
+    -> compare-and-set orphaned->resuming (0 rows -> 409) -> S4 kill-switch
+    check #1 -> prepare_live_resume -> S4 kill-switch check #2 (C-01 item 1,
+    closes the window while the exchange-scan/validation step was running)
+    -> audit run_resumed{...} (S-09 enriched payload) -> resuming->running
+    (also persisting protective_mode into config, S-10) -> commit -> spawn
+    the task with NO awaits between the commit and task-registration
+    (C-01 item 2).
+
+    Every exception raised between the first CAS succeeding and the final
+    commit -- other than an ``HTTPException`` this function itself raises
+    after already performing its own explicit rollback+audit -- reverts the
+    row back to 'orphaned' and writes a ``run_resume_rejected`` audit row
+    before surfacing a 500 (C-04/S-06 defense in depth: no exception on this
+    path may ever leave a run silently stuck at 'resuming').
+    """
+    from api.config import get_settings
+    from api.services.audit_log import record_audit_event
+    from api.services.run_recovery import prepare_live_resume
+    from trading.safety import LiveTradingGate
+
+    log = logger.bind(endpoint="resume_run", run_id=str(run_id), mode=mode)
+    settings = get_settings()
+
+    row = await db.execute(select(RunORM).where(RunORM.id == run_id))
+    run: RunORM | None = row.scalar_one_or_none()
+    if run is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Run {run_id} not found.",
+        )
+
+    if run.run_mode != "live":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Run {run_id} is a {run.run_mode!r} run. Resume is live-only "
+                "(S10) -- paper runs resume automatically at API boot."
+            ),
+        )
+
+    # Gate layers 1-3 (env flag + API keys + token).  U2: mode=protective is
+    # ALSO token-gated -- there is no lighter-weight path for either mode.
+    gate = LiveTradingGate()
+    gate_result = gate.check_gate(
+        settings=settings,
+        confirm_token=x_live_confirm_token or "",
+    )
+    if not gate_result.passed:
+        failed_layers = [layer.name for layer in gate_result.layers if not layer.passed]
+        log.warning("runs.resume_live_gate_failed", failures=gate_result.failures)
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(f"Live trading gate check failed. Failed layers: {', '.join(failed_layers)}."),
+        )
+
+    # -----------------------------------------------------------------
+    # WP1.8a-round2 (C-03/S-03): resolve and validate EVERY config value
+    # the spawned engine will need, BEFORE the orphaned->resuming CAS.
+    # A 422 here costs nothing -- the run stays 'orphaned', untouched.
+    # Validating any of this AFTER the CAS (as round-1 did) risks leaving
+    # a run stuck at 'resuming' forever if the spawn itself never happens.
+    # -----------------------------------------------------------------
+    orphan_config = dict(run.config or {})
+
+    strategy_name = (str(orphan_config.get("strategy_name", "")).lower().replace("-", "_"))
+    if not is_mode_allowed(strategy_name, RunMode.LIVE):
+        availability = get_availability(strategy_name)
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"Strategy {strategy_name!r} is not available for live "
+                f"trading (status={availability.status.value}) and cannot "
+                f"be resumed. {availability.demotion_reason}".strip()
+            ),
+        )
+
+    strategy_cls = _get_strategy_registry().get(strategy_name)
+    if strategy_cls is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Strategy {strategy_name!r} is no longer registered.",
+        )
+
+    symbols: list[str] = orphan_config.get("symbols") or []
+    if not symbols:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Run {run_id} has no configured symbols; cannot resume.",
+        )
+
+    try:
+        timeframe = TimeFrame(str(orphan_config.get("timeframe", "1h")))
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="invalid_timeframe",
+        ) from exc
+
+    strategy_params: dict[str, Any] = orphan_config.get("strategy_params") or {}
+    if not isinstance(strategy_params, dict):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="invalid_strategy_params",
+        )
+
+    trailing_pct: float | None = None
+    raw_tsp = strategy_params.get("trailing_stop_pct")
+    if raw_tsp is not None:
+        try:
+            trailing_pct = float(raw_tsp)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="invalid_trailing_stop_pct",
+            ) from exc
+
+    bracket_config: dict[str, object] = orphan_config.get("bracket_config") or {}
+    if not isinstance(bracket_config, dict):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="invalid_bracket_config",
+        )
+
+    initial_capital = str(orphan_config.get("initial_capital", "10000"))
+    try:
+        Decimal(initial_capital)
+    except ArithmeticError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="invalid_initial_capital",
+        ) from exc
+
+    # Concurrency cap (AR-006, same as promote_to_live).
+    active_count = sum(1 for t in _RUN_TASKS.values() if not t.done())
+    if active_count >= settings.max_concurrent_runs:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                f"Concurrent run cap reached ({active_count}/{settings.max_concurrent_runs}). "
+                "Stop an existing run before resuming."
+            ),
+        )
+
+    # Compare-and-set orphaned -> resuming.  0 rows updated means either the
+    # run was never orphaned, or a concurrent resume request already won
+    # the race -- both are a 409 (WP18-R-02).
+    now = datetime.now(tz=UTC)
+    cas_result = await db.execute(
+        update(RunORM)
+        .where(RunORM.id == run_id, RunORM.status == "orphaned")
+        .values(status="resuming", updated_at=now)
+    )
+    await db.flush()
+    if cas_result.rowcount == 0:  # type: ignore[attr-defined]
+        await db.refresh(run)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Run {run_id} is not orphaned (current status: "
+                f"{run.status!r}); it cannot be resumed."
+            ),
+        )
+    await db.refresh(run)
+
+    async def _reject(reason: str) -> None:
+        """Roll status back to orphaned and audit the rejection (S11)."""
+        await db.execute(
+            update(RunORM)
+            .where(RunORM.id == run_id, RunORM.status == "resuming")
+            .values(status="orphaned", updated_at=datetime.now(tz=UTC))
+        )
+        await record_audit_event(
+            db,
+            event_type="run_resume_rejected",
+            resource_type="run",
+            resource_id=str(run_id),
+            request=request,
+            payload={"reason": reason, "mode": mode},
+        )
+        await db.commit()
+
+    kill_switch_after_start = False
+    try:
+        # S4 check #1: normal resume is blocked by a kill-switch pressed
+        # after this run started; protective resume is explicitly exempt
+        # (U2/S4).
+        if mode == "normal" and await _kill_switch_triggered_after(db, run):
+            await _reject("kill_switch_after_start")
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="kill_switch_after_start",
+            )
+
+        try:
+            snapshot = await prepare_live_resume(db, run, None)
+        except ResumeRejected as exc:
+            await _reject(exc.reason)
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=exc.reason,
+            ) from exc
+
+        # S4 check #2 (WP1.8a-round2 C-01 item 1): prepare_live_resume can
+        # take real wall-clock time (exchange scan in 1.8b); re-check right
+        # before the final CAS so a kill-switch pressed WHILE that call was
+        # running is not missed.
+        kill_switch_after_start = await _kill_switch_triggered_after(db, run)
+        if mode == "normal" and kill_switch_after_start:
+            await _reject("kill_switch_after_start")
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="kill_switch_after_start",
+            )
+
+        # WP1.8a-round2 (S-09): enrich the audit payload with everything an
+        # operator reviewing the incident timeline would want, computed
+        # from data already in hand (no extra DB round-trip).
+        fill_count = len(snapshot.fills)
+        rebuilt_qty_by_symbol: dict[str, str] = {}
+        for fill in sorted(snapshot.fills, key=lambda f: (f.executed_at, str(f.fill_id))):
+            held = Decimal(rebuilt_qty_by_symbol.get(fill.symbol, "0"))
+            held = held + fill.quantity if fill.side == OrderSide.BUY else held - fill.quantity
+            rebuilt_qty_by_symbol[fill.symbol] = str(held)
+        elapsed_seconds = max((datetime.now(tz=UTC) - run.started_at).total_seconds(), 0.0)
+
+        await record_audit_event(
+            db,
+            event_type="run_resumed",
+            resource_type="run",
+            resource_id=str(run_id),
+            request=request,
+            payload={
+                "mode": mode,
+                "previous_status": "orphaned",
+                "kill_switch_after_start": kill_switch_after_start,
+                "fill_count": fill_count,
+                "rebuilt_qty_by_symbol": rebuilt_qty_by_symbol,
+                "peak_equity_hint": (
+                    str(snapshot.peak_equity_hint) if snapshot.peak_equity_hint is not None else None
+                ),
+                "elapsed_seconds": elapsed_seconds,
+            },
+        )
+
+        # WP1.8a-round2 (S-10): persist protective_mode onto the run's own
+        # config so it survives process restarts and is visible on GET.
+        updated_config = dict(orphan_config)
+        updated_config["protective_mode"] = mode == "protective"
+
+        final_now = datetime.now(tz=UTC)
+        final_result = await db.execute(
+            update(RunORM)
+            .where(RunORM.id == run_id, RunORM.status == "resuming")
+            .values(status="running", updated_at=final_now, config=updated_config)
+        )
+        if final_result.rowcount == 0:  # type: ignore[attr-defined]
+            # Defensive -- nothing else can touch a 'resuming' row, but never
+            # leave it stuck there if it somehow happens.
+            await _reject("resume_state_lost")
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="resume_state_lost",
+            )
+        await db.commit()
+    except HTTPException:
+        # Already handled: the branch that raised it already performed its
+        # own explicit rollback-to-orphaned + audit row above.
+        raise
+    except Exception:
+        # WP1.8a-round2 (C-04/S-06): any OTHER exception on this path (a
+        # DB error, an unexpected bug in payload construction, etc.) must
+        # never leave the row silently stuck at 'resuming' -- revert and
+        # audit here too, exactly like the explicit rejection paths above.
+        log.exception("runs.resume_unexpected_error")
+        try:
+            await _reject("resume_internal_error")
+        except Exception:
+            log.exception("runs.resume_reject_after_error_failed")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="resume_internal_error",
+        ) from None
+
+    # -----------------------------------------------------------------
+    # WP1.8a-round2 (C-01 item 2): the commit above is the single
+    # linearisation point a concurrent stop_run/emergency_stop_run/
+    # kill-switch waits on (they all take their own row lock).  Everything
+    # from here down uses ONLY values already resolved above (no
+    # ``await db.refresh(run)``) and the two statements that matter --
+    # ``asyncio.create_task`` and the ``_RUN_TASKS`` registration -- are
+    # consecutive with no ``await`` between them and the commit, so no
+    # concurrent request can observe status='running' with no task
+    # registered yet (the race round-1 shipped with).
+    # -----------------------------------------------------------------
+    run.status = "running"
+    run.updated_at = final_now
+    run.config = updated_config
+
+    try:
+        task = asyncio.create_task(
+            _run_live_engine(
+                run_id_str=str(run_id),
+                strategy_cls=strategy_cls,
+                strategy_name=strategy_name,
+                strategy_params=strategy_params,
+                symbols=symbols,
+                timeframe=timeframe,
+                initial_capital=initial_capital,
+                trailing_stop_pct=trailing_pct,
+                bracket_config=bracket_config,
+                enable_adaptive_learning=False,
+                resume=snapshot,
+                protective_mode=(mode == "protective"),
+                elapsed_seconds=elapsed_seconds,
+            ),
+            name=f"live-engine-resumed-{run_id}",
+        )
+        _RUN_TASKS[str(run_id)] = task
+    except Exception as exc:
+        # WP1.8a-round2 (C-03/S-03): the row already committed 'running' --
+        # a failure constructing/spawning the task (e.g. a bad kwarg) must
+        # not leave a 'running' row with no task ever backing it.  Revert
+        # using the SAME session (already committed, free to start a new
+        # transaction) since this is a fresh failure, not part of the
+        # 'resuming' rollback above.
+        log.exception("runs.resume_spawn_failed")
+        await db.execute(
+            update(RunORM)
+            .where(RunORM.id == run_id, RunORM.status == "running")
+            .values(status="orphaned", updated_at=datetime.now(tz=UTC))
+        )
+        await record_audit_event(
+            db,
+            event_type="run_resume_rejected",
+            resource_type="run",
+            resource_id=str(run_id),
+            request=request,
+            payload={"reason": "spawn_failed", "mode": mode},
+        )
+        await db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="spawn_failed",
+        ) from exc
+
+    log.info("runs.resumed", run_id=str(run_id), mode=mode)
+    return _run_orm_to_detail_response(run)
+
+
+# ---------------------------------------------------------------------------
 # Live diagnostics endpoint
 # ---------------------------------------------------------------------------
 
@@ -1902,64 +2356,139 @@ def _validate_params_against_schema(
     return errors
 
 # ---------------------------------------------------------------------------
-# Startup helper: recover orphaned paper/live runs (Sprint 24)
+# Startup helper: recover orphaned paper/live runs (WP1.8a, supersedes
+# Sprint 24's copy-to-a-new-run-id recovery chain)
 # ---------------------------------------------------------------------------
+#
+# WP1.8a changes boot-time recovery from "copy to a new run_id" (Sprint 24)
+# to two mode-specific strategies (synthesis spec S5/S6):
+#
+# - LIVE: a 'running' (hard-kill -- the task never reached its own
+#   `finally` block to write 'orphaned') or already-'orphaned' (graceful
+#   shutdown, see run_orchestrator.py) run is left/transitioned to
+#   'orphaned' with NO engine task started (O1) -- only a successful
+#   POST /runs/{id}/resume starts one.
+# - PAPER: a 'running' or 'orphaned' run is rebuilt IN PLACE under the SAME
+#   run_id from persisted fill history (`PortfolioAccounting.from_fills`)
+#   and its engine task restarts immediately.  `config["resume_count"]`
+#   counts every attempt; a 4th (i.e. count > 3) marks the run 'error'
+#   instead of retrying again, and a fill/order integrity failure
+#   (`check_fill_integrity`, O10/R-06 -- e.g. the 30s flush window lost a
+#   fill) also marks 'error'.
+#
+# The Sprint 24 `recovered_from_run_id IS NULL` filter is dropped entirely
+# (S6) -- both modes now key off `status`, not lineage.
 
 
-async def _mark_orphan_error(
+_MAX_PAPER_RESUME_COUNT = 3
+
+
+async def _mark_run_error(
     factory: Any,
     run_id: uuid.UUID,
     log: Any,
+    *,
+    reason: str,
 ) -> None:
-    """Mark an orphaned run as error so it does not stay running forever."""
+    """Mark a non-terminal ('running' or 'orphaned') run as 'error'.
+
+    Used by both the live and paper boot-recovery paths when a run cannot
+    be safely orphaned/rebuilt (unknown strategy, exhausted resume budget,
+    corrupt fill history, ...).  Idempotent -- a no-op if the run has
+    already left the non-terminal set.
+    """
     try:
         async with factory() as session:
-            result = await session.execute(
-                select(RunORM).where(RunORM.id == run_id)
-            )
+            result = await session.execute(select(RunORM).where(RunORM.id == run_id))
             stale = result.scalar_one_or_none()
-            if stale is not None and stale.status == "running":
+            if stale is not None and stale.status in ("running", "orphaned"):
                 now = datetime.now(tz=UTC)
                 stale.status = "error"
                 stale.stopped_at = now
                 stale.updated_at = now
                 await session.commit()
+                log.warning("recovery.run_marked_error", run_id=str(run_id), reason=reason)
     except Exception:
         log.exception("recovery.mark_error_failed", run_id=str(run_id))
 
 
+# Backwards-compat alias -- Sprint 24 tests / callers referenced this name.
+_mark_orphan_error = _mark_run_error
+
+
+async def _orphan_live_run(factory: Any, run_id: uuid.UUID, log: Any) -> bool:  # noqa: ANN401
+    """Transition a live run to 'orphaned' with an audit row (S5).
+
+    Conditional on the row still being 'running' -- if it is already
+    'orphaned' (a prior graceful shutdown that nobody has resumed yet),
+    this is a no-op and returns False so the caller does not spam a
+    duplicate audit row on every subsequent boot.
+
+    Returns
+    -------
+    bool
+        True if this call performed the running -> orphaned transition.
+    """
+    from api.services.audit_log import record_audit_event
+
+    try:
+        async with factory() as session:
+            result = await session.execute(select(RunORM).where(RunORM.id == run_id))
+            run = result.scalar_one_or_none()
+            # WP1.8a-round2 (S-04/C-06): a hard kill mid-resume leaves the
+            # row 'resuming', not 'running' -- it never reached the final
+            # CAS.  That row is just as orphaned (no task, no exchange
+            # session) as a plain 'running' row killed outright, so it
+            # must be covered here too, not just by the boot query.
+            if run is None or run.status not in ("running", "resuming"):
+                return False
+            previous_status = run.status
+            now = datetime.now(tz=UTC)
+            run.status = "orphaned"
+            run.updated_at = now
+            await record_audit_event(
+                session,
+                event_type="run_orphaned",
+                resource_type="run",
+                resource_id=str(run_id),
+                request=None,
+                payload={
+                    "trigger": "boot",
+                    "run_mode": "live",
+                    "previous_status": previous_status,
+                },
+            )
+            await session.commit()
+            return True
+    except Exception:
+        log.exception("recovery.orphan_live_run_failed", run_id=str(run_id))
+        return False
+
+
 async def recover_orphaned_runs() -> int:
-    """Recover orphaned paper/live runs on API startup.
+    """Boot-time orphan handling for paper/live runs (WP1.8a S5/S6).
 
-    When the API container restarts, any paper or live run that was in
-    ``status='running'`` is an orphan -- its asyncio.Task has been killed and
-    will never update the DB again.  This function:
+    Queries every run with ``run_mode IN ('paper', 'live')`` and
+    ``status IN ('running', 'orphaned')`` -- 'running' catches a hard kill
+    (the engine task never reached its own teardown), 'orphaned' catches a
+    graceful shutdown nobody has resumed yet.
 
-    1. Queries the DB for all runs with status='running' and run_mode in
-       ('paper', 'live').
-    2. For each orphan:
-       a. Marks the original as status='error', stopped_at=now().
-       b. Creates a new RunORM with a fresh UUID, copying config verbatim,
-          and setting ``recovered_from_run_id`` to the orphan's ID.
-       c. Starts the appropriate background coroutine (_run_paper_engine or
-          _run_live_engine) and registers the new task in _RUN_TASKS.
-    3. For live-mode orphans, re-checks that layers 1 and 2 of the safety
-       gate are satisfied (env flag + API keys). Layer 3 (confirm_token) is
-       a runtime-only gate and is skipped here -- the operator already proved
-       intent when the original run was created.  If layers 1/2 fail the
-       live orphan is skipped (marked error only; no new run is created).
+    - Live runs are left/transitioned to 'orphaned' with no task started
+      (O1); an operator must call ``POST /runs/{id}/resume``.
+    - Paper runs are rebuilt in place under the SAME run_id from persisted
+      fills and their task restarts immediately, subject to a bounded
+      resume-count budget and a fill/order integrity check.
 
-    Each orphan is processed in its own try/except so a single bad run does
-    not prevent the others from being recovered.  The entire function is
-    wrapped in a top-level try/except so a DB error at startup does not crash
-    the API process.
+    Each run is processed in its own try/except so one bad row never blocks
+    the rest; the whole function is wrapped so a DB error at startup never
+    crashes the API process.
 
     Returns
     -------
     int
-        Number of runs successfully recovered (new tasks started).
+        Number of paper runs successfully rebuilt and restarted.  Live
+        orphaning is not counted here (no task is started for it -- O1).
     """
-    from api.config import get_settings
     from api.db.models import RunORM
     from api.db.session import get_session_factory
 
@@ -1969,223 +2498,168 @@ async def recover_orphaned_runs() -> int:
     try:
         factory = get_session_factory()
 
-        # --- Step 1: find orphaned runs ---
-        # Exclude runs that were themselves recovered (non-null recovered_from_run_id)
-        # to prevent ever-deepening recovery chains on repeated restarts (CR-001).
         async with factory() as session:
             result = await session.execute(
                 select(RunORM).where(
-                    RunORM.status == "running",
+                    # WP1.8a-round2 (S-04/C-06): 'resuming' is included so a
+                    # hard kill mid-resume (never reached the final CAS) is
+                    # picked back up at the next boot instead of sitting
+                    # invisibly stuck forever.
+                    RunORM.status.in_(["running", "orphaned", "resuming"]),
                     RunORM.run_mode.in_(["paper", "live"]),
-                    RunORM.recovered_from_run_id.is_(None),
                 )
             )
-            orphans = list(result.scalars().all())
+            candidates = list(result.scalars().all())
 
-            # CR-004 (auto-retry review): runs created by recovery OR by the
-            # paper auto-retry carry a non-null recovered_from_run_id and are
-            # deliberately excluded above (chain prevention).  If any are
-            # stuck in 'running' after a restart they will never be recovered
-            # — surface them loudly so the operator can stop/restart manually.
-            skipped_result = await session.execute(
-                select(RunORM.id).where(
-                    RunORM.status == "running",
-                    RunORM.run_mode.in_(["paper", "live"]),
-                    RunORM.recovered_from_run_id.is_not(None),
-                )
-            )
-            stuck_chain_ids = [str(rid) for rid in skipped_result.scalars().all()]
-            if stuck_chain_ids:
-                log.warning(
-                    "recovery.chained_runs_not_recovered",
-                    run_ids=stuck_chain_ids,
-                    note=(
-                        "recovered/auto-retried runs are excluded from orphan "
-                        "recovery; stop and restart these manually"
-                    ),
-                )
-
-        if not orphans:
+        if not candidates:
             log.debug("recovery.no_orphans_found")
             return 0
 
-        log.info("recovery.orphans_found", count=len(orphans))
+        log.info("recovery.orphans_found", count=len(candidates))
 
-        settings = get_settings()
+        for candidate in candidates:
+            run_id = candidate.id
+            run_id_str = str(run_id)
+            run_config = dict(candidate.config or {})
 
-        for orphan in orphans:
-            orphan_id = str(orphan.id)
-            orphan_mode = orphan.run_mode
-            orphan_config = dict(orphan.config or {})
-            log.info(
-                "recovery.found_orphan",
-                run_id=orphan_id,
-                mode=orphan_mode,
-                strategy=orphan_config.get("strategy_name"),
-            )
+            # -------------------------------------------------------------
+            # LIVE: orphan it (or leave it orphaned) and move on -- never
+            # start a task (O1).
+            # -------------------------------------------------------------
+            if candidate.run_mode == "live":
+                try:
+                    transitioned = await _orphan_live_run(factory, run_id, log)
+                    if transitioned:
+                        log.error(
+                            "recovery.run_orphaned",
+                            run_id=run_id_str,
+                            strategy=run_config.get("strategy_name"),
+                        )
+                    else:
+                        log.debug("recovery.live_already_orphaned", run_id=run_id_str)
+                except Exception:
+                    log.exception("recovery.run_failed", run_id=run_id_str)
+                continue
 
+            # -------------------------------------------------------------
+            # PAPER: rebuild in place under the same run_id.
+            # -------------------------------------------------------------
             try:
-                # --- Extract config fields ---
-                strategy_name: str | None = orphan_config.get("strategy_name")
-                symbols: list[str] = orphan_config.get("symbols") or []
-                timeframe_str: str = orphan_config.get("timeframe", "1h")
-                initial_capital: str = orphan_config.get("initial_capital", "10000")
-                strategy_params: dict[str, Any] = orphan_config.get("strategy_params") or {}
+                strategy_name: str | None = run_config.get("strategy_name")
+                symbols: list[str] = run_config.get("symbols") or []
+                timeframe_str: str = run_config.get("timeframe", "1h")
+                initial_capital: str = run_config.get("initial_capital", "10000")
+                strategy_params: dict[str, Any] = run_config.get("strategy_params") or {}
+                bracket_config: dict[str, object] = run_config.get("bracket_config") or {}
 
-                # Validate strategy is still registered
                 if not strategy_name:
-                    log.warning("recovery.orphan_skipped", run_id=orphan_id, reason="missing_strategy_name")
-                    await _mark_orphan_error(factory, orphan.id, log)
+                    await _mark_run_error(factory, run_id, log, reason="missing_strategy_name")
                     continue
 
                 registry = _get_strategy_registry()
                 strategy_cls = registry.get(strategy_name)
                 if strategy_cls is None:
-                    log.warning("recovery.orphan_skipped", run_id=orphan_id, reason="unknown_strategy", strategy_name=strategy_name)
-                    await _mark_orphan_error(factory, orphan.id, log)
+                    await _mark_run_error(factory, run_id, log, reason="unknown_strategy")
                     continue
 
                 if not symbols:
-                    log.warning("recovery.orphan_skipped", run_id=orphan_id, reason="empty_symbols")
-                    await _mark_orphan_error(factory, orphan.id, log)
+                    await _mark_run_error(factory, run_id, log, reason="empty_symbols")
                     continue
 
-                # Validate timeframe before DB write (CR-005)
                 try:
                     timeframe = TimeFrame(timeframe_str)
                 except ValueError:
-                    log.warning("recovery.orphan_skipped", run_id=orphan_id, reason="invalid_timeframe", timeframe=timeframe_str)
-                    await _mark_orphan_error(factory, orphan.id, log)
+                    await _mark_run_error(factory, run_id, log, reason="invalid_timeframe")
                     continue
 
-                # Strategy-availability lockdown (Sprint 51 Cycle 2, IMPL-S51C2-102).
-                # FAIL-CLOSED: a demoted strategy must NOT be auto-restarted in
-                # paper/live.  Mark the orphan as error and skip (do not recreate).
-                # Single source of truth shared with create_run.  Normalize the
-                # strategy name (SEC-001) so the availability key matches
-                # create_run's keyspace regardless of how it was stored.
                 normalized_strategy_name = strategy_name.lower().replace("-", "_")
-                # Validate orphan_mode before constructing RunMode (C1/SEC-007):
-                # a corrupt run_mode column would otherwise raise an uncaught
-                # ValueError; mirror the timeframe-validation skip pattern.
+                if not is_mode_allowed(normalized_strategy_name, RunMode.PAPER):
+                    await _mark_run_error(factory, run_id, log, reason="strategy_mode_not_allowed")
+                    continue
+
+                resume_count = int(run_config.get("resume_count", 0)) + 1
+                if resume_count > _MAX_PAPER_RESUME_COUNT:
+                    await _mark_run_error(factory, run_id, log, reason="resume_count_exceeded")
+                    continue
+
+                # WP1.8a-round2 (S-06/C-04): a snapshot-load failure (a
+                # corrupt row that cannot even be parsed back into the pure
+                # Order/Fill models -- see run_persistence.load_resume_snapshot)
+                # must fail this candidate closed, exactly like a
+                # check_fill_integrity rejection below, never propagate up
+                # into the outer ``except Exception`` (which would log it
+                # but leave the row silently stuck at running/orphaned).
                 try:
-                    orphan_run_mode = RunMode(orphan_mode)
-                except ValueError:
-                    log.warning(
-                        "recovery.orphan_skipped",
-                        reason="invalid_run_mode",
-                        run_id=orphan_id,
-                        mode=orphan_mode,
-                    )
-                    await _mark_orphan_error(factory, orphan.id, log)
+                    async with factory() as session:
+                        snapshot = await _load_resume_snapshot(session, candidate)
+                except ResumeRejected as exc:
+                    await _mark_run_error(factory, run_id, log, reason=exc.reason)
                     continue
-                if not is_mode_allowed(normalized_strategy_name, orphan_run_mode):
-                    log.warning(
-                        "recovery.orphan_skipped",
-                        run_id=orphan_id,
-                        reason="strategy_mode_not_allowed",
-                        strategy_name=normalized_strategy_name,
-                        mode=orphan_mode,
-                    )
-                    await _mark_orphan_error(factory, orphan.id, log)
+                except Exception:
+                    log.exception("recovery.snapshot_load_failed", run_id=run_id_str)
+                    await _mark_run_error(factory, run_id, log, reason="snapshot_load_failed")
                     continue
-
-                # --- Live-mode safety gate re-check (layers 1 + 2 only) ---
-                if orphan_mode == "live":
-                    env_ok = settings.enable_live_trading
-                    keys_ok = (
-                        settings.exchange_api_key is not None
-                        and settings.exchange_api_secret is not None
-                        and settings.exchange_api_key.get_secret_value().strip() != ""
-                        and settings.exchange_api_secret.get_secret_value().strip() != ""
-                    )
-                    if not env_ok or not keys_ok:
-                        log.warning("recovery.live_orphan_skipped_gate", run_id=orphan_id, env_ok=env_ok, keys_ok=keys_ok)
-                        await _mark_orphan_error(factory, orphan.id, log)
-                        continue
-
-                # --- Atomically mark original as error and create recovery run ---
-                new_run_id = uuid.uuid4()
-                new_run_id_str = str(new_run_id)
+                try:
+                    check_fill_integrity(snapshot.fills, snapshot.orders, symbols=set(symbols))
+                except ResumeRejected as exc:
+                    await _mark_run_error(factory, run_id, log, reason=exc.reason)
+                    continue
 
                 async with factory() as session:
-                    result2 = await session.execute(
-                        select(RunORM).where(RunORM.id == orphan.id)
-                    )
+                    result2 = await session.execute(select(RunORM).where(RunORM.id == run_id))
                     stale = result2.scalar_one_or_none()
-                    if stale is None or stale.status != "running":
-                        log.debug("recovery.orphan_already_handled", run_id=orphan_id)
+                    # WP1.8a-round2 (S-04/C-06): also accept 'resuming' here --
+                    # a paper row can only reach this rebuild path via the
+                    # boot query above, which now includes it too.
+                    if stale is None or stale.status not in ("running", "orphaned", "resuming"):
+                        log.debug("recovery.orphan_already_handled", run_id=run_id_str)
                         continue
 
                     now = datetime.now(tz=UTC)
-                    stale.status = "error"
-                    stale.stopped_at = now
+                    updated_config = dict(stale.config or {})
+                    updated_config["resume_count"] = resume_count
+                    stale.config = updated_config
+                    stale.status = "running"
                     stale.updated_at = now
-
-                    new_run = RunORM(
-                        id=new_run_id,
-                        run_mode=orphan_mode,
-                        status="running",
-                        config=orphan_config,
-                        started_at=now,
-                        recovered_from_run_id=orphan.id,
-                    )
-                    session.add(new_run)
+                    started_at = stale.started_at
                     await session.commit()
 
-                log.info("recovery.db_records_written", original_run_id=orphan_id, new_run_id=new_run_id_str)
-
-                # --- Start background engine task ---
-                # Extract trailing_stop_pct from saved strategy params (Sprint 27)
-                recovery_trailing_pct: float | None = None
+                elapsed_seconds = max((datetime.now(tz=UTC) - started_at).total_seconds(), 0.0)
+                trailing_pct: float | None = None
                 raw_tsp = strategy_params.get("trailing_stop_pct")
                 if raw_tsp is not None:
-                    recovery_trailing_pct = float(raw_tsp)
+                    trailing_pct = float(raw_tsp)
 
-                # Re-apply persisted bracket-exit config on recovery.
-                recovery_bracket_config: dict[str, object] = (
-                    orphan_config.get("bracket_config") or {}
-                )
-
-                _engine_kwargs: dict[str, Any] = {
-                    "run_id_str": new_run_id_str,
-                    "strategy_cls": strategy_cls,
-                    "strategy_name": strategy_name,
-                    "strategy_params": strategy_params,
-                    "symbols": symbols,
-                    "timeframe": timeframe,
-                    "initial_capital": initial_capital,
-                    "trailing_stop_pct": recovery_trailing_pct,
-                    "bracket_config": recovery_bracket_config,
-                }
-                if orphan_mode == "paper":
-                    # CR-002 (auto-retry review): carry the auto-retry attempt
-                    # counter across an API restart so a persistently crashing
-                    # run cannot reset its bounded retry budget via recovery.
-                    _engine_kwargs["auto_retry_attempt"] = int(
-                        orphan_config.get("auto_retry_attempt", 0)
-                    )
-                coro = _run_paper_engine if orphan_mode == "paper" else _run_live_engine
                 task = asyncio.create_task(
-                    coro(**_engine_kwargs),
-                    name=f"recovery-{orphan_mode}-{new_run_id_str[:8]}",
+                    _run_paper_engine(
+                        run_id_str=run_id_str,
+                        strategy_cls=strategy_cls,
+                        strategy_name=strategy_name,
+                        strategy_params=strategy_params,
+                        symbols=symbols,
+                        timeframe=timeframe,
+                        initial_capital=initial_capital,
+                        trailing_stop_pct=trailing_pct,
+                        bracket_config=bracket_config,
+                        auto_retry_attempt=int(run_config.get("auto_retry_attempt", 0)),
+                        resume=snapshot,
+                        elapsed_seconds=elapsed_seconds,
+                    ),
+                    name=f"recovery-paper-{run_id_str[:8]}",
                 )
-                _RUN_TASKS[new_run_id_str] = task
+                _RUN_TASKS[run_id_str] = task
 
                 log.info(
-                    "recovery.run_recovered",
-                    original_run_id=orphan_id,
-                    new_run_id=new_run_id_str,
-                    mode=orphan_mode,
+                    "recovery.paper_resumed",
+                    run_id=run_id_str,
+                    resume_count=resume_count,
                 )
                 recovered_count += 1
 
             except Exception:
-                log.exception(
-                    "recovery.run_failed",
-                    run_id=orphan_id,
-                )
-                # Continue to next orphan -- one bad run must not block others
+                log.exception("recovery.run_failed", run_id=run_id_str)
+                # Continue to the next candidate -- one bad run must not
+                # block the others.
 
     except Exception:
         log.exception("recovery.fatal_error")
