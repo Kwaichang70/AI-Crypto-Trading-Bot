@@ -14,6 +14,7 @@ import type {
   AggregatePortfolio,
   EquityCurveResponse,
   FillListResponse,
+  KillSwitchStatus,
   LearningState,
   ModelVersion,
   ModelVersionListResponse,
@@ -25,7 +26,9 @@ import type {
   PositionListResponse,
   Run,
   RunCreateRequest,
+  RunEmergencyStopResponse,
   RunListResponse,
+  RunStopResponse,
   Strategy,
   StrategyListResponse,
   TradeListResponse,
@@ -86,6 +89,19 @@ export interface HealthResponse {
   /** Component-level status map, e.g. { db: "ok", redis: "ok" } */
   components?: Record<string, "ok" | "degraded" | "error">;
 }
+
+// ---------------------------------------------------------------------------
+// WP1.7a/1.7b (AC8): timeouts for stop / emergency-stop / kill-switch-shaped
+// requests must allow >= 60s -- flatten can take up to ~30s server-side plus
+// a 5s outer margin. Admin-proxy-route timeouts of the same shape live in
+// ./admin-fetch (kill-switch press/clear, resume, entries-latch clear); these
+// two are for the direct (non-admin, X-API-Key-only) backend calls below.
+// ---------------------------------------------------------------------------
+
+/** DELETE /api/v1/runs/{id} — a flatten pass can take up to ~35s server-side. */
+export const STOP_TIMEOUT_MS = 65_000;
+/** POST /api/v1/runs/{id}/emergency-stop — same flatten budget as stop. */
+export const EMERGENCY_STOP_TIMEOUT_MS = 65_000;
 
 // ---------------------------------------------------------------------------
 // Core fetch wrapper
@@ -254,19 +270,87 @@ export async function fetchRun(id: string): Promise<ApiResult<Run>> {
   return apiGet<Run>(`/api/v1/runs/${id}`, { cache: "no-store" });
 }
 
-/** POST /api/v1/runs — create / start a new run (120 s timeout for backtests). */
+/**
+ * POST /api/v1/runs — create / start a new run (120 s timeout for backtests).
+ *
+ * WP1.7a/SY-10 (S13): a live-mode confirmation is sent EXCLUSIVELY via the
+ * `X-Live-Confirm-Token` request header, never in the JSON body — pass the
+ * typed token as `liveConfirmToken`, not on `body.confirmToken` (which the
+ * UI must never populate; see the field's own deprecation note in
+ * `./types`). The backend already prefers the header over the deprecated
+ * body field (`runs.py:515`).
+ */
 export async function createRun(
   body: RunCreateRequest,
+  liveConfirmToken?: string,
 ): Promise<ApiResult<Run>> {
-  return apiFetch<Run>("/api/v1/runs", {
-    method: "POST",
-    body: JSON.stringify(body),
-  }, 120_000);
+  return apiFetch<Run>(
+    "/api/v1/runs",
+    {
+      method: "POST",
+      body: JSON.stringify(body),
+      // Conditional spread (not `headers: token ? {...} : undefined`) so no
+      // property is ever explicitly assigned `undefined` under this repo's
+      // `exactOptionalPropertyTypes` tsconfig.
+      ...(liveConfirmToken
+        ? { headers: { "X-Live-Confirm-Token": liveConfirmToken } }
+        : {}),
+    },
+    120_000,
+  );
 }
 
-/** DELETE /api/v1/runs/{id} — stop a running run. */
-export async function stopRun(id: string): Promise<ApiResult<Run>> {
-  return apiDelete<Run>(`/api/v1/runs/${id}`);
+/**
+ * DELETE /api/v1/runs/{id} — stop a running run (WP1.7a).
+ *
+ * `flatten` is REQUIRED by the backend for a running LIVE run (omitting it
+ * returns 422 `flatten_decision_required`); optional for paper/orphaned/
+ * resuming (default false there). AC8: >= 60s timeout — an accepted
+ * `flatten=true` can run the engine's flatten pass for up to ~30s plus a 5s
+ * outer margin server-side.
+ */
+export async function stopRun(
+  id: string,
+  opts?: { flatten?: boolean },
+): Promise<ApiResult<RunStopResponse>> {
+  const qs = opts?.flatten === undefined ? "" : `?flatten=${opts.flatten}`;
+  return apiFetch<RunStopResponse>(
+    `/api/v1/runs/${id}${qs}`,
+    { method: "DELETE" },
+    STOP_TIMEOUT_MS,
+  );
+}
+
+/**
+ * POST /api/v1/runs/{id}/emergency-stop — hard-stop, never refuses (SY-07).
+ * `flatten` is optional (default false). AC8: >= 60s timeout, same rationale
+ * as `stopRun`.
+ */
+export async function emergencyStop(
+  id: string,
+  opts?: { flatten?: boolean; reason?: string },
+): Promise<ApiResult<RunEmergencyStopResponse>> {
+  const qs = opts?.flatten === undefined ? "" : `?flatten=${opts.flatten}`;
+  return apiFetch<RunEmergencyStopResponse>(
+    `/api/v1/runs/${id}/emergency-stop${qs}`,
+    {
+      method: "POST",
+      ...(opts?.reason ? { headers: { "X-Emergency-Reason": opts.reason } } : {}),
+    },
+    EMERGENCY_STOP_TIMEOUT_MS,
+  );
+}
+
+/**
+ * GET /api/v1/emergency/kill-switch — read-only global latch status for the
+ * S13 sidebar badge. Requires only X-API-Key (not admin) — called directly,
+ * never through an /api/admin/* proxy (SY-11: only admin-key-gated
+ * endpoints get a proxy; this one doesn't need one).
+ */
+export async function fetchKillSwitchStatus(): Promise<ApiResult<KillSwitchStatus>> {
+  return apiGet<KillSwitchStatus>("/api/v1/emergency/kill-switch", {
+    cache: "no-store",
+  });
 }
 
 /** PATCH /api/v1/runs/{id}/archive — archive a stopped/error run. */

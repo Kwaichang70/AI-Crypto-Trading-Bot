@@ -72,6 +72,8 @@ __all__ = [
     "RunStopResponse",
     "UnprotectedPositionResponse",
     "RunEmergencyStopResponse",
+    # WP1.7b (CF-B2): entries-latch clear response
+    "EntriesLatchClearResponse",
     # Error
     "ErrorResponse",
     # M5 (Sprint 49): leaderboard eligibility constants
@@ -643,6 +645,23 @@ class RunEmergencyStopResponse(RunDetailResponse):
     #: truly orphaned live run) -- unprotected_positions could not be
     #: computed AT ALL (not "empty", genuinely "unknown").
     exposure_unknown: bool = False
+
+
+class EntriesLatchClearResponse(BaseModel):
+    """``POST /api/v1/runs/{id}/entries-latch/clear`` response.
+
+    WP1.7b (CF-B2, S-R2-05 RR-6): the endpoint used to return a raw
+    snake_case ``dict``, unlike every other kill-switch/flatten response.
+    This model uses ``API_MODEL_CONFIG`` so the wire format matches the
+    rest of the kill-switch family (camelCase). This contract is FIXED --
+    a parallel UI agent codes against ``{runId, cleared, stillLatchedBy}``.
+    """
+
+    model_config = _API_MODEL_CONFIG
+
+    run_id: str
+    cleared: str
+    still_latched_by: list[str] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------

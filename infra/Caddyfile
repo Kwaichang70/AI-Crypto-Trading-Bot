@@ -40,6 +40,34 @@
         reverse_proxy ui:3000
     }
 
+    # WP1.7b (C21, WP17-D-01): admin-gated actions (kill-switch, kill-switch
+    # clear, run resume, entries-latch clear) are Next.js server routes under
+    # apps/ui/src/app/api/admin/*. Those routes run getServerSession() +
+    # isAdmin() first, and only then read INTERNAL_ADMIN_API_KEY server-side
+    # and forward it as X-Admin-Key to the FastAPI backend. The browser never
+    # holds the admin key.
+    #
+    # This block MUST appear BEFORE the generic handle /api/* below (same
+    # first-match-wins rule as /api/auth/* above) so a request to
+    # /api/admin/... reaches ui:3000 (session/role gated) rather than being
+    # proxied straight to api:8000.
+    #
+    # NOTE (WP17-D-01 design decision, see reports/vp2-wp1.7/devops-design.md):
+    # FastAPI's own admin endpoints (e.g. /api/v1/emergency/kill-switch,
+    # /api/v1/runs/{id}/resume) are intentionally left reachable through the
+    # handle /api/* -> api:8000 block below. require_admin() on those routes
+    # does a constant-time compare of the caller's X-Admin-Key against the
+    # server-side ADMIN_API_KEY secret (apps/api/deps.py); a caller without
+    # that secret cannot authenticate no matter which path they use, so the
+    # direct api:8000 path is not a bypass of the UI's session/role check --
+    # it is a second, equally-authenticated path (kept deliberately, as an
+    # operator curl fallback if the ui container is down). Do not add
+    # path-based header stripping/blocking for X-Admin-Key here: it would
+    # duplicate app-layer auth for no real security gain and add fragility.
+    handle /api/admin/* {
+        reverse_proxy ui:3000
+    }
+
     # All other /api/* routes go to the FastAPI backend.
     # handle /api/* preserves the full /api/v1/... prefix (NOT handle_path).
     handle /api/* {

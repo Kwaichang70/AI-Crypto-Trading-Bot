@@ -13,7 +13,6 @@ import {
   fetchPositions,
   fetchDiagnostics,
   fetchLearningState,
-  stopRun,
   archiveRun,
   formatCurrency,
   formatPct,
@@ -31,6 +30,10 @@ import { EquityCurveChart } from "@/components/charts/equity-curve";
 import { aggregateTradesBySymbol } from "@/lib/aggregate";
 import { quoteCurrencyPrefix } from "@/lib/currency";
 import { useToast } from "@/components/ui/toast";
+import { LiveBanner } from "@/components/live-banner";
+import { StopRunDialog } from "@/components/stop-run-dialog";
+import { ResumeRunDialog } from "@/components/resume-run-dialog";
+import { AdminOnly } from "@/components/admin-only";
 
 // ---------------------------------------------------------------------------
 // Trade columns
@@ -402,8 +405,13 @@ export default function RunDetailPage() {
   const [learning, setLearning] = useState<LearningState | null>(null);
   const [diagnostics, setDiagnostics] = useState<Record<string, unknown> | null>(null);
   const [isLoading, setIsLoading] = useState(true);
-  const [isStopping, setIsStopping] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // WP1.7a/1.7b (CF-B3, S13): replaces the old one-click handleStop for
+  // running runs — a live running run now goes through <StopRunDialog>,
+  // which forces an explicit flatten/keep-positions choice before it calls
+  // stopRun(). An 'orphaned' live run instead offers <ResumeRunDialog>.
+  const [stopDialogOpen, setStopDialogOpen] = useState(false);
+  const [resumeDialogOpen, setResumeDialogOpen] = useState(false);
 
   const loadData = useCallback(async () => {
     const [runRes, portRes, curveRes, tradesRes, ordersRes, fillsRes, posRes, learnRes] = await Promise.all([
@@ -438,9 +446,12 @@ export default function RunDetailPage() {
   }, [loadData]);
 
   // Poll every 5 seconds for active runs, pausing when the browser tab is hidden.
+  // WP17b-S-02: also poll while 'resuming' -- a live run stuck showing this
+  // stale status must refresh promptly once the backend moves it to
+  // 'running' again, otherwise StopRunDialog could be shown a stale status
+  // that hides the mandatory flatten choice.
   useEffect(() => {
-    // Only poll while the run is in an active state.
-    if (run?.status !== "running") return;
+    if (run?.status !== "running" && run?.status !== "resuming") return;
 
     const startPolling = () => setInterval(() => void loadData(), 5000);
 
@@ -479,17 +490,17 @@ export default function RunDetailPage() {
     return () => clearInterval(intervalId);
   }, [run?.status, id]);
 
-  async function handleStop() {
-    if (!run) return;
-    setIsStopping(true);
-    const result = await stopRun(run.id);
-    if (result.ok) {
-      setRun(result.data);
-      toast("Run stopped", "success");
-    } else {
-      setError(result.error.message);
-    }
-    setIsStopping(false);
+  function handleStopped(updated: Run) {
+    setRun(updated);
+    toast(
+      updated.status === "running" ? "Stop did not complete — see the flatten result." : "Run stopped",
+      updated.status === "running" ? "warning" : "success",
+    );
+  }
+
+  function handleResumed(updated: Run) {
+    setRun(updated);
+    toast("Run resumed", "success");
   }
 
   // Currency-consistent monetary prefix: derived from the run's quote
@@ -567,14 +578,23 @@ export default function RunDetailPage() {
         subtitle={`${run.runMode} · ${strategyName} · ${symbols}`}
         actions={
           <div className="flex items-center gap-2">
-            {run.status === "running" && (
+            {(run.status === "running" || run.status === "orphaned" || run.status === "resuming") && (
               <button
-                onClick={() => void handleStop()}
-                disabled={isStopping}
+                onClick={() => setStopDialogOpen(true)}
                 className="rounded-lg border border-red-300 bg-red-50 px-4 py-2 text-sm font-medium text-red-600 transition-colors hover:bg-red-100 dark:border-red-700 dark:bg-red-900/20 dark:text-red-400 dark:hover:bg-red-900/40 disabled:opacity-50"
               >
-                {isStopping ? "Stopping…" : "Stop Run"}
+                Stop Run
               </button>
+            )}
+            {run.runMode === "live" && run.status === "orphaned" && (
+              <AdminOnly>
+                <button
+                  onClick={() => setResumeDialogOpen(true)}
+                  className="rounded-lg border border-indigo-300 bg-indigo-50 px-4 py-2 text-sm font-medium text-indigo-600 transition-colors hover:bg-indigo-100 dark:border-indigo-700 dark:bg-indigo-900/20 dark:text-indigo-400 dark:hover:bg-indigo-900/40"
+                >
+                  Resume Run
+                </button>
+              </AdminOnly>
             )}
             {isDone && (
               <button
@@ -596,6 +616,8 @@ export default function RunDetailPage() {
         }
       />
 
+      {run.runMode === "live" && <LiveBanner />}
+
       {/* Status + metadata row */}
       <div className="flex flex-wrap items-center gap-3 text-sm text-slate-500 dark:text-slate-400">
         <RunStatusBadge status={run.status} />
@@ -604,6 +626,23 @@ export default function RunDetailPage() {
           <span>Stopped {new Date(run.stoppedAt).toLocaleString()}</span>
         )}
       </div>
+
+      {stopDialogOpen && (
+        <StopRunDialog
+          run={run}
+          positions={positions}
+          onClose={() => setStopDialogOpen(false)}
+          onStopped={handleStopped}
+        />
+      )}
+
+      {resumeDialogOpen && (
+        <ResumeRunDialog
+          runId={run.id}
+          onClose={() => setResumeDialogOpen(false)}
+          onResumed={handleResumed}
+        />
+      )}
 
       {/* Tabs */}
       <Tabs

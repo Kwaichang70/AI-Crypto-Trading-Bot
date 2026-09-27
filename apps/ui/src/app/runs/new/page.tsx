@@ -7,9 +7,11 @@ import {
   fetchStrategySchema,
   createRun,
 } from "@/lib/api";
-import type { Strategy, JsonSchemaProperty, RunMode } from "@/lib/types";
+import type { Strategy, JsonSchemaProperty, RunMode, RunCreateRequest } from "@/lib/types";
 import { Header } from "@/components/layout/header";
 import { useToast } from "@/components/ui/toast";
+import { LiveBanner } from "@/components/live-banner";
+import { LiveConfirmDialog } from "@/components/live-confirm-dialog";
 
 const TIMEFRAMES = ["1m", "5m", "15m", "1h", "4h", "1d"];
 const COMMON_SYMBOLS = ["BTC/EUR", "ETH/EUR", "SOL/EUR", "XRP/EUR", "ADA/EUR"];
@@ -131,12 +133,17 @@ function NewRunInner() {
   const [initialCapital, setInitialCapital] = useState(preCapital || "10000");
   const [backtestStart, setBacktestStart] = useState("2024-01-01T00:00");
   const [backtestEnd, setBacktestEnd] = useState("2024-12-31T23:59");
-  const [confirmToken, setConfirmToken] = useState("");
   const [enableLearning, setEnableLearning] = useState(false);
   const [autoApplyLearning, setAutoApplyLearning] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [isLoadingStrategies, setIsLoadingStrategies] = useState(true);
+  // WP1.7a/1.7b (SY-10, S13): the live confirmation token is NEVER held in
+  // page-level state — only inside <LiveConfirmDialog>'s own transient
+  // state, cleared on close. This page only remembers WHETHER the dialog
+  // that will collect it is open, plus the already-validated body to submit
+  // once the operator types it.
+  const [pendingLiveBody, setPendingLiveBody] = useState<RunCreateRequest | null>(null);
 
   useEffect(() => {
     async function load() {
@@ -220,6 +227,29 @@ function NewRunInner() {
     }
   }
 
+  // WP1.7a/SY-10 (S13): submits an already-validated body, optionally with a
+  // live confirmation token sent ONLY as the `X-Live-Confirm-Token` header
+  // (never in the body — see `createRun` in `@/lib/api`).
+  async function submitCreateRun(body: RunCreateRequest, liveConfirmToken?: string) {
+    setIsSubmitting(true);
+    const result = await createRun(body, liveConfirmToken);
+
+    if (result.ok) {
+      toast("Run started successfully", "success");
+      setPendingLiveBody(null);
+      router.push(`/runs/${result.data.id}`);
+    } else {
+      // WP17b-S-10 (round 2): a failed live create used to leave
+      // `submitError` set behind the still-open <LiveConfirmDialog>
+      // overlay -- fully hidden from the operator, who saw nothing happen.
+      // Closing the dialog here surfaces the error in the underlying form
+      // (the operator can simply reopen it by clicking Start Run again).
+      setPendingLiveBody(null);
+      setSubmitError(result.error.message);
+      setIsSubmitting(false);
+    }
+  }
+
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setSubmitError(null);
@@ -245,8 +275,6 @@ function NewRunInner() {
       return;
     }
 
-    setIsSubmitting(true);
-
     const body = {
       strategyName: selectedStrategy.name,
       strategyParams,
@@ -256,20 +284,18 @@ function NewRunInner() {
       initialCapital,
       backtestStart: mode === "backtest" ? new Date(backtestStart).toISOString() : null,
       backtestEnd: mode === "backtest" ? new Date(backtestEnd).toISOString() : null,
-      confirmToken: mode === "live" ? confirmToken : undefined,
       enableAdaptiveLearning: mode !== "backtest" ? enableLearning : undefined,
       autoApplyLearning: mode === "paper" && enableLearning ? autoApplyLearning : undefined,
     };
 
-    const result = await createRun(body);
-
-    if (result.ok) {
-      toast("Run started successfully", "success");
-      router.push(`/runs/${result.data.id}`);
-    } else {
-      setSubmitError(result.error.message);
-      setIsSubmitting(false);
+    if (mode === "live") {
+      // Defer submission until the typed <LiveConfirmDialog> token is
+      // collected — the body itself never carries a confirmToken field.
+      setPendingLiveBody(body);
+      return;
     }
+
+    void submitCreateRun(body);
   }
 
   return (
@@ -330,19 +356,13 @@ function NewRunInner() {
               : "Live trading executes real orders on your exchange account."}
           </p>
           {mode === "live" && (
-            <div>
-              <label className="block text-sm font-medium text-slate-700 dark:text-slate-300">
-                Confirm Token
-              </label>
-              <input
-                type="password"
-                value={confirmToken}
-                onChange={(e) => setConfirmToken(e.target.value)}
-                placeholder="LIVE_TRADING_CONFIRM_TOKEN from .env"
-                className="mt-1 w-full rounded-lg border border-red-300 dark:border-red-800 bg-white dark:bg-slate-800 px-3 py-2 text-sm text-slate-900 dark:text-slate-200 focus:border-red-500 focus:outline-none focus:ring-1 focus:ring-red-500"
-              />
-              <p className="mt-1 text-xs text-red-400">
-                This will place real orders. Ensure ENABLE_LIVE_TRADING=true and your API key are set in .env.
+            <div className="space-y-2">
+              <LiveBanner compact />
+              <p className="text-xs text-red-400">
+                This will place real orders. Ensure ENABLE_LIVE_TRADING=true
+                and your API key are set in .env. Clicking Start Run will ask
+                for the live-trading confirmation token separately — it is
+                never typed into this form.
               </p>
             </div>
           )}
@@ -600,9 +620,21 @@ function NewRunInner() {
           disabled={isSubmitting || isLoadingStrategies}
           className="w-full rounded-lg bg-indigo-600 py-3 text-sm font-semibold text-white transition-colors hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500"
         >
-          {isSubmitting ? "Starting run…" : "Start Run"}
+          {isSubmitting ? "Starting run…" : mode === "live" ? "Start Run…" : "Start Run"}
         </button>
       </form>
+
+      <LiveConfirmDialog
+        open={pendingLiveBody !== null}
+        title="Confirm live run"
+        description="This starts a LIVE run that places real orders. Type the live-trading confirmation token to proceed."
+        confirmLabel="Start Live Run"
+        loading={isSubmitting}
+        onCancel={() => setPendingLiveBody(null)}
+        onConfirm={(token) => {
+          if (pendingLiveBody) void submitCreateRun(pendingLiveBody, token);
+        }}
+      />
     </div>
   );
 }

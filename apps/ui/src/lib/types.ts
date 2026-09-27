@@ -198,7 +198,182 @@ export interface RunCreateRequest {
   initialCapital: string;
   backtestStart?: string | null;
   backtestEnd?: string | null;
+  /**
+   * WP1.7a/SY-10 (S13): deprecated body-field fallback only. The UI never
+   * populates this — a live-mode confirmation is sent EXCLUSIVELY via the
+   * `X-Live-Confirm-Token` request header (see `createRun()` in `./api`),
+   * so real callers pass the token as a `createRun(body, token)` argument,
+   * never as part of this object. Kept typed (rather than removed) purely
+   * so any not-yet-migrated caller/fixture that still sets it continues to
+   * compile; the backend accepts the header only from this UI going forward.
+   */
   confirmToken?: string | undefined;
+}
+
+// ---------------------------------------------------------------------------
+// WP1.7a/1.7b: kill switch, per-run entries latch, flatten result envelopes
+// -----------------------------------------------------------------------
+// Mirrors apps/api/routers/emergency.py (KillSwitch*) and the FlattenResult /
+// UnprotectedPosition / RunStopResponse / RunEmergencyStopResponse models in
+// apps/api/schemas.py -- every one of those shares the project's camelCase
+// `API_MODEL_CONFIG`, so every field below is camelCase on the wire too.
+// ---------------------------------------------------------------------------
+
+export type FlattenSymbolStatus =
+  | "no_position"
+  | "flat"
+  | "dust"
+  | "partial"
+  | "in_flight"
+  | "failed";
+
+export type FlattenCause =
+  | "ledger_doubt"
+  | "inflight_other"
+  | "submit_unknown"
+  | "rejected"
+  | "timeout_open"
+  | "lock_timeout"
+  | "live_gate_closed"
+  | "error";
+
+/** One symbol's outcome from a single StrategyEngine.flatten() call. */
+export interface FlattenSymbolResult {
+  symbol: string;
+  status: FlattenSymbolStatus;
+  cause: FlattenCause | null;
+  /** Decimal strings — precision preserved from the backend. */
+  heldBefore: string;
+  soldQty: string;
+  remainingQty: string;
+  orderIds: readonly string[];
+  error: string | null;
+}
+
+export type FlattenOutcome = "noop" | "flattened" | "partial" | "failed";
+
+/** Run-level result from a single StrategyEngine.flatten() call. */
+export interface FlattenResult {
+  runId: string;
+  outcome: FlattenOutcome;
+  complete: boolean;
+  symbols: readonly FlattenSymbolResult[];
+  latchPersisted: boolean;
+}
+
+/** One still-held symbol reported by emergency-stop / stop (SY-07). */
+export interface UnprotectedPosition {
+  symbol: string;
+  /** Decimal string. */
+  qty: string;
+  source: "ledger" | "persisted";
+}
+
+/** DELETE /api/v1/runs/{id} 200 response. */
+export interface RunStopResponse extends Run {
+  flatten: FlattenResult | null;
+  unprotectedPositions: readonly UnprotectedPosition[];
+}
+
+/** POST /api/v1/runs/{id}/emergency-stop 200 response. */
+export interface RunEmergencyStopResponse extends Run {
+  flatten: FlattenResult | null;
+  unprotectedPositions: readonly UnprotectedPosition[];
+  exposureUnknown: boolean;
+}
+
+/**
+ * Error `detail` bodies for stop_run's 422/409s are raw dicts constructed
+ * directly in apps/api/routers/runs.py (NOT pydantic models), so — unlike
+ * every other shape on this page — they bypass `API_MODEL_CONFIG`'s
+ * alias_generator and stay snake_case on the wire. `flatten` is the one
+ * exception: it is a `FlattenResultResponse.model_dump(by_alias=True)`
+ * embedded inside the raw dict, so ITS OWN fields are still camelCase.
+ */
+export interface FlattenDecisionRequiredDetail {
+  code: "flatten_decision_required";
+  held_symbols: readonly string[];
+}
+
+export interface FlattenIncompleteDetail {
+  code: "flatten_incomplete";
+  flatten: FlattenResult;
+}
+
+export interface FlattenRequiresRunningEngineDetail {
+  code: "flatten_requires_running_engine";
+}
+
+export interface KillSwitchActiveDetail {
+  code: "kill_switch_active";
+}
+
+export interface EntriesLatchedDetail {
+  code: "entries_latched";
+  reason: string;
+}
+
+export interface NotLatchedDetail {
+  code: "not_latched";
+}
+
+/** GET /api/v1/emergency/kill-switch — read-only status for the UI badge. */
+export interface KillSwitchStatus {
+  latched: boolean;
+  since: string | null;
+  reason: string | null;
+  /** "unknown" -- the latch could not be read at boot (fail-closed, latched). */
+  source: "db" | "unknown";
+}
+
+export interface KillSwitchRunError {
+  runId: string;
+  error: string;
+}
+
+/** POST /api/v1/emergency/kill-switch 200 response (WP1.7a shape, SY-08). */
+export interface KillSwitchPressResponse {
+  latched: boolean;
+  latchPersisted: boolean;
+  since: string | null;
+  runsLatched: readonly string[];
+  orphanedLiveRunIds: readonly string[];
+  resumingRunIds: readonly string[];
+  flattenResults: Readonly<Record<string, FlattenResult>>;
+  errors: readonly KillSwitchRunError[];
+}
+
+export interface KillSwitchRunKeptLatched {
+  runId: string;
+  reasons: readonly string[];
+}
+
+/** POST /api/v1/emergency/kill-switch/clear 200 response. */
+export interface KillSwitchClearResponse {
+  wasLatched: boolean;
+  runsUnlatched: readonly string[];
+  runsKeptLatched: readonly KillSwitchRunKeptLatched[];
+}
+
+/**
+ * POST /api/v1/runs/{id}/entries-latch/clear 200 response.
+ *
+ * CF-B2 (shipped in this same WP) gave `clear_entries_latch`
+ * (apps/api/routers/runs.py) a proper `API_MODEL_CONFIG` response model --
+ * camelCase on the wire, matching this type field-for-field. `cleared` is
+ * typed as the literal `"flatten_incomplete"` (WP17b-C-03) rather than a
+ * plain `string`: the DB's own `ck_runs_entries_latch_reason` CHECK
+ * constraint (apps/api/db/models.py) means this per-run latch reason can
+ * only ever BE `'flatten_incomplete'` -- the backend's own
+ * `EntriesLatchClearResponse.cleared: str` (apps/api/schemas.py) is looser
+ * only because Pydantic has no equivalent DB-level constraint to mirror;
+ * the UI can and should be stricter here for a stronger compile-time
+ * guarantee against a typo'd comparison.
+ */
+export interface EntriesLatchClearResponse {
+  runId: string;
+  cleared: "flatten_incomplete";
+  stillLatchedBy: readonly string[];
 }
 
 // ---------------------------------------------------------------------------

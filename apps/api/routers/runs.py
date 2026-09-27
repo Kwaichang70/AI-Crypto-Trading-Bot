@@ -54,6 +54,7 @@ from api.db.models import (
 from api.db.session import get_db
 from api.deps import require_admin
 from api.schemas import (
+    EntriesLatchClearResponse,
     ErrorResponse,
     FlattenResultResponse,
     RunCreateRequest,
@@ -1796,6 +1797,7 @@ class _ClearEntriesLatchRequest(BaseModel):
 @router.post(
     "/{run_id}/entries-latch/clear",
     status_code=status.HTTP_200_OK,
+    response_model=EntriesLatchClearResponse,
     responses={
         401: {"description": "Missing or invalid X-Admin-Key"},
         403: {"description": "X-Admin-Key rejected"},
@@ -1821,7 +1823,7 @@ async def clear_entries_latch(
     db: Annotated[AsyncSession, Depends(get_db)],
     request: Request,
     x_live_confirm_token: Annotated[str | None, Header()] = None,
-) -> dict[str, Any]:
+) -> EntriesLatchClearResponse:
     log = logger.bind(endpoint="clear_entries_latch", run_id=str(run_id))
 
     stmt = select(RunORM).where(RunORM.id == run_id).with_for_update()
@@ -1897,11 +1899,11 @@ async def clear_entries_latch(
         still_latched_by = sorted(engine.risk_manager.kill_switch_reasons)
 
     log.warning("runs.entries_latch_cleared", cleared_reason=cleared_reason)
-    return {
-        "run_id": str(run_id),
-        "cleared": cleared_reason,
-        "still_latched_by": still_latched_by,
-    }
+    return EntriesLatchClearResponse(
+        run_id=str(run_id),
+        cleared=cleared_reason,
+        still_latched_by=still_latched_by,
+    )
 
 
 # ---------------------------------------------------------------------------

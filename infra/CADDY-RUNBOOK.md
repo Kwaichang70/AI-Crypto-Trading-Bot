@@ -153,6 +153,66 @@ grep -n 'TAILSCALE_FQDN' /opt/trading-bot/infra/Caddyfile
 
 ---
 
+## STEP 2a — Pre-deploy config validation (mandatory, WP1.7b S-08/S-09)
+
+Run this **before** `docker compose up`, every time `.env`, `docker-compose.yml`
+or the Caddyfile changes.
+
+### S-08 — validate compose renders, without leaking secrets to logs
+
+```bash
+cd /opt/trading-bot/infra
+docker compose --env-file /opt/trading-bot/.env config --quiet
+echo "exit code: $?"   # 0 = renders cleanly (all required vars present); non-zero = see stderr
+```
+
+> [!CAUTION]
+> **Always pass `--quiet` here, never run the plain `docker compose config`
+> in this step.** `docker compose config` (no `--quiet`) prints the fully
+> **interpolated** compose file to stdout — every `${ADMIN_API_KEY:?...}`,
+> `${POSTGRES_PASSWORD:?...}`, `${NEXTAUTH_SECRET:?...}` etc. is replaced
+> with its real secret value in the printed output. `--quiet` validates and
+> exits non-zero on any missing/`:?` variable **without** printing the
+> rendered config. Never pipe the plain (non-`--quiet`) form to a file, to
+> CI logs, or to a terminal that gets captured/screen-shared — the
+> resulting output is a plaintext secret dump.
+>
+> This validation step does not require the Docker daemon to be running
+> (`docker compose config` only reads and interpolates the compose file);
+> it can be run as a pure syntax/completeness check even before the stack
+> is started.
+
+### S-09 — confirm `ADMIN_API_KEY` and `INTERNAL_ADMIN_API_KEY` match, without printing either
+
+`infra/docker-compose.yml` intentionally keeps these as two separate `.env`
+variables (api's `ADMIN_API_KEY`, ui's `INTERNAL_ADMIN_API_KEY`) rather than
+one variable reused via compose substitution. Nothing enforces that an
+operator sets them to the same value. A mismatch **fails closed** — every
+admin action (kill-switch, kill-switch clear, resume, entries-latch clear)
+returns 403 — so this is an availability check, not a security gate, but it
+should still be run after editing `.env` and before declaring a deploy done.
+
+Compare their SHA-256 hashes instead of the raw values, so neither key is
+ever printed to the terminal or a log:
+
+```bash
+cd /opt/trading-bot
+HASH_A=$(grep -E '^ADMIN_API_KEY=' .env | cut -d= -f2- | sha256sum | cut -d' ' -f1)
+HASH_B=$(grep -E '^INTERNAL_ADMIN_API_KEY=' .env | cut -d= -f2- | sha256sum | cut -d' ' -f1)
+if [ "$HASH_A" = "$HASH_B" ]; then
+  echo "OK: ADMIN_API_KEY and INTERNAL_ADMIN_API_KEY match (sha256 $HASH_A)"
+else
+  echo "MISMATCH: ADMIN_API_KEY (sha256 $HASH_A) != INTERNAL_ADMIN_API_KEY (sha256 $HASH_B)"
+  echo "Every admin action will return 403 until these are set identically."
+fi
+```
+
+Only the hashes are ever displayed, never `$ADMIN_API_KEY` or
+`$INTERNAL_ADMIN_API_KEY` themselves. If you see `MISMATCH`, fix `.env` and
+re-run both S-08 and this check before proceeding to STEP 3.
+
+---
+
 ## STEP 3 — Deploy the updated Docker stack
 
 On the Hetzner server (SSH via Tailscale IP, or still via public IP before firewall goes live):
@@ -255,6 +315,110 @@ curl --max-time 5 https://167.235.51.90:3001/
 Expected: connection timeout or refused. If you get a TLS response, the Hetzner
 firewall rule for port 3001 is missing — fix it in the Hetzner Cloud Console before
 considering this step complete.
+
+---
+
+## Kill-switch / admin routing deploy conditions (WP1.7b, C21 + CF-B5)
+
+These apply once WP1.7a (persisted kill-switch latch + stop-with-flatten,
+see `reports/vp2-wp1.7/final-synthesis-1.7a.md`) and WP1.7b (this admin
+routing + UI work) are both deployed together. **1.7a alone is NOT
+deployable** -- see DC-1/DC-2 below.
+
+### DC-1 / DC-2 -- ship 1.7a and 1.7b together; keep live trading off until then
+
+Do not deploy WP1.7a to any environment where the UI is used unless WP1.7b
+ships with it in the same release. The pre-1.7b UI reads the old
+kill-switch response shape and cannot send the `flatten` decision, so an
+operator stopping a live run from the UI would see a misleading result.
+`ENABLE_LIVE_TRADING` must stay `false` in any environment running 1.7a
+without 1.7b.
+
+### DC-3 -- keep the API at a single worker
+
+`infra/Dockerfile.api` runs uvicorn with `--workers 1`. Do **not** add a
+`command:` override in `docker-compose.yml`, and do not raise worker count
+in any deploy script. The in-process `_RUN_ENGINES` registry and the
+kill-switch latch mirror (`apps/api/services/kill_switch.py`) both assume a
+single process; running more than one worker would let each worker hold an
+independent, inconsistent latch/engine state (tracked as CF-L7, multi-worker
+safety, for a future work package).
+
+### DC-4 -- migration 018 must run before the app starts
+
+The entrypoint (`infra/docker-entrypoint.sh`) runs `alembic upgrade head`
+before starting the API process, so this is normally automatic. If the app
+starts against a database that has not yet run migration 018
+(`018_kill_switch_latch_flatten`), `kill_switch.load()` fails and every run
+comes up latched with reason `latch_state_unknown` (fail-closed, per I4).
+That is safe -- no run can enter new positions -- but it blocks run
+creation, promotion and resume until the process is restarted against a
+healthy, migrated database. If you see `latch_state_unknown` immediately
+after a deploy, check `alembic current` against the API container's
+database before doing anything else.
+
+### DC-5 -- rollback steps
+
+If WP1.7a/1.7b need to be rolled back:
+
+1. **Record state first.** Before touching anything, capture:
+   - `GET /api/v1/emergency/kill-switch` (global latch state).
+   - Every run currently holding a per-run latch
+     (`runs.entries_latch_reason IS NOT NULL`).
+   - Any open positions on runs you are about to affect.
+2. **Resolve positions.** For any run holding an open position that the
+   rollback would otherwise orphan, stop or flatten it first through the
+   still-running (pre-rollback) API -- the downgrade below removes the
+   columns that track `flatten_incomplete`, so do this before downgrading.
+3. **Revert the application code** (revert the WP1.7a/1.7b commit(s)) and
+   redeploy the prior image.
+4. **Downgrade the database:** `alembic downgrade 017`. This drops the
+   `kill_switch_state` table and the per-run `entries_latch_reason` /
+   `entries_latched_at` columns -- any latch state and `flatten_incomplete`
+   markers are permanently lost, which is why step 1 (record state first)
+   and step 2 (resolve positions first) are mandatory and come before this
+   step, not after.
+5. Restart the API so it picks up the reverted code against the downgraded
+   schema.
+
+### DC-6 -- a kill-switch clear can be overridden by a pending press (S-R3-02)
+
+A kill-switch **clear** issued while a kill-switch **press** is still
+pending (submitted but not yet acknowledged) may be overridden by that
+press: the latch is fail-closed, so if both operations are in flight the
+final state is **latched**, not cleared.
+
+After issuing a clear, always confirm with:
+
+```
+GET /api/v1/emergency/kill-switch
+```
+
+that `latched` is `false`. If it is still `true`, re-issue the clear.
+Never assume a clear succeeded just because the request returned 200.
+
+### DC-7 -- operator behaviour changes to know before using the kill switch
+
+- The kill switch no longer stops runs. It only blocks **new entries**;
+  existing positions' exits (stop-loss, take-profit, trailing stop) keep
+  running normally.
+- Creating a **paper** run while the switch is latched now returns 409
+  `kill_switch_active` (previously only live runs were blocked) -- a
+  latched new run sitting silently inert was judged worse than an explicit
+  rejection.
+- Both the global clear and the per-run entries-latch clear require the
+  admin key (`X-Admin-Key`, injected server-side by the Next.js admin proxy
+  routes -- the browser never holds it). Clearing a per-run latch on a
+  **live** run additionally requires `X-Live-Confirm-Token`.
+- Stopping a **live** run now requires an explicit `flatten` decision
+  (`true`/`false`); omitting it returns 422 `flatten_decision_required`.
+  An emergency stop with `flatten=true` can take up to about 35 s -- the UI
+  timeout for stop and kill-switch actions must be at least 60 s (AC8).
+- An incomplete flatten (partial fill, in-flight order, etc.) leaves the
+  run **running**, not stopped, with a persisted `flatten_incomplete`
+  per-run latch. The stop call returns 409 `flatten_incomplete` with the
+  partial result; retry the stop, or stop with `flatten=false` to abandon
+  the position tracking (it stays on the exchange, unmanaged).
 
 ---
 

@@ -15,7 +15,6 @@ import { RunStatusBadge } from "@/components/ui/status-badge";
 import { Header } from "@/components/layout/header";
 import { EquityOverview } from "@/components/dashboard/equity-overview";
 import { MarketSignals } from "@/components/dashboard/market-signals";
-import { KillSwitchButton } from "@/components/kill-switch-button";
 
 export const metadata: Metadata = { title: "Dashboard" };
 export const dynamic = "force-dynamic";
@@ -121,7 +120,6 @@ export default async function DashboardPage() {
             >
               New Backtest
             </Link>
-            <KillSwitchButton />
           </div>
         }
       />

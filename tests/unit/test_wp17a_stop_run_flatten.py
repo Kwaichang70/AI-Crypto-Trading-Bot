@@ -323,7 +323,7 @@ class TestClearEntriesLatch:
             )
 
         assert run.entries_latch_reason is None
-        assert result["cleared"] == "flatten_incomplete"
+        assert result.cleared == "flatten_incomplete"
         audit_mock.assert_awaited_once()
         assert audit_mock.await_args.kwargs["event_type"] == "entries_latch_cleared"
 
