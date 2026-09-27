@@ -234,6 +234,45 @@ class _NeverPlacedWatch:
     rejected_at: datetime
 
 
+@dataclass(frozen=True)
+class _SellCap:
+    """WP1.11a (D1/D11): the full result of a SELL-cap computation.
+
+    ``cap`` is the only field ``process_signal`` actually sizes the order
+    against; the rest are diagnostic-only, carried through to the
+    ``live.sell_capped`` warning (D11) so a capped exit's exact reason is
+    never a guessing game. ``cap_reason`` is one of ``"none"`` (no capping
+    applied), ``"ledger"`` (an in-flight/settled/unconfirmed-cancel SELL
+    reservation is the limiting factor), ``"free"`` (the fresh exchange
+    ``free`` balance is), ``"i8"`` (a fresh-balance I8 mismatch was
+    detected on this very call, D7), ``"ledger_doubt"`` (the balance was
+    unavailable/unparseable AND the ledger itself carries doubt, D6 -- cap
+    forced to 0) or ``"balance_unavailable"`` (the balance was
+    unavailable/unparseable but the ledger is clean, D6 -- cap falls back
+    to ``floor_prec(own_avail)``).
+
+    WP1.11a round 2 (C-03): more than one of these can be true on the same
+    call (e.g. an I8 mismatch AND a free-balance shortfall); ``cap_reason``
+    picks exactly one label by a fixed precedence, evaluated in this
+    order: ``"i8"`` > ``"free"`` > ``"ledger"`` > ``"none"`` (the two
+    fetch-failure reasons, ``"ledger_doubt"``/``"balance_unavailable"``,
+    are mutually exclusive with the other four and with each other --
+    they only ever arise on the fetch-failure/unparseable-balance path).
+    This is a producer/reviewer-accepted design choice, not dictated by
+    D11 -- every underlying numeric field (``own``, ``own_avail``, ``cap``,
+    ``free``) is logged alongside it regardless, so an operator can always
+    reconstruct the true limiting factor(s) even when more than one was
+    true.
+    """
+
+    own: Decimal
+    own_avail: Decimal
+    cap: Decimal
+    cap_reason: str
+    free: Decimal | None
+    balance_fresh: bool
+
+
 @overload
 def _safe_decimal(value: Any, default: Decimal = ...) -> Decimal: ...
 @overload
@@ -707,6 +746,31 @@ class LiveExecutionEngine(BaseExecutionEngine):
         # or a resume's WP1.8b import of the now-known order.
         self._contradicted_sell_reserve: dict[str, Decimal] = {}
 
+        # WP1.11a (D5(b)/A3): order_id -> a CANCELED order still awaiting
+        # exchange confirmation of its final terminal state and filled
+        # amount -- cancel_order adds an entry the instant the cancel ack
+        # arrives (never releasing the pre-cancel reserve on the strength
+        # of the ack alone) and removes it only once a fresh fetch_order
+        # reports a terminal status with a finite filled (D9);
+        # check_resting_orders retries every bar until then.
+        self._cancel_unconfirmed: set[UUID] = set()
+        # WP1.11a (D7/J4): symbols with a confirmed I8 mismatch
+        # (own_avail* > exchange total + tol) on a FRESH balance read --
+        # sticky for the engine's lifetime (cleared only by an operator or
+        # WP1.8), and consulted by _ledger_doubt (D6/U-111a) so a later
+        # balance-fetch failure fails closed instead of trusting the
+        # ledger alone.
+        self._i8_doubt: set[str] = set()
+        # WP1.11a (D10/S-07): one asyncio.Lock per symbol, held across the
+        # whole "compute the SELL cap, then submit" critical section
+        # (_held_quantity through submit_order returning) -- BUYs never
+        # take this lock.
+        self._sell_locks: dict[str, asyncio.Lock] = {}
+        # WP1.11a (D3): order_ids already alerted on for
+        # ``live.sell_reserve_stale`` -- fires once per order, not on
+        # every _pending_sell_quantity call.
+        self._stale_sell_alerted: set[UUID] = set()
+
         self._log = self._log.bind(
             engine="live",
             exchange=getattr(exchange, "id", "unknown"),
@@ -953,12 +1017,27 @@ class LiveExecutionEngine(BaseExecutionEngine):
           ``order.quantity - routed_gross`` (the un-filled remainder is
           also "pending" in the sense that it could still fill and needs
           to be reserved against);
-        - settled (``FILLED``/``CANCELED``/``EXPIRED``):
+        - awaiting cancel confirmation (WP1.11a D1/D5(b)): the FULL
+          remaining ``order.quantity - routed_gross``, never just the
+          last known ``filled_quantity`` -- until the exchange confirms a
+          terminal status with a finite fill, a cancel may have raced a
+          complete fill this engine has no evidence of yet;
+        - settled (``FILLED``/``CANCELED``/``EXPIRED``, confirmed):
           ``max(order.filled_quantity - routed_gross, 0)`` (filled but not
           yet routed into the portfolio).
 
         Both use ``_routed_gross_qty`` (gross, matching ``filled_quantity``'s
         unit), never ``sum(Fill.quantity)`` (net of fees, S-02).
+
+        WP1.11a (D2/D3): a stale OPEN/PARTIAL SELL (unconfirmed by a
+        successful reconcile for over ``_INFLIGHT_SELL_MAX_AGE_S``) no
+        longer RELEASES its reservation on a timer (that regression is
+        exactly what let a second SELL sell external coins,
+        WP111a-R-01) -- it keeps reserving ``quantity - routed_gross``
+        forever, flags ``sell_order_state_unknown`` and logs
+        ``live.sell_reserve_stale`` at critical once per order. Release
+        now happens only on evidence: a successful reconcile, or the G2
+        cid-lookup fallback (``check_resting_orders``, D4).
         """
         pending = Decimal("0")
         now = datetime.now(tz=UTC)
@@ -985,17 +1064,52 @@ class LiveExecutionEngine(BaseExecutionEngine):
 
             routed_gross = self._routed_gross_qty.get(order.order_id, Decimal("0"))
 
+            if order.order_id in self._cancel_unconfirmed:
+                # WP1.11a (D1/D5(b)): reserve the FULL remaining quantity,
+                # not just the last known filled_quantity, until the
+                # exchange confirms this cancel's true final state.
+                # Round 2 (S2-04): its outcome is exactly as unknown as a
+                # stale OPEN SELL's once it's been unconfirmed this long --
+                # apply the same D3 alert/flag (once per order); the
+                # CANCELED transition already refreshed `updated_at` to
+                # the cancel time (S2-06 keeps a non-terminal reconcile
+                # reply from resetting it further).
+                age_s = (now - order.updated_at).total_seconds()
+                if age_s > _INFLIGHT_SELL_MAX_AGE_S:
+                    self._flag_reconcile(symbol, "sell_order_state_unknown")
+                    if order.order_id not in self._stale_sell_alerted:
+                        self._stale_sell_alerted.add(order.order_id)
+                        self._log.critical(
+                            "live.sell_reserve_stale",
+                            order_id=str(order.order_id),
+                            symbol=symbol,
+                            age_seconds=age_s,
+                        )
+                pending += max(order.quantity - routed_gross, Decimal("0"))
+                continue
+
             if order.status in (OrderStatus.OPEN, OrderStatus.PARTIAL):
                 age_s = (now - order.updated_at).total_seconds()
                 if age_s > _INFLIGHT_SELL_MAX_AGE_S:
-                    # WP11-S-R2-02 (regression fix): this order's state can
-                    # no longer be trusted -- updated_at only advances on a
-                    # successful reconcile, so a persistently-failing
-                    # fetch_order (e.g. OrderNotFound) means it may never
-                    # reconcile again. Reserving it forever would block
-                    # every future SELL; flag it instead.
+                    # WP11-S-R2-02 / WP1.11a (D2, amended): this order's
+                    # state can no longer be trusted -- updated_at only
+                    # advances on a successful reconcile, so a
+                    # persistently-failing fetch_order (e.g. OrderNotFound)
+                    # means it may never reconcile again. It is most often
+                    # ALREADY FILLED on the exchange (every live SELL is a
+                    # MARKET order) -- releasing the reservation here would
+                    # let the next SELL sell exactly that external coin
+                    # (WP111a-R-01, CE1/E5'). Flag and alert, but keep
+                    # reserving; block BUYs run-wide via _stale_open_sell.
                     self._flag_reconcile(symbol, "sell_order_state_unknown")
-                    continue
+                    if order.order_id not in self._stale_sell_alerted:
+                        self._stale_sell_alerted.add(order.order_id)
+                        self._log.critical(
+                            "live.sell_reserve_stale",
+                            order_id=str(order.order_id),
+                            symbol=symbol,
+                            age_seconds=age_s,
+                        )
                 pending += max(order.quantity - routed_gross, Decimal("0"))
             elif order.status == OrderStatus.PENDING_SUBMIT:
                 # PENDING_SUBMIT with a known exchange id is not reachable
@@ -1099,6 +1213,44 @@ class LiveExecutionEngine(BaseExecutionEngine):
                 return entry
         return None
 
+    def _stale_open_sell(self) -> Order | None:
+        """WP1.11a (D3): a run-wide BUY block companion to
+        ``_stale_unknown_sell`` -- an OPEN/PARTIAL SELL that hasn't been
+        confirmed by a successful reconcile in over
+        ``_INFLIGHT_SELL_MAX_AGE_S`` blocks every new BUY exactly like an
+        unknown submit does, because its true fate (filled? still live?)
+        is genuinely unknown and a fresh BUY must not spend run cash while
+        that ambiguity stands (D2's own reservation only protects THIS
+        symbol's own_avail; it says nothing about a fresh BUY elsewhere).
+
+        Round 2 (S2-04): a SELL still awaiting cancel confirmation
+        (``_cancel_unconfirmed``) is exactly as unknown as a stale
+        OPEN/PARTIAL SELL once it's aged past the same threshold, so it
+        blocks BUYs run-wide too.
+        """
+        now = datetime.now(tz=UTC)
+        for order in self._orders.values():
+            if order.side != OrderSide.SELL:
+                continue
+            age_s = (now - order.updated_at).total_seconds()
+            if age_s <= _INFLIGHT_SELL_MAX_AGE_S:
+                continue
+            if order.order_id in self._cancel_unconfirmed:
+                return order
+            if order.status in (OrderStatus.OPEN, OrderStatus.PARTIAL):
+                return order
+        return None
+
+    def _sell_lock(self, symbol: str) -> asyncio.Lock:
+        """WP1.11a (D10/S-07): the per-symbol lock held by
+        ``process_signal``'s SELL branch from the cap computation through
+        ``submit_order`` returning (never the post-submit reconcile)."""
+        lock = self._sell_locks.get(symbol)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._sell_locks[symbol] = lock
+        return lock
+
     def _maybe_log_inflight_block_stale(self, order: Order) -> None:
         """WP1.4 (S-04, security round 2): once ``order`` has been
         blocking new BUYs for longer than ``_buy_inflight_stale_after_s``
@@ -1124,50 +1276,165 @@ class LiveExecutionEngine(BaseExecutionEngine):
                 age_seconds=age_s,
             )
 
-    async def _held_quantity(self, symbol: str) -> tuple[Decimal, Decimal, Decimal]:
-        """Return ``(own, own_avail, capped)`` for a SELL against ``symbol``.
+    def _parse_base_balance(
+        self, balance: dict[str, Any], base: str
+    ) -> tuple[Decimal | None, Decimal | None]:
+        """WP1.11a (D8): parse ``(total, free)`` for ``base`` out of a
+        fresh ``fetch_balance()`` response. Missing, non-finite, negative,
+        or a missing base coin (the 250-account page can omit it) all come
+        back as ``None`` ("unavailable") -- routed by the caller through
+        D6's ledger-doubt fetch-failure logic, never silently coerced to
+        zero and never left uncapped.
+        """
+
+        def _parse(section: dict[str, Any] | None) -> Decimal | None:
+            value = _safe_decimal((section or {}).get(base), default=None)
+            if value is None or not value.is_finite() or value < Decimal("0"):
+                return None
+            return value
+
+        total = _parse(balance.get("total"))
+        free = _parse(balance.get("free"))
+        return total, free
+
+    def _ledger_doubt(self, symbol: str) -> bool:
+        """WP1.11a (D6/U-111a): True iff ``symbol``'s ``own_avail*`` figure
+        carries ledger-side uncertainty a fetch-failure fallback must not
+        paper over -- derived directly from engine state (never from
+        ``reconcile_required``, which an unrelated reason like
+        ``market_missing`` could also set). Five independent sources
+        (D6/T9): an unresolved unknown SELL submit, a stale OPEN/PARTIAL
+        SELL (D3), a positive contradicted-SELL reserve, an order still
+        awaiting cancel confirmation (D5(b)), or a sticky I8 mismatch
+        (D7/J4 -- cleared only by an operator or WP1.8).
+        """
+        if symbol in self._i8_doubt:
+            return True
+        if self._contradicted_sell_reserve.get(symbol, Decimal("0")) > Decimal("0"):
+            return True
+        for entry in self._unknown_submits.values():
+            if entry.symbol == symbol and entry.side == OrderSide.SELL:
+                return True
+        now = datetime.now(tz=UTC)
+        for order in self._orders.values():
+            if order.symbol != symbol or order.side != OrderSide.SELL:
+                continue
+            if order.order_id in self._cancel_unconfirmed:
+                return True
+            if (
+                order.status in (OrderStatus.OPEN, OrderStatus.PARTIAL)
+                and (now - order.updated_at).total_seconds() > _INFLIGHT_SELL_MAX_AGE_S
+            ):
+                return True
+        return False
+
+    def _sell_cap_on_fetch_failure(
+        self, symbol: str, own_avail: Decimal
+    ) -> tuple[Decimal, str]:
+        """WP1.11a (D6/U-111a): the SELL cap when a fresh balance read is
+        unavailable (the ``fetch_balance`` call itself failed, D6, or its
+        per-asset fields were unparseable, D8). Allowed to fall back to
+        ``floor_prec(own_avail)`` ONLY when ``_ledger_doubt`` is clear --
+        otherwise the cap is 0, logged at critical on every attempt (so it
+        retries every bar until the doubt clears or the balance recovers).
+        """
+        if self._ledger_doubt(symbol):
+            self._log.critical(
+                "live.sell_blocked_ledger_doubt",
+                symbol=symbol,
+                own_avail=str(own_avail),
+            )
+            return Decimal("0"), "ledger_doubt"
+        return self._floor_to_amount_precision(symbol, own_avail), "balance_unavailable"
+
+    async def _held_quantity(self, symbol: str) -> _SellCap:
+        """Return the SELL-cap computation for ``symbol`` (WP1.11a D1).
 
         ``own`` is read from the attached position source (I2).
-        ``own_avail`` (WP11-S-03) subtracts this-symbol SELL quantity still
-        in flight from ``own`` -- a second SELL signal before the first is
-        routed must never re-sell the same quantity out of an external
-        holding. ``capped`` floors SELL exposure to ``min(own_avail, free)``
-        using a **fresh** balance fetch (D15) -- both ``own_avail`` and
-        ``capped`` fall back to being uncapped (never capped down further)
-        when the balance is unavailable or the market's base asset is
-        unknown, per I1's "never block the exit".
+        ``own_avail`` (WP11-S-03/WP1.11a D1) subtracts every this-symbol
+        SELL quantity still in flight, awaiting cancel confirmation, or
+        settled-but-unrouted from ``own`` -- a second SELL signal before
+        the first is routed must never re-sell the same quantity out of an
+        external holding. ``cap`` floors SELL exposure to
+        ``min(own_avail, free)`` using a **fresh** balance fetch (D15),
+        never ``free - external`` and never ``fetch_open_orders`` (D1's
+        proof holds without either).
+
+        WP1.11a (D6/U-111a) supersedes the old WP1.1 I1 "never block the
+        exit" fallback: a fetch failure or an unparseable balance field
+        (D8) now falls back to ``floor_prec(own_avail)`` ONLY when the
+        ledger itself carries no doubt (``_ledger_doubt``); otherwise the
+        cap is 0 (fail closed) rather than uncapped.
 
         Also runs the I8 mismatch check (``own_avail`` vs exchange
-        ``total``, D9/S-03) so it fires on every SELL, not only at startup
-        sync, without going stale while a SELL is still in flight.
+        ``total``, D7) on every SELL -- NOT a hard block (U1): the exit
+        still gets ``min(own_avail, free)``, but the symbol is marked
+        sticky-doubtful (``_i8_doubt``, J4) and logged at critical.
         """
         own = self._own_quantity(symbol)
         if own <= Decimal("0"):
-            return own, own, own
+            return _SellCap(
+                own=own, own_avail=own, cap=own, cap_reason="none",
+                free=None, balance_fresh=False,
+            )
 
         pending_sell = self._pending_sell_quantity(symbol)
         own_avail = max(own - pending_sell, Decimal("0"))
         if own_avail <= Decimal("0"):
-            return own, own_avail, Decimal("0")
+            return _SellCap(
+                own=own, own_avail=own_avail, cap=Decimal("0"), cap_reason="ledger",
+                free=None, balance_fresh=False,
+            )
 
         base = self._base_asset(symbol)
         balance = await self._fetch_balance_cached(fresh=True)
         if balance is None or base is None:
-            return own, own_avail, own_avail
+            cap, reason = self._sell_cap_on_fetch_failure(symbol, own_avail)
+            return _SellCap(
+                own=own, own_avail=own_avail, cap=cap, cap_reason=reason,
+                free=None, balance_fresh=False,
+            )
+
+        total, free = self._parse_base_balance(balance, base)
+        if total is None or free is None:
+            # WP1.11a (D8): an unparseable/missing per-asset balance field
+            # is treated exactly like a fetch failure (D6).
+            cap, reason = self._sell_cap_on_fetch_failure(symbol, own_avail)
+            return _SellCap(
+                own=own, own_avail=own_avail, cap=cap, cap_reason=reason,
+                free=free, balance_fresh=True,
+            )
 
         tol = self._amount_tolerance(symbol)
-        # WP11-S-07: unparseable balance values are treated as unavailable
-        # (None), never coerced to zero.
-        total = _safe_decimal((balance.get("total") or {}).get(base), default=None)
-        if total is not None and own_avail > total + tol:
+        i8_mismatch = own_avail > total + tol
+        if i8_mismatch:
+            # WP1.11a (D7/U1): NOT a hard block -- flag, log critical, and
+            # mark the symbol sticky-doubtful (J4); the exit still gets
+            # min(own_avail, free) below.
             self._flag_reconcile(symbol, "own_exceeds_exchange_total")
+            self._i8_doubt.add(symbol)
+            self._log.critical(
+                "live.sell_i8_mismatch",
+                symbol=symbol,
+                own_avail=str(own_avail),
+                total=str(total),
+            )
 
-        free = _safe_decimal((balance.get("free") or {}).get(base), default=None)
-        if free is None:
-            return own, own_avail, own_avail
-
-        capped = min(own_avail, free)
-        return own, own_avail, max(capped, Decimal("0"))
+        cap = self._floor_to_amount_precision(
+            symbol, max(min(own_avail, free), Decimal("0"))
+        )
+        if i8_mismatch:
+            reason = "i8"
+        elif cap < own_avail:
+            reason = "free"
+        elif own_avail < own:
+            reason = "ledger"
+        else:
+            reason = "none"
+        return _SellCap(
+            own=own, own_avail=own_avail, cap=cap, cap_reason=reason,
+            free=free, balance_fresh=True,
+        )
 
     # ------------------------------------------------------------------
     # Safety gate
@@ -1478,9 +1745,29 @@ class LiveExecutionEngine(BaseExecutionEngine):
             order = self._transition(order, OrderStatus.OPEN)
 
             # Extract fill data from response
-            filled_qty = _safe_decimal(
-                ccxt_response.get("filled"), order.quantity
-            )
+            raw_filled = ccxt_response.get("filled")
+            filled_qty = _safe_decimal(raw_filled, order.quantity)
+            if not filled_qty.is_finite() or filled_qty < Decimal("0"):
+                # WP1.11a round 2 (S2-02): the create_order/adoption path
+                # had no equivalent of _apply_exchange_order_state's D9
+                # guard -- a non-finite or negative `filled` on an
+                # instant-FILLED reply must not be trusted (it would
+                # otherwise poison every later _held_quantity call for
+                # this symbol with InvalidOperation). Stay OPEN (the
+                # regular per-bar reconcile settles it once real data
+                # arrives) -- the order already reserves its FULL
+                # quantity in this state (_pending_sell_quantity's
+                # OPEN branch reserves quantity - routed_gross, which
+                # ignores filled_quantity entirely), so no coverage is
+                # lost by refusing to mutate here.
+                self._log.critical(
+                    "live.reconcile_filled_invalid",
+                    order_id=str(order.order_id),
+                    symbol=order.symbol,
+                    status=ccxt_status,
+                    raw_filled=str(raw_filled)[:200],
+                )
+                return order
             avg_price = _safe_decimal(
                 ccxt_response.get("average")
             ) or _safe_decimal(ccxt_response.get("price"), Decimal("0"))
@@ -2138,6 +2425,23 @@ class LiveExecutionEngine(BaseExecutionEngine):
 
         exchange_order_id = self._exchange_order_map.get(order_id)
 
+        if exchange_order_id is None and order.status == OrderStatus.PENDING_SUBMIT:
+            # WP1.11a (D5(a)/W3): create_order's outcome for this order is
+            # STILL AMBIGUOUS (no exchange id recorded yet) -- it may have
+            # been accepted anyway. Locally CANCELing it here would release
+            # I5b(a)'s unknown-submit reserve on the strength of a caller's
+            # cancel alone, with no exchange evidence either way (exactly
+            # the leak StrategyEngine.stop()'s cancel-every-open-order loop
+            # would otherwise trigger on every shutdown). Leave the order
+            # exactly as-is; the per-bar unknown-submit resolver is the
+            # only path that may resolve it.
+            self._log.warning(
+                "live.cancel_skipped_unknown_submit",
+                order_id=str(order_id),
+                symbol=order.symbol,
+            )
+            return order
+
         try:
             if exchange_order_id:
                 await ccxt_retry(
@@ -2159,6 +2463,17 @@ class LiveExecutionEngine(BaseExecutionEngine):
                 exchange_order_id=exchange_order_id,
                 symbol=order.symbol,
             )
+
+            # WP1.11a (D5(b)/A3): the cancel ack alone is not evidence of
+            # the order's TRUE final fill -- it may have raced a fill on
+            # the exchange side. Keep it in _cancel_unconfirmed (so
+            # _pending_sell_quantity reserves its FULL remaining quantity,
+            # D1) until a fresh fetch_order confirms a terminal status
+            # with a finite filled amount.
+            self._cancel_unconfirmed.add(order_id)
+            order, confirmed = await self._reconcile_order_ex(order)
+            if confirmed:
+                self._cancel_unconfirmed.discard(order_id)
 
         except (ccxt_async.OrderNotFound, ccxt_async.InvalidOrder):
             # Race condition: order was already filled on exchange
@@ -2255,6 +2570,21 @@ class LiveExecutionEngine(BaseExecutionEngine):
         and flags ``reconcile_required`` for a PENDING_SUBMIT BUY with no
         exchange id, mirroring the SELL side (WP14-S-05).
 
+        WP1.11a (external-coin-safe SELL cap, D1-D11): the SELL cap is
+        ``floor_prec(min(own_avail*, fresh free))`` -- a pure ledger
+        computation (D1) with no ``free - external`` term and no
+        ``fetch_open_orders`` call (J1's proof holds without either). A
+        per-symbol lock (D10) is held from the cap computation through
+        ``submit_order`` returning (not the post-submit reconcile) so two
+        concurrent SELL signals for the same symbol can never both size
+        off the same not-yet-reserved quantity. A balance-fetch failure or
+        an unparseable balance field (D6/D8) falls back to
+        ``floor_prec(own_avail*)`` only when the ledger itself carries no
+        doubt (``_ledger_doubt``); a fresh-balance I8 mismatch (D7) is
+        logged at critical and marks the symbol sticky-doubtful but is NOT
+        a hard block (U1). ``live.sell_capped`` (D11) logs the full cap
+        breakdown whenever it actually constrained the sold quantity.
+
         Parameters
         ----------
         signal:
@@ -2281,366 +2611,435 @@ class LiveExecutionEngine(BaseExecutionEngine):
         self._sync_positions_cache(signal.symbol)
 
         held_quantity: Decimal | None = None
-        if side == OrderSide.BUY:
-            # I4/D2: a flagged symbol blocks BUYs only; SELLs are never
-            # blocked by reconcile_required.
-            if signal.symbol in self._reconcile_required:
-                self._log.warning(
-                    "live.buy_blocked_reconcile_required",
-                    strategy_id=signal.strategy_id,
-                    symbol=signal.symbol,
-                    reason=self._reconcile_required[signal.symbol],
-                )
-                return []
-            if self._position_source is not None:
-                # WP1.4 (S-04): a run whose symbols don't share one quote
-                # currency never sizes/caps a BUY off the right balance --
-                # blocked once at on_start, never healed mid-run.
-                if self._run_buy_block is not None:
-                    # WP1.4b round 3 (S-R2-05): renamed from
-                    # "live.buy_blocked_quote_mismatch" -- this run-wide
-                    # halt now also covers "never_placed_contradicted"
-                    # (S-01c), not just the original quote-mismatch case;
-                    # ``reason`` still distinguishes them.
-                    self._log.warning(
-                        "live.buy_blocked_run_block",
-                        strategy_id=signal.strategy_id,
-                        symbol=signal.symbol,
-                        reason=self._run_buy_block,
-                    )
-                    return []
-                # WP1.4b round 2 (R-02(a)): a stale unknown SELL (>= 300s
-                # unresolved) blocks every new BUY, run-wide, until it
-                # resolves on evidence -- checked BEFORE the in-flight-BUY
-                # check below.
-                stale_sell = self._stale_unknown_sell()
-                if stale_sell is not None:
-                    self._log.warning(
-                        "live.buy_blocked_stale_unknown_sell",
-                        strategy_id=signal.strategy_id,
-                        symbol=signal.symbol,
-                        blocked_symbol=stale_sell.symbol,
-                    )
-                    return []
-                # WP1.4 (S-02/A-04): a BUY still in flight anywhere in the
-                # run, or filled but not yet routed, blocks every new BUY
-                # -- otherwise a late fill lets the next BUY spend the
-                # same run cash twice (R-03's alternative, a reduced
-                # run_cash_avail, was rejected in favour of this simpler
-                # rule). No age expiry (R3): a stuck order blocks until it
-                # genuinely routes or an operator intervenes.
-                blocking_order = self._inflight_buy_orders()
-                if blocking_order is not None:
-                    # Security round 2 (WP14-S-04): a one-time, error-level
-                    # alert if this has been blocking for too long, plus
-                    # the blocking order's id/status/unrouted amount on
-                    # every occurrence -- both were missing before.
-                    self._maybe_log_inflight_block_stale(blocking_order)
-                    blocking_routed = self._routed_gross_qty.get(
-                        blocking_order.order_id, Decimal("0")
-                    )
-                    self._log.warning(
-                        "live.buy_blocked_inflight_buy",
-                        strategy_id=signal.strategy_id,
-                        symbol=signal.symbol,
-                        blocking_order_id=str(blocking_order.order_id),
-                        blocking_status=blocking_order.status.value,
-                        unrouted=str(blocking_order.filled_quantity - blocking_routed),
-                    )
-                    return []
-        else:
-            own, own_avail, capped = await self._held_quantity(signal.symbol)
-            if own <= Decimal("0"):
-                self._log.info(
-                    "live.sell_no_position",
-                    strategy_id=signal.strategy_id,
-                    symbol=signal.symbol,
-                )
-                return []
-            if own_avail <= Decimal("0"):
-                # WP11-S-03: this symbol's own quantity is fully accounted
-                # for by SELL orders already in flight -- do NOT sell the
-                # same quantity again (e.g. out of an external holding).
-                # This does not block protection: the exit is already
-                # submitted and will route once its fill is picked up.
-                self._log.warning(
-                    "live.sell_inflight_pending",
-                    strategy_id=signal.strategy_id,
-                    symbol=signal.symbol,
-                    own=str(own),
-                    reserved=str(own - own_avail),
-                )
-                return []
-            if capped <= Decimal("0"):
-                self._log.warning(
-                    "live.sell_capped_to_zero",
-                    strategy_id=signal.strategy_id,
-                    symbol=signal.symbol,
-                    own=str(own),
-                )
-                return []
-            held_quantity = capped
-
-        # Fetch current ticker for position sizing (uses ccxt_retry)
+        sell_lock: asyncio.Lock | None = None
+        sell_cap: _SellCap | None = None
         try:
-            ticker = await ccxt_retry(
-                self._exchange.fetch_ticker, signal.symbol,
-                max_retries=2, base_delay=1.0,
-                operation=f"fetch_ticker({signal.symbol})",
-            )
-            last_price = Decimal(str(ticker.get("last", "0")))
-            if last_price <= Decimal("0"):
-                self._log.error(
-                    "live.invalid_ticker_price",
-                    symbol=signal.symbol,
-                    ticker=ticker,
-                )
-                return []
-        except Exception as exc:
-            self._log.error(
-                "live.ticker_fetch_failed",
-                symbol=signal.symbol,
-                error=str(exc),
-                user_message=translate_ccxt_error(exc),
-            )
-            return []
-
-        # SYN-S51: target_position is the authoritative sizing input; the
-        # risk manager ceiling only de-sizes. equity is fetched from the
-        # same source the legacy calculate_position_size call used; for SELL
-        # we pass the held quantity so the resolver can full-close / cap.
-        #
-        # WP1.4 (D5/S-01): with a source attached, NAV/peak/basis come from
-        # the portfolio, never the exchange balance (I-1). BUY sizes at
-        # ``min(NAV, initial_capital)`` (I-2); SELL and the risk gate (I-3)
-        # both use the source's raw ``current_equity`` so a run in profit
-        # never shows a false drawdown. With no source, the legacy
-        # exchange-balance path (D8) is unchanged.
-        nav: Decimal
-        peak_equity: Decimal | None
-        if self._position_source is not None:
-            source = self._position_source
             if side == OrderSide.BUY:
-                snapshot = self._equity_snapshot(signal.symbol, last_price)
-                if snapshot is None:
+                # I4/D2: a flagged symbol blocks BUYs only; SELLs are never
+                # blocked by reconcile_required.
+                if signal.symbol in self._reconcile_required:
                     self._log.warning(
-                        "live.nav_unavailable",
+                        "live.buy_blocked_reconcile_required",
+                        strategy_id=signal.strategy_id,
+                        symbol=signal.symbol,
+                        reason=self._reconcile_required[signal.symbol],
+                    )
+                    return []
+                # WP1.11a round 2 (S2-03/J4): a sticky I8 mismatch survives
+                # even a later `reconcile_required` overwrite (e.g.
+                # sync_positions's self-clearing `balance_unavailable`) --
+                # `_i8_doubt` is checked directly here so U1's "a mismatch
+                # blocks BUYs" and J4's "sticky until an operator/WP1.8
+                # clears it" both hold regardless of what the single-reason
+                # `reconcile_required` map currently says.
+                if signal.symbol in self._i8_doubt:
+                    self._log.warning(
+                        "live.buy_blocked_i8_doubt",
                         strategy_id=signal.strategy_id,
                         symbol=signal.symbol,
                     )
                     return []
-                equity = snapshot.sizing_basis
-                nav = snapshot.nav
-                peak_equity = snapshot.peak
+                if self._position_source is not None:
+                    # WP1.4 (S-04): a run whose symbols don't share one quote
+                    # currency never sizes/caps a BUY off the right balance --
+                    # blocked once at on_start, never healed mid-run.
+                    if self._run_buy_block is not None:
+                        # WP1.4b round 3 (S-R2-05): renamed from
+                        # "live.buy_blocked_quote_mismatch" -- this run-wide
+                        # halt now also covers "never_placed_contradicted"
+                        # (S-01c), not just the original quote-mismatch case;
+                        # ``reason`` still distinguishes them.
+                        self._log.warning(
+                            "live.buy_blocked_run_block",
+                            strategy_id=signal.strategy_id,
+                            symbol=signal.symbol,
+                            reason=self._run_buy_block,
+                        )
+                        return []
+                    # WP1.4b round 2 (R-02(a)): a stale unknown SELL (>= 300s
+                    # unresolved) blocks every new BUY, run-wide, until it
+                    # resolves on evidence -- checked BEFORE the in-flight-BUY
+                    # check below.
+                    stale_sell = self._stale_unknown_sell()
+                    if stale_sell is not None:
+                        self._log.warning(
+                            "live.buy_blocked_stale_unknown_sell",
+                            strategy_id=signal.strategy_id,
+                            symbol=signal.symbol,
+                            blocked_symbol=stale_sell.symbol,
+                        )
+                        return []
+                    # WP1.11a (D3): a stale OPEN/PARTIAL SELL (unconfirmed by a
+                    # successful reconcile for >= 300s) blocks every new BUY,
+                    # run-wide, exactly like a stale unknown submit -- checked
+                    # right next to it.
+                    stale_open_sell = self._stale_open_sell()
+                    if stale_open_sell is not None:
+                        self._log.warning(
+                            "live.buy_blocked_stale_open_sell",
+                            strategy_id=signal.strategy_id,
+                            symbol=signal.symbol,
+                            blocked_symbol=stale_open_sell.symbol,
+                        )
+                        return []
+                    # WP1.4 (S-02/A-04): a BUY still in flight anywhere in the
+                    # run, or filled but not yet routed, blocks every new BUY
+                    # -- otherwise a late fill lets the next BUY spend the
+                    # same run cash twice (R-03's alternative, a reduced
+                    # run_cash_avail, was rejected in favour of this simpler
+                    # rule). No age expiry (R3): a stuck order blocks until it
+                    # genuinely routes or an operator intervenes.
+                    blocking_order = self._inflight_buy_orders()
+                    if blocking_order is not None:
+                        # Security round 2 (WP14-S-04): a one-time, error-level
+                        # alert if this has been blocking for too long, plus
+                        # the blocking order's id/status/unrouted amount on
+                        # every occurrence -- both were missing before.
+                        self._maybe_log_inflight_block_stale(blocking_order)
+                        blocking_routed = self._routed_gross_qty.get(
+                            blocking_order.order_id, Decimal("0")
+                        )
+                        self._log.warning(
+                            "live.buy_blocked_inflight_buy",
+                            strategy_id=signal.strategy_id,
+                            symbol=signal.symbol,
+                            blocking_order_id=str(blocking_order.order_id),
+                            blocking_status=blocking_order.status.value,
+                            unrouted=str(blocking_order.filled_quantity - blocking_routed),
+                        )
+                        return []
             else:
-                nav = source.current_equity
-                equity = nav
-                peak_equity = max(source.get_peak_equity(), nav)
-        else:
-            equity = await self._fetch_equity()
-            nav = equity
-            peak_equity = None  # fetched later, exactly where D8 always fetched it
-
-        quantity = self._resolve_order_quantity(
-            signal=signal,
-            side=side,
-            last_price=last_price,
-            equity=equity,
-            held_quantity=held_quantity,
-        )
-
-        if quantity <= Decimal("0"):
-            self._log.warning(
-                "live.zero_quantity",
-                strategy_id=signal.strategy_id,
-                symbol=signal.symbol,
-                equity=str(equity),
-                last_price=str(last_price),
-                confidence=signal.confidence,
-            )
-            return []
-
-        # WP1.4 (I-4/I-5): BUY affordability cap -- run cash and a fresh
-        # exchange free-quote balance, never the sizing basis alone (D5
-        # would otherwise let a run with a shrunk account balance still
-        # size off its own book). Applied before the min-amount/min-cost
-        # checks and the precision floor (spec BUY sequence step 7).
-        # SELLs are never touched by this guard (I-5).
-        #
-        # Security round 2 (amends I-4): the cap price is
-        # ``max(last, ask)``, not ``last`` alone, and ``buf`` folds in a
-        # slippage margin on top of the taker fee -- ``last`` (or a
-        # misreported taker fee) alone let a fill push run cash negative
-        # (WP14-S-02). ``buy_cap_price`` also becomes the price
-        # ``submit_order``'s Coinbase path sizes the order against
-        # (WP14-S-01) instead of fetching a second, later ticker.
-        buy_cap_price: Decimal | None = None
-        if side == OrderSide.BUY and self._position_source is not None:
-            source = self._position_source
-            quote = self._quote_asset(signal.symbol)
-            balance = await self._fetch_balance_cached(fresh=True)
-            free_quote = (
-                _safe_decimal((balance.get("free") or {}).get(quote), default=None)
-                if balance is not None and quote is not None
-                else None
-            )
-            # WP14-S-03 (security round 2): a non-finite (NaN/Inf) free
-            # balance is exactly as unusable as a missing one -- a NaN
-            # comparison below would otherwise raise InvalidOperation.
-            if free_quote is None or not free_quote.is_finite():
-                self._log.warning(
-                    "live.buy_blocked_balance_unavailable",
-                    strategy_id=signal.strategy_id,
+                # WP1.11a (D10/S-07): held from right here (before the cap is
+                # even computed) through submit_order returning below -- two
+                # concurrent SELL signals for the same symbol must never both
+                # compute their cap off the same not-yet-reserved own_avail.
+                lock = self._sell_lock(signal.symbol)
+                await lock.acquire()
+                sell_lock = lock
+                sell_cap = await self._held_quantity(signal.symbol)
+                own, own_avail, capped = sell_cap.own, sell_cap.own_avail, sell_cap.cap
+                if own <= Decimal("0"):
+                    self._log.info(
+                        "live.sell_no_position",
+                        strategy_id=signal.strategy_id,
+                        symbol=signal.symbol,
+                    )
+                    return []
+                if own_avail <= Decimal("0"):
+                    # WP11-S-03: this symbol's own quantity is fully accounted
+                    # for by SELL orders already in flight -- do NOT sell the
+                    # same quantity again (e.g. out of an external holding).
+                    # This does not block protection: the exit is already
+                    # submitted and will route once its fill is picked up.
+                    self._log.warning(
+                        "live.sell_inflight_pending",
+                        strategy_id=signal.strategy_id,
+                        symbol=signal.symbol,
+                        own=str(own),
+                        reserved=str(own - own_avail),
+                    )
+                    return []
+                if capped <= Decimal("0"):
+                    self._log.warning(
+                        "live.sell_capped_to_zero",
+                        strategy_id=signal.strategy_id,
+                        symbol=signal.symbol,
+                        own=str(own),
+                    )
+                    return []
+                held_quantity = capped
+            # Fetch current ticker for position sizing (uses ccxt_retry)
+            try:
+                ticker = await ccxt_retry(
+                    self._exchange.fetch_ticker, signal.symbol,
+                    max_retries=2, base_delay=1.0,
+                    operation=f"fetch_ticker({signal.symbol})",
+                )
+                last_price = Decimal(str(ticker.get("last", "0")))
+                if last_price <= Decimal("0"):
+                    self._log.error(
+                        "live.invalid_ticker_price",
+                        symbol=signal.symbol,
+                        ticker=ticker,
+                    )
+                    return []
+            except Exception as exc:
+                self._log.error(
+                    "live.ticker_fetch_failed",
                     symbol=signal.symbol,
+                    error=str(exc),
+                    user_message=translate_ccxt_error(exc),
                 )
                 return []
-            cash = max(source.cash, Decimal("0"))
-            if free_quote < cash:
-                self._log.warning(
-                    "live.run_cash_exceeds_exchange_free",
-                    strategy_id=signal.strategy_id,
-                    symbol=signal.symbol,
-                    run_cash=str(cash),
-                    free_quote=str(free_quote),
-                )
-            ask_price = _safe_decimal(ticker.get("ask"), default=None)
-            if ask_price is None or not ask_price.is_finite() or ask_price <= Decimal("0"):
-                ask_price = last_price
-            buy_cap_price = max(last_price, ask_price)
-            buf = self._taker_buffer(signal.symbol) + self._buy_cap_slippage_pct
-            quantity = self._cap_buy_quantity(
-                quantity, buy_cap_price, min(cash, free_quote), buf
+
+            # SYN-S51: target_position is the authoritative sizing input; the
+            # risk manager ceiling only de-sizes. equity is fetched from the
+            # same source the legacy calculate_position_size call used; for SELL
+            # we pass the held quantity so the resolver can full-close / cap.
+            #
+            # WP1.4 (D5/S-01): with a source attached, NAV/peak/basis come from
+            # the portfolio, never the exchange balance (I-1). BUY sizes at
+            # ``min(NAV, initial_capital)`` (I-2); SELL and the risk gate (I-3)
+            # both use the source's raw ``current_equity`` so a run in profit
+            # never shows a false drawdown. With no source, the legacy
+            # exchange-balance path (D8) is unchanged.
+            nav: Decimal
+            peak_equity: Decimal | None
+            if self._position_source is not None:
+                source = self._position_source
+                if side == OrderSide.BUY:
+                    snapshot = self._equity_snapshot(signal.symbol, last_price)
+                    if snapshot is None:
+                        self._log.warning(
+                            "live.nav_unavailable",
+                            strategy_id=signal.strategy_id,
+                            symbol=signal.symbol,
+                        )
+                        return []
+                    equity = snapshot.sizing_basis
+                    nav = snapshot.nav
+                    peak_equity = snapshot.peak
+                else:
+                    nav = source.current_equity
+                    equity = nav
+                    peak_equity = max(source.get_peak_equity(), nav)
+            else:
+                equity = await self._fetch_equity()
+                nav = equity
+                peak_equity = None  # fetched later, exactly where D8 always fetched it
+
+            quantity = self._resolve_order_quantity(
+                signal=signal,
+                side=side,
+                last_price=last_price,
+                equity=equity,
+                held_quantity=held_quantity,
             )
 
-        # ------------------------------------------------------------------
-        # Exchange minimum order size validation
-        # Checked after all quantity adjustments (position cap, etc.) so we
-        # evaluate the final quantity that would actually be submitted.
-        # markets is populated by load_markets() in on_start(); if markets is
-        # not yet loaded (e.g. in disabled-gate mode) the dict will be empty
-        # and the guard is skipped gracefully.
-        # ------------------------------------------------------------------
-        markets: dict[str, Any] = getattr(self._exchange, "markets", {}) or {}
-        market = markets.get(signal.symbol)
-        if market:
-            limits: dict[str, Any] = market.get("limits") or {}
-            amount_limits: dict[str, Any] = limits.get("amount") or {}
-            cost_limits: dict[str, Any] = limits.get("cost") or {}
+            # WP1.11a (D11): whenever the SELL cap actually constrained the
+            # resolved quantity below what the strategy would otherwise have
+            # sold (computed with the SAME sizing formula against the
+            # UNCAPPED own quantity), log the full cap breakdown at warning.
+            # Never the balance dict, never `info` -- at most the base
+            # asset's `free` as one value (S-08).
+            if side == OrderSide.SELL and sell_cap is not None:
+                requested_quantity = self._resolve_order_quantity(
+                    signal=signal,
+                    side=side,
+                    last_price=last_price,
+                    equity=equity,
+                    held_quantity=sell_cap.own,
+                )
+                if quantity < requested_quantity:
+                    self._log.warning(
+                        "live.sell_capped",
+                        symbol=signal.symbol,
+                        strategy_id=signal.strategy_id,
+                        requested=str(requested_quantity),
+                        own=str(sell_cap.own),
+                        reserved=str(sell_cap.own - sell_cap.own_avail),
+                        own_avail=str(sell_cap.own_avail),
+                        cap=str(sell_cap.cap),
+                        cap_reason=sell_cap.cap_reason,
+                        balance_fresh=sell_cap.balance_fresh,
+                        free=str(sell_cap.free) if sell_cap.free is not None else None,
+                    )
 
-            min_amount = amount_limits.get("min")
-            min_cost = cost_limits.get("min")
-
-            notional = quantity * last_price
-
-            if min_amount is not None and float(quantity) < float(min_amount):
+            if quantity <= Decimal("0"):
                 self._log.warning(
-                    "live.below_min_amount",
+                    "live.zero_quantity",
+                    strategy_id=signal.strategy_id,
+                    symbol=signal.symbol,
+                    equity=str(equity),
+                    last_price=str(last_price),
+                    confidence=signal.confidence,
+                )
+                return []
+
+            # WP1.4 (I-4/I-5): BUY affordability cap -- run cash and a fresh
+            # exchange free-quote balance, never the sizing basis alone (D5
+            # would otherwise let a run with a shrunk account balance still
+            # size off its own book). Applied before the min-amount/min-cost
+            # checks and the precision floor (spec BUY sequence step 7).
+            # SELLs are never touched by this guard (I-5).
+            #
+            # Security round 2 (amends I-4): the cap price is
+            # ``max(last, ask)``, not ``last`` alone, and ``buf`` folds in a
+            # slippage margin on top of the taker fee -- ``last`` (or a
+            # misreported taker fee) alone let a fill push run cash negative
+            # (WP14-S-02). ``buy_cap_price`` also becomes the price
+            # ``submit_order``'s Coinbase path sizes the order against
+            # (WP14-S-01) instead of fetching a second, later ticker.
+            buy_cap_price: Decimal | None = None
+            if side == OrderSide.BUY and self._position_source is not None:
+                source = self._position_source
+                quote = self._quote_asset(signal.symbol)
+                balance = await self._fetch_balance_cached(fresh=True)
+                free_quote = (
+                    _safe_decimal((balance.get("free") or {}).get(quote), default=None)
+                    if balance is not None and quote is not None
+                    else None
+                )
+                # WP14-S-03 (security round 2): a non-finite (NaN/Inf) free
+                # balance is exactly as unusable as a missing one -- a NaN
+                # comparison below would otherwise raise InvalidOperation.
+                if free_quote is None or not free_quote.is_finite():
+                    self._log.warning(
+                        "live.buy_blocked_balance_unavailable",
+                        strategy_id=signal.strategy_id,
+                        symbol=signal.symbol,
+                    )
+                    return []
+                cash = max(source.cash, Decimal("0"))
+                if free_quote < cash:
+                    self._log.warning(
+                        "live.run_cash_exceeds_exchange_free",
+                        strategy_id=signal.strategy_id,
+                        symbol=signal.symbol,
+                        run_cash=str(cash),
+                        free_quote=str(free_quote),
+                    )
+                ask_price = _safe_decimal(ticker.get("ask"), default=None)
+                if ask_price is None or not ask_price.is_finite() or ask_price <= Decimal("0"):
+                    ask_price = last_price
+                buy_cap_price = max(last_price, ask_price)
+                buf = self._taker_buffer(signal.symbol) + self._buy_cap_slippage_pct
+                quantity = self._cap_buy_quantity(
+                    quantity, buy_cap_price, min(cash, free_quote), buf
+                )
+
+            # ------------------------------------------------------------------
+            # Exchange minimum order size validation
+            # Checked after all quantity adjustments (position cap, etc.) so we
+            # evaluate the final quantity that would actually be submitted.
+            # markets is populated by load_markets() in on_start(); if markets is
+            # not yet loaded (e.g. in disabled-gate mode) the dict will be empty
+            # and the guard is skipped gracefully.
+            # ------------------------------------------------------------------
+            markets: dict[str, Any] = getattr(self._exchange, "markets", {}) or {}
+            market = markets.get(signal.symbol)
+            if market:
+                limits: dict[str, Any] = market.get("limits") or {}
+                amount_limits: dict[str, Any] = limits.get("amount") or {}
+                cost_limits: dict[str, Any] = limits.get("cost") or {}
+
+                min_amount = amount_limits.get("min")
+                min_cost = cost_limits.get("min")
+
+                notional = quantity * last_price
+
+                if min_amount is not None and float(quantity) < float(min_amount):
+                    self._log.warning(
+                        "live.below_min_amount",
+                        symbol=signal.symbol,
+                        quantity=str(quantity),
+                        min_amount=str(min_amount),
+                        msg=(
+                            f"Order quantity {quantity} below exchange minimum "
+                            f"{min_amount} for {signal.symbol}"
+                        ),
+                    )
+                    return []
+
+                if min_cost is not None and float(notional) < float(min_cost):
+                    self._log.warning(
+                        "live.below_min_cost",
+                        symbol=signal.symbol,
+                        notional=str(notional),
+                        min_cost=str(min_cost),
+                        msg=(
+                            f"Order notional {notional} below exchange minimum cost "
+                            f"{min_cost} for {signal.symbol}"
+                        ),
+                    )
+                    return []
+
+            # WP1.1 (D5): floor to the market's own amount precision (step size
+            # or decimal places) instead of a fixed 8dp — one helper for both
+            # sides. A quantity that floors to zero (sub-precision dust) is
+            # treated exactly like the zero-quantity guard above.
+            floored_quantity = self._floor_to_amount_precision(signal.symbol, quantity)
+            if floored_quantity <= Decimal("0"):
+                self._log.warning(
+                    "live.zero_quantity_after_precision_floor",
+                    strategy_id=signal.strategy_id,
                     symbol=signal.symbol,
                     quantity=str(quantity),
-                    min_amount=str(min_amount),
-                    msg=(
-                        f"Order quantity {quantity} below exchange minimum "
-                        f"{min_amount} for {signal.symbol}"
-                    ),
                 )
                 return []
 
-            if min_cost is not None and float(notional) < float(min_cost):
+            # Build the proposed order
+            client_order_id = f"{self._run_id}-{uuid4().hex[:12]}"
+            proposed_order = Order(
+                client_order_id=client_order_id,
+                run_id=self._run_id,
+                symbol=signal.symbol,
+                side=side,
+                order_type=OrderType.MARKET,
+                quantity=floored_quantity,
+            )
+
+            # Pre-trade risk check. WP1.1 (WP11-A-03): read open positions from
+            # the attached source when present (D1); fall back to the legacy
+            # `_positions` cache otherwise (D8).
+            if self._position_source is not None:
+                open_positions = self._position_source.get_open_positions()
+            else:
+                open_positions = [
+                    p for p in self._positions.values() if not p.is_flat
+                ]
+            daily_pnl = self._calculate_daily_pnl()
+            if peak_equity is None:
+                # D8 (no source): fetched here, exactly where this call has
+                # always lived -- never moved earlier, so a return above this
+                # point (zero quantity, below-minimum, precision floor) still
+                # never triggers a peak fetch, unchanged from before WP1.4.
+                peak_equity = await self._fetch_peak_equity()
+
+            risk_result = self._risk_manager.pre_trade_check(
+                order=proposed_order,
+                current_equity=nav,
+                open_positions=open_positions,
+                daily_pnl=daily_pnl,
+                peak_equity=peak_equity,
+                market_price=last_price,
+            )
+
+            if not risk_result.approved:
                 self._log.warning(
-                    "live.below_min_cost",
+                    "live.signal_rejected",
+                    strategy_id=signal.strategy_id,
                     symbol=signal.symbol,
-                    notional=str(notional),
-                    min_cost=str(min_cost),
-                    msg=(
-                        f"Order notional {notional} below exchange minimum cost "
-                        f"{min_cost} for {signal.symbol}"
-                    ),
+                    reasons=risk_result.rejection_reasons,
                 )
                 return []
 
-        # WP1.1 (D5): floor to the market's own amount precision (step size
-        # or decimal places) instead of a fixed 8dp — one helper for both
-        # sides. A quantity that floors to zero (sub-precision dust) is
-        # treated exactly like the zero-quantity guard above.
-        floored_quantity = self._floor_to_amount_precision(signal.symbol, quantity)
-        if floored_quantity <= Decimal("0"):
-            self._log.warning(
-                "live.zero_quantity_after_precision_floor",
-                strategy_id=signal.strategy_id,
-                symbol=signal.symbol,
-                quantity=str(quantity),
-            )
-            return []
+            # Apply adjusted quantity from risk check (only when approved;
+            # on rejection adjusted_quantity is 0 and we already returned above)
+            if risk_result.approved and risk_result.adjusted_quantity < proposed_order.quantity:
+                proposed_order = proposed_order.model_copy(update={
+                    "quantity": risk_result.adjusted_quantity,
+                })
 
-        # Build the proposed order
-        client_order_id = f"{self._run_id}-{uuid4().hex[:12]}"
-        proposed_order = Order(
-            client_order_id=client_order_id,
-            run_id=self._run_id,
-            symbol=signal.symbol,
-            side=side,
-            order_type=OrderType.MARKET,
-            quantity=floored_quantity,
-        )
+            if risk_result.warnings:
+                self._log.warning(
+                    "live.risk_warnings",
+                    strategy_id=signal.strategy_id,
+                    symbol=signal.symbol,
+                    warnings=risk_result.warnings,
+                )
 
-        # Pre-trade risk check. WP1.1 (WP11-A-03): read open positions from
-        # the attached source when present (D1); fall back to the legacy
-        # `_positions` cache otherwise (D8).
-        if self._position_source is not None:
-            open_positions = self._position_source.get_open_positions()
-        else:
-            open_positions = [
-                p for p in self._positions.values() if not p.is_flat
-            ]
-        daily_pnl = self._calculate_daily_pnl()
-        if peak_equity is None:
-            # D8 (no source): fetched here, exactly where this call has
-            # always lived -- never moved earlier, so a return above this
-            # point (zero quantity, below-minimum, precision floor) still
-            # never triggers a peak fetch, unchanged from before WP1.4.
-            peak_equity = await self._fetch_peak_equity()
+            # WP14-S-01 (security round 2): record the price the affordability
+            # cap sized this BUY against so submit_order's Coinbase path can
+            # reuse it instead of fetching a second, later ticker.
+            if side == OrderSide.BUY and buy_cap_price is not None:
+                self._buy_sizing_price[proposed_order.order_id] = buy_cap_price
 
-        risk_result = self._risk_manager.pre_trade_check(
-            order=proposed_order,
-            current_equity=nav,
-            open_positions=open_positions,
-            daily_pnl=daily_pnl,
-            peak_equity=peak_equity,
-            market_price=last_price,
-        )
-
-        if not risk_result.approved:
-            self._log.warning(
-                "live.signal_rejected",
-                strategy_id=signal.strategy_id,
-                symbol=signal.symbol,
-                reasons=risk_result.rejection_reasons,
-            )
-            return []
-
-        # Apply adjusted quantity from risk check (only when approved;
-        # on rejection adjusted_quantity is 0 and we already returned above)
-        if risk_result.approved and risk_result.adjusted_quantity < proposed_order.quantity:
-            proposed_order = proposed_order.model_copy(update={
-                "quantity": risk_result.adjusted_quantity,
-            })
-
-        if risk_result.warnings:
-            self._log.warning(
-                "live.risk_warnings",
-                strategy_id=signal.strategy_id,
-                symbol=signal.symbol,
-                warnings=risk_result.warnings,
-            )
-
-        # WP14-S-01 (security round 2): record the price the affordability
-        # cap sized this BUY against so submit_order's Coinbase path can
-        # reuse it instead of fetching a second, later ticker.
-        if side == OrderSide.BUY and buy_cap_price is not None:
-            self._buy_sizing_price[proposed_order.order_id] = buy_cap_price
-
-        # Submit
-        submitted_order = await self.submit_order(proposed_order)
+            # Submit
+            submitted_order = await self.submit_order(proposed_order)
+        finally:
+            if sell_lock is not None:
+                sell_lock.release()
 
         # Coinbase processes market orders asynchronously — the initial response
         # often returns status="open" with filled=None.  Wait briefly and
@@ -2863,6 +3262,156 @@ class LiveExecutionEngine(BaseExecutionEngine):
     # Reconciliation
     # ------------------------------------------------------------------
 
+    def _apply_exchange_order_state(
+        self, order: Order, ccxt_order: dict[str, Any]
+    ) -> tuple[Order, bool]:
+        """WP1.11a (D4/D9): apply one fresh exchange order snapshot (from
+        ``fetch_order`` or a ``_lookup_by_cid`` match) to ``order`` --
+        extracted from the pre-WP1.11a inline ``_reconcile_order`` body so
+        both the regular per-bar reconcile and the G2 cid-lookup fallback
+        (``check_resting_orders``) share IDENTICAL fill/state semantics.
+
+        WP1.11a (D9, A3 gap): a ``filled`` that is missing, non-finite, or
+        negative on a TERMINAL exchange status, or non-finite on ANY
+        status, is treated as a FAILURE -- no mutation, no ``updated_at``
+        refresh, so a stale/garbage response can never make a SELL's
+        reservation look settled when it isn't (the pre-WP1.11a code
+        stored a bare ``0`` for a ``None`` ``filled`` on a closed order,
+        A3's exact gap). A ``None`` ``filled`` on a NON-terminal status
+        (Coinbase returns this while a market order is still processing)
+        is still coerced to 0, unchanged from before.
+
+        Returns ``(order, confirmed)`` where ``confirmed`` is True iff the
+        EXCHANGE's own reported status is terminal and its ``filled`` was
+        valid (not a failure per the above) -- used by ``cancel_order``/
+        ``check_resting_orders`` to decide when a ``_cancel_unconfirmed``
+        entry may finally be released (D5(b)). ``confirmed`` reflects the
+        exchange's reported status, NOT whether ``order`` itself actually
+        transitioned locally (which can fail, e.g. the order is already
+        CANCELED and the state machine forbids CANCELED -> FILLED).
+        """
+        previous_filled_qty = order.filled_quantity
+        ccxt_status = ccxt_order.get("status", "open")
+        target_status = self._map_ccxt_order_status(ccxt_status)
+        is_terminal = target_status in _TERMINAL_ORDER_STATUSES
+
+        raw_filled = ccxt_order.get("filled")
+        filled_qty = _safe_decimal(raw_filled, default=None)
+
+        failure = False
+        if ccxt_status is None:
+            # WP1.11a round 2 (S2-06): an explicit `status: None` is
+            # exactly as "unavailable" as a missing `filled` -- must not
+            # refresh `updated_at` (that would silently reset D3's
+            # staleness clock and the run-wide BUY block with it) or be
+            # trusted as a genuine "still open" reply.
+            failure = True
+        elif filled_qty is None:
+            if is_terminal:
+                failure = True
+            else:
+                filled_qty = Decimal("0")
+        elif not filled_qty.is_finite():
+            failure = True
+        elif filled_qty < Decimal("0") and is_terminal:
+            failure = True
+
+        if failure:
+            # WP1.11a round 2 (C-02): a TERMINAL status with an invalid
+            # `filled` means the reservation is now stuck (only an
+            # operator-visible signal fixes it, per D2's "no timer
+            # release") -- critical, not warning. A non-terminal invalid
+            # `filled` (e.g. NaN while still OPEN) still self-heals on the
+            # next successful reconcile, so it stays at warning.
+            log = self._log.critical if is_terminal else self._log.warning
+            log(
+                "live.reconcile_filled_invalid",
+                order_id=str(order.order_id),
+                symbol=order.symbol,
+                status=ccxt_status,
+                raw_filled=str(raw_filled)[:200],
+            )
+            return order, False
+        assert filled_qty is not None  # narrowed: the only None case set `failure` above
+
+        avg_price = (
+            _safe_decimal(ccxt_order.get("average"))
+            or _safe_decimal(ccxt_order.get("price"))
+            or None
+        )
+
+        order = order.model_copy(update={
+            "filled_quantity": filled_qty,
+            "average_fill_price": avg_price,
+            "updated_at": datetime.now(tz=UTC),
+        })
+        self._orders[order.order_id] = order
+
+        if filled_qty != previous_filled_qty:
+            # WP11-A-08: the exchange balance changed with the fill.
+            self._invalidate_balance_cache()
+
+        # Handle partial fills
+        applied_status = target_status
+        if (
+            applied_status == OrderStatus.OPEN
+            and filled_qty > Decimal("0")
+            and filled_qty < order.quantity
+        ):
+            applied_status = OrderStatus.PARTIAL
+
+        # Only transition if the status actually changed
+        if applied_status != order.status:
+            try:
+                order = self._transition(order, applied_status)
+            except Exception as exc:
+                self._log.warning(
+                    "live.reconciliation_transition_failed",
+                    order_id=str(order.order_id),
+                    from_status=order.status.value,
+                    to_status=applied_status.value,
+                    error=str(exc),
+                )
+
+        self._log.debug(
+            "live.order_reconciled",
+            order_id=str(order.order_id),
+            exchange_order_id=self._exchange_order_map.get(order.order_id),
+            status=order.status.value,
+            filled_quantity=str(order.filled_quantity),
+        )
+
+        return order, is_terminal
+
+    async def _reconcile_order_ex(self, order: Order) -> tuple[Order, bool]:
+        """WP1.11a (D4): fetch ``order``'s current exchange state and apply
+        it via :meth:`_apply_exchange_order_state`, returning
+        ``(order, confirmed)``. ``confirmed`` is False (never raises) when
+        there is no exchange id yet or the fetch itself fails."""
+        exchange_order_id = self._exchange_order_map.get(order.order_id)
+        if exchange_order_id is None:
+            return order, False
+
+        try:
+            ccxt_order = await ccxt_retry(
+                self._exchange.fetch_order,
+                exchange_order_id,
+                order.symbol,
+                max_retries=2, base_delay=1.0,
+                operation=f"reconcile_order({order.symbol})",
+            )
+        except Exception as exc:
+            self._log.warning(
+                "live.reconciliation_failed",
+                order_id=str(order.order_id),
+                exchange_order_id=exchange_order_id,
+                error=str(exc),
+                user_message=translate_ccxt_error(exc),
+            )
+            return order, False
+
+        return self._apply_exchange_order_state(order, ccxt_order)
+
     async def _reconcile_order(self, order: Order) -> Order:
         """
         Reconcile local order state with the exchange.
@@ -2880,82 +3429,50 @@ class LiveExecutionEngine(BaseExecutionEngine):
         Order:
             Updated order reflecting the exchange state.
         """
-        exchange_order_id = self._exchange_order_map.get(order.order_id)
-        if exchange_order_id is None:
+        order, _confirmed = await self._reconcile_order_ex(order)
+        return order
+
+    async def _resolve_stale_sell_via_cid(self, order: Order) -> Order:
+        """WP1.11a (D4, "G2 resolver"): a last-resort client-order-id
+        lookup for a SELL that has been OPEN/PARTIAL and unconfirmed by a
+        successful reconcile for over ``_INFLIGHT_SELL_MAX_AGE_S`` --
+        ``fetch_order`` is already retried every bar
+        (``check_resting_orders``); this adds only the one thing D4 calls
+        for: when that keeps failing, fall back to an exact cid match via
+        ``_lookup_by_cid`` (never a trades lookup, out of scope) and apply
+        it through the same :meth:`_apply_exchange_order_state` helper --
+        an evidence-only release (A3/J2), same as every other path.
+
+        Round 2 (S2-05): a cid match is only ever an exact
+        (symbol, side, client_order_id) match (``_lookup_by_cid``'s own
+        W4 guarantee) -- but if the exchange's own id on that match
+        disagrees with the id this order was ALREADY mapped to, adopting
+        it anyway would apply a different order's fill data under this
+        order's identity. A real collision is practically impossible
+        (Coinbase enforces unique cids and ours carry a random 48-bit
+        suffix), but the check is cheap and the failure mode is severe
+        enough to guard against defensively.
+        """
+        submit_ms = int(order.created_at.timestamp() * 1000)
+        outcome, raw = await self._lookup_by_cid(
+            order.symbol, order.client_order_id, submit_ms, OrderSide.SELL,
+        )
+        if outcome != "found":
             return order
-
-        previous_filled_qty = order.filled_quantity
-
-        try:
-            ccxt_order = await ccxt_retry(
-                self._exchange.fetch_order,
-                exchange_order_id,
-                order.symbol,
-                max_retries=2, base_delay=1.0,
-                operation=f"reconcile_order({order.symbol})",
-            )
-
-            # Update fill data (guard against None from Coinbase)
-            filled_qty = _safe_decimal(ccxt_order.get("filled"), Decimal("0"))
-            avg_price = (
-                _safe_decimal(ccxt_order.get("average"))
-                or _safe_decimal(ccxt_order.get("price"))
-                or None
-            )
-
-            order = order.model_copy(update={
-                "filled_quantity": filled_qty,
-                "average_fill_price": avg_price,
-                "updated_at": datetime.now(tz=UTC),
-            })
-            self._orders[order.order_id] = order
-
-            if filled_qty != previous_filled_qty:
-                # WP11-A-08: the exchange balance changed with the fill.
-                self._invalidate_balance_cache()
-
-            # Determine target status
-            ccxt_status = ccxt_order.get("status", "open")
-            target_status = self._map_ccxt_order_status(ccxt_status)
-
-            # Handle partial fills
-            if (
-                target_status == OrderStatus.OPEN
-                and filled_qty > Decimal("0")
-                and filled_qty < order.quantity
-            ):
-                target_status = OrderStatus.PARTIAL
-
-            # Only transition if the status actually changed
-            if target_status != order.status:
-                try:
-                    order = self._transition(order, target_status)
-                except Exception as exc:
-                    self._log.warning(
-                        "live.reconciliation_transition_failed",
-                        order_id=str(order.order_id),
-                        from_status=order.status.value,
-                        to_status=target_status.value,
-                        error=str(exc),
-                    )
-
-            self._log.debug(
-                "live.order_reconciled",
+        assert raw is not None
+        raw_id = raw.get("id")
+        mapped_id = self._exchange_order_map.get(order.order_id)
+        if raw_id is not None and mapped_id is not None and str(raw_id) != str(mapped_id):
+            self._flag_reconcile(order.symbol, "submit_lookup_mismatch")
+            self._log.error(
+                "live.submit_lookup_cid_mismatch",
+                symbol=order.symbol,
                 order_id=str(order.order_id),
-                exchange_order_id=exchange_order_id,
-                status=order.status.value,
-                filled_quantity=str(order.filled_quantity),
+                expected_exchange_id=mapped_id,
+                found_exchange_id=str(raw_id),
             )
-
-        except Exception as exc:
-            self._log.warning(
-                "live.reconciliation_failed",
-                order_id=str(order.order_id),
-                exchange_order_id=exchange_order_id,
-                error=str(exc),
-                user_message=translate_ccxt_error(exc),
-            )
-
+            return order
+        order, _confirmed = self._apply_exchange_order_state(order, raw)
         return order
 
     async def reconcile_open_orders(self) -> int:
@@ -3015,13 +3532,21 @@ class LiveExecutionEngine(BaseExecutionEngine):
         Two candidate classes for ``symbol``:
         - OPEN/PARTIAL orders: re-reconciled against the exchange so a fill
           that arrived after ``process_signal``'s own wait is picked up on
-          the very next bar (a late fill, WP11-A-R1).
+          the very next bar (a late fill, WP11-A-R1). WP1.11a (D4): a SELL
+          that's been unconfirmed this way for over
+          ``_INFLIGHT_SELL_MAX_AGE_S`` additionally gets one G2 cid-lookup
+          fallback (``_resolve_stale_sell_via_cid``) when the reconcile
+          itself didn't resolve it.
         - Terminal orders (FILLED/CANCELED/REJECTED/EXPIRED) whose routed
           **gross** fill quantity (``_routed_gross_qty``, S-02 -- not
           ``sum(Fill.quantity)``, which is net of fees) is still below
           ``filled_quantity`` -- e.g. a synthesised partial fill that later
           gains a second real trade record, or a CANCELED order that
           carries a partial fill.
+        - WP1.11a (D5(b)): every order still in ``_cancel_unconfirmed`` for
+          ``symbol`` is re-reconciled here too (even if its routed/filled
+          gap is already zero) so the entry is released the moment the
+          exchange confirms a terminal status with a finite fill.
         """
         # WP1.4b (D8): resolve this symbol's still-ambiguous submits first
         # -- a lookup here can adopt/reject an order this same call would
@@ -3029,16 +3554,39 @@ class LiveExecutionEngine(BaseExecutionEngine):
         await self._resolve_unknown_submits(symbol)
 
         candidates: list[Order] = []
+        reconciled_ids: set[UUID] = set()
+        now = datetime.now(tz=UTC)
         for order in list(self._orders.values()):
             if order.symbol != symbol:
                 continue
             if order.status in (OrderStatus.OPEN, OrderStatus.PARTIAL):
                 order = await self._reconcile_order(order)
+                reconciled_ids.add(order.order_id)
+                if (
+                    order.side == OrderSide.SELL
+                    and order.status in (OrderStatus.OPEN, OrderStatus.PARTIAL)
+                    and (now - order.updated_at).total_seconds() > _INFLIGHT_SELL_MAX_AGE_S
+                ):
+                    order = await self._resolve_stale_sell_via_cid(order)
                 candidates.append(order)
             elif order.status in _TERMINAL_ORDER_STATUSES and order.filled_quantity > Decimal("0"):
                 routed_gross = self._routed_gross_qty.get(order.order_id, Decimal("0"))
                 if routed_gross < order.filled_quantity:
                     candidates.append(order)
+
+        # WP1.11a (D5(b)): re-reconcile every still-unconfirmed cancel for
+        # this symbol, even one with no routed/filled gap -- only a fresh
+        # exchange confirmation (terminal status, finite filled) may ever
+        # release it (never a timer, J2).
+        for order_id in [
+            oid for oid in self._cancel_unconfirmed if oid not in reconciled_ids
+        ]:
+            pending_cancel = self._orders.get(order_id)
+            if pending_cancel is None or pending_cancel.symbol != symbol:
+                continue
+            _pending_cancel, confirmed = await self._reconcile_order_ex(pending_cancel)
+            if confirmed:
+                self._cancel_unconfirmed.discard(order_id)
         return candidates
 
     # ------------------------------------------------------------------
@@ -3458,8 +4006,22 @@ class LiveExecutionEngine(BaseExecutionEngine):
                         max_retries=1, base_delay=0.5,
                         operation=f"shutdown_cancel({order.symbol})",
                     )
-                self._transition(order, OrderStatus.CANCELED)
+                # WP1.11a round 2 (S2-08): use the TRANSITIONED order from
+                # here on, not the stale pre-cancel local variable -- the
+                # old code passed the pre-transition order into
+                # _reconcile_order_ex below, so a reconcile reply that was
+                # still "open" could overwrite self._orders back to OPEN.
+                order = self._transition(order, OrderStatus.CANCELED)
                 cancel_count += 1
+                if order.side == OrderSide.SELL:
+                    # WP1.11a (D5(b)/A3, round 2 C-04): only a SELL's
+                    # cancel needs the evidence-based confirmation -- a
+                    # BUY's cancel has no SELL-cap reservation riding on
+                    # it.
+                    self._cancel_unconfirmed.add(order.order_id)
+                    order, confirmed = await self._reconcile_order_ex(order)
+                    if confirmed:
+                        self._cancel_unconfirmed.discard(order.order_id)
             except (ccxt_async.OrderNotFound, ccxt_async.InvalidOrder):
                 self._log.debug(
                     "live.cancel_already_terminal_on_stop",

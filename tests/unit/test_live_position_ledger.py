@@ -534,9 +534,11 @@ async def test_r10_balance_cache_invalidated_after_fill() -> None:
 
 @pytest.mark.asyncio
 async def test_r11_balance_fetch_failure_still_allows_floored_sell() -> None:
-    """R-11: when the balance fetch fails, the SELL is never blocked --
-    `capped` falls back to `own` (I1's "never block the exit"), floored to
-    the market precision. Uses a half-close signal so both the
+    """R-11 (amended by WP1.11a D6/U-111a): when the balance fetch fails
+    AND the symbol's ledger carries no doubt, the SELL is still never
+    blocked -- `cap` falls back to `floor_prec(own_avail)` (superseding
+    the old WP1.1 I1 "never block the exit" fallback, which used to
+    return `own_avail` uncapped). Uses a half-close signal so both the
     balance-failure fallback and the precision floor are exercised
     together."""
     engine, portfolio, _, ex = _make_engine_with_source(
@@ -1132,10 +1134,18 @@ async def test_p7_unknown_sell_reserved_until_never_placed(
 
 @pytest.mark.asyncio
 async def test_p8_stale_open_sell_with_unreconcilable_state_not_reserved() -> None:
-    """P8 (WP11-S-R2-02, MEDIUM regression): an OPEN SELL whose state can
-    no longer be verified (fetch_order persistently raising OrderNotFound,
-    so ``updated_at`` never advances) must stop being reserved once it is
-    older than ``_INFLIGHT_SELL_MAX_AGE_S``."""
+    """WP1.11a (D2/D3): inverts the old WP11-S-R2-02 regression test --
+    an OPEN SELL whose state can no longer be verified (fetch_order
+    persistently raising OrderNotFound, so ``updated_at`` never advances)
+    must KEEP reserving its quantity past ``_INFLIGHT_SELL_MAX_AGE_S``.
+    The old "release on a timer" behaviour is exactly what let a second
+    SELL sell external coins (WP111a-R-01/CE1: every live SELL is a
+    MARKET order, so a stale OPEN SELL has most likely already filled).
+    The engine instead flags the symbol, logs one critical
+    ``live.sell_reserve_stale``, and blocks BUYs run-wide
+    (``_stale_open_sell``). Only real exchange evidence (a successful
+    reconcile) releases it.
+    """
     engine, portfolio, _, ex = _make_engine_with_source(
         fetch_balance_response={"total": {_BASE: 0.02}, "free": {_BASE: 0.02}},
     )
@@ -1159,12 +1169,44 @@ async def test_p8_stale_open_sell_with_unreconcilable_state_not_reserved() -> No
     engine._exchange_order_map[stale_order.order_id] = "exch-stale-sell"
     ex.fetch_order.side_effect = Exception("OrderNotFound: no such order")
 
-    second_orders = await engine.process_signal(
-        _make_signal(direction=SignalDirection.SELL, target_position=Decimal("0"))
-    )
+    with capture_logs() as cap:
+        second_orders = await engine.process_signal(
+            _make_signal(direction=SignalDirection.SELL, target_position=Decimal("0"))
+        )
 
-    assert len(second_orders) == 1, "the next SELL must still be submitted"
+    assert second_orders == [], "the timer alone must never release the reservation"
     assert engine.reconcile_required.get(_SYMBOL) == "sell_order_state_unknown"
+    stale_alerts = [e for e in cap if e.get("event") == "live.sell_reserve_stale"]
+    assert len(stale_alerts) == 1, "exactly one critical alert per stale order"
+    assert stale_alerts[0].get("log_level") == "critical"
+
+    # A second call must not re-alert (D3: once per order).
+    with capture_logs() as cap2:
+        await engine.process_signal(
+            _make_signal(direction=SignalDirection.SELL, target_position=Decimal("0"))
+        )
+    assert not [e for e in cap2 if e.get("event") == "live.sell_reserve_stale"]
+
+    # BUYs are blocked run-wide while the stale SELL stands (D3).
+    buy_orders = await engine.process_signal(
+        _make_signal(direction=SignalDirection.BUY, target_position=Decimal("100"))
+    )
+    assert buy_orders == [], "a stale open SELL must block every new BUY run-wide"
+
+    # Evidence finally arrives: fetch_order now reports the order closed
+    # with a finite filled amount -- the reservation is released via
+    # check_resting_orders' regular reconcile path.
+    ex.fetch_order.side_effect = None
+    ex.fetch_order.return_value = {
+        "id": "exch-stale-sell",
+        "status": "closed",
+        "filled": "0.02",
+        "average": str(_LAST_PRICE),
+        "price": str(_LAST_PRICE),
+    }
+    candidates = await engine.check_resting_orders(_SYMBOL, _LAST_PRICE)
+    assert engine._orders[stale_order.order_id].status == OrderStatus.FILLED
+    assert stale_order.order_id in {o.order_id for o in candidates}
 
 
 @pytest.mark.asyncio

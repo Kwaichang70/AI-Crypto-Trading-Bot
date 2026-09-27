@@ -156,8 +156,16 @@ class FakeCCXTExchange:
         *,
         exchange_id: str = "coinbase",
         taker_fee_pct: Decimal = Decimal("0.006"),
+        balance_mode: str = "v3",
     ) -> None:
         self.id = exchange_id
+        # WP1.11a: "v3" (default) mirrors this fake's pre-existing
+        # behaviour -- fetch_balance's free excludes lock_balance()'d
+        # holds. "v2" mirrors real ccxt Coinbase's DEFAULT fetchBalance
+        # option (parse_custom_balance): free == total always, holds are
+        # not visible at all (WP111a-S-01's CE1). Mutate
+        # ``exchange.balance_mode`` directly to flip mid-test.
+        self.balance_mode = balance_mode
         self.has: dict[str, bool] = {"fetchOrderTrades": False}
         self.timeframes: dict[str, str] = dict.fromkeys(_TIMEFRAME_DURATION_MS, "")
         self.markets: dict[str, dict[str, Any]] = {}
@@ -569,12 +577,17 @@ class FakeCCXTExchange:
         free: dict[str, float] = {}
         used: dict[str, float] = {}
         for currency, amount in self._balances.items():
-            locked = self._locked.get(currency, Decimal("0"))
-            free_amount = amount - locked
-            if free_amount < Decimal("0"):
-                free_amount = Decimal("0")
+            if self.balance_mode == "v2":
+                # WP1.11a: real ccxt Coinbase v2 semantics -- free == total,
+                # holds are invisible (WP111a-S-01's CE1/T1).
+                free_amount = amount
+            else:
+                locked = self._locked.get(currency, Decimal("0"))
+                free_amount = amount - locked
+                if free_amount < Decimal("0"):
+                    free_amount = Decimal("0")
             free[currency] = float(free_amount)
-            used[currency] = float(locked)
+            used[currency] = float(amount - free_amount)
         return {"total": total, "free": free, "used": used}
 
     # ------------------------------------------------------------------

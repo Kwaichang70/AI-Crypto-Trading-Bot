@@ -61,6 +61,7 @@ from uuid import UUID, uuid4
 
 import ccxt.async_support as ccxt_async
 import pytest
+from structlog.testing import capture_logs
 
 from common.types import OrderSide, OrderStatus, OrderType, SignalDirection
 from trading.engines.live import LiveExecutionEngine
@@ -624,19 +625,52 @@ class TestCancelOrder:
 
     @pytest.mark.asyncio
     async def test_cancel_open_order_transitions_to_canceled(self) -> None:
-        """Cancelling an OPEN order transitions it to CANCELED status."""
-        engine, _, _ = _make_engine()
+        """Cancelling an OPEN order transitions it to CANCELED status.
+
+        WP1.11a (D5(b)): the cancel ack alone is not evidence of the
+        order's true final fill, so cancel_order also re-reconciles once
+        against the exchange -- here it stubs a confirmed
+        (terminal-status, finite-``filled``) response, so
+        ``_cancel_unconfirmed`` clears immediately.
+        """
+        engine, _, _ = _make_engine(
+            exchange_kwargs={
+                "fetch_order_response": {
+                    "id": "exch-001",
+                    "status": "canceled",
+                    "filled": "0",
+                    "average": None,
+                    "price": str(_LAST_PRICE),
+                },
+            }
+        )
         order = _make_market_order()
         submitted = await engine.submit_order(order)
         assert submitted.status == OrderStatus.OPEN
 
         canceled = await engine.cancel_order(submitted.order_id)
         assert canceled.status == OrderStatus.CANCELED
+        assert submitted.order_id not in engine._cancel_unconfirmed
 
     @pytest.mark.asyncio
     async def test_cancel_order_calls_exchange_cancel(self) -> None:
-        """cancel_order() calls exchange.cancel_order with the exchange order ID."""
-        engine, _, ex = _make_engine()
+        """cancel_order() calls exchange.cancel_order with the exchange order ID.
+
+        WP1.11a (D5(b)): stubs a confirmed cancel response so the
+        post-cancel reconcile this method now performs doesn't leave the
+        order in ``_cancel_unconfirmed`` and mask what this test targets.
+        """
+        engine, _, ex = _make_engine(
+            exchange_kwargs={
+                "fetch_order_response": {
+                    "id": "exch-001",
+                    "status": "canceled",
+                    "filled": "0",
+                    "average": None,
+                    "price": str(_LAST_PRICE),
+                },
+            }
+        )
         order = _make_market_order()
         submitted = await engine.submit_order(order)
         exchange_order_id = submitted.exchange_order_id
@@ -694,8 +728,12 @@ class TestCancelOrder:
     @pytest.mark.asyncio
     async def test_cancel_order_without_exchange_id_transitions_locally(self) -> None:
         """
-        If no exchange_order_id is mapped (order never reached exchange), cancel_order
-        transitions locally to CANCELED without calling the exchange.
+        WP1.11a (D5(a)/W3): if no exchange_order_id is mapped, create_order's
+        outcome for this order is STILL AMBIGUOUS (it may have been accepted
+        anyway) -- cancel_order must NOT locally CANCEL it (that would
+        release the I5b(a) unknown-submit reserve on the strength of a
+        cancel alone, with no exchange evidence either way). The order is
+        left exactly as PENDING_SUBMIT, and the exchange is never called.
         """
         engine, _, ex = _make_engine()
         # Manually register an order that was never submitted to the exchange
@@ -704,12 +742,13 @@ class TestCancelOrder:
         engine._orders[order.order_id] = order_in_pending
         # Deliberately leave _exchange_order_map empty for this order
 
-        canceled = await engine.cancel_order(order.order_id)
+        with capture_logs() as cap:
+            canceled = await engine.cancel_order(order.order_id)
 
-        assert canceled.status == OrderStatus.CANCELED
+        assert canceled.status == OrderStatus.PENDING_SUBMIT
         # exchange.cancel_order must not have been invoked
         ex.cancel_order.assert_not_called()
-
+        assert any(e.get("event") == "live.cancel_skipped_unknown_submit" for e in cap)
 
 # ===========================================================================
 # Group 7: Get Order
@@ -1332,8 +1371,24 @@ class TestLifecycle:
 
     @pytest.mark.asyncio
     async def test_on_stop_cancels_open_orders_on_exchange(self) -> None:
-        """on_stop() calls exchange.cancel_order for each open order that has an exchange ID."""
-        engine, _, ex = _make_engine()
+        """on_stop() calls exchange.cancel_order for each open order that has an exchange ID.
+
+        WP1.11a (D5(b)): on_stop's cancel loop also re-reconciles once per
+        cancelled order (same evidence-based confirmation as
+        cancel_order()) -- stubs a confirmed cancel response so
+        ``_cancel_unconfirmed`` clears for both orders.
+        """
+        engine, _, ex = _make_engine(
+            exchange_kwargs={
+                "fetch_order_response": {
+                    "id": "exch-001",
+                    "status": "canceled",
+                    "filled": "0",
+                    "average": None,
+                    "price": str(_LAST_PRICE),
+                },
+            }
+        )
         # Submit two orders that remain OPEN
         o1 = await engine.submit_order(_make_market_order())
         o2 = await engine.submit_order(_make_market_order())
@@ -1347,6 +1402,7 @@ class TestLifecycle:
 
         # cancel_order should have been called once for each open order
         assert ex.cancel_order.call_count == 2
+        assert not engine._cancel_unconfirmed
 
     @pytest.mark.asyncio
     async def test_on_stop_continues_despite_cancel_failure(self) -> None:

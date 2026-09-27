@@ -389,13 +389,26 @@ async def test_s10_buy_sizing_price_hint_never_leaks_on_non_coinbase_exchange() 
         fetch_balance_response={"total": {"EUR": 1000.0}, "free": {"EUR": 1000.0}},
     )
     assert ex.id != "coinbase"  # the mock's default id
+    # WP1.11a (D9): a `None` `filled` on a terminal ("closed") status is
+    # now a reconcile FAILURE (A3 gap) -- give a real filled amount here
+    # so each BUY in the loop below actually settles to FILLED and
+    # doesn't block the next one via _inflight_buy_orders.
+    ex.fetch_order.return_value = {
+        "id": "exch-001", "status": "closed", "filled": "0.1",
+        "average": "100", "price": "100",
+    }
     portfolio._cash = Decimal("1000")
-
     for _ in range(5):
         orders = await engine.process_signal(
             _make_signal(symbol="BTC/EUR", direction=SignalDirection.BUY, target=Decimal("10"))
         )
         assert len(orders) == 1
+        # Route the fill (synthesised from average_fill_price, since
+        # fetch_my_trades/fetch_order_trades are empty) so the order's
+        # gross fill is no longer "unrouted" -- otherwise WP1.11a (D9)'s
+        # now-correct filled=0.1 (previously silently coerced to 0)
+        # legitimately blocks every next BUY via _inflight_buy_orders.
+        await engine.get_fills(orders[0].order_id)
 
     assert engine._buy_sizing_price == {}
 
