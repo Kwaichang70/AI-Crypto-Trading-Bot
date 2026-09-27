@@ -159,6 +159,19 @@ def race_app(monkeypatch: pytest.MonkeyPatch) -> Any:
 
     get_settings.cache_clear()
 
+    # WP1.7a: the global kill switch is now a process-wide, persisted
+    # latch (SY-01) -- TestR3KillSwitchLatencyDuringResumeScan and
+    # TestPD1AbaRaceFencedAgainstSupersededResume both press the REAL
+    # /api/v1/emergency/kill-switch endpoint against this real app, which
+    # flips module-level in-memory state that would otherwise leak into
+    # every later test in this file/session (a resume in a LATER test
+    # would then see kill_switch_active and get 409 instead of whatever
+    # that test actually exercises). Reset before every test, exactly
+    # like the DB/settings state above.
+    from api.services import kill_switch as _kill_switch
+
+    _kill_switch.reset_state_for_tests()
+
     # The module-level engine/session-factory singletons in api.db.session
     # are lazy but cached forever once built -- a prior test module in the
     # same process may have already built one against a different (or no)

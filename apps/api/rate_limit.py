@@ -378,7 +378,10 @@ async def _rate_limit_middleware(request: Request, call_next: Any) -> Response:
     # switch is a security property; the audit_events row records every
     # invocation so abuse is detectable post-incident.
     # Exact match (not endswith) to prevent unintended path inheritance.
-    if path == "/api/v1/emergency/kill-switch":
+    # WP1.7a round 2 (S-11): POST-only -- GET /kill-switch is a plain
+    # authenticated status read (X-API-Key, not admin) with no incident-
+    # response urgency justifying a rate-limit bypass.
+    if path == "/api/v1/emergency/kill-switch" and request.method.upper() == "POST":
         return cast(Response, await call_next(request))
 
     # Determine the appropriate limit tier

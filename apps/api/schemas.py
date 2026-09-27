@@ -65,6 +65,13 @@ __all__ = [
     # Strategies
     "StrategyInfoResponse",
     "StrategyListResponse",
+    # WP1.7a: kill-switch latch / flatten
+    "API_MODEL_CONFIG",
+    "FlattenSymbolResultResponse",
+    "FlattenResultResponse",
+    "RunStopResponse",
+    "UnprotectedPositionResponse",
+    "RunEmergencyStopResponse",
     # Error
     "ErrorResponse",
     # M5 (Sprint 49): leaderboard eligibility constants
@@ -84,6 +91,13 @@ _API_MODEL_CONFIG = ConfigDict(
     use_enum_values=True,    # Serialise StrEnum members as their string value
     # Strict decimal string handling — monetary fields use explicit serialisers
 )
+
+#: WP1.7a round 2 (C-03): public alias so other routers (emergency.py)
+#: can give their own response models the SAME camelCase convention
+#: instead of mixing snake_case top-level fields with camelCase nested
+#: sub-objects (e.g. KillSwitchResponse.flatten_results values, which
+#: are FlattenResultResponse and already carry this config).
+API_MODEL_CONFIG = _API_MODEL_CONFIG
 
 
 # ---------------------------------------------------------------------------
@@ -542,6 +556,93 @@ class RunDetailResponse(RunResponse):
         default=None,
         description="Populated for mode=backtest after successful execution",
     )
+
+
+# ---------------------------------------------------------------------------
+# WP1.7a: flatten result + stop/emergency-stop response envelopes
+# ---------------------------------------------------------------------------
+
+class FlattenSymbolResultResponse(BaseModel):
+    """One symbol's outcome from a single ``StrategyEngine.flatten()`` call."""
+
+    model_config = _API_MODEL_CONFIG
+
+    symbol: str
+    status: Literal["no_position", "flat", "dust", "partial", "in_flight", "failed"]
+    cause: (
+        Literal[
+            "ledger_doubt",
+            "inflight_other",
+            "submit_unknown",
+            "rejected",
+            "timeout_open",
+            "lock_timeout",
+            "live_gate_closed",
+            "error",
+        ]
+        | None
+    ) = None
+    held_before: str
+    sold_qty: str
+    remaining_qty: str
+    order_ids: list[str] = Field(default_factory=list)
+    error: str | None = None
+
+    @field_validator("held_before", "sold_qty", "remaining_qty", mode="before")
+    @classmethod
+    def _stringify_decimal(cls, v: Decimal | str) -> str:
+        return str(v)
+
+
+class FlattenResultResponse(BaseModel):
+    """Run-level result from a single ``StrategyEngine.flatten()`` call."""
+
+    model_config = _API_MODEL_CONFIG
+
+    run_id: str
+    outcome: Literal["noop", "flattened", "partial", "failed"]
+    complete: bool
+    symbols: list[FlattenSymbolResultResponse] = Field(default_factory=list)
+    latch_persisted: bool = True
+
+
+class RunStopResponse(RunDetailResponse):
+    """``DELETE /api/v1/runs/{id}`` response -- the run plus an optional
+    flatten result (``None`` when ``flatten`` was not requested)."""
+
+    flatten: FlattenResultResponse | None = None
+    #: WP1.7a round 2 (S-13): populated when an explicit '?flatten=false'
+    #: (or a paper stop) leaves a live position open -- mirrors
+    #: RunEmergencyStopResponse's own field so the operator is never
+    #: silently left unaware of stranded exposure.
+    unprotected_positions: list[UnprotectedPositionResponse] = Field(default_factory=list)
+
+
+class UnprotectedPositionResponse(BaseModel):
+    """One still-held symbol reported by ``emergency-stop`` (SY-07)."""
+
+    model_config = _API_MODEL_CONFIG
+
+    symbol: str
+    qty: str
+    source: Literal["ledger", "persisted"]
+
+    @field_validator("qty", mode="before")
+    @classmethod
+    def _stringify_qty(cls, v: Decimal | str) -> str:
+        return str(v)
+
+
+class RunEmergencyStopResponse(RunDetailResponse):
+    """``POST /api/v1/runs/{id}/emergency-stop`` response."""
+
+    flatten: FlattenResultResponse | None = None
+    unprotected_positions: list[UnprotectedPositionResponse] = Field(default_factory=list)
+    #: WP1.7a round 2 (S-14): True when this run is 'live' but no engine
+    #: was found in this process (single-worker invariant broken, or a
+    #: truly orphaned live run) -- unprotected_positions could not be
+    #: computed AT ALL (not "empty", genuinely "unknown").
+    exposure_unknown: bool = False
 
 
 # ---------------------------------------------------------------------------

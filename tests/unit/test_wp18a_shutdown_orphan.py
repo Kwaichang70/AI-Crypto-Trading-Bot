@@ -80,6 +80,12 @@ class _FakeEngine:
         self.start = AsyncMock()
         self.run_live_loop = AsyncMock(side_effect=asyncio.CancelledError())
         self.stop = AsyncMock()
+        # WP1.7a: run_orchestrator calls kill_switch.apply_latch(engine, ...)
+        # synchronously right after registering the engine (I5), which
+        # reads engine.risk_manager -- a MagicMock stand-in is enough
+        # here, since this file tests shutdown-vs-crash status handling,
+        # not latch behaviour.
+        self.risk_manager = MagicMock()
 
 
 @pytest.fixture(autouse=True)

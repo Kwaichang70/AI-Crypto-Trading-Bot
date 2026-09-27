@@ -200,8 +200,12 @@ def test_017_upgrade_downgrade_upgrade_round_trip() -> None:
 
     ids = asyncio.run(_seed(dsn))
 
-    # --- 2. Downgrade one revision: 017 -> 016 ---
-    command.downgrade(cfg, "-1")
+    # --- 2. Downgrade to 016 (i.e. undo exactly migration 017's own
+    # downgrade) -- WP1.7a's migration 018 is now head, so a relative
+    # "-1" from head would only undo 018, not 017. Target the revision
+    # id explicitly so this test keeps verifying 017's OWN downgrade
+    # regardless of how many migrations are appended after it.
+    command.downgrade(cfg, "016")
 
     orphaned_status = asyncio.run(_fetch_run_status(dsn, ids["orphaned_run_id"]))
     resuming_status = asyncio.run(_fetch_run_status(dsn, ids["resuming_run_id"]))

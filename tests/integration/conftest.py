@@ -20,6 +20,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from api.config import get_settings
+from api.services import kill_switch as _kill_switch
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +73,13 @@ def app_dev_mode(monkeypatch: pytest.MonkeyPatch) -> Any:
 def client_dev(app_dev_mode: Any) -> Generator[TestClient, None, None]:
     """TestClient bound to a dev-mode app."""
     with TestClient(app_dev_mode, raise_server_exceptions=False) as c:
+        # WP1.7a round 2 (S-02): the app's own lifespan just tried to load
+        # the persisted kill-switch state from a real Postgres that does not
+        # exist in this test environment, so it fail-closed (mark_unknown()).
+        # These generic dev-mode tests are not exercising kill-switch
+        # behaviour, so force a deterministic loaded/inactive mirror here,
+        # after lifespan startup has already run.
+        _kill_switch.reset_state_for_tests()
         yield c
 
 
@@ -90,6 +98,8 @@ def app_prod_mode(monkeypatch: pytest.MonkeyPatch) -> Any:
 def client_prod(app_prod_mode: Any) -> Generator[TestClient, None, None]:
     """TestClient bound to a production-mode app (auth required)."""
     with TestClient(app_prod_mode, raise_server_exceptions=False) as c:
+        # WP1.7a round 2 (S-02): see client_dev for rationale.
+        _kill_switch.reset_state_for_tests()
         yield c
 
 
@@ -177,6 +187,8 @@ def client_dev_with_db(
     app_dev_mode.dependency_overrides[get_db] = _override_get_db
 
     with TestClient(app_dev_mode, raise_server_exceptions=False) as c:
+        # WP1.7a round 2 (S-02): see client_dev for rationale.
+        _kill_switch.reset_state_for_tests()
         yield c
 
     # Teardown: remove override so subsequent fixtures see a clean app

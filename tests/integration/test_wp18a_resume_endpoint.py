@@ -119,6 +119,13 @@ def _make_run_row(status: str = "orphaned", *, started_at: datetime | None = Non
         updated_at=datetime(2026, 1, 1, tzinfo=UTC),
         n_closed_trades=None,
         metrics_v2_backfilled=False,
+        # WP1.7a: resume_run reads this column directly (both the 409
+        # entries_latched guard and the entries_latch_reason= kwarg
+        # threaded to _run_live_engine). None == "not latched", matching
+        # every fixture row in this file (none of them exercise the
+        # per-run-latched case).
+        entries_latch_reason=None,
+        entries_latched_at=None,
     )
 
 

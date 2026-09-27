@@ -216,6 +216,34 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
 
     # ------------------------------------------------------------------
+    # 3a. WP1.7a (I4): load the persisted kill-switch latch BEFORE
+    #     recovering any orphaned run -- a rebuilt engine's own
+    #     apply_latch() call (inside run_paper_engine/run_live_engine)
+    #     reads this in-memory mirror synchronously, so it MUST already
+    #     reflect the persisted state by the time recovery starts
+    #     spawning tasks below. A read failure leaves the process
+    #     latched (fail-closed) and logs at critical -- recovery still
+    #     proceeds (every recovered run just starts pre-latched).
+    # ------------------------------------------------------------------
+    from api.services import kill_switch as _kill_switch
+
+    try:
+        from api.db.session import get_session_factory as _get_session_factory_ks
+
+        _ks_factory = _get_session_factory_ks()
+        async with _ks_factory() as _ks_db:
+            await _kill_switch.load(_ks_db)
+    except Exception:
+        # WP1.7a round 2 (S-02, WP17a-C-01): this is a WIDER net than
+        # load()'s own internal try/except -- it also catches a failure
+        # in session-factory construction or the ``async with`` context-
+        # manager entry itself, i.e. anything that could prevent load()
+        # from ever running at all. mark_unknown() forces the mirror
+        # fail-closed regardless of which of the two failed.
+        log.critical("kill_switch.boot_load_error", exc_info=True)
+        _kill_switch.mark_unknown()
+
+    # ------------------------------------------------------------------
     # 3b. Recover orphaned paper/live runs (Sprint 24)
     # ------------------------------------------------------------------
     try:

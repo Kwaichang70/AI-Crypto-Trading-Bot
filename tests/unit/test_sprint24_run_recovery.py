@@ -102,6 +102,13 @@ def _make_orphan(
         started_at=datetime.now(UTC),
         stopped_at=None,
         updated_at=datetime.now(UTC),
+        # WP1.7a: recover_orphaned_runs reads this column when rebuilding
+        # a paper engine (entries_latch_reason threaded through to
+        # run_paper_engine so a persisted per-run latch survives a
+        # rebuild).  None here == "not latched", matching every orphan
+        # fixture in this file (none of them exercise the latched case).
+        entries_latch_reason=None,
+        entries_latched_at=None,
     )
 
 

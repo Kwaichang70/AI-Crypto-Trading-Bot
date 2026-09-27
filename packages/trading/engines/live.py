@@ -1297,6 +1297,16 @@ class LiveExecutionEngine(BaseExecutionEngine):
         free = _parse(balance.get("free"))
         return total, free
 
+    def ledger_doubt(self, symbol: str) -> bool:
+        """WP1.7a round 2 (S-15): public accessor used by
+        ``StrategyEngine.flatten``'s cause derivation -- delegates to
+        the existing, narrower :meth:`_ledger_doubt` (I8 mismatch /
+        unresolved unknown SELL / stale open SELL / pending
+        cancel-confirm), never the general-purpose ``reconcile_required``
+        dict (an unrelated reason, e.g. a BUY-side flag, could also set
+        that one for this same symbol)."""
+        return self._ledger_doubt(symbol)
+
     def _ledger_doubt(self, symbol: str) -> bool:
         """WP1.11a (D6/U-111a): True iff ``symbol``'s ``own_avail*`` figure
         carries ledger-side uncertainty a fetch-failure fallback must not

@@ -1,4 +1,11 @@
-"""Unit tests for Sprint 50 Cycle 3 global kill-switch.
+"""Unit tests for the global kill-switch endpoint (Sprint 50 Cycle 3, WP1.7a).
+
+WP1.7a (reports/vp2-wp1.7/synthesis-spec.md) flips the kill switch from
+"stop every running run" into a persisted LATCH that blocks new entries
+while every run keeps running (D3): ``test_kill_switch_two_runs_stopped``
+and ``test_kill_switch_partial_failure`` are rewritten below to assert
+``runs_latched`` (not ``runs_stopped``) and that NOTHING is cancelled or
+removed from the registries.
 
 Tests:
   1. require_admin — 401 when header absent
@@ -6,9 +13,9 @@ Tests:
   3. require_admin — 401 when admin_api_key not configured (§Fix-J: was 503)
   4. require_admin — passes (no exception) when key matches
   5. kill_switch — 0 running runs returns 200 + note
-  6. kill_switch — 2 running runs: stops both, returns summary
-  7. kill_switch — 1 of 2 fails: returns stopped=1 + errors=[1]
-  8. kill_switch — audit row written BEFORE stop (verify via mock)
+  6. kill_switch — 2 running runs: latches both, cancels neither
+  7. kill_switch — a run engine missing from the registry is skipped, not an error
+  8. kill_switch — audit row written BEFORE the latch mutation (verify via mock)
   TestAdminApiKeyValidator — 6 validator cases (§Fix-H)
 """
 
@@ -22,6 +29,7 @@ from pydantic import SecretStr
 
 from api.deps import require_admin
 from api.config import Settings
+from api.services import kill_switch as kill_switch_service
 
 
 # ---------------------------------------------------------------------------
@@ -41,6 +49,26 @@ def _make_request(headers: dict[str, str] | None = None) -> MagicMock:
     req.headers = headers or {}
     req.client = SimpleNamespace(host="127.0.0.1")
     return req
+
+
+@pytest.fixture(autouse=True)
+def _reset_kill_switch_mirror():
+    """Every test starts from a clean, LOADED, un-latched in-memory
+    mirror -- without this, activate()'s own synchronous flip in one
+    test would leak into the next (module-level global, WP1.7a design).
+    Round 2 (S-02): the root ``tests/conftest.py`` autouse fixture
+    already does exactly this for the whole suite; this file's own copy
+    is kept as a belt-and-suspenders local reset."""
+    kill_switch_service.reset_state_for_tests()
+    yield
+    kill_switch_service.reset_state_for_tests()
+
+
+def _make_engine() -> MagicMock:
+    engine = MagicMock()
+    engine.risk_manager = MagicMock()
+    engine.risk_manager.trigger_kill_switch = MagicMock()
+    return engine
 
 
 # ---------------------------------------------------------------------------
@@ -102,55 +130,58 @@ async def test_require_admin_correct_key_passes() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_kill_switch_no_active_runs() -> None:
-    """Returns 200 with note when no runs are running.
-
-    WP1.8a: the audit row is now written unconditionally (even with 0
-    running runs -- S4), so begin_nested() must be mocked as an async
-    context manager here too (it previously was never reached on this
-    early-return path).
-    """
-    from api.routers.emergency import kill_switch
-
+def _make_db_mock() -> AsyncMock:
     mock_db = AsyncMock()
-    mock_result = MagicMock()
-    mock_result.scalars.return_value.all.return_value = []
-    mock_db.execute = AsyncMock(return_value=mock_result)
-
     nested_cm = MagicMock()
     nested_cm.__aenter__ = AsyncMock(return_value=None)
     nested_cm.__aexit__ = AsyncMock(return_value=False)
     mock_db.begin_nested = MagicMock(return_value=nested_cm)
+    mock_db.commit = AsyncMock()
+    mock_db.flush = AsyncMock()
+    mock_db.execute = AsyncMock()
+    return mock_db
 
-    with patch("api.routers.emergency.record_audit_event", new=AsyncMock()):
+
+@pytest.mark.asyncio
+async def test_kill_switch_no_active_runs() -> None:
+    """Returns 200 with an empty runs_latched list when no runs are running.
+
+    WP1.8a: the audit row is written unconditionally (even with 0 running
+    runs -- S4).
+    """
+    from api.routers.emergency import kill_switch
+
+    mock_db = _make_db_mock()
+    mock_result = MagicMock()
+    mock_result.scalars.return_value.all.return_value = []
+    mock_db.execute = AsyncMock(return_value=mock_result)
+
+    with (
+        patch("api.routers.emergency.record_audit_event", new=AsyncMock()),
+        patch.object(kill_switch_service, "activate", new=AsyncMock(return_value=True)),
+    ):
         response = await kill_switch(
             request=_make_request(),
             db=mock_db,
             reason=None,
             settings=_make_settings("a" * 32 + "b1c2d3e4f5g6"),
+            body=None,
         )
 
-    assert response.runs_stopped == []
-    assert response.note == "no active runs to stop"
+    assert response.latched is True
+    assert response.latch_persisted is True
+    assert response.runs_latched == []
     assert response.errors == []
 
 
 @pytest.mark.asyncio
 async def test_kill_switch_with_only_orphaned_live_runs_writes_audit_row() -> None:
     """WP1.8a S4: pressing kill-switch while 0 runs are 'running' but a live
-    run sits 'orphaned' must still write an audit row recording it -- at
-    HEAD (V3) the endpoint returned early with NO audit write at all in
-    this case, leaving no trace of an operator pressing the switch while a
-    position sat unprotected."""
+    run sits 'orphaned' must still write an audit row recording it."""
     from api.routers.emergency import kill_switch
 
     orphaned_id = uuid.uuid4()
 
-    # WP1.8a-round2 (S-01 item 3): kill_switch now issues a SINGLE locking
-    # SELECT ... WHERE status IN ('running', 'orphaned') FOR UPDATE and
-    # splits the rows by status in Python, rather than two separate
-    # queries -- one mock result row is enough to cover both branches.
     orphaned_run = MagicMock()
     orphaned_run.id = orphaned_id
     orphaned_run.run_mode = "live"
@@ -159,37 +190,36 @@ async def test_kill_switch_with_only_orphaned_live_runs_writes_audit_row() -> No
     candidates_result = MagicMock()
     candidates_result.scalars.return_value.all.return_value = [orphaned_run]
 
-    mock_db = AsyncMock()
+    mock_db = _make_db_mock()
     mock_db.execute = AsyncMock(return_value=candidates_result)
-
-    nested_cm = MagicMock()
-    nested_cm.__aenter__ = AsyncMock(return_value=None)
-    nested_cm.__aexit__ = AsyncMock(return_value=False)
-    mock_db.begin_nested = MagicMock(return_value=nested_cm)
 
     audit_calls: list[dict] = []
 
     async def _audit_side_effect(*args: object, **kwargs: object) -> None:
         audit_calls.append(kwargs)
 
-    with patch("api.routers.emergency.record_audit_event", side_effect=_audit_side_effect):
+    with (
+        patch("api.routers.emergency.record_audit_event", side_effect=_audit_side_effect),
+        patch.object(kill_switch_service, "activate", new=AsyncMock(return_value=True)),
+    ):
         response = await kill_switch(
             request=_make_request(),
             db=mock_db,
             reason=None,
             settings=_make_settings("a" * 32 + "b1c2d3e4f5g6"),
+            body=None,
         )
 
     assert len(audit_calls) == 1, "the audit row must be written even with 0 running runs"
     assert audit_calls[0]["event_type"] == "kill_switch"
     assert audit_calls[0]["payload"]["orphaned_live_run_ids"] == [str(orphaned_id)]
-    assert response.runs_stopped == []
-    assert response.note is not None and "orphaned" in response.note
+    assert response.runs_latched == []
+    assert response.orphaned_live_run_ids == [str(orphaned_id)]
 
 
 @pytest.mark.asyncio
-async def test_kill_switch_two_runs_stopped() -> None:
-    """Stops 2 running runs, returns both UUIDs in runs_stopped."""
+async def test_kill_switch_two_runs_latched_not_stopped() -> None:
+    """Latches 2 running runs (runs_latched), cancels/removes NEITHER."""
     from api.routers.emergency import kill_switch
 
     run_a = MagicMock()
@@ -202,47 +232,46 @@ async def test_kill_switch_two_runs_stopped() -> None:
     run_b.run_mode = "live"
     run_b.status = "running"
 
-    mock_db = AsyncMock()
+    mock_db = _make_db_mock()
     mock_result = MagicMock()
     mock_result.scalars.return_value.all.return_value = [run_a, run_b]
     mock_db.execute = AsyncMock(return_value=mock_result)
 
-    # Set up begin_nested as async context manager
-    nested_cm = MagicMock()
-    nested_cm.__aenter__ = AsyncMock(return_value=None)
-    nested_cm.__aexit__ = AsyncMock(return_value=False)
-    mock_db.begin_nested = MagicMock(return_value=nested_cm)
+    engine_a = _make_engine()
+    engine_b = _make_engine()
+    fake_engines = {str(run_a.id): engine_a, str(run_b.id): engine_b}
+    fake_tasks = {str(run_a.id): MagicMock(), str(run_b.id): MagicMock()}
 
     with (
-        patch("api.routers.emergency._RUN_TASKS", {}),
-        patch("api.routers.emergency._RUN_ENGINES", {}),
-        patch("api.routers.emergency._LEARNING_INSTANCES", {}),
+        patch("api.routers.emergency._RUN_ENGINES", fake_engines),
         patch("api.routers.emergency.record_audit_event", new=AsyncMock()),
+        patch.object(kill_switch_service, "activate", new=AsyncMock(return_value=True)),
     ):
         response = await kill_switch(
             request=_make_request(),
             db=mock_db,
             reason="unit test",
             settings=_make_settings("a" * 32 + "b1c2d3e4f5g6"),
+            body=None,
         )
 
-    assert str(run_a.id) in response.runs_stopped
-    assert str(run_b.id) in response.runs_stopped
+    assert str(run_a.id) in response.runs_latched
+    assert str(run_b.id) in response.runs_latched
     assert response.errors == []
-    assert response.note is None
+    engine_a.risk_manager.trigger_kill_switch.assert_called_once()
+    engine_b.risk_manager.trigger_kill_switch.assert_called_once()
+
+    # Nothing was cancelled or removed -- D3.
+    assert str(run_a.id) in fake_engines
+    assert str(run_b.id) in fake_engines
+    for task in fake_tasks.values():
+        task.cancel.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_kill_switch_partial_failure() -> None:
-    """One run fails to stop; other is stopped; both recorded correctly.
-
-    Uses an explicit response list so the flush failure is deterministic:
-      flush #1 = run_ok status update (succeeds)
-      flush #2 = run_bad status update (raises RuntimeError)
-
-    The audit write is inside begin_nested() and record_audit_event is
-    patched, so it does NOT trigger a bare db.flush() call.
-    """
+async def test_kill_switch_missing_engine_skipped_not_error() -> None:
+    """A 'running' row with no in-process engine (single-worker invariant
+    broken) is silently skipped -- not counted as latched, not an error."""
     from api.routers.emergency import kill_switch
 
     run_ok = MagicMock()
@@ -250,55 +279,41 @@ async def test_kill_switch_partial_failure() -> None:
     run_ok.run_mode = "paper"
     run_ok.status = "running"
 
-    run_bad = MagicMock()
-    run_bad.id = uuid.uuid4()
-    run_bad.run_mode = "live"
-    run_bad.status = "running"
+    run_missing = MagicMock()
+    run_missing.id = uuid.uuid4()
+    run_missing.run_mode = "live"
+    run_missing.status = "running"
 
-    # Set up begin_nested as async context manager
-    nested_cm = MagicMock()
-    nested_cm.__aenter__ = AsyncMock(return_value=None)
-    nested_cm.__aexit__ = AsyncMock(return_value=False)
-
-    # flush_responses: 2 entries (1 per run in the loop)
-    flush_responses: list[Exception | None] = [None, RuntimeError("DB connection lost")]
-
-    async def _flush_side_effect() -> None:
-        response = flush_responses.pop(0)
-        if isinstance(response, Exception):
-            raise response
-
-    mock_db = AsyncMock()
-    mock_db.begin_nested = MagicMock(return_value=nested_cm)
-    mock_db.flush = _flush_side_effect
+    mock_db = _make_db_mock()
     mock_result = MagicMock()
-    mock_result.scalars.return_value.all.return_value = [run_ok, run_bad]
+    mock_result.scalars.return_value.all.return_value = [run_ok, run_missing]
     mock_db.execute = AsyncMock(return_value=mock_result)
 
+    engine_ok = _make_engine()
+    fake_engines = {str(run_ok.id): engine_ok}  # run_missing has NO engine
+
     with (
-        patch("api.routers.emergency._RUN_TASKS", {}),
-        patch("api.routers.emergency._RUN_ENGINES", {}),
-        patch("api.routers.emergency._LEARNING_INSTANCES", {}),
+        patch("api.routers.emergency._RUN_ENGINES", fake_engines),
         patch("api.routers.emergency.record_audit_event", new=AsyncMock()),
+        patch.object(kill_switch_service, "activate", new=AsyncMock(return_value=True)),
     ):
         response = await kill_switch(
             request=_make_request(),
             db=mock_db,
             reason=None,
             settings=_make_settings("a" * 32 + "b1c2d3e4f5g6"),
+            body=None,
         )
 
-    assert str(run_ok.id) in response.runs_stopped
-    assert len(response.errors) == 1
-    assert response.errors[0].run_id == str(run_bad.id)
-    assert "DB connection lost" in response.errors[0].error_msg
-    # Verify flush response list was fully consumed (both scheduled flushes fired)
-    assert flush_responses == [], "Expected all 2 flush slots to be consumed"
+    assert str(run_ok.id) in response.runs_latched
+    assert str(run_missing.id) not in response.runs_latched
+    assert response.errors == []
 
 
 @pytest.mark.asyncio
-async def test_kill_switch_audit_written_before_stop() -> None:
-    """Audit row must be written even when all stop attempts fail."""
+async def test_kill_switch_audit_written_before_latch() -> None:
+    """Audit row (and the latch persistence) happen before the per-engine
+    latch loop -- verified via call-order side effects."""
     from api.routers.emergency import kill_switch
 
     run_x = MagicMock()
@@ -306,42 +321,39 @@ async def test_kill_switch_audit_written_before_stop() -> None:
     run_x.run_mode = "paper"
     run_x.status = "running"
 
-    audit_called = False
-
-    # Set up begin_nested as async context manager
-    nested_cm = MagicMock()
-    nested_cm.__aenter__ = AsyncMock(return_value=None)
-    nested_cm.__aexit__ = AsyncMock(return_value=False)
+    call_order: list[str] = []
 
     async def _audit_side_effect(*args: object, **kwargs: object) -> None:
-        nonlocal audit_called
-        audit_called = True
-        # After audit is called, subsequent flush will raise
-        mock_db.flush.side_effect = RuntimeError("forced failure")
+        call_order.append("audit")
 
-    mock_db = AsyncMock()
-    mock_db.begin_nested = MagicMock(return_value=nested_cm)
-    mock_db.flush = AsyncMock()
+    engine_x = _make_engine()
+    engine_x.risk_manager.trigger_kill_switch = MagicMock(
+        side_effect=lambda *a, **k: call_order.append("latch")
+    )
+
+    mock_db = _make_db_mock()
     mock_result = MagicMock()
     mock_result.scalars.return_value.all.return_value = [run_x]
     mock_db.execute = AsyncMock(return_value=mock_result)
 
     with (
-        patch("api.routers.emergency._RUN_TASKS", {}),
-        patch("api.routers.emergency._RUN_ENGINES", {}),
-        patch("api.routers.emergency._LEARNING_INSTANCES", {}),
+        patch("api.routers.emergency._RUN_ENGINES", {str(run_x.id): engine_x}),
         patch("api.routers.emergency.record_audit_event", side_effect=_audit_side_effect),
+        patch.object(kill_switch_service, "activate", new=AsyncMock(return_value=True)),
     ):
         response = await kill_switch(
             request=_make_request(),
             db=mock_db,
             reason=None,
             settings=_make_settings("a" * 32 + "b1c2d3e4f5g6"),
+            body=None,
         )
 
-    assert audit_called, "Audit event must be called before stop attempts"
-    # Run failed to stop (flush raised after audit), so errors list is non-empty
-    assert len(response.errors) == 1
+    # WP1.7a round 2 (S-01): the engine-latch loop is now the handler's
+    # literal FIRST action (before any DB access, including the audit
+    # write) -- a DB outage must never leave a running engine unlatched.
+    assert call_order == ["latch", "audit"], "engines must latch BEFORE any DB/audit work"
+    assert response.runs_latched == [str(run_x.id)]
 
 
 # ---------------------------------------------------------------------------

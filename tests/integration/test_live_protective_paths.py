@@ -969,3 +969,268 @@ async def test_sell_capped_at_free_when_balance_partially_locked(
     )
 
     await stack.engine.stop()
+
+
+# ---------------------------------------------------------------------------
+# WP1.7a (reports/vp2-wp1.7/synthesis-spec.md) -- StrategyEngine.flatten().
+#
+# These scenarios drive ``stack.engine.flatten()`` directly, exactly as the
+# API layer will (``stop_run``/``emergency_stop_run``/the global kill switch
+# all latch the risk manager first, then await ``engine.flatten(reason=...)``
+# with no DB lock held -- WP17-R-09). On HEAD 4d594d0 ``StrategyEngine`` has
+# no ``flatten`` attribute at all, so every scenario below fails with
+# ``AttributeError`` -- this is the harness proof the producer report cites
+# for AC1.
+# ---------------------------------------------------------------------------
+
+
+async def test_emergency_stop_while_holding_flatten_true_flat(
+    exchange: FakeCCXTExchange,
+) -> None:
+    """AC1: emergency stop while holding, with flatten=true -> flat.
+
+    Mirrors ``emergency_stop_run(flatten=True)``: latch entries first
+    (``stop_in_progress``, SY-03), then flatten. The run ends fully flat
+    and the result is a complete, single-SELL ``FlattenResult``.
+    """
+    strategy = ScriptedSignalStrategy("flatten-emergency-stop", _buy_params())
+    stack = await _build_and_warm(exchange, strategy)
+
+    await step_bar(stack, SYMBOL, START_PRICE, timeframe=TIMEFRAME_STR)
+    bought_qty = exchange.order_log[-1]["amount"]
+    position_after_buy = stack.portfolio.get_position(SYMBOL)
+    assert position_after_buy is not None and not position_after_buy.is_flat
+
+    stack.risk_manager.trigger_kill_switch("stop_in_progress")
+    result = await stack.engine.flatten(reason="emergency_stop", timeout_s=30.0)
+
+    assert result.outcome == "flattened"
+    assert result.complete is True
+    assert len(result.symbols) == 1
+    symbol_result = result.symbols[0]
+    assert symbol_result.symbol == SYMBOL
+    assert symbol_result.status == "flat"
+    assert _approx_eq(symbol_result.sold_qty, bought_qty)
+    assert symbol_result.remaining_qty == Decimal("0")
+
+    position_after_flatten = stack.portfolio.get_position(SYMBOL)
+    assert position_after_flatten is not None and position_after_flatten.is_flat
+
+    sell_orders = [o for o in exchange.order_log if o["side"] == "sell"]
+    assert len(sell_orders) == 1, f"expected exactly one flatten SELL; got {exchange.order_log!r}"
+    assert sell_orders[-1]["amount"] == bought_qty
+
+    await stack.engine.stop()
+
+
+async def test_flatten_precondition_requires_kill_switch(
+    exchange: FakeCCXTExchange,
+) -> None:
+    """I7: flatten() raises FlattenPreconditionError when the kill switch
+    is not already active -- it never runs while entries are still open."""
+    from trading.strategy_engine import FlattenPreconditionError
+
+    strategy = ScriptedSignalStrategy("flatten-precondition", _buy_params())
+    stack = await _build_and_warm(exchange, strategy)
+    await step_bar(stack, SYMBOL, START_PRICE, timeframe=TIMEFRAME_STR)
+
+    assert stack.risk_manager.kill_switch_active is False
+    with pytest.raises(FlattenPreconditionError):
+        await stack.engine.flatten(reason="stop", timeout_s=5.0)
+
+    await stack.engine.stop()
+
+
+async def test_kill_switch_then_stop_loss_still_exits(exchange: FakeCCXTExchange) -> None:
+    """Kill switch, then the SL still exits (D3/I2 -- the kill switch never
+    cancels tasks or removes engines; exits keep running even with the
+    switch latched and no flatten requested)."""
+    strategy = ScriptedSignalStrategy("kill-switch-sl-still-fires", _buy_params())
+    stack = await _build_and_warm(exchange, strategy, engine_config={"bracket_stop_loss_pct": 0.05})
+
+    await step_bar(stack, SYMBOL, START_PRICE, timeframe=TIMEFRAME_STR)
+    bought_qty = exchange.order_log[-1]["amount"]
+
+    stack.risk_manager.trigger_kill_switch("global_kill_switch")
+
+    breach_price = START_PRICE * Decimal("0.80")
+    await step_bar(stack, SYMBOL, breach_price, timeframe=TIMEFRAME_STR)
+
+    sell_orders = [o for o in exchange.order_log if o["side"] == "sell"]
+    assert sell_orders and sell_orders[-1]["amount"] == bought_qty, (
+        "the stop-loss must still fire while the global latch is active and no flatten runs"
+    )
+    position = stack.portfolio.get_position(SYMBOL)
+    assert position is not None and position.is_flat
+    assert stack.risk_manager.kill_switch_active is True
+
+    await stack.engine.stop()
+
+
+async def test_stop_with_flatten_ends_flat(exchange: FakeCCXTExchange) -> None:
+    """Stop with flatten -> flat (engine layer): the same flatten() call
+    stop_run(flatten=true) awaits, driven with reason='stop'."""
+    strategy = ScriptedSignalStrategy("flatten-stop", _buy_params())
+    stack = await _build_and_warm(exchange, strategy)
+    await step_bar(stack, SYMBOL, START_PRICE, timeframe=TIMEFRAME_STR)
+    bought_qty = exchange.order_log[-1]["amount"]
+
+    stack.risk_manager.trigger_kill_switch("stop_in_progress")
+    result = await stack.engine.flatten(reason="stop", timeout_s=30.0)
+
+    assert result.complete is True
+    assert result.outcome == "flattened"
+    position = stack.portfolio.get_position(SYMBOL)
+    assert position is not None and position.is_flat
+
+    # Mirrors stop_run's own sequence once flatten is complete: cancel the
+    # task / stop the engine.
+    await stack.engine.stop()
+    assert exchange.order_log[-1]["amount"] == bought_qty
+
+
+async def test_flatten_ledger_doubt_caps_to_zero_partial_and_latched(
+    exchange: FakeCCXTExchange,
+) -> None:
+    """Ledger doubt (I8 mismatch, own_avail > exchange free) caps the SELL
+    to zero: the symbol result is 'partial' with cause='ledger_doubt', the
+    run-level outcome is 'partial' (never 'failed' -- risk-design
+    WP17-R-17), and the kill-switch latch this scenario set stays active
+    (the run, if driven through the router, would stay running and
+    latched -- WP17-R-08)."""
+    strategy = ScriptedSignalStrategy("flatten-ledger-doubt", _buy_params())
+    stack = await _build_and_warm(exchange, strategy)
+    await step_bar(stack, SYMBOL, START_PRICE, timeframe=TIMEFRAME_STR)
+    assert exchange.balance_of(BASE) > Decimal("0")
+
+    # An operator withdraws the bot's entire BTC balance directly on the
+    # exchange while the position ledger still shows it as held -- own
+    # (ledger) now exceeds total/free (exchange) (I8).
+    exchange.set_balance(BASE, Decimal("0"))
+
+    stack.risk_manager.trigger_kill_switch("stop_in_progress")
+    with capture_logs() as cap:
+        result = await stack.engine.flatten(reason="stop", timeout_s=2.0)
+
+    assert result.complete is False
+    assert result.outcome == "partial"
+    symbol_result = result.symbols[0]
+    assert symbol_result.status == "partial"
+    assert symbol_result.cause == "ledger_doubt"
+    assert symbol_result.sold_qty == Decimal("0")
+    assert stack.execution.reconcile_required, "the I8 mismatch must have been flagged"
+
+    critical_events = [e for e in cap if e.get("event") == "flatten.incomplete"]
+    assert critical_events, f"expected a critical flatten.incomplete log; got {cap!r}"
+
+    assert stack.risk_manager.kill_switch_active is True, "the latch must stay active"
+
+    await stack.engine.stop()
+
+
+async def test_flatten_external_holding_only_bot_qty_sold(exchange: FakeCCXTExchange) -> None:
+    """0.5 BTC external + 0.01 BTC bot -> flatten sells only the bot's own
+    quantity (D15/J1/I1 -- flatten goes through the same capped
+    process_signal path as every other exit)."""
+    exchange.set_balance(BASE, Decimal("0.5"))  # pre-existing external holding
+
+    strategy = ScriptedSignalStrategy("flatten-external-holdings", _buy_params())
+    stack = await _build_and_warm(exchange, strategy)
+    await step_bar(stack, SYMBOL, START_PRICE, timeframe=TIMEFRAME_STR)
+    bot_bought_qty = exchange.order_log[-1]["amount"]
+    assert exchange.balance_of(BASE) == Decimal("0.5") + bot_bought_qty
+
+    stack.risk_manager.trigger_kill_switch("stop_in_progress")
+    result = await stack.engine.flatten(reason="stop", timeout_s=30.0)
+
+    assert result.outcome == "flattened"
+    assert result.complete is True
+    assert _approx_eq(result.symbols[0].sold_qty, bot_bought_qty)
+
+    sell_orders = [o for o in exchange.order_log if o["side"] == "sell"]
+    assert sell_orders and sell_orders[-1]["amount"] == bot_bought_qty
+    assert exchange.balance_of(BASE) == Decimal("0.5"), (
+        "external holdings must be untouched by flatten"
+    )
+
+    await stack.engine.stop()
+
+
+async def test_flatten_racing_bracket_exit_exactly_one_sell(
+    exchange: FakeCCXTExchange,
+) -> None:
+    """Double flatten (or flatten racing a bracket exit): exactly one
+    SELL reaches the exchange -- the second attempt sees the position
+    already flat (I6/_cycle_lock: a bracket exit inside _process_bar and
+    a concurrent flatten() call can never interleave on the same
+    position)."""
+    strategy = ScriptedSignalStrategy("flatten-race-bracket", _buy_params())
+    stack = await _build_and_warm(exchange, strategy, engine_config={"bracket_stop_loss_pct": 0.05})
+    await step_bar(stack, SYMBOL, START_PRICE, timeframe=TIMEFRAME_STR)
+    bought_qty = exchange.order_log[-1]["amount"]
+
+    stack.risk_manager.trigger_kill_switch("stop_in_progress")
+
+    # Breach the stop-loss so the NEXT _process_bar call would exit too,
+    # then race it against a concurrent flatten() -- both content for
+    # _cycle_lock, so they run strictly one after the other, never
+    # interleaved.
+    exchange.push_bar(SYMBOL, START_PRICE * Decimal("0.80"), timeframe=TIMEFRAME_STR)
+    results = await asyncio.gather(
+        stack.engine._poll_and_process(),
+        stack.engine.flatten(reason="stop", timeout_s=30.0),
+    )
+    flatten_result = next(r for r in results if r is not None)
+
+    sell_orders = [o for o in exchange.order_log if o["side"] == "sell"]
+    assert len(sell_orders) == 1, f"expected exactly one SELL; got {exchange.order_log!r}"
+    assert sell_orders[-1]["amount"] == bought_qty
+
+    position = stack.portfolio.get_position(SYMBOL)
+    assert position is not None and position.is_flat
+    assert flatten_result.outcome in ("flattened", "noop")
+
+    await stack.engine.stop()
+
+
+# ---------------------------------------------------------------------------
+# WP1.7a round 2 (S-06): flatten()'s own deadline must cover ACQUIRING
+# _cycle_lock, not just the per-symbol work after it -- a hung
+# _process_bar (simulated here by holding the lock externally) must
+# never let flatten() block past its own advertised timeout_s.
+# ---------------------------------------------------------------------------
+
+
+async def test_flatten_lock_acquisition_timeout_reports_lock_timeout(
+    exchange: FakeCCXTExchange,
+) -> None:
+    strategy = ScriptedSignalStrategy("flatten-lock-timeout", _buy_params())
+    stack = await _build_and_warm(exchange, strategy)
+    await step_bar(stack, SYMBOL, START_PRICE, timeframe=TIMEFRAME_STR)
+    bought_qty = exchange.order_log[-1]["amount"]
+    assert bought_qty > 0
+
+    stack.risk_manager.trigger_kill_switch("stop_in_progress")
+
+    # Simulate a hung _process_bar (or a hung exchange call inside it) by
+    # holding _cycle_lock externally for the whole flatten() call below.
+    await stack.engine._cycle_lock.acquire()
+    try:
+        result = await stack.engine.flatten(reason="stop", timeout_s=0.2)
+    finally:
+        stack.engine._cycle_lock.release()
+
+    assert result.complete is False
+    # "in_flight" (not "failed") -- flatten() never even attempted a
+    # SELL, so this is not a hard failure, exactly like an unresolved
+    # submit or a reserved-by-another-SELL block would be.
+    assert result.outcome == "partial"
+    assert len(result.symbols) == 1
+    assert result.symbols[0].status == "in_flight"
+    assert result.symbols[0].cause == "lock_timeout"
+    # Nothing was sold -- flatten() never even attempted a SELL, since it
+    # never got past acquiring the lock.
+    sell_orders = [o for o in exchange.order_log if o["side"] == "sell"]
+    assert sell_orders == []
+
+    await stack.engine.stop()

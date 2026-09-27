@@ -744,6 +744,25 @@ async def _auto_retry_paper_run(
                     crashed_status=crashed.status,
                 )
                 return
+            # WP1.7a round 2 (S-16): a fresh paper run created while the
+            # global kill switch is latched would sit inert from its very
+            # first bar (entries blocked by apply_latch, I5) -- and if the
+            # CRASHED run itself carried a persisted 'flatten_incomplete'
+            # per-run latch, that context would simply be dropped (a new
+            # run has no history to inherit it from). Skip the retry
+            # entirely in either case; the crashed run stays 'error' for
+            # an operator to handle explicitly (matches SY-08's "a
+            # latched new run would sit silently inert" rationale for
+            # create_run's own 409).
+            from api.services import kill_switch as _kill_switch
+
+            if _kill_switch.is_active() or crashed.entries_latch_reason is not None:
+                log.warning(
+                    "runs.auto_retry_skipped_kill_switch_active",
+                    kill_switch_active=_kill_switch.is_active(),
+                    crashed_entries_latch_reason=crashed.entries_latch_reason,
+                )
+                return
             new_config = dict(crashed.config or {})
             # Observability only — orphan recovery reads this back explicitly
             # at its call site; nothing else consumes it (CR-006).
@@ -806,6 +825,7 @@ async def run_paper_engine(
     auto_retry_attempt: int = 0,
     resume: ResumeSnapshot | None = None,
     elapsed_seconds: float = 0.0,
+    entries_latch_reason: str | None = None,
 ) -> None:
     """
     Background coroutine that runs a paper trading engine for a single run.
@@ -862,10 +882,17 @@ async def run_paper_engine(
         ``started_at`` (0.0 for a fresh run).  Subtracted from
         ``max_run_duration_hours`` so a resumed run's auto-stop still fires
         relative to when it was first started, not when it was resumed.
+    entries_latch_reason:
+        WP1.7a (SY-02): the run's persisted ``entries_latch_reason`` column
+        (only ever ``'flatten_incomplete'``), when this call is
+        recovering/resuming a run that has one. ``None`` for a fresh run
+        (``create_run`` never sets one -- a brand-new row has no history to
+        latch on).
     """
     from api.config import get_settings
     from api.db.models import RunORM
     from api.db.session import get_session_factory
+    from api.services import kill_switch as _kill_switch
     from common.types import RunMode
     from data.services.ccxt_market_data import CCXTMarketDataService
     from trading.engines.paper import PaperExecutionEngine
@@ -988,6 +1015,10 @@ async def run_paper_engine(
         )
 
         _RUN_ENGINES[run_id_str] = engine
+        # WP1.7a (I5): synchronous, no ``await`` in between -- applies the
+        # global latch mirror and/or this run's own persisted latch before
+        # anything else can observe this engine as registered.
+        _kill_switch.apply_latch(engine, entries_latch_reason=entries_latch_reason)
         await engine.start(run_id_str)
         log.info("runs.paper_engine_running")
 
@@ -1201,6 +1232,7 @@ async def run_live_engine(
     resume: ResumeSnapshot | None = None,
     protective_mode: bool = False,
     elapsed_seconds: float = 0.0,
+    entries_latch_reason: str | None = None,
 ) -> None:
     """
     Background coroutine that runs a live trading engine for a single run.
@@ -1234,10 +1266,13 @@ async def run_live_engine(
     elapsed_seconds:
         Seconds already elapsed since the run's *original* ``started_at``
         (0.0 for a fresh run) -- see ``run_paper_engine``.
+    entries_latch_reason:
+        WP1.7a (SY-02) -- see ``run_paper_engine``.
     """
     from api.config import get_settings
     from api.db.models import RunORM
     from api.db.session import get_session_factory
+    from api.services import kill_switch as _kill_switch
     from common.types import RunMode
     from data.services.ccxt_market_data import CCXTMarketDataService
     from trading.engines.live import LiveExecutionEngine
@@ -1398,6 +1433,8 @@ async def run_live_engine(
         )
 
         _RUN_ENGINES[run_id_str] = engine
+        # WP1.7a (I5): synchronous, no ``await`` in between.
+        _kill_switch.apply_latch(engine, entries_latch_reason=entries_latch_reason)
         await engine.start(run_id_str)
         log.info("runs.live_engine_running")
 

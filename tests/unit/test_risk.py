@@ -2310,3 +2310,66 @@ class TestQT003ClusterExposureCap:
             max_cluster_exposure_pct=0.50,
         )
         assert params.max_cluster_exposure_pct == 0.50
+
+
+# ---------------------------------------------------------------------------
+# WP1.7a (SY-03): the kill switch is a SET of independent latch reasons.
+# ---------------------------------------------------------------------------
+
+
+class TestKillSwitchReasonSet:
+    """trigger_kill_switch(reason) adds to a set; reset_kill_switch(reason)
+    removes exactly one reason, leaving the others active."""
+
+    def test_independent_reasons_each_latch(self) -> None:
+        manager = _make_manager()
+        manager.trigger_kill_switch("global_kill_switch")
+        manager.trigger_kill_switch("flatten_incomplete")
+        assert manager.kill_switch_active is True
+        assert manager.kill_switch_reasons == frozenset(
+            {"global_kill_switch", "flatten_incomplete"}
+        )
+
+    def test_clearing_one_reason_leaves_others_active(self) -> None:
+        manager = _make_manager()
+        manager.trigger_kill_switch("global_kill_switch")
+        manager.trigger_kill_switch("flatten_incomplete")
+
+        manager.reset_kill_switch("flatten_incomplete")
+
+        assert manager.kill_switch_active is True
+        assert manager.kill_switch_reasons == frozenset({"global_kill_switch"})
+
+    def test_clearing_the_last_reason_deactivates(self) -> None:
+        manager = _make_manager()
+        manager.trigger_kill_switch("stop_in_progress")
+        manager.reset_kill_switch("stop_in_progress")
+        assert manager.kill_switch_active is False
+        assert manager.kill_switch_reasons == frozenset()
+
+    def test_reset_with_no_reason_clears_everything(self) -> None:
+        """Backward compatibility: reset_kill_switch() with no argument
+        clears the WHOLE set (pre-WP1.7a callers are unaffected)."""
+        manager = _make_manager()
+        manager.trigger_kill_switch("global_kill_switch")
+        manager.trigger_kill_switch("flatten_incomplete")
+
+        manager.reset_kill_switch()
+
+        assert manager.kill_switch_active is False
+        assert manager.kill_switch_reasons == frozenset()
+
+    def test_clearing_an_absent_reason_is_a_no_op(self) -> None:
+        manager = _make_manager()
+        manager.trigger_kill_switch("global_kill_switch")
+        manager.reset_kill_switch("some_other_reason")
+        assert manager.kill_switch_active is True
+        assert manager.kill_switch_reasons == frozenset({"global_kill_switch"})
+
+    def test_triggering_the_same_reason_twice_is_idempotent(self) -> None:
+        manager = _make_manager()
+        manager.trigger_kill_switch("global_kill_switch")
+        manager.trigger_kill_switch("global_kill_switch")
+        assert manager.kill_switch_reasons == frozenset({"global_kill_switch"})
+        manager.reset_kill_switch("global_kill_switch")
+        assert manager.kill_switch_active is False

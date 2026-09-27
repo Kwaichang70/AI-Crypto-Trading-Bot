@@ -251,8 +251,17 @@ class BaseRiskManager(abc.ABC):
     def __init__(self, run_id: str, params: RiskParameters) -> None:
         self._run_id = run_id
         self._params = params
-        self._kill_switch_active: bool = False
-        self._kill_switch_reason: str | None = None
+        # WP1.7a (SY-03): a SET of independent latch reasons, not a single
+        # bool + reason string.  ``kill_switch_active`` is derived as
+        # ``bool(reasons)`` so multiple callers (the global kill switch,
+        # an incomplete flatten, a stop in progress, an unreadable
+        # persisted latch at boot) can each hold their own reason without
+        # clobbering one another -- clearing ONE reason (reset_kill_switch)
+        # leaves the others in place. Canonical reasons used elsewhere in
+        # this codebase: 'global_kill_switch', 'latch_state_unknown',
+        # 'stop_in_progress', 'flatten_incomplete'; callers may pass any
+        # other free-text reason too (unchanged from the pre-WP1.7a API).
+        self._kill_switch_reasons: set[str] = set()
         self._consecutive_losses: int = 0
         self._cooldown_bars_remaining: int = 0
         # WP1.8 S-10: defence-in-depth mirror of a live resume's
@@ -277,7 +286,22 @@ class BaseRiskManager(abc.ABC):
 
     @property
     def kill_switch_active(self) -> bool:
-        return self._kill_switch_active
+        return bool(self._kill_switch_reasons)
+
+    @property
+    def kill_switch_reasons(self) -> frozenset[str]:
+        """WP1.7a: the full set of active latch reasons (SY-03)."""
+        return frozenset(self._kill_switch_reasons)
+
+    @property
+    def kill_switch_reason(self) -> str | None:
+        """Backward-compatible single-reason view: one representative
+        reason (deterministically the lexicographically-first) when the
+        latch is active, else ``None``. Prefer :attr:`kill_switch_reasons`
+        for anything that must see every held reason."""
+        if not self._kill_switch_reasons:
+            return None
+        return sorted(self._kill_switch_reasons)[0]
 
     @property
     def protective_mode(self) -> bool:
@@ -310,34 +334,54 @@ class BaseRiskManager(abc.ABC):
 
     def trigger_kill_switch(self, reason: str) -> None:
         """
-        Immediately halt all new order submissions.
+        Add ``reason`` to the set of active latch reasons (WP1.7a, SY-03).
 
-        This is a one-way latch — only ``reset_kill_switch`` can clear it.
-        The reason is logged at CRITICAL severity.
+        Idempotent per reason (adding the same reason twice is a no-op on
+        state, though it is still logged). Only :meth:`reset_kill_switch`
+        can remove a reason. The reason is logged at CRITICAL severity.
 
         Parameters
         ----------
         reason:
-            Human-readable explanation for the halt.
+            Human-readable explanation for the halt. See the reason-set
+            docstring on ``__init__`` for the canonical values used
+            elsewhere in this codebase.
         """
-        self._kill_switch_active = True
-        self._kill_switch_reason = reason
+        self._kill_switch_reasons.add(reason)
         self._log.critical(
             "risk.kill_switch_triggered",
             reason=reason,
+            reasons=sorted(self._kill_switch_reasons),
             alert="TRADING_HALTED",
         )
 
-    def reset_kill_switch(self) -> None:
+    def reset_kill_switch(self, reason: str | None = None) -> None:
         """
-        Clear the kill switch and resume normal operation.
+        Remove one latch reason, or every reason, from the active set.
 
-        This MUST be called explicitly by an operator — it is never
+        WP1.7a (SY-03): passing ``reason=None`` (the default -- preserves
+        every pre-WP1.7a caller's behaviour unchanged) clears the ENTIRE
+        set, exactly like the old single-flag ``reset_kill_switch()``.
+        Passing a specific ``reason`` removes only that one -- the latch
+        stays active (``kill_switch_active`` stays ``True``) if any other
+        reason remains, e.g. clearing ``'flatten_incomplete'`` after a
+        successful retry must not silently also clear an unrelated
+        ``'global_kill_switch'``.
+
+        This MUST be called explicitly by an operator (directly, or via
+        the kill-switch/entries-latch clear endpoints) — it is never
         cleared automatically.
         """
-        self._kill_switch_active = False
-        self._kill_switch_reason = None
-        self._log.warning("risk.kill_switch_reset")
+        if reason is None:
+            self._kill_switch_reasons.clear()
+        else:
+            self._kill_switch_reasons.discard(reason)
+        self._log.warning(
+            "risk.kill_switch_reset",
+            reason=reason,
+            still_active=self.kill_switch_active,
+            remaining_reasons=sorted(self._kill_switch_reasons),
+        )
 
     # ------------------------------------------------------------------
     # Abstract interface
@@ -538,10 +582,12 @@ class BaseRiskManager(abc.ABC):
     # ------------------------------------------------------------------
 
     def _check_kill_switch(self) -> RiskViolation | None:
-        if self._kill_switch_active:
+        if self._kill_switch_reasons:
             return RiskViolation(
                 rule="kill_switch",
-                message=f"Kill switch active: {self._kill_switch_reason}",
+                message=(
+                    f"Kill switch active: {', '.join(sorted(self._kill_switch_reasons))}"
+                ),
                 blocking=True,
             )
         return None
@@ -707,5 +753,5 @@ class BaseRiskManager(abc.ABC):
         return (
             f"{self.__class__.__name__}("
             f"run_id={self._run_id!r}, "
-            f"kill_switch={self._kill_switch_active})"
+            f"kill_switch={self.kill_switch_active})"
         )

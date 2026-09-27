@@ -60,6 +60,7 @@ __all__ = [
     "OptimizationRunORM",
     "OptimizationEntryORM",
     "AuditEventORM",
+    "KillSwitchStateORM",
 ]
 
 # ---------------------------------------------------------------------------
@@ -119,6 +120,10 @@ class RunORM(Base):
         CheckConstraint(
             "stopped_at IS NULL OR stopped_at >= started_at",
             name="ck_runs_stopped_after_started",
+        ),
+        CheckConstraint(
+            "entries_latch_reason IS NULL OR entries_latch_reason = 'flatten_incomplete'",
+            name="ck_runs_entries_latch_reason",
         ),
     )
 
@@ -215,6 +220,29 @@ class RunORM(Base):
         nullable=False,
         server_default="false",
         comment="True after backfill_metrics_v2.py has populated n_closed_trades for this row.",
+    )
+
+    # WP1.7a: per-run entries latch (SY-02).  Set when a normal stop's
+    # flatten does not complete (D3/D5/D8): entries stay blocked -- exits
+    # keep running -- until an operator clears it via
+    # POST /runs/{id}/entries-latch/clear.  The ONLY reason ever stored
+    # here is 'flatten_incomplete' (enforced by ck_runs_entries_latch_reason)
+    # -- the global kill switch is never mirrored into this column (SY-01:
+    # global state is never copied into per-run columns).
+    entries_latch_reason: Mapped[str | None] = mapped_column(
+        String(32),
+        nullable=True,
+        default=None,
+        comment=(
+            "Per-run entries latch reason. NULL = not latched. The only "
+            "non-NULL value is 'flatten_incomplete' (WP1.7a)."
+        ),
+    )
+    entries_latched_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        default=None,
+        comment="UTC timestamp when entries_latch_reason was last set. NULL when not latched.",
     )
 
     created_at: Mapped[datetime] = mapped_column(
@@ -1497,7 +1525,8 @@ class AuditEventORM(Base):
             "'paper_promoted_to_live', "
             "'model_oos_gate_bypassed', "
             "'run_orphaned', 'run_resumed', 'run_resume_rejected', "
-            "'resume_orders_imported'"
+            "'resume_orders_imported', "
+            "'kill_switch_cleared', 'run_flatten', 'entries_latch_cleared'"
             ")",
             name="ck_audit_events_event_type",
         ),
@@ -1514,3 +1543,71 @@ class AuditEventORM(Base):
             f"actor={self.actor} event={self.event_type} "
             f"resource={self.resource_type}:{self.resource_id}>"
         )
+
+
+# ---------------------------------------------------------------------------
+# 13. kill_switch_state  -- WP1.7a global kill-switch latch (single row)
+# ---------------------------------------------------------------------------
+
+class KillSwitchStateORM(Base):
+    """Single-row table backing the process-wide kill-switch latch (SY-01).
+
+    Read fail-closed at boot by ``api.services.kill_switch.load()`` --
+    deriving the latch from ``audit_events`` was rejected (a flush failure
+    inside ``record_audit_event`` is swallowed, and the audit trail has no
+    natural "clear" row without a synthetic migration step every deploy).
+    The single row (``id`` fixed at 1 via CHECK) is written in the SAME
+    transaction as the ``kill_switch``/``kill_switch_cleared`` audit row.
+    """
+
+    __tablename__ = "kill_switch_state"
+    __table_args__ = (
+        CheckConstraint("id = 1", name="ck_kill_switch_state_singleton"),
+    )
+
+    id: Mapped[int] = mapped_column(
+        Integer(),
+        primary_key=True,
+        comment="Always 1 -- singleton row enforced by ck_kill_switch_state_singleton.",
+    )
+    active: Mapped[bool] = mapped_column(
+        Boolean(),
+        nullable=False,
+        default=False,
+        comment="True while the global kill switch is latched.",
+    )
+    reason: Mapped[str | None] = mapped_column(
+        Text(),
+        nullable=True,
+        default=None,
+        comment="Operator-supplied reason from the most recent activation.",
+    )
+    activated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        default=None,
+    )
+    activated_by: Mapped[str | None] = mapped_column(
+        String(128),
+        nullable=True,
+        default=None,
+        comment="Actor identifier (admin-key hash prefix) that activated the latch.",
+    )
+    cleared_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        default=None,
+    )
+    cleared_by: Mapped[str | None] = mapped_column(
+        String(128),
+        nullable=True,
+        default=None,
+    )
+    clear_reason: Mapped[str | None] = mapped_column(
+        Text(),
+        nullable=True,
+        default=None,
+    )
+
+    def __repr__(self) -> str:
+        return f"<KillSwitchStateORM active={self.active} reason={self.reason!r}>"

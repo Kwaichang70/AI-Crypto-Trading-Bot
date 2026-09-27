@@ -39,6 +39,7 @@ from typing import Annotated, Any, Literal
 
 import structlog
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import String, cast, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import noload
@@ -54,9 +55,13 @@ from api.db.session import get_db
 from api.deps import require_admin
 from api.schemas import (
     ErrorResponse,
+    FlattenResultResponse,
     RunCreateRequest,
     RunDetailResponse,
+    RunEmergencyStopResponse,
     RunListResponse,
+    RunStopResponse,
+    UnprotectedPositionResponse,
 )
 from api.services.run_orchestrator import (
     _IncrementalFlushState,
@@ -82,8 +87,14 @@ from api.services.run_persistence import (
 from common.types import OrderSide, RunMode, TimeFrame
 from trading.recovery import ResumeRejected, check_fill_integrity, replay_sort_key
 from trading.strategy_availability import get_availability, is_mode_allowed
+from trading.strategy_engine import FlattenResult, build_synthetic_flatten_result
 
 __all__ = ["router", "recover_orphaned_runs"]
+
+
+def _flatten_result_to_response(result: FlattenResult) -> FlattenResultResponse:
+    """WP1.7a: convert the engine-layer dataclass into the API schema."""
+    return FlattenResultResponse.model_validate(result, from_attributes=True)
 
 router = APIRouter(prefix="/runs", tags=["runs"])
 
@@ -559,6 +570,20 @@ async def create_run(
     # health-check probes.  Backtest mode runs synchronously inside this
     # handler so it does not affect the running cap — only paper/live count.
     if body.mode in ("paper", "live"):
+        # WP1.7a (SY-08 extension): while the global kill switch is
+        # latched, a new run of either mode would sit created but silently
+        # inert (entries blocked from the very first bar via apply_latch,
+        # I5) -- reject it outright instead. Backtests are unaffected (no
+        # engine, no entries to block).
+        from api.services import kill_switch as _kill_switch
+
+        if _kill_switch.is_active():
+            log.warning("runs.create_blocked_kill_switch_active", mode=body.mode)
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "kill_switch_active"},
+            )
+
         from api.config import get_settings as _get_settings
 
         _settings = _get_settings()
@@ -1154,22 +1179,43 @@ async def get_run(
 @router.delete(
     "/{run_id}",
     status_code=status.HTTP_200_OK,
-    response_model=RunDetailResponse,
+    response_model=RunStopResponse,
     responses={
         404: {"model": ErrorResponse, "description": "Run not found"},
-        409: {"model": ErrorResponse, "description": "Run is not in a stoppable state"},
+        409: {
+            "model": ErrorResponse,
+            "description": (
+                "Run is not in a stoppable state, its flatten did not "
+                "complete, or flatten was requested against a non-running "
+                "engine"
+            ),
+        },
+        422: {
+            "model": ErrorResponse,
+            "description": "flatten is required for a running live run",
+        },
     },
     summary="Stop a running trading run",
     description=(
         "Transitions a run from 'running' to 'stopped'. "
-        "Returns 409 if the run is already stopped or errored."
+        "Returns 409 if the run is already stopped or errored. "
+        "WP1.7a: '?flatten=true|false' is REQUIRED for a running LIVE run "
+        "(422 'flatten_decision_required' with the held symbols if "
+        "omitted); optional for paper (default false). "
+        "'?flatten=true' sells every held symbol through the same capped "
+        "process_signal path any other exit uses (never more than "
+        "min(own, balance)) before the task is cancelled. An incomplete "
+        "flatten leaves the run 'running' with entries latched and "
+        "returns 409 'flatten_incomplete' with the partial result -- the "
+        "operator may retry, or stop again with '?flatten=false'."
     ),
 )
 async def stop_run(
     run_id: uuid.UUID,
     db: Annotated[AsyncSession, Depends(get_db)],
     request: Request,
-) -> RunDetailResponse:
+    flatten: Annotated[bool | None, Query()] = None,
+) -> RunStopResponse:
     """
     Stop a running trading run.
 
@@ -1183,21 +1229,29 @@ async def stop_run(
         WP1.8b (S2-03): passed through to the orphaned/resuming-stop audit
         row below so actor/IP/user-agent are captured (previously
         ``request=None``).
+    flatten:
+        WP1.7a (SY-05). Required for a running LIVE run; optional
+        (default False) for paper, orphaned or resuming.
 
     Returns
     -------
-    RunDetailResponse
-        The updated run record with status='stopped'.
+    RunStopResponse
+        The updated run record with status='stopped' (or, for an
+        incomplete flatten, still 'running'), plus the flatten result.
 
     Raises
     ------
     HTTPException 404:
         When no run with the given ID exists.
     HTTPException 409:
-        When the run is already in a terminal state (stopped/error).
+        When the run is already in a terminal state (stopped/error), when
+        flatten was requested against a non-running engine, or when the
+        flatten did not complete.
+    HTTPException 422:
+        When a running live run omits the required flatten decision.
     """
     log = logger.bind(endpoint="stop_run", run_id=str(run_id))
-    log.info("runs.stop_requested")
+    log.info("runs.stop_requested", flatten=flatten)
 
     # WP1.8a-round2 (C-01/S-01 item 4): lock the row before the status guard
     # so a concurrent resume's uncommitted orphaned->resuming->running
@@ -1233,52 +1287,258 @@ async def stop_run(
             ),
         )
 
-    was_orphaned_or_resuming = run.status in ("orphaned", "resuming")
-    previous_status = run.status
-
-    now = datetime.now(tz=UTC)
-    run.status = "stopped"
-    run.stopped_at = now
-    run.updated_at = now
-
-    await db.flush()
-
-    # WP1.8a-round2 (S-08), extended WP1.8b for 'resuming': stopping an
-    # orphaned OR resuming run may be closing out an unprotected position
-    # (S8) -- make that loud and durable, not a silent, unaudited
-    # transition like a normal stop.
-    if was_orphaned_or_resuming:
-        log.critical(
-            "runs.orphan_stopped",
-            run_id=str(run_id),
-            run_mode=run.run_mode,
-            previous_status=previous_status,
+    # WP1.7a (SY-05): flatten only ever means something against a live,
+    # running engine -- an orphaned/resuming run has no engine to flatten
+    # through (flattening an orphaned run is explicitly out of scope for
+    # 1.7a, per the synthesis spec).
+    if flatten and run.status in ("orphaned", "resuming"):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "flatten_requires_running_engine"},
         )
+
+    engine = _RUN_ENGINES.get(str(run_id)) if run.status == "running" else None
+
+    if run.status == "running" and run.run_mode == "live" and flatten is None:
+        held_symbols: list[str] = []
+        if engine is not None:
+            for _sym in engine.symbols:
+                _pos = engine.portfolio.get_position(_sym)
+                if _pos is not None and not _pos.is_flat:
+                    held_symbols.append(_sym)
+        log.warning("runs.stop_flatten_decision_required", held_symbols=held_symbols)
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "flatten_decision_required", "held_symbols": held_symbols},
+        )
+
+    do_flatten = bool(flatten) and run.status == "running"
+
+    if do_flatten and engine is None:
+        # Single-worker invariant broken (a 'running' row with no engine
+        # in this process) -- cannot flatten what isn't here (open risk
+        # WP17a-P-02, see producer report).
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "flatten_requires_running_engine"},
+        )
+
+    if not do_flatten:
+        # ------------------------------------------------------------
+        # Original stop flow (flatten not requested/false, or the run
+        # was orphaned/resuming).
+        # ------------------------------------------------------------
+        was_orphaned_or_resuming = run.status in ("orphaned", "resuming")
+        previous_status = run.status
+
+        # WP1.7a round 2 (S-13): an explicit '?flatten=false' (or a
+        # paper stop) on a running engine that still holds a position
+        # must never strand it silently -- compute + log + audit exactly
+        # like emergency-stop already does, BEFORE the status mutation
+        # below so the "still running, still holding" snapshot is exact.
+        unprotected: list[UnprotectedPositionResponse] = []
+        if engine is not None:
+            for _sym in engine.symbols:
+                _pos = engine.portfolio.get_position(_sym)
+                if _pos is not None and not _pos.is_flat:
+                    unprotected.append(
+                        UnprotectedPositionResponse(
+                            symbol=_sym, qty=str(_pos.quantity), source="ledger"
+                        )
+                    )
+
+        now = datetime.now(tz=UTC)
+        run.status = "stopped"
+        run.stopped_at = now
+        run.updated_at = now
+
+        await db.flush()
+
         from api.services.audit_log import record_audit_event
 
+        # WP1.8a-round2 (S-08), extended WP1.8b for 'resuming': stopping an
+        # orphaned OR resuming run may be closing out an unprotected position
+        # (S8) -- make that loud and durable, not a silent, unaudited
+        # transition like a normal stop.
+        if was_orphaned_or_resuming:
+            log.critical(
+                "runs.orphan_stopped",
+                run_id=str(run_id),
+                run_mode=run.run_mode,
+                previous_status=previous_status,
+            )
+            await record_audit_event(
+                db,
+                event_type="emergency_stop",
+                resource_type="run",
+                resource_id=str(run_id),
+                request=request,
+                payload={
+                    "run_mode": run.run_mode,
+                    "trigger": "stop_run_orphaned",
+                    "previous_status": previous_status,
+                },
+            )
+
+        if unprotected:
+            log.critical(
+                "runs.stopped_with_open_position",
+                run_id=str(run_id),
+                symbols=[p.symbol for p in unprotected],
+            )
+            await record_audit_event(
+                db,
+                event_type="run_flatten",
+                resource_type="run",
+                resource_id=str(run_id),
+                request=request,
+                payload={
+                    "phase": "skipped",
+                    "trigger": "stop_flatten_false",
+                    "symbols": [p.symbol for p in unprotected],
+                },
+            )
+
+        # Cancel the background task if one exists for this run (an orphaned
+        # run has none -- O1 -- so this is a no-op in that case).
+        task = _RUN_TASKS.pop(str(run_id), None)
+        _RUN_ENGINES.pop(str(run_id), None)
+        if task is not None and not task.done():
+            task.cancel()
+            log.info("runs.engine_task_cancelled", run_id=str(run_id))
+
+        log.info("runs.stopped", run_id=str(run_id))
+        base_response = _run_orm_to_detail_response(run)
+        return RunStopResponse(
+            **base_response.model_dump(), flatten=None, unprotected_positions=unprotected
+        )
+
+    # ------------------------------------------------------------------
+    # WP1.7a flatten path (WP17-R-09): release this row's FOR UPDATE lock
+    # BEFORE calling engine.flatten() -- it can take up to 30s of real
+    # wall-clock time, which must never block a concurrent stop/resume/
+    # kill-switch waiting on this same row.
+    # ------------------------------------------------------------------
+    await db.commit()
+
+    from api.services.audit_log import record_audit_event
+
+    # mypy: `do_flatten` being True at this point (the `not do_flatten`
+    # branch above always returns) is exactly the condition the earlier
+    # `if do_flatten and engine is None: raise` guard already enforced --
+    # this assert only makes that cross-variable invariant visible to
+    # the type checker, it can never actually fire at runtime.
+    assert engine is not None
+    engine.risk_manager.trigger_kill_switch("stop_in_progress")
+
+    # WP1.7a round 2 (S-06/S-07): flatten() itself now bounds its own
+    # _cycle_lock acquisition against timeout_s, but a hung process_signal
+    # call *inside* an already-acquired attempt has no such bound -- the
+    # shielded task + outer wait_for is the safety net for that, and for
+    # any other exception flatten() did not already catch internally. A
+    # shielded task is never itself cancelled by the wait_for timeout, so
+    # an in-flight SELL keeps running to completion in the background
+    # even if this request gives up waiting on it.
+    flatten_task = asyncio.create_task(engine.flatten(reason="stop", timeout_s=30.0))
+    try:
+        flatten_result = await asyncio.wait_for(asyncio.shield(flatten_task), timeout=30.0 + 5.0)
+    except TimeoutError:
+        log.critical("runs.stop_flatten_timeout", run_id=str(run_id))
+        flatten_result = build_synthetic_flatten_result(engine, reason="stop", cause="timeout_open")
+    except Exception as exc:
+        log.critical(
+            "runs.stop_flatten_exception", run_id=str(run_id), error=str(exc), exc_info=True
+        )
+        flatten_result = build_synthetic_flatten_result(
+            engine, reason="stop", cause="error", error=str(exc)
+        )
+    flatten_response = _flatten_result_to_response(flatten_result)
+
+    # Re-acquire a short, fresh transaction to record the outcome.
+    result2 = await db.execute(
+        select(RunORM).where(RunORM.id == run_id).with_for_update()
+    )
+    run2 = result2.scalar_one_or_none()
+
+    if run2 is None or run2.status != "running":
+        # A concurrent kill-switch/emergency-stop/second stop already moved
+        # this row while flatten was running -- surface the flatten result
+        # without fighting whatever already happened to the row.
+        log.warning(
+            "runs.stop_flatten_race_lost",
+            observed_status=run2.status if run2 is not None else None,
+        )
+        base_response = _run_orm_to_detail_response(run2 if run2 is not None else run)
+        return RunStopResponse(**base_response.model_dump(), flatten=flatten_response)
+
+    if not flatten_result.complete:
+        now = datetime.now(tz=UTC)
+        run2.entries_latch_reason = "flatten_incomplete"
+        run2.entries_latched_at = now
+        run2.updated_at = now
         await record_audit_event(
             db,
-            event_type="emergency_stop",
+            event_type="run_flatten",
             resource_type="run",
             resource_id=str(run_id),
             request=request,
             payload={
-                "run_mode": run.run_mode,
-                "trigger": "stop_run_orphaned",
-                "previous_status": previous_status,
+                "phase": "incomplete",
+                "trigger": "stop",
+                "outcome": flatten_result.outcome,
+                "cause": [r.cause for r in flatten_result.symbols if r.cause is not None],
+            },
+        )
+        # S-08: persist and commit FIRST. Only once that succeeds do we
+        # touch the in-memory latch -- add the durable 'flatten_incomplete'
+        # reason and release 'stop_in_progress' (the temporary latch this
+        # handler itself added above); if the commit raises, the
+        # exception propagates and 'stop_in_progress' is left in place
+        # (fail-closed: the engine stays latched either way).
+        await db.commit()
+        engine.risk_manager.trigger_kill_switch("flatten_incomplete")
+        engine.risk_manager.reset_kill_switch("stop_in_progress")
+        log.critical(
+            "runs.stop_flatten_incomplete",
+            run_id=str(run_id),
+            outcome=flatten_result.outcome,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "flatten_incomplete",
+                "flatten": flatten_response.model_dump(by_alias=True),
             },
         )
 
-    # Cancel the background task if one exists for this run (an orphaned
-    # run has none -- O1 -- so this is a no-op in that case).
+    # Flatten complete -- proceed with the stop exactly like the
+    # no-flatten path above (I8: never cancel while incomplete).
+    now = datetime.now(tz=UTC)
+    run2.status = "stopped"
+    run2.stopped_at = now
+    run2.updated_at = now
+    if run2.entries_latch_reason == "flatten_incomplete":
+        run2.entries_latch_reason = None
+        run2.entries_latched_at = None
+    await record_audit_event(
+        db,
+        event_type="run_flatten",
+        resource_type="run",
+        resource_id=str(run_id),
+        request=request,
+        payload={"phase": "completed", "trigger": "stop", "outcome": flatten_result.outcome},
+    )
+    await db.flush()
+
     task = _RUN_TASKS.pop(str(run_id), None)
     _RUN_ENGINES.pop(str(run_id), None)
     if task is not None and not task.done():
         task.cancel()
         log.info("runs.engine_task_cancelled", run_id=str(run_id))
 
-    log.info("runs.stopped", run_id=str(run_id))
-    return _run_orm_to_detail_response(run)
+    log.info("runs.stopped", run_id=str(run_id), flatten_outcome=flatten_result.outcome)
+    base_response = _run_orm_to_detail_response(run2)
+    return RunStopResponse(**base_response.model_dump(), flatten=flatten_response)
 
 
 # ---------------------------------------------------------------------------
@@ -1288,7 +1548,7 @@ async def stop_run(
 @router.post(
     "/{run_id}/emergency-stop",
     status_code=status.HTTP_200_OK,
-    response_model=RunDetailResponse,
+    response_model=RunEmergencyStopResponse,
     responses={
         404: {"model": ErrorResponse, "description": "Run not found"},
         409: {"model": ErrorResponse, "description": "Run already in terminal state"},
@@ -1301,7 +1561,12 @@ async def stop_run(
         "can isolate operator interventions.  Functionally equivalent to "
         "DELETE /runs/{id} but always available — use this when the "
         "API key bucket is throttled by the same incident you are trying "
-        "to halt (e.g. a stuck client retrying DELETE)."
+        "to halt (e.g. a stuck client retrying DELETE). "
+        "WP1.7a: '?flatten=' is OPTIONAL and defaults to false -- this "
+        "endpoint must NEVER refuse to stop (SY-07, never 422). It always "
+        "stops regardless of the flatten outcome; when the run still "
+        "holds crypto afterwards the response lists 'unprotected_positions' "
+        "and 'runs.stopped_with_open_position' is logged at critical."
     ),
 )
 async def emergency_stop_run(
@@ -1309,11 +1574,14 @@ async def emergency_stop_run(
     request: Request,
     db: Annotated[AsyncSession, Depends(get_db)],
     reason: Annotated[str | None, Header(alias="X-Emergency-Reason")] = None,
-) -> RunDetailResponse:
+    flatten: Annotated[bool, Query()] = False,
+) -> RunEmergencyStopResponse:
     """Hard-stop a run with persistent audit trail.
 
     Body identical to DELETE /runs/{id}: transitions status to 'stopped',
     cancels the engine task, removes from _RUN_ENGINES / _LEARNING_INSTANCES.
+    WP1.7a adds an optional, never-blocking flatten pass (SY-07) -- this
+    endpoint always stops, even when flatten is incomplete or omitted.
 
     Additional SEC-006 behaviour:
       * One ``audit_events`` row with ``event_type='emergency_stop'`` is
@@ -1323,7 +1591,7 @@ async def emergency_stop_run(
         payload so operators can leave a one-line incident note.
     """
     log = logger.bind(endpoint="emergency_stop_run", run_id=str(run_id))
-    log.warning("runs.emergency_stop_requested", reason=reason)
+    log.warning("runs.emergency_stop_requested", reason=reason, flatten=flatten)
 
     # WP1.8a-round2 (C-01/S-01 item 4): lock the row before the status guard
     # so a concurrent resume's uncommitted transition is waited on.
@@ -1365,9 +1633,118 @@ async def emergency_stop_run(
             "run_mode": run.run_mode,
             "strategy": (run.config or {}).get("strategy_name"),
             "reason": reason,
+            "flatten_requested": flatten,
         },
     )
 
+    engine = _RUN_ENGINES.get(str(run_id)) if run.status == "running" else None
+    flatten_result: FlattenResult | None = None
+
+    if flatten and engine is not None:
+        # WP17-R-09: release the row lock before the (up to 30s) flatten
+        # call -- this transaction has already committed its audit row via
+        # record_audit_event's own flush; commit here releases the FOR
+        # UPDATE lock the rest of this request no longer needs to hold.
+        await db.commit()
+        engine.risk_manager.trigger_kill_switch("stop_in_progress")
+
+        # WP1.7a round 2 (S-05): emergency-stop must ALWAYS stop. Run
+        # flatten as a shielded task so a caller-side timeout can never
+        # cancel an in-flight SELL, and bound the wait so a hung flatten
+        # (or an exception it did not already catch internally) can never
+        # prevent the stop below from happening.
+        flatten_task = asyncio.create_task(
+            engine.flatten(reason="emergency_stop", timeout_s=30.0)
+        )
+        try:
+            flatten_result = await asyncio.wait_for(
+                asyncio.shield(flatten_task), timeout=30.0 + 5.0
+            )
+        except TimeoutError:
+            log.critical("runs.emergency_stop_flatten_timeout", run_id=str(run_id))
+            flatten_result = build_synthetic_flatten_result(
+                engine, reason="emergency_stop", cause="timeout_open"
+            )
+        except Exception as exc:
+            log.critical(
+                "runs.emergency_stop_flatten_exception",
+                run_id=str(run_id),
+                error=str(exc),
+                exc_info=True,
+            )
+            flatten_result = build_synthetic_flatten_result(
+                engine, reason="emergency_stop", cause="error", error=str(exc)
+            )
+
+        # mypy: every branch above (success, TimeoutError, any other
+        # Exception) assigns a real FlattenResult -- this is never None
+        # by the time control reaches here.
+        assert flatten_result is not None
+
+        result2 = await db.execute(
+            select(RunORM).where(RunORM.id == run_id).with_for_update()
+        )
+        refreshed = result2.scalar_one_or_none()
+        if refreshed is not None:
+            run = refreshed
+
+        await record_audit_event(
+            db,
+            event_type="run_flatten",
+            resource_type="run",
+            resource_id=str(run_id),
+            request=request,
+            payload={
+                "phase": "completed" if flatten_result.complete else "incomplete",
+                "trigger": "emergency_stop",
+                "outcome": flatten_result.outcome,
+            },
+        )
+        if not flatten_result.complete:
+            log.critical(
+                "flatten.incomplete",
+                run_id=str(run_id),
+                outcome=flatten_result.outcome,
+            )
+
+    # SY-07: report any position still held so the operator knows the
+    # exchange-side exposure this stop leaves behind. Best-effort from the
+    # live in-process ledger only (source="ledger").
+    unprotected: list[UnprotectedPositionResponse] = []
+    exposure_unknown = False
+    if engine is not None:
+        for _sym in engine.symbols:
+            _pos = engine.portfolio.get_position(_sym)
+            if _pos is not None and not _pos.is_flat:
+                unprotected.append(
+                    UnprotectedPositionResponse(
+                        symbol=_sym, qty=str(_pos.quantity), source="ledger"
+                    )
+                )
+    elif run.run_mode == "live":
+        # WP1.7a round 2 (S-14): a live run with NO in-process engine
+        # (a truly orphaned live run, or the single-worker invariant
+        # broken) -- exposure is not "empty", it is genuinely UNKNOWN.
+        exposure_unknown = True
+        log.critical("runs.stopped_with_unknown_exposure", run_id=str(run_id))
+        await record_audit_event(
+            db,
+            event_type="emergency_stop",
+            resource_type="run",
+            resource_id=str(run_id),
+            request=request,
+            payload={"trigger": "emergency_stop_exposure_unknown", "exposure_unknown": True},
+        )
+
+    if unprotected:
+        log.critical(
+            "runs.stopped_with_open_position",
+            run_id=str(run_id),
+            symbols=[p.symbol for p in unprotected],
+        )
+
+    # SY-07: emergency stop ALWAYS stops, regardless of the flatten
+    # outcome above.
     now = datetime.now(tz=UTC)
     run.status = "stopped"
     run.stopped_at = now
@@ -1383,8 +1760,148 @@ async def emergency_stop_run(
         task.cancel()
         log.warning("runs.emergency_engine_task_cancelled")
 
-    log.warning("runs.emergency_stopped", reason=reason)
-    return _run_orm_to_detail_response(run)
+    log.warning(
+        "runs.emergency_stopped",
+        reason=reason,
+        flatten_outcome=flatten_result.outcome if flatten_result is not None else None,
+    )
+    base_response = _run_orm_to_detail_response(run)
+    return RunEmergencyStopResponse(
+        **base_response.model_dump(),
+        flatten=_flatten_result_to_response(flatten_result) if flatten_result is not None else None,
+        unprotected_positions=unprotected,
+        exposure_unknown=exposure_unknown,
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /api/v1/runs/{run_id}/entries-latch/clear  -- WP1.7a (SY-09)
+# ---------------------------------------------------------------------------
+
+class _ClearEntriesLatchRequest(BaseModel):
+    """Body for POST /runs/{id}/entries-latch/clear."""
+
+    reason: str = Field(min_length=3, max_length=500)
+
+    @field_validator("reason")
+    @classmethod
+    def _sanitise(cls, v: str) -> str:
+        # WP1.7a round 2 (S-17): sanitise identically to the global
+        # kill-switch's clear reason and X-Emergency-Reason header.
+        from api.services.audit_log import sanitise_reason
+
+        return sanitise_reason(v)
+
+
+@router.post(
+    "/{run_id}/entries-latch/clear",
+    status_code=status.HTTP_200_OK,
+    responses={
+        401: {"description": "Missing or invalid X-Admin-Key"},
+        403: {"description": "X-Admin-Key rejected"},
+        404: {"description": "Run not found"},
+        409: {"description": "Run is not latched"},
+        422: {"description": "Live run missing X-Live-Confirm-Token"},
+    },
+    summary="Clear a run's persisted entries latch",
+    description=(
+        "Removes the 'flatten_incomplete' per-run latch (SY-02/SY-09) so "
+        "entries can resume for THIS run. Requires the admin key plus a "
+        "3-500 character reason; a live run also requires "
+        "X-Live-Confirm-Token, because clearing re-enables BUYs. Never "
+        "automatic (WP1.2 S9). Removes only 'flatten_incomplete' -- an "
+        "active GLOBAL kill switch, if also latching this run's engine, "
+        "is untouched (use POST /emergency/kill-switch/clear for that)."
+    ),
+    dependencies=[Depends(require_admin)],
+)
+async def clear_entries_latch(
+    run_id: uuid.UUID,
+    body: _ClearEntriesLatchRequest,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    request: Request,
+    x_live_confirm_token: Annotated[str | None, Header()] = None,
+) -> dict[str, Any]:
+    log = logger.bind(endpoint="clear_entries_latch", run_id=str(run_id))
+
+    stmt = select(RunORM).where(RunORM.id == run_id).with_for_update()
+    result = await db.execute(stmt)
+    run = result.scalar_one_or_none()
+    if run is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Run {run_id} not found",
+        )
+
+    if run.run_mode == "live":
+        from api.config import get_settings
+        from trading.safety import LiveTradingGate
+
+        gate = LiveTradingGate()
+        gate_result = gate.check_gate(
+            settings=get_settings(), confirm_token=x_live_confirm_token or ""
+        )
+        if not gate_result.passed:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="X-Live-Confirm-Token is required to clear a live run's entries latch.",
+            )
+
+    if run.entries_latch_reason is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "not_latched"},
+        )
+
+    cleared_reason = run.entries_latch_reason
+    now = datetime.now(tz=UTC)
+    run.entries_latch_reason = None
+    run.entries_latched_at = None
+    run.updated_at = now
+
+    # WP1.7a round 2 (S-10): write the audit row WITHOUT swallowing, then
+    # commit. Only after that commit succeeds do we touch the in-process
+    # engine's latch -- a failure here rolls back (via the session
+    # dependency's own except-branch) and returns 503, leaving the run's
+    # persisted latch (and the engine's own risk-manager reason) both
+    # untouched.
+    from api.services.audit_log import record_audit_event_strict
+
+    try:
+        await record_audit_event_strict(
+            db,
+            event_type="entries_latch_cleared",
+            resource_type="run",
+            resource_id=str(run_id),
+            request=request,
+            payload={"reason": body.reason, "cleared_reason": cleared_reason},
+        )
+        await db.commit()
+    except Exception as exc:
+        await db.rollback()
+        log.critical("runs.entries_latch_clear_persist_failed", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "entries_latch_clear_not_persisted"},
+        ) from exc
+
+    # Reflect the clear on the in-process engine (if this run is currently
+    # running) -- risk_manager.reset_kill_switch(reason) only removes the
+    # ONE reason named; a global-latch reason held by the same engine (if
+    # any) is left untouched, exactly matching the DB-level "only
+    # flatten_incomplete" scope (SY-09).
+    engine = _RUN_ENGINES.get(str(run_id))
+    still_latched_by: list[str] = []
+    if engine is not None:
+        engine.risk_manager.reset_kill_switch(cleared_reason)
+        still_latched_by = sorted(engine.risk_manager.kill_switch_reasons)
+
+    log.warning("runs.entries_latch_cleared", cleared_reason=cleared_reason)
+    return {
+        "run_id": str(run_id),
+        "cleared": cleared_reason,
+        "still_latched_by": still_latched_by,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1681,6 +2198,18 @@ async def promote_to_live(
             ),
         )
 
+    # WP1.7a (SY-08): while the global kill switch is latched, promotion
+    # to a fresh live run is rejected outright -- same rationale as
+    # create_run's own check.
+    from api.services import kill_switch as _kill_switch
+
+    if _kill_switch.is_active():
+        log.warning("runs.promote_blocked_kill_switch_active", source_run_id=str(run_id))
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "kill_switch_active"},
+        )
+
     # Concurrency cap check (AR-006)
     active_count = sum(1 for t in _RUN_TASKS.values() if not t.done())
     if active_count >= settings.max_concurrent_runs:
@@ -1907,6 +2436,26 @@ async def resume_run(
                 f"Run {run_id} is a {run.run_mode!r} run. Resume is live-only "
                 "(S10) -- paper runs resume automatically at API boot."
             ),
+        )
+
+    # WP1.7a (SY-08): the global latch and this run's own persisted latch
+    # are both orthogonal to (and cheaper than) the audit-row-derived
+    # ``kill_switch_after_start`` check further down -- a protective resume
+    # is exempt from ALL THREE (U2/S4: protective resumes exist precisely
+    # to recover a run under an active/uncertain safety state; the
+    # rebuilt engine still starts latched either way via ``apply_latch``,
+    # so no entries can slip through).
+    from api.services import kill_switch as _kill_switch
+
+    if mode == "normal" and _kill_switch.is_active():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "kill_switch_active"},
+        )
+    if mode == "normal" and run.entries_latch_reason is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "entries_latched", "reason": run.entries_latch_reason},
         )
 
     # Gate layers 1-3 (env flag + API keys + token).  U2: mode=protective is
@@ -2293,6 +2842,7 @@ async def resume_run(
                 resume=snapshot,
                 protective_mode=(mode == "protective"),
                 elapsed_seconds=elapsed_seconds,
+                entries_latch_reason=run.entries_latch_reason,
             ),
             name=f"live-engine-resumed-{run_id}",
         )
@@ -2783,6 +3333,10 @@ async def recover_orphaned_runs() -> int:
                     stale.status = "running"
                     stale.updated_at = now
                     started_at = stale.started_at
+                    # WP1.7a (SY-02): carry the persisted per-run latch
+                    # (only ever 'flatten_incomplete') across the rebuild
+                    # -- captured before commit expires the ORM instance.
+                    entries_latch_reason = stale.entries_latch_reason
                     await session.commit()
 
                 elapsed_seconds = max((datetime.now(tz=UTC) - started_at).total_seconds(), 0.0)
@@ -2805,6 +3359,7 @@ async def recover_orphaned_runs() -> int:
                         auto_retry_attempt=int(run_config.get("auto_retry_attempt", 0)),
                         resume=snapshot,
                         elapsed_seconds=elapsed_seconds,
+                        entries_latch_reason=entries_latch_reason,
                     ),
                     name=f"recovery-paper-{run_id_str[:8]}",
                 )
