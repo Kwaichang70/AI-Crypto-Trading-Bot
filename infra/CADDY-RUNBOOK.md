@@ -337,10 +337,12 @@ From your Windows machine (PowerShell, with Tailscale running):
 
 ```powershell
 # No -k flag needed — certificate is browser-trusted via Tailscale LE
-curl.exe https://server-name.tail12345.ts.net/api/v1/health
+curl.exe https://server-name.tail12345.ts.net/api/v1/health/background
 ```
 
 Expected: JSON response (HTTP 200 or 401 if REQUIRE_API_AUTH=true).
+Note: `/api/v1/health` does not exist (no route); the health router is
+mounted at `/api/v1/health/background`.
 
 ```powershell
 # Verify Grafana
@@ -406,7 +408,7 @@ single process; running more than one worker would let each worker hold an
 independent, inconsistent latch/engine state (tracked as CF-L7, multi-worker
 safety, for a future work package).
 
-### DC-4 -- migration 018 must run before the app starts
+### DC-4 -- migrations 018 and 019 must run before the app starts
 
 The entrypoint (`infra/docker-entrypoint.sh`) runs `alembic upgrade head`
 before starting the API process, so this is normally automatic. If the app
@@ -419,29 +421,55 @@ healthy, migrated database. If you see `latch_state_unknown` immediately
 after a deploy, check `alembic current` against the API container's
 database before doing anything else.
 
+Migration 019 (`idempotency_keys`, WP7.0) has the same rule: without that
+table, every run create and every promote-to-live fails at the idempotency
+claim. The target after this branch is `019 (head)`. The explicit
+migrate-then-start order is in `docs/runbooks/deploy-fase1-minimumset.md`
+section 4.3.
+
 ### DC-5 -- rollback steps
 
-If WP1.7a/1.7b need to be rolled back:
+Full procedure: `docs/runbooks/deploy-fase1-minimumset.md` section 6. Summary
+(the order matters; an older image cannot start on schema 019 because it does
+not contain the newer migration scripts, so the downgrade runs with the
+**new** image, before any older code is deployed):
 
 1. **Record state first.** Before touching anything, capture:
    - `GET /api/v1/emergency/kill-switch` (global latch state).
    - Every run currently holding a per-run latch
      (`runs.entries_latch_reason IS NOT NULL`).
-   - Any open positions on runs you are about to affect.
-2. **Resolve positions.** For any run holding an open position that the
-   rollback would otherwise orphan, stop or flatten it first through the
-   still-running (pre-rollback) API -- the downgrade below removes the
-   columns that track `flatten_incomplete`, so do this before downgrading.
-3. **Revert the application code** (revert the WP1.7a/1.7b commit(s)) and
-   redeploy the prior image.
-4. **Downgrade the database:** `alembic downgrade 017`. This drops the
+   - Every live run and any open positions on runs you are about to affect.
+2. **Gate G-RB (before ANY downgrade and before deploying ANY older code).**
+   All of the following must hold, recorded in the deploy log:
+   - no live run is `running`, `orphaned` or `resuming`;
+   - no bot-held position above dust remains on the exchange: every live
+     position was closed or flattened through the running **new** API
+     (an `orphaned` run is closed with `DELETE ...?flatten=false` plus a
+     manual sell of exactly the ledger qty; protective resume is allowed
+     on the new image only, with the live window opened and closed as in
+     the smoke runbook);
+   - `ENABLE_LIVE_TRADING` is `false` on the running new image.
+   If any of these fails, do not downgrade. The downgrade drops the columns
+   that track `flatten_incomplete`, and `alembic downgrade 017` relabels
+   `orphaned`/`resuming` runs to `error`, which the stop endpoints reject.
+3. **Stop the api** (`docker compose ... stop api`).
+4. **Downgrade the database with the new image**, then only afterwards
+   deploy older code:
+   ```
+   cd /opt/trading-bot   # deploy dir; the paths below are relative to it
+   TARGET=018   # 018, 017 or 016
+   docker compose -f infra/docker-compose.yml --env-file .env run --rm --no-deps --entrypoint sh api -c \
+     "cd /app/infra/alembic && python -m alembic -c alembic.ini downgrade $TARGET && python -m alembic -c alembic.ini current"
+   ```
+   For WP1.7a/1.7b this is `alembic downgrade 017`: it drops the
    `kill_switch_state` table and the per-run `entries_latch_reason` /
    `entries_latched_at` columns -- any latch state and `flatten_incomplete`
-   markers are permanently lost, which is why step 1 (record state first)
-   and step 2 (resolve positions first) are mandatory and come before this
-   step, not after.
-5. Restart the API so it picks up the reverted code against the downgraded
-   schema.
+   markers are permanently lost, which is why steps 1 and 2 come before
+   this step, not after. `alembic downgrade 018` reverts only WP7.0 (drops
+   `idempotency_keys`); `016` returns to the `origin/main` schema.
+5. **Revert the application code** (LIFO: WP7.0, then WP1.3a, then WP1.7a/b
+   and WP1.8) and redeploy the prior image. Restart the API so it picks up
+   the reverted code against the downgraded schema.
 
 ### DC-6 -- a kill-switch clear can be overridden by a pending press (S-R3-02)
 
@@ -482,7 +510,11 @@ Never assume a clear succeeded just because the request returned 200.
   partial result; retry the stop, or stop with `flatten=false` to abandon
   the position tracking (it stays on the exchange, unmanaged).
 
-### DC-8 -- WP7.0: a run in `error` with no engine (ambiguous commit)
+### DC-70-4 -- WP7.0: a run in `error` with no engine (ambiguous commit)
+
+(Formerly labelled DC-8, which collided with WP1.7b's DC-8 (`config --quiet`);
+CF-70-15.) For a smoke live create, follow
+`docs/runbooks/smoke-roundtrip-mechanics-test.md` section 7.
 
 > Note: this is a backend (WP7.0 idempotency) operator note, not a Caddy
 > item -- it is filed here because this is the runbook's existing home
