@@ -28,3 +28,27 @@ Core trading engine containing the heart of the system.
 - Deterministic backtests via seed control
 - No silent failures — all errors must be logged and handled
 - Fee/slippage model must be configurable (taker %, maker %, slippage bps)
+
+
+### WP1.3a (exit-config validation, no-pyramiding held gate)
+- `exit_config.py` is the ONE pure validator for bracket/trailing config and
+  `allow_pyramiding` -- no engine/DB imports. `create_run`/`promote_to_live`/
+  `resume_run` (API), `StrategyEngine.__init__`, `BacktestRunner.__init__`
+  and `ParameterOptimizer.__init__` all call it; none of them may
+  independently re-implement bracket/trailing parsing.
+- `None`/`""`/exact `0` mean "unset" for the four bracket pct/multiplier
+  fields and `trailing_stop_pct` -- EXCEPT `bracket_atr_period`, which is
+  never "off" (0 is a hard 422).
+- `BaseStrategy.requires_exit_manager` defaults `True` (fail-closed); every
+  registry strategy declares it explicitly in its own class body, test-
+  enforced. `default_allow_pyramiding` defaults `False`; only
+  `DCARSIHybridStrategy`/`GridTradingStrategy` set it `True`.
+- The engine's held gate (`StrategyEngine._entry_blocked_by_held_position`)
+  only touches `SignalDirection.BUY`; it runs inside the step-5 per-signal
+  loop, after the kill-switch/protective filter. Live pyramiding is banned
+  at the API layer AND in `run_orchestrator.run_live_engine` (defence in
+  depth) -- never inside `StrategyEngine` itself, so library-mechanics
+  tests can still exercise two same-symbol BUYs via an explicit,
+  commented `allow_pyramiding=True`.
+- See `reports/vp2-wp1.3a/synthesis-spec.md` for the full bounds table
+  (E1-E11, W1-W8) and the fix map.

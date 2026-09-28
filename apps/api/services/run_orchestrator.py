@@ -46,6 +46,7 @@ from api.db.models import (
 )
 from api.services.audit_log import record_audit_event
 from common.types import TimeFrame
+from trading.exit_config import ExitConfigError
 from trading.recovery import ResumeSnapshot
 
 __all__ = [
@@ -688,6 +689,7 @@ async def _auto_retry_paper_run(
     bracket_config: dict[str, object] | None,
     enable_adaptive_learning: bool,
     auto_apply_learning: bool,
+    allow_pyramiding: bool = False,
 ) -> None:
     """Recreate a crashed paper run after a backoff (bounded attempts).
 
@@ -795,6 +797,7 @@ async def _auto_retry_paper_run(
                 enable_adaptive_learning=enable_adaptive_learning,
                 auto_apply_learning=auto_apply_learning,
                 auto_retry_attempt=next_attempt,
+                allow_pyramiding=allow_pyramiding,
             ),
             name=f"paper-engine-retry-{new_run_id}",
         )
@@ -826,6 +829,7 @@ async def run_paper_engine(
     resume: ResumeSnapshot | None = None,
     elapsed_seconds: float = 0.0,
     entries_latch_reason: str | None = None,
+    allow_pyramiding: bool = False,
 ) -> None:
     """
     Background coroutine that runs a paper trading engine for a single run.
@@ -904,6 +908,10 @@ async def run_paper_engine(
     log.info("runs.paper_engine_starting")
 
     final_status = "stopped"
+    # WP1.3a (SY-13a-19): a construction-time ExitConfigError is a
+    # deterministic config problem, never a transient one -- retrying it
+    # would just crash again, three times, for nothing.
+    _skip_auto_retry = False
     engine: StrategyEngine | None = None
     portfolio: Any = None
     execution: Any = None
@@ -995,7 +1003,7 @@ async def run_paper_engine(
             )
 
         # Build engine config  -- include trailing stop if configured
-        engine_config: dict[str, object] = {}
+        engine_config: dict[str, object] = {"allow_pyramiding": allow_pyramiding}
         if trailing_stop_pct is not None:
             engine_config["trailing_stop_pct"] = trailing_stop_pct
         for _bk, _bv in (bracket_config or {}).items():
@@ -1011,7 +1019,7 @@ async def run_paper_engine(
             symbols=symbols,
             timeframe=timeframe,
             run_mode=RunMode.PAPER,
-            config=engine_config if engine_config else None,
+            config=engine_config,
         )
 
         _RUN_ENGINES[run_id_str] = engine
@@ -1077,6 +1085,27 @@ async def run_paper_engine(
             except Exception:
                 log.exception("runs.paper_engine_stop_error")
         raise  # Must re-raise CancelledError for asyncio bookkeeping
+
+    except ExitConfigError as exc:
+        # WP1.3a (SY-13a-19): the engine constructor rejected the exit
+        # config / allow_pyramiding.  create_run/promote/resume already
+        # validate this before spawning the task, so reaching here means a
+        # legacy/edge path (e.g. paper boot recovery -- which validates
+        # separately and never reaches this branch either, or a caller that
+        # bypassed the router).  error/invalid_exit_config, never retried.
+        final_status = "error"
+        _skip_auto_retry = True
+        log.error(
+            "runs.paper_engine_exit_config_invalid",
+            code=exc.code,
+            reasons=[i.reason for i in exc.issues],
+        )
+        await _cancel_engine_side_tasks(
+            auto_stop_task=auto_stop_task,
+            learning_task=learning_task,
+            learning_stop_event=learning_stop_event,
+            flush_task=flush_task,
+        )
 
     except Exception:
         final_status = "error"
@@ -1197,7 +1226,9 @@ async def run_paper_engine(
         # final_status == "error" (CancelledError re-raises above).  The
         # retry task is fire-and-forget; it sleeps the backoff first so this
         # finally block returns immediately.
-        if final_status == "error":
+        # WP1.3a (SY-13a-19): NEVER retry a deterministic ExitConfigError --
+        # it would just crash again, three times, for nothing.
+        if final_status == "error" and not _skip_auto_retry:
             asyncio.create_task(
                 _auto_retry_paper_run(
                     crashed_run_id=run_id_str,
@@ -1212,6 +1243,7 @@ async def run_paper_engine(
                     bracket_config=bracket_config,
                     enable_adaptive_learning=enable_adaptive_learning,
                     auto_apply_learning=auto_apply_learning,
+                    allow_pyramiding=allow_pyramiding,
                 ),
                 name=f"auto-retry-{run_id_str[:8]}",
             )
@@ -1233,6 +1265,8 @@ async def run_live_engine(
     protective_mode: bool = False,
     elapsed_seconds: float = 0.0,
     entries_latch_reason: str | None = None,
+    allow_pyramiding: bool = False,
+    exit_config_waived: bool = False,
 ) -> None:
     """
     Background coroutine that runs a live trading engine for a single run.
@@ -1326,6 +1360,17 @@ async def run_live_engine(
                 )
                 return
 
+        # WP1.3a (SY-13a-20, D-13a-1): live pyramiding is forbidden.  The
+        # API layer (create/promote/resume) already rejects this before
+        # spawning the task; this is defence in depth for every production
+        # live engine, built here, so the ban holds even if a future caller
+        # bypasses the router.  Raised BEFORE StrategyEngine(...) -- library-
+        # mechanics tests construct a StrategyEngine directly with an
+        # explicit, commented allow_pyramiding=True (H2/H3), which never
+        # goes through this coroutine.
+        if allow_pyramiding:
+            raise ValueError("live_pyramiding_forbidden")
+
         settings = get_settings()
         capital = Decimal(initial_capital)
 
@@ -1412,7 +1457,12 @@ async def run_live_engine(
             log.info("runs.adaptive_learning_enabled", auto_apply=False)
 
         # Build engine config  -- include trailing stop if configured
-        live_engine_config: dict[str, object] = {}
+        live_engine_config: dict[str, object] = {"allow_pyramiding": allow_pyramiding}
+        if exit_config_waived:
+            # WP1.3a (SY-13a-16): only ever set by a protective resume that
+            # salvaged a partially-invalid exit config -- StrategyEngine
+            # itself re-enforces that this requires protective_mode=True.
+            live_engine_config["exit_config_waived"] = True
         if trailing_stop_pct is not None:
             live_engine_config["trailing_stop_pct"] = trailing_stop_pct
         for _bk, _bv in (bracket_config or {}).items():
@@ -1428,7 +1478,7 @@ async def run_live_engine(
             symbols=symbols,
             timeframe=timeframe,
             run_mode=RunMode.LIVE,
-            config=live_engine_config if live_engine_config else None,
+            config=live_engine_config,
             protective_mode=protective_mode,
         )
 

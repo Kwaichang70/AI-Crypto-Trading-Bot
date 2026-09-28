@@ -12,6 +12,7 @@ GET  /api/v1/optimize/{id}  — Retrieve one optimization run with its full entr
 
 from __future__ import annotations
 
+import math
 import uuid
 from datetime import datetime
 from decimal import Decimal
@@ -29,10 +30,50 @@ from api.db import get_db
 from api.db.models import OptimizationEntryORM, OptimizationRunORM
 from common.types import TimeFrame
 # TODO(sprint-30): extract to api.services.market_data / api.services.strategy_registry
-from api.routers.runs import _fetch_bars_for_backtest, _get_strategy_registry
+from api.routers.runs import (
+    _fetch_bars_for_backtest,
+    _get_strategy_registry,
+)
+from trading.exit_config import ExitConfigError, validate_param_grid_exit_config
 from trading.optimizer import SUPPORTED_METRICS, ParameterOptimizer
 
 __all__ = ["router"]
+
+
+def _optimize_exit_config_error_detail(exc: ExitConfigError) -> dict[str, Any]:
+    """WP13a-C-01 (security/critic round 2): the optimizer's 422 envelope is
+    COMBINATION-scoped, not field-scoped -- a sibling of
+    ``api.routers.runs._exit_config_error_detail`` rather than a reuse of
+    it, matching ``apps/ui/src/lib/types.ts::OptimizeExitConfigIssue``
+    exactly: every ``errors[]`` item carries ``combo_index`` (which grid
+    combination failed) and ``params`` (its full parameter dict), with
+    ``field`` always the PLAIN field name (never a composite
+    ``combo[i].field`` string). ``total_invalid`` is the real count across
+    every combination, independent of the 20-item cap on ``errors[]``.
+    """
+    combo_issues = getattr(exc, "combo_issues", ())
+    detail: dict[str, Any] = {
+        "code": exc.code,
+        "errors": [
+            {
+                "combo_index": issue.combo_index,
+                "params": issue.params,
+                "field": issue.field,
+                "reason": issue.reason,
+                "value": issue.value,
+                "min": issue.min,
+                "max": issue.max,
+                "message": issue.message,
+            }
+            for issue in combo_issues
+        ],
+        "total_invalid": getattr(exc, "total_invalid", len(combo_issues)),
+    }
+    if exc.warnings:
+        detail["warnings"] = [
+            {"code": w.code, "field": w.field, "message": w.message} for w in exc.warnings
+        ]
+    return detail
 
 router = APIRouter(prefix="/optimize", tags=["optimize"])
 logger = structlog.get_logger(__name__)
@@ -209,6 +250,57 @@ async def run_optimization(
             detail="backtest_start must be before backtest_end",
         )
 
+    # WP13a-S-R3-03 (security round 3, Info): an empty value list on ANY
+    # paramGrid key makes the full cross-product 0 (``math.prod`` of a list
+    # containing a 0-length factor is 0), which is <= max_combinations and
+    # so would otherwise sail straight through the cap check below into a
+    # vacuous 200 with zero combinations run -- reject it explicitly, with
+    # a clear message, before that cap check.
+    _empty_grid_keys = sorted(k for k, v in body.param_grid.items() if len(v) == 0)
+    if _empty_grid_keys:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"paramGrid values must be non-empty lists; empty for: "
+                f"{_empty_grid_keys}."
+            ),
+        )
+
+    # WP13a-S-R2-01 (security round 2): enforce the SAME max_combinations
+    # cap ``ParameterOptimizer.__init__`` applies today (identical status
+    # code and message), but BEFORE the exit-config pre-validation below --
+    # otherwise an oversized grid would pay the full, unbounded per-
+    # combination validation cost on the event loop before ever reaching
+    # the cap. This restores the baseline ordering (cheap size check first).
+    total_grid_combinations = math.prod(len(v) for v in body.param_grid.values())
+    if total_grid_combinations > body.max_combinations:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Parameter grid produces {total_grid_combinations} combinations, "
+                f"exceeding max_combinations={body.max_combinations}. "
+                f"Reduce the grid or increase max_combinations."
+            ),
+        )
+
+    # WP1.3a (SY-13a-17): pre-validate EVERY grid combination's exit config
+    # before any bar fetch (a 422 here costs nothing; a bar fetch is a real
+    # exchange round trip). ``ExitConfigError`` is a ``ValueError``
+    # subclass, so it MUST be caught before the generic ``except
+    # ValueError`` below (G-3) or it would silently map to 400.
+    try:
+        validate_param_grid_exit_config(strategy_cls, body.param_grid)
+    except ExitConfigError as exc:
+        log.warning(
+            "optimize.exit_config_invalid",
+            code=exc.code,
+            total_invalid=getattr(exc, "total_invalid", None),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=_optimize_exit_config_error_detail(exc),
+        ) from exc
+
     timeframe = TimeFrame(body.timeframe)
 
     # Step 1: Fetch OHLCV data ONCE
@@ -232,6 +324,12 @@ async def run_optimization(
             top_n=body.top_n,
             max_combinations=body.max_combinations,
         )
+    except ExitConfigError as exc:
+        # Defence in depth: ParameterOptimizer.__init__ also validates.
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=_optimize_exit_config_error_detail(exc),
+        ) from exc
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

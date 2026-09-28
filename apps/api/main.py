@@ -58,6 +58,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from api.auth import require_api_key
+from api.body_size_limit import BodySizeLimitMiddleware
 from api.config import get_settings
 from api.prometheus import setup_prometheus
 from api.rate_limit import setup_rate_limiting
@@ -685,6 +686,15 @@ def create_app() -> FastAPI:
     setup_rate_limiting(application)
     _register_routes(application)
     setup_prometheus(application)
+
+    # WP1.3a round 6 (user decision): added LAST so it is the OUTERMOST
+    # middleware layer -- Starlette makes the most-recently-added
+    # middleware the outermost one, so this sits outside CORS, request
+    # timing AND rate limiting, and runs long before any dependency
+    # (auth, pydantic body parsing) ever gets a chance to touch the body.
+    application.add_middleware(
+        BodySizeLimitMiddleware, max_bytes=settings.max_request_body_bytes
+    )
 
     return application
 

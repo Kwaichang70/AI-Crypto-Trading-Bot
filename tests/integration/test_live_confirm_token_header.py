@@ -54,6 +54,13 @@ def _live_payload(*, confirm_token: str | None = None) -> dict[str, Any]:
     # confirm-token tests).  ma_crossover is now DEMOTED -> backtest-only and
     # would be rejected with 422 BEFORE the gate, which is unrelated to the
     # confirm-token behaviour under test here.
+    # WP1.3a (ST-44): grid_trading accumulates by design
+    # (default_allow_pyramiding=True) and live pyramiding is forbidden
+    # (D-13a-1/E11) -- without an explicit allowPyramiding=false the
+    # exit-config validator now also returns 422 BEFORE the gate (I6 takes
+    # priority over the 3-layer gate, same rationale as the availability
+    # 422 above). Pass it explicitly so this request reaches the gate,
+    # exactly like the ma_crossover workaround already documented here.
     body: dict[str, Any] = {
         "strategyName": "grid_trading",
         "strategyParams": {},
@@ -61,6 +68,7 @@ def _live_payload(*, confirm_token: str | None = None) -> dict[str, Any]:
         "timeframe": "1h",
         "mode": "live",
         "initialCapital": "10000.00",
+        "allowPyramiding": False,
     }
     if confirm_token is not None:
         body["confirmToken"] = confirm_token

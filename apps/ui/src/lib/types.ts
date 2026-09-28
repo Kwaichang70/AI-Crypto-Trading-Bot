@@ -34,6 +34,14 @@ export interface RunConfig {
   initial_capital: string;
   backtest_start?: string;
   backtest_end?: string;
+  /**
+   * WP1.3a (SY-13a-08): resolved (never absent after create/promote/normal
+   * resume/paper recovery) — an explicit `allowPyramiding` on the request
+   * wins, otherwise the strategy's own `default_allow_pyramiding` ClassVar
+   * (`True` only for dca_rsi_hybrid/grid_trading, `False` elsewhere).
+   * Optional here purely for back-compat with pre-WP1.3a persisted configs.
+   */
+  allow_pyramiding?: boolean;
 }
 
 export interface Run {
@@ -75,6 +83,28 @@ export interface Run {
    * Added by M5 backend (Sprint 49).
    */
   leaderboardEligible?: boolean;
+  /**
+   * WP1.3a (SY-13a §5 API contract): warnings emitted by the exit-config /
+   * pyramiding validator on a SUCCESSFUL 201 create. Absent/empty on every
+   * other read of a `Run` (GET /runs/{id} does not replay them) — this is a
+   * create-response-only field, so callers must capture it from the
+   * `createRun()` result at the moment of creation (see CF-13a-1 item 3).
+   */
+  configWarnings?: readonly ConfigWarning[];
+  /**
+   * WP1.3a (SY-13a-16): set on a PROTECTIVE resume (200) when one or more
+   * exit-config components were dropped ("salvaged") to let the resume
+   * proceed under the waiver. `null` when nothing was waived (including
+   * every non-resume read and every normal-mode resume).
+   */
+  exitConfigWaived?: ExitConfigWaived | null;
+  /**
+   * WP1.3a (SY-13a-16): true when, after a protective-resume salvage, the
+   * surviving config has NO downside exit at all (no SL/trailing) — the
+   * critical "flatten recommended" case. `null`/absent outside a protective
+   * resume response.
+   */
+  exitManagerMissing?: boolean | null;
 }
 
 /**
@@ -199,6 +229,18 @@ export interface RunCreateRequest {
   backtestStart?: string | null;
   backtestEnd?: string | null;
   /**
+   * WP1.3a (SY-13a-08, CF-13a-1 item 4): `StrictBool` on the wire — never
+   * send a truthy/falsy non-boolean. An explicit value always wins over the
+   * strategy's `default_allow_pyramiding`. The UI always sends this
+   * explicitly (never omitted) so the resolved value the operator saw in
+   * the form is exactly what the backend persists:
+   *   - live mode: always `false` (forced, not editable in the form).
+   *   - paper/backtest: the checkbox value, which itself defaults to the
+   *     strategy's own default (see `strategyDefaultAllowPyramiding` in
+   *     `./exit-config`).
+   */
+  allowPyramiding?: boolean;
+  /**
    * WP1.7a/SY-10 (S13): deprecated body-field fallback only. The UI never
    * populates this — a live-mode confirmation is sent EXCLUSIVELY via the
    * `X-Live-Confirm-Token` request header (see `createRun()` in `./api`),
@@ -208,6 +250,114 @@ export interface RunCreateRequest {
    * compile; the backend accepts the header only from this UI going forward.
    */
   confirmToken?: string | undefined;
+}
+
+// ---------------------------------------------------------------------------
+// WP1.3a: exit-config / pyramiding validator error envelope + warnings
+// -----------------------------------------------------------------------
+// Mirrors packages/trading/exit_config.py's ExitConfigIssue/ExitConfigWarning
+// dataclasses and apps/api's 422 `{"detail": {...}}` envelope for create,
+// promote-to-live, resume and optimize (reports/vp2-wp1.3a/synthesis-spec.md
+// §5/§18). These raw-dict `detail` bodies are NOT pydantic models (same
+// precedent as `FlattenDecisionRequiredDetail.held_symbols` above), so their
+// fields stay snake_case on the wire even though this project's pydantic
+// response MODELS use camelCase — do not "fix" these to camelCase.
+// ---------------------------------------------------------------------------
+
+/** One field-level validation issue from the exit-config/pyramiding validator. */
+export interface ExitConfigIssue {
+  field: string | null;
+  reason: string;
+  /** Stringified, truncated to <=64 chars server-side. */
+  value: string | null;
+  min: number | null;
+  max: number | null;
+  message: string;
+}
+
+/** One non-blocking warning (W1-W5, W7, W8) returned alongside a 2xx. */
+export interface ConfigWarning {
+  code: string;
+  field: string | null;
+  message: string;
+}
+
+export type ExitConfigErrorCode =
+  | "invalid_exit_config"
+  | "exit_manager_required"
+  | "live_pyramiding_forbidden";
+
+/** 422 `detail` when a bracket/trailing value fails validation (E1-E4/E6/E7/E9/E10). */
+export interface InvalidExitConfigDetail {
+  code: "invalid_exit_config";
+  errors: readonly ExitConfigIssue[];
+  warnings?: readonly ConfigWarning[];
+  hint?: string;
+}
+
+/** 422 `detail` when a `requires_exit_manager=True` strategy has no downside exit (E5). */
+export interface ExitManagerRequiredDetail {
+  code: "exit_manager_required";
+  strategy: string;
+  requires_one_of: readonly string[];
+  errors: readonly ExitConfigIssue[];
+  warnings?: readonly ConfigWarning[];
+  hint?: string;
+}
+
+/** 422 `detail` for a resolved-True `allowPyramiding` in LIVE (E11, D-13a-1). */
+export interface LivePyramidingForbiddenDetail {
+  code: "live_pyramiding_forbidden";
+  strategy: string;
+  hint?: string;
+  errors: readonly ExitConfigIssue[];
+  warnings?: readonly ConfigWarning[];
+}
+
+/** Union of every structured 422 body create/promote/resume can return (SY-13a-18). */
+export type ExitConfigErrorDetail =
+  | InvalidExitConfigDetail
+  | ExitManagerRequiredDetail
+  | LivePyramidingForbiddenDetail;
+
+/**
+ * One grid-combination-scoped issue from `POST /api/v1/optimize`'s 422
+ * (WP13a-C-01, round 2): the backend emits EXACTLY this flat shape --
+ * `{combo_index, params, field, reason, value, min, max, message}`, no more
+ * no less. Written out explicitly here (not `extends ExitConfigIssue`,
+ * even though the field set is identical) so this contract is unambiguous
+ * at a glance and does not silently drift if the base `ExitConfigIssue`
+ * ever grows a field the optimize envelope doesn't carry.
+ */
+export interface OptimizeExitConfigIssue {
+  combo_index: number;
+  params: Record<string, unknown>;
+  field: string | null;
+  reason: string;
+  /** Stringified, truncated to <=64 chars server-side. */
+  value: string | null;
+  min: number | null;
+  max: number | null;
+  message: string;
+}
+
+/**
+ * `POST /api/v1/optimize` 422 `detail` — same top-level codes as create/
+ * promote/resume, but `errors[]` items are combination-scoped (`combo_index`,
+ * `params`) and the list is capped at 20, with the top-level `total_invalid`
+ * always present (WP13a-C-01) giving the real count (SY-13a-17/§5).
+ */
+export interface OptimizeExitConfigErrorDetail {
+  code: "invalid_exit_config" | "exit_manager_required";
+  errors: readonly OptimizeExitConfigIssue[];
+  total_invalid: number;
+  warnings?: readonly ConfigWarning[];
+}
+
+/** `exitConfigWaived` on a protective-resume `Run` (SY-13a-16). */
+export interface ExitConfigWaived {
+  code: string;
+  errors: readonly ExitConfigIssue[];
 }
 
 // ---------------------------------------------------------------------------
@@ -607,6 +757,17 @@ export interface Strategy {
   demotionReason?: string | null;
   /** Criteria that must be met before the strategy can be re-promoted. */
   promotionRequirements?: readonly string[];
+  /**
+   * WP1.3a (SY-13a-08): mirrors `strategy_cls.default_allow_pyramiding`
+   * (`True` only for dca_rsi_hybrid/grid_trading, `False` on every other
+   * registry strategy) IF the backend schema endpoint exposes it. This is
+   * NOT part of the WP1.3a backend API contract (§4/§5 only add it as an
+   * internal ClassVar) — absent on every API response as of this WP, so the
+   * UI falls back to `PYRAMIDING_DEFAULT_TRUE_STRATEGIES` in
+   * `./exit-config`. Typed here (optional) purely so a future backend
+   * change that DOES expose it is picked up for free, with no UI change.
+   */
+  defaultAllowPyramiding?: boolean;
 }
 
 export interface StrategyListResponse {

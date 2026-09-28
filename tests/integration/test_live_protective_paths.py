@@ -67,6 +67,7 @@ from tests.integration.fakes.live_harness import (
 from tests.integration.fakes.scripted_strategy import ScriptedSignalStrategy
 from trading.models import Signal
 from trading.risk import RiskParameters
+from trading.strategies.momentum_breakout import MomentumBreakoutStrategy
 from trading.strategy import BaseStrategy, StrategyMetadata
 
 # ---------------------------------------------------------------------------
@@ -143,6 +144,8 @@ class _ScriptedSequenceStrategy(BaseStrategy):
         ),
         tags=["test-only"],
     )
+    # WP1.3a (SY-13a-06): test-only double, no bracket/trailing configured.
+    requires_exit_manager = False
 
     def __init__(self, strategy_id: str, params: dict[str, Any] | None = None) -> None:
         super().__init__(strategy_id, params)
@@ -594,6 +597,10 @@ async def test_buy_restart_reconcile_stop_loss(exchange: FakeCCXTExchange) -> No
     strategy_after = ScriptedSignalStrategy(
         "buy-restart-noop", {"direction": "buy", "call_index": 999}
     )
+    # WP1.3a (A-36/ST-44): allow_pyramiding=True -- this resumed portfolio
+    # already holds the pre-mismatch position, so the new default
+    # no-pyramiding held gate would otherwise drop the scripted BUY before
+    # it ever reaches the reconcile_required check this test is about.
     stack_after = await build_resumed_live_stack(
         exchange=exchange,
         strategy=strategy_after,
@@ -602,7 +609,7 @@ async def test_buy_restart_reconcile_stop_loss(exchange: FakeCCXTExchange) -> No
         initial_capital=INITIAL_CAPITAL,
         run_id=run_id,
         fills=persisted_fills,
-        engine_config={"bracket_stop_loss_pct": 0.05},
+        engine_config={"bracket_stop_loss_pct": 0.05, "allow_pyramiding": True},
     )
     await start_and_warmup(stack_after, run_id)
 
@@ -659,6 +666,10 @@ async def test_resume_mismatch_flags_blocks_buy_caps_sell(exchange: FakeCCXTExch
         "resume-mismatch",
         {"schedule": [(0, "buy", str(TARGET_NOTIONAL))]},
     )
+    # WP1.3a (A-36/ST-44): allow_pyramiding=True -- this resumed portfolio
+    # already holds the pre-mismatch position, so the new default
+    # no-pyramiding held gate would otherwise drop the scripted BUY before
+    # it ever reaches the reconcile_required check this test is about.
     stack_after = await build_resumed_live_stack(
         exchange=exchange,
         strategy=strategy_after,
@@ -667,7 +678,7 @@ async def test_resume_mismatch_flags_blocks_buy_caps_sell(exchange: FakeCCXTExch
         initial_capital=INITIAL_CAPITAL,
         run_id=run_id,
         fills=persisted_fills,
-        engine_config={"bracket_stop_loss_pct": 0.05},
+        engine_config={"bracket_stop_loss_pct": 0.05, "allow_pyramiding": True},
     )
     await start_and_warmup(stack_after, run_id)
 
@@ -1234,3 +1245,242 @@ async def test_flatten_lock_acquisition_timeout_reports_lock_timeout(
     assert sell_orders == []
 
     await stack.engine.stop()
+
+
+# ---------------------------------------------------------------------------
+# WP1.3a (SY-13a-10, AC1): "two breakouts, one position" -- the real
+# MomentumBreakoutStrategy against the real held gate.  The single most
+# important acceptance criterion of WP1.3a: with the default
+# allow_pyramiding=False, a second same-symbol BUY signal while already
+# holding is dropped BEFORE it ever reaches process_signal, and the run
+# still enters again cleanly after a bracket SL flattens it (ST-37/AC1).
+# ---------------------------------------------------------------------------
+
+
+async def test_wp13a_two_breakouts_one_position(exchange: FakeCCXTExchange) -> None:
+    strategy = MomentumBreakoutStrategy(
+        "wp13a-two-breakouts",
+        {"lookback": 3, "trend_sma_period": None, "position_size": 100},
+    )
+    stack = await _build_and_warm(
+        exchange,
+        strategy,
+        engine_config={
+            "bracket_mode": "fixed",
+            "bracket_stop_loss_pct": 0.05,
+            "bracket_take_profit_pct": 0.5,
+        },
+    )
+
+    orig_process_signal = stack.execution.process_signal
+    process_signal_calls: list[Signal] = []
+
+    async def _spy_process_signal(signal: Signal) -> Any:
+        process_signal_calls.append(signal)
+        return await orig_process_signal(signal)
+
+    stack.execution.process_signal = _spy_process_signal  # type: ignore[method-assign]
+
+    # Bar 1 (close 51000): a new breakout -- the first, and only, BUY.
+    await step_bar(stack, SYMBOL, Decimal("51000"), timeframe=TIMEFRAME_STR)
+    buy_orders = [o for o in exchange.order_log if o["side"] == "buy"]
+    assert len(buy_orders) == 1, f"expected exactly one BUY; got {exchange.order_log!r}"
+    first_fill_qty = stack.portfolio.get_position(SYMBOL).quantity  # type: ignore[union-attr]
+    assert first_fill_qty > 0
+    buy_signal_calls_after_first = sum(
+        1 for s in process_signal_calls if s.direction == SignalDirection.BUY
+    )
+    assert buy_signal_calls_after_first == 1
+
+    # Bar 2 (close 50500): a dip, not a new high -- no signal at all.
+    await step_bar(stack, SYMBOL, Decimal("50500"), timeframe=TIMEFRAME_STR)
+    assert len([o for o in exchange.order_log if o["side"] == "buy"]) == 1
+
+    # Bar 3 (close 52000): a second new breakout -- MUST be dropped as
+    # "already held", never reaching process_signal, and the ledger
+    # quantity is unchanged (still exactly the first fill).
+    with capture_logs() as cap3:
+        await step_bar(stack, SYMBOL, Decimal("52000"), timeframe=TIMEFRAME_STR)
+    buy_orders = [o for o in exchange.order_log if o["side"] == "buy"]
+    assert len(buy_orders) == 1, (
+        f"the second breakout must NOT submit a second BUY; got {exchange.order_log!r}"
+    )
+    assert stack.portfolio.get_position(SYMBOL).quantity == first_fill_qty  # type: ignore[union-attr]
+    buy_signal_calls_after_second = sum(
+        1 for s in process_signal_calls if s.direction == SignalDirection.BUY
+    )
+    assert buy_signal_calls_after_second == 1, (
+        "process_signal must not be called for the held-gate-dropped BUY"
+    )
+    assert any(e.get("event") == "engine.entry_skipped_position_held" for e in cap3), (
+        f"expected a held-skip log; got {cap3!r}"
+    )
+
+    # Bar 4 (close 48000): a >=5% breach of the fixed 5% SL -- exactly one
+    # SELL, flattening the position.  (Also not a new strategy breakout:
+    # 48000 is well below every recent high, so the SELL is bracket-only.)
+    await step_bar(stack, SYMBOL, Decimal("48000"), timeframe=TIMEFRAME_STR)
+    sell_orders = [o for o in exchange.order_log if o["side"] == "sell"]
+    assert len(sell_orders) == 1, f"expected exactly one SL SELL; got {exchange.order_log!r}"
+    flat_position = stack.portfolio.get_position(SYMBOL)
+    assert flat_position is None or flat_position.is_flat
+
+    # Bar 5 (close 53000): flat again, a fresh breakout above every prior
+    # high -- a brand-new BUY is allowed.
+    await step_bar(stack, SYMBOL, Decimal("53000"), timeframe=TIMEFRAME_STR)
+    buy_orders = [o for o in exchange.order_log if o["side"] == "buy"]
+    assert len(buy_orders) == 2, f"expected a new entry after flat; got {exchange.order_log!r}"
+
+    await stack.engine.stop()
+
+
+async def test_wp13a_two_breakouts_pyramiding_enabled_gives_two_buys(
+    exchange: FakeCCXTExchange,
+) -> None:
+    """ST-38: the SAME path, with library-level allow_pyramiding=True --
+    proves the held gate (not some other mechanism) is what caused the
+    single BUY above."""
+    strategy = MomentumBreakoutStrategy(
+        "wp13a-two-breakouts-pyramiding",
+        {"lookback": 3, "trend_sma_period": None, "position_size": 100},
+    )
+    stack = await _build_and_warm(
+        exchange,
+        strategy,
+        engine_config={
+            "bracket_mode": "fixed",
+            "bracket_stop_loss_pct": 0.05,
+            "bracket_take_profit_pct": 0.5,
+            "allow_pyramiding": True,
+        },
+    )
+
+    await step_bar(stack, SYMBOL, Decimal("51000"), timeframe=TIMEFRAME_STR)
+    await step_bar(stack, SYMBOL, Decimal("50500"), timeframe=TIMEFRAME_STR)
+    await step_bar(stack, SYMBOL, Decimal("52000"), timeframe=TIMEFRAME_STR)
+
+    buy_orders = [o for o in exchange.order_log if o["side"] == "buy"]
+    assert len(buy_orders) == 2, (
+        f"with allow_pyramiding=True both breakouts must fill; got {exchange.order_log!r}"
+    )
+
+    await stack.engine.stop()
+
+
+# ---------------------------------------------------------------------------
+# WP13a-S-01 (security round 2): a REAL StrategyEngine(LIVE,
+# protective_mode=True, exit_config_waived=True) must construct for a
+# BUY-only, requires_exit_manager strategy with NO exit config at all (or
+# TP-only) -- and, once constructed, flatten() must still bring a held
+# position to flat.  This is the harness proof the security report asked
+# for, independent of the API-layer test in test_wp18a_resume_endpoint.py.
+# ---------------------------------------------------------------------------
+
+
+async def test_wp13a_protective_resume_no_exit_config_constructs_and_flattens(
+    exchange: FakeCCXTExchange,
+) -> None:
+    run_id = "wp13a-s01-no-exit"
+    strategy_before = MomentumBreakoutStrategy(
+        "wp13a-s01-entry",
+        {"lookback": 3, "trend_sma_period": None, "position_size": 100},
+    )
+    stack_before = await _build_and_warm(
+        exchange,
+        strategy_before,
+        engine_config={
+            "bracket_mode": "fixed",
+            "bracket_stop_loss_pct": 0.05,
+            "bracket_take_profit_pct": 0.5,
+        },
+        run_id=run_id,
+    )
+    # Force a breakout BUY so there is a real held position to flatten.
+    await step_bar(stack_before, SYMBOL, Decimal("51000"), timeframe=TIMEFRAME_STR)
+    bought_qty = exchange.order_log[-1]["amount"]
+    assert bought_qty > 0
+    persisted_fills = stack_before.execution.get_all_fills()
+
+    # Resume PROTECTIVELY with NO exit config at all (the legacy-run
+    # scenario WP13a-S-01 is about) -- construction must NOT raise
+    # exit_manager_required, because exit_config_waived=True is accepted
+    # (only) together with protective_mode=True.
+    strategy_after = MomentumBreakoutStrategy(
+        "wp13a-s01-resumed", {"lookback": 3, "trend_sma_period": None, "position_size": 100}
+    )
+    stack_after = await build_resumed_live_stack(
+        exchange=exchange,
+        strategy=strategy_after,
+        symbol=SYMBOL,
+        timeframe=TIMEFRAME,
+        initial_capital=INITIAL_CAPITAL,
+        run_id=run_id,
+        fills=persisted_fills,
+        engine_config={"exit_config_waived": True},  # no bracket, no trailing
+        protective_mode=True,
+    )
+    await start_and_warmup(stack_after, run_id)
+
+    assert stack_after.engine._bracket_exit is None
+    assert stack_after.engine._trailing_stop is None
+
+    stack_after.risk_manager.trigger_kill_switch("stop_in_progress")
+    result = await stack_after.engine.flatten(reason="stop", timeout_s=30.0)
+    assert result.complete is True
+    assert stack_after.portfolio.get_position(SYMBOL).is_flat
+
+    await stack_after.engine.stop()
+
+
+async def test_wp13a_protective_resume_tp_only_constructs_and_flattens(
+    exchange: FakeCCXTExchange,
+) -> None:
+    """Same as above, TP-only (a downside-blind bracket) instead of no
+    bracket at all -- also must waive, not raise."""
+    run_id = "wp13a-s01-tp-only"
+    strategy_before = MomentumBreakoutStrategy(
+        "wp13a-s01-tp-entry",
+        {"lookback": 3, "trend_sma_period": None, "position_size": 100},
+    )
+    stack_before = await _build_and_warm(
+        exchange,
+        strategy_before,
+        engine_config={
+            "bracket_mode": "fixed",
+            "bracket_stop_loss_pct": 0.05,
+            "bracket_take_profit_pct": 0.5,
+        },
+        run_id=run_id,
+    )
+    await step_bar(stack_before, SYMBOL, Decimal("51000"), timeframe=TIMEFRAME_STR)
+    assert exchange.order_log[-1]["amount"] > 0
+    persisted_fills = stack_before.execution.get_all_fills()
+
+    strategy_after = MomentumBreakoutStrategy(
+        "wp13a-s01-tp-resumed", {"lookback": 3, "trend_sma_period": None, "position_size": 100}
+    )
+    stack_after = await build_resumed_live_stack(
+        exchange=exchange,
+        strategy=strategy_after,
+        symbol=SYMBOL,
+        timeframe=TIMEFRAME,
+        initial_capital=INITIAL_CAPITAL,
+        run_id=run_id,
+        fills=persisted_fills,
+        engine_config={
+            "exit_config_waived": True,
+            "bracket_mode": "fixed",
+            "bracket_take_profit_pct": 0.5,
+        },
+        protective_mode=True,
+    )
+    await start_and_warmup(stack_after, run_id)
+
+    assert stack_after.engine._bracket_exit is not None  # TP-only bracket DID build
+
+    stack_after.risk_manager.trigger_kill_switch("stop_in_progress")
+    result = await stack_after.engine.flatten(reason="stop", timeout_s=30.0)
+    assert result.complete is True
+    assert stack_after.portfolio.get_position(SYMBOL).is_flat
+
+    await stack_after.engine.stop()

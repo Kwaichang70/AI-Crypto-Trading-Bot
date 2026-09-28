@@ -16,6 +16,33 @@
 #   3. TS_PERMIT_CERT_UID must be set in /etc/default/tailscaled on host (see STEP 1c).
 #   4. tailscaled.sock must be mounted into this container (see docker-compose.yml).
 #   5. Run caddy-config.sh to substitute {{TAILSCALE_FQDN}} before deploying.
+#
+# WP1.3a (defence in depth, see reports/vp2-wp1.3a/security-report-r4.md and
+# -r5.md): security found repeated event-loop DoS via large request bodies on
+# /api/v1/optimize. A parallel API-level ASGI limit (1 MiB, 413) was added in
+# apps/api. This Caddyfile adds the same 1 MiB cap at the edge, on every
+# proxied /api/* handle block below, via `request_body { max_size 1MB }`.
+# `request_body` with `max_size` requires the *block* form shown below --
+# Caddy silently ignores an inline `request_body max_size 1MB` (see
+# https://github.com/rybbit-io/rybbit/issues/1136) -- and has been part of
+# Caddy's standard distribution (module caddyhttp.reverse_proxy siblings
+# aside, this is caddyhttp.requestbody) since Caddy 2.0, well below the
+# `caddy:2-alpine` tag pinned in infra/docker-compose.yml, so no image bump
+# is required for this change.
+#
+# Caddy returns HTTP 413 (Payload Too Large) when a body exceeds `max_size`.
+# NOTE (known Caddy upstream nuance, see caddyserver/caddy#4558 and #5652,
+# still open as of Caddy 2.11.x): with `reverse_proxy`, if the *upstream*
+# service (api:8000 / ui:3000) starts reading the request body before
+# `request_body` finishes enforcing the cap, some oversized requests can
+# surface to the client as 502 (Bad Gateway) instead of 413 -- this is a
+# transport-layer race in Caddy's own reverse_proxy + request_body
+# interaction, not a misconfiguration here. Either status code means the
+# oversized body was rejected and never reached the application; a plain
+# 200 is the only failure mode operators need to investigate (see
+# CADDY-RUNBOOK.md's body-size-limit verification step). The independent
+# API-level ASGI limit (apps/api) is what guarantees rejection either way,
+# even if Caddy's own response code varies.
 # =============================================================================
 
 {
@@ -36,7 +63,15 @@
     # NextAuth OAuth callbacks MUST reach the UI container, not the FastAPI backend.
     # This more-specific handle block MUST appear BEFORE handle /api/* because
     # Caddy v2 evaluates handle blocks in source order and stops at the first match.
+    #
+    # WP1.3a: capped at 1MB even though this path only ever carries small
+    # next-auth OAuth callback payloads (state/code exchanges, session
+    # cookies) -- there is no legitimate reason for a large body here, so
+    # the same edge-of-network cap applies for defence in depth.
     handle /api/auth/* {
+        request_body {
+            max_size 1MB
+        }
         reverse_proxy ui:3000
     }
 
@@ -64,13 +99,29 @@
     # operator curl fallback if the ui container is down). Do not add
     # path-based header stripping/blocking for X-Admin-Key here: it would
     # duplicate app-layer auth for no real security gain and add fragility.
+    #
+    # WP1.3a: admin action payloads (flatten decision, resume params) are
+    # small JSON bodies well under 1MB; same edge cap applied here too.
     handle /api/admin/* {
+        request_body {
+            max_size 1MB
+        }
         reverse_proxy ui:3000
     }
 
     # All other /api/* routes go to the FastAPI backend.
     # handle /api/* preserves the full /api/v1/... prefix (NOT handle_path).
+    #
+    # WP1.3a (security-report-r4.md / -r5.md): /api/v1/optimize accepted
+    # attacker-controlled parameter grids large enough to pin the event
+    # loop before any application-level validation ran. This 1MB edge cap
+    # rejects such bodies at Caddy with 413 before they reach api:8000 at
+    # all, ahead of (and independent from) the API's own 1 MiB ASGI-level
+    # body-size middleware -- defence in depth, not a replacement for it.
     handle /api/* {
+        request_body {
+            max_size 1MB
+        }
         reverse_proxy api:8000
     }
 

@@ -417,6 +417,11 @@ class TestProcessBar:
         mocks["strategy"].on_bar = MagicMock(return_value=[sig])
         mocks["execution"].process_signal = AsyncMock(return_value=[])
         mocks["execution"].check_resting_orders = None
+        # WP13a-S-04 (security round 2): the held gate now treats a
+        # non-Position, non-None get_position() return as HELD (fail
+        # closed) rather than "not held" -- explicitly flat here since
+        # this test is about signal routing, not held-state.
+        mocks["portfolio"].get_position = MagicMock(return_value=None)
 
         bar = _make_bar()
         await engine._process_bar({"BTC/USDT": bar}, {"BTC/USDT": [bar]})
@@ -559,6 +564,9 @@ class TestProcessBar:
         )
         mocks["execution"].process_signal = AsyncMock(return_value=[])
         mocks["execution"].check_resting_orders = None
+        # WP13a-S-04 (security round 2): see the identical note above --
+        # explicitly flat since this test is about multi-signal routing.
+        mocks["portfolio"].get_position = MagicMock(return_value=None)
 
         bar_btc = _make_bar(symbol="BTC/USDT", close="105")
         bar_eth = _make_bar(symbol="ETH/USDT", close="3000")

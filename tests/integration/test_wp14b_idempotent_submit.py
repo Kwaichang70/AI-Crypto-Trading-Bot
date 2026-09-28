@@ -128,6 +128,8 @@ class _RepeatingBuyStrategy(BaseStrategy):
         description="WP1.4b T1 harness-only strategy.",
         tags=["test-only"],
     )
+    # WP1.3a (SY-13a-06): test-only double, no bracket/trailing configured.
+    requires_exit_manager = False
 
     def __init__(self, strategy_id: str, params: dict[str, Any] | None = None) -> None:
         super().__init__(strategy_id, params)

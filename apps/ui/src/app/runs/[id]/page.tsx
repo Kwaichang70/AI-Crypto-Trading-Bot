@@ -33,6 +33,8 @@ import { useToast } from "@/components/ui/toast";
 import { LiveBanner } from "@/components/live-banner";
 import { StopRunDialog } from "@/components/stop-run-dialog";
 import { ResumeRunDialog } from "@/components/resume-run-dialog";
+import { PromoteRunDialog } from "@/components/promote-run-dialog";
+import { ConfigWarningsBanner, ProtectiveResumeBanner } from "@/components/config-warnings-banner";
 import { AdminOnly } from "@/components/admin-only";
 
 // ---------------------------------------------------------------------------
@@ -412,6 +414,8 @@ export default function RunDetailPage() {
   // stopRun(). An 'orphaned' live run instead offers <ResumeRunDialog>.
   const [stopDialogOpen, setStopDialogOpen] = useState(false);
   const [resumeDialogOpen, setResumeDialogOpen] = useState(false);
+  // WP1.3a (CF-13a-1 item 2): promote a stopped, eligible paper run to live.
+  const [promoteDialogOpen, setPromoteDialogOpen] = useState(false);
 
   const loadData = useCallback(async () => {
     const [runRes, portRes, curveRes, tradesRes, ordersRes, fillsRes, posRes, learnRes] = await Promise.all([
@@ -499,8 +503,22 @@ export default function RunDetailPage() {
   }
 
   function handleResumed(updated: Run) {
+    // WP1.3a (CF-13a-1 item 3): `updated` carries `exitConfigWaived`/
+    // `exitManagerMissing` on a protective resume (SY-13a-16) -- storing the
+    // whole object is enough for <ProtectiveResumeBanner> below to render
+    // them; no separate state needed.
     setRun(updated);
     toast("Run resumed", "success");
+    if (updated.exitManagerMissing) {
+      toast("Resumed with no downside exit — flatten recommended.", "error");
+    } else if (updated.exitConfigWaived) {
+      toast("Resumed with part of the exit config waived.", "warning");
+    }
+  }
+
+  function handlePromoted(newLiveRun: Run) {
+    toast("Promoted to a new live run", "success");
+    router.push(`/runs/${newLiveRun.id}`);
   }
 
   // Currency-consistent monetary prefix: derived from the run's quote
@@ -565,6 +583,12 @@ export default function RunDetailPage() {
   const isDone =
     run.status === "stopped" || run.status === "error";
 
+  // WP1.3a (CF-13a-1 item 2): client-side eligibility hint only -- the
+  // backend (`promote_to_live`) is the authority on trade-count/runtime
+  // gates and re-checks everything; this just avoids showing the button on
+  // a run that can obviously never be promoted (wrong mode, still running).
+  const canOfferPromote = run.runMode === "paper" && run.status === "stopped";
+
   return (
     <div className="space-y-6">
       {/* Back link */}
@@ -593,6 +617,22 @@ export default function RunDetailPage() {
                   className="rounded-lg border border-indigo-300 bg-indigo-50 px-4 py-2 text-sm font-medium text-indigo-600 transition-colors hover:bg-indigo-100 dark:border-indigo-700 dark:bg-indigo-900/20 dark:text-indigo-400 dark:hover:bg-indigo-900/40"
                 >
                   Resume Run
+                </button>
+              </AdminOnly>
+            )}
+            {canOfferPromote && (
+              // WP13a-S-02 (security round 2): wrapped in <AdminOnly>,
+              // matching Resume Run above -- promotion starts a new LIVE
+              // run, so it gets the same admin-only visibility as Resume,
+              // even though the confirm-token gate (not this) is the real
+              // barrier server-side (promote_to_live has no require_admin
+              // yet; see the WP3.2 carry-forward in the producer report).
+              <AdminOnly>
+                <button
+                  onClick={() => setPromoteDialogOpen(true)}
+                  className="rounded-lg border border-indigo-300 bg-indigo-50 px-4 py-2 text-sm font-medium text-indigo-600 transition-colors hover:bg-indigo-100 dark:border-indigo-700 dark:bg-indigo-900/20 dark:text-indigo-400 dark:hover:bg-indigo-900/40"
+                >
+                  Promote to Live
                 </button>
               </AdminOnly>
             )}
@@ -627,6 +667,14 @@ export default function RunDetailPage() {
         )}
       </div>
 
+      {/* WP1.3a (CF-13a-1 item 3): config warnings from a just-completed
+          create, and the protective-resume waiver/missing-exit banner. */}
+      <ConfigWarningsBanner warnings={run.configWarnings} />
+      <ProtectiveResumeBanner
+        exitConfigWaived={run.exitConfigWaived}
+        exitManagerMissing={run.exitManagerMissing}
+      />
+
       {stopDialogOpen && (
         <StopRunDialog
           run={run}
@@ -642,6 +690,21 @@ export default function RunDetailPage() {
           onClose={() => setResumeDialogOpen(false)}
           onResumed={handleResumed}
         />
+      )}
+
+      {promoteDialogOpen && (
+        // WP13a-S-02: dialog render also gated, belt-and-suspenders --
+        // promoteDialogOpen can only become true via the AdminOnly-gated
+        // trigger button above, but a viewer session flipping to admin
+        // mid-session (or a future caller of setPromoteDialogOpen) must
+        // not leave this mounted without the same check.
+        <AdminOnly>
+          <PromoteRunDialog
+            sourceRunId={run.id}
+            onClose={() => setPromoteDialogOpen(false)}
+            onPromoted={handlePromoted}
+          />
+        </AdminOnly>
       )}
 
       {/* Tabs */}

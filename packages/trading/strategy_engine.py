@@ -54,6 +54,11 @@ from data.indicators import atr as _atr_series
 from data.market_data import BaseMarketDataService, MarketDataError
 from trading.bracket_exit import BracketExitManager
 from trading.execution import BaseExecutionEngine
+from trading.exit_config import (
+    parse_exit_config,
+    require_exit_manager,
+    resolve_allow_pyramiding,
+)
 from trading.models import Fill, Order, Position, Signal, TradeResult
 from trading.portfolio import PortfolioAccounting
 from trading.risk import BaseRiskManager
@@ -63,11 +68,11 @@ from trading.trade_journal import ExitReasonDetector, TradeExcursionTracker, Tra
 from trading.trailing_stop import TrailingStopManager
 
 __all__ = [
-    "StrategyEngine",
     "EngineState",
     "FlattenPreconditionError",
     "FlattenResult",
     "FlattenSymbolResult",
+    "StrategyEngine",
 ]
 
 logger = structlog.get_logger(__name__)
@@ -440,50 +445,81 @@ class StrategyEngine:
             s: [] for s in self._symbols
         }
 
-        # Trailing stop manager (optional, configured via "trailing_stop_pct")
-        trailing_stop_pct = self._config.get("trailing_stop_pct")
+        # WP1.3a (SY-13a-01/06/22): a bad exit config is now a hard
+        # construction failure everywhere (create/promote/resume already
+        # validated it -- this is defence in depth for any caller that
+        # builds a StrategyEngine directly, e.g. BacktestRunner/tests).  The
+        # previous "warn and disable" behaviour (``engine.trailing_stop_
+        # disabled`` / ``engine.bracket_exit_disabled``) is gone: a run must
+        # never silently trade with no exit (C15).
+        #
+        # A protective resume MAY waive ``require_exit_manager`` (never the
+        # parse itself) via ``exit_config_waived=True``, which is accepted
+        # only together with ``protective_mode=True`` (SY-13a-16) -- entries
+        # are already fully blocked in protective mode (``_drop_entry_
+        # signals``), so a missing exit cannot let a new position open
+        # unprotected; it only lets the operator reach ``flatten=true``.
+        exit_config_waived = bool(self._config.get("exit_config_waived", False))
+        if exit_config_waived and not protective_mode:
+            raise ValueError(
+                "exit_config_waived=True is only accepted with protective_mode=True"
+            )
+
+        _bracket_raw = {
+            k: self._config.get(k)
+            for k in (
+                "bracket_mode",
+                "bracket_stop_loss_pct",
+                "bracket_take_profit_pct",
+                "bracket_atr_sl_multiplier",
+                "bracket_atr_tp_multiplier",
+                "bracket_atr_period",
+            )
+            if k in self._config
+        }
+        _exit_cfg = parse_exit_config(
+            bracket=_bracket_raw,
+            trailing_stop_pct=self._config.get("trailing_stop_pct"),
+        )
+        if not exit_config_waived:
+            require_exit_manager(self._strategies, _exit_cfg)
+
         self._trailing_stop: TrailingStopManager | None = None
-        if trailing_stop_pct is not None:
-            try:
-                self._trailing_stop = TrailingStopManager(
-                    trailing_stop_pct=float(trailing_stop_pct),
-                    strategy_id="trailing_stop",
-                )
-            except (ValueError, TypeError) as exc:
-                structlog.get_logger(__name__).warning(
-                    "engine.trailing_stop_disabled",
-                    reason=str(exc),
-                    trailing_stop_pct=trailing_stop_pct,
-                )
+        if _exit_cfg.trailing_stop_pct is not None:
+            self._trailing_stop = TrailingStopManager(
+                trailing_stop_pct=_exit_cfg.trailing_stop_pct,
+                strategy_id="trailing_stop",
+            )
 
         # Bracket exit manager (optional, fixed/ATR stop-loss + take-profit).
         # Anchored to position entry price; complements the trailing stop.
         # Config keys carry a ``bracket_`` prefix to avoid collision with any
         # strategy's own parameter names.
         self._bracket_exit: BracketExitManager | None = None
-        _bracket_keys = (
-            "bracket_stop_loss_pct",
-            "bracket_take_profit_pct",
-            "bracket_atr_sl_multiplier",
-            "bracket_atr_tp_multiplier",
+        if _exit_cfg.bracket:
+            _raw_atr_period: Any = _exit_cfg.bracket.get("bracket_atr_period")
+            self._bracket_exit = BracketExitManager(
+                stop_loss_pct=_opt_float(_exit_cfg.bracket.get("bracket_stop_loss_pct")),
+                take_profit_pct=_opt_float(_exit_cfg.bracket.get("bracket_take_profit_pct")),
+                bracket_mode=str(_exit_cfg.bracket.get("bracket_mode") or "fixed"),
+                atr_sl_multiplier=_opt_float(_exit_cfg.bracket.get("bracket_atr_sl_multiplier")),
+                atr_tp_multiplier=_opt_float(_exit_cfg.bracket.get("bracket_atr_tp_multiplier")),
+                atr_period=int(_raw_atr_period or 14),
+                strategy_id="bracket_exit",
+            )
+
+        # WP1.3a (SY-13a-08): resolve allow_pyramiding from the (already
+        # type-checked) config, defaulting per-strategy when absent.  A
+        # non-bool value is a construction error (E1-style, but this is the
+        # engine layer -- the API layer never lets a non-bool through).
+        _raw_pyramiding = self._config.get("allow_pyramiding")
+        if _raw_pyramiding is not None and not isinstance(_raw_pyramiding, bool):
+            raise ValueError(
+                f"allow_pyramiding must be a bool, got {_raw_pyramiding!r}"
+            )
+        self._allow_pyramiding: bool = resolve_allow_pyramiding(
+            _raw_pyramiding, self._strategies
         )
-        if any(self._config.get(k) is not None for k in _bracket_keys):
-            try:
-                self._bracket_exit = BracketExitManager(
-                    stop_loss_pct=_opt_float(self._config.get("bracket_stop_loss_pct")),
-                    take_profit_pct=_opt_float(self._config.get("bracket_take_profit_pct")),
-                    bracket_mode=str(self._config.get("bracket_mode") or "fixed"),
-                    atr_sl_multiplier=_opt_float(self._config.get("bracket_atr_sl_multiplier")),
-                    atr_tp_multiplier=_opt_float(self._config.get("bracket_atr_tp_multiplier")),
-                    atr_period=int(self._config.get("bracket_atr_period") or 14),
-                    strategy_id="bracket_exit",
-                )
-            except (ValueError, TypeError) as exc:
-                structlog.get_logger(__name__).warning(
-                    "engine.bracket_exit_disabled",
-                    reason=str(exc),
-                    bracket_mode=self._config.get("bracket_mode"),
-                )
 
         # Higher-timeframe bar data (optional, for multi-TF strategies)
         self._htf_bars: dict[str, dict[str, list[OHLCVBar]]] | None = None
@@ -816,7 +852,7 @@ class StrategyEngine:
 
         # Reset exposure counters for this backtest run
         self._exposure_bars_total = 0
-        self._exposure_bars_per_symbol = {s: 0 for s in self._symbols}
+        self._exposure_bars_per_symbol = dict.fromkeys(self._symbols, 0)
 
         # Sprint 50 Cycle 6 (IMPL-C6-002): equity-curve length captured at the
         # moment processing crosses into the first OOS bar. Stays None when
@@ -966,7 +1002,7 @@ class StrategyEngine:
                         self._stop_event.wait(),
                         timeout=sleep_time,
                     )
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     # Normal: timeout means the stop event was not set
                     pass
 
@@ -1188,6 +1224,53 @@ class StrategyEngine:
                                 }
                             )
 
+                # WP1.3a (SY-13a-10): per-signal, fail-closed "no pyramiding"
+                # gate.  BUY-only; SELLs are never touched (R-I7/I5).  Runs
+                # after the kill-switch/protective filter and the CB
+                # wipe/REDUCE sizing above, before ``process_signal`` so a
+                # second same-bar BUY sees the first one's fill (paper/
+                # backtest: synchronous MARKET fills) or in-flight state
+                # (live: the existing WP1.4 run-wide block, SY-13a-11).
+                if signal.direction == SignalDirection.BUY and not self._allow_pyramiding:
+                    try:
+                        _held = self._entry_blocked_by_held_position(
+                            signal.symbol, current_bars.get(signal.symbol)
+                        )
+                    except Exception:
+                        self._log.error(
+                            "engine.entry_held_state_unknown",
+                            symbol=signal.symbol,
+                            strategy_id=signal.strategy_id,
+                            exc_info=True,
+                        )
+                        continue
+                    if _held:
+                        self._log_held_skip(signal)
+                        continue
+
+                # WP1.3a (SY-13a-14, partial): a BUY that has an ATR bracket
+                # configured but no computable ATR yet, and no trailing stop
+                # to fall back on, would open with no protectable downside
+                # level this bar.  This IS logged as a missed entry
+                # (TradeSkipLogger) -- unlike the held-skip above, it is not
+                # a suppressed add-on, it is a genuinely dropped entry.
+                if signal.direction == SignalDirection.BUY and not self._entry_protectable(
+                    signal.symbol, history_by_symbol
+                ):
+                    bar_ref = current_bars.get(signal.symbol)
+                    self._skip_logger.log_skip(
+                        symbol=signal.symbol,
+                        skip_reason="exit_level_unavailable",
+                        hypothetical_entry_price=bar_ref.close if bar_ref is not None else None,
+                        signal_context=dict(signal.metadata) if signal.metadata else None,
+                    )
+                    self._log.warning(
+                        "engine.entry_skipped_exit_level_unavailable",
+                        symbol=signal.symbol,
+                        strategy_id=signal.strategy_id,
+                    )
+                    continue
+
                 orders = await self._execution_engine.process_signal(signal)
                 bar_orders += len(orders)
 
@@ -1358,6 +1441,84 @@ class StrategyEngine:
     # ------------------------------------------------------------------
     # Entry-signal filtering (WP1.2 / S6)
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # WP1.3a: no-pyramiding held gate + entry-protectability gate
+    # ------------------------------------------------------------------
+
+    def _entry_dust_threshold(self, symbol: str, last: Decimal | None) -> Decimal:
+        """Duck-typed: only ``LiveExecutionEngine`` implements
+        ``entry_dust_threshold`` (SY-13a-12).  Paper/backtest have no
+        exchange minimums, so the default is ``Decimal(0)`` (same as
+        ``is_flat``).  Looked up on the *type*, not the instance, so a bare
+        ``MagicMock()`` execution engine in a unit test (which auto-creates
+        any instance attribute on access) is correctly treated as "no
+        accessor" -- only a real ``LiveExecutionEngine`` (or a test double
+        built with ``spec=LiveExecutionEngine``) has this on its class."""
+        accessor = getattr(type(self._execution_engine), "entry_dust_threshold", None)
+        if not callable(accessor):
+            return Decimal("0")
+        bound_accessor: Any = accessor.__get__(self._execution_engine)
+        result = bound_accessor(symbol, last)
+        return result if isinstance(result, Decimal) else Decimal(str(result))
+
+    def _entry_blocked_by_held_position(
+        self, symbol: str, last_bar: OHLCVBar | None
+    ) -> bool:
+        """True iff a BUY for ``symbol`` must be dropped because the ledger
+        already shows more than dust (SY-13a-10/12, R-I2).
+
+        Deliberately does NOT catch exceptions -- the caller wraps this in
+        its own try/except and drops the BUY on ANY exception, fail-closed
+        (R-I6/SY-13a-10), logging ``engine.entry_held_state_unknown``.
+        """
+        position = self._portfolio.get_position(symbol)
+        if position is None:
+            return False
+        if not isinstance(position, Position):
+            # WP13a-S-04 (security round 2): a non-None value that is NOT a
+            # real Position is a ledger-state anomaly (e.g. a broken/mocked
+            # portfolio), not evidence of "flat" -- fail closed (R-I6) by
+            # treating it as held, exactly like the caller's own
+            # try/except treats any exception from this method.
+            return True
+        if position.is_flat:
+            return False
+        last_price = Decimal(str(last_bar.close)) if last_bar is not None else None
+        threshold = self._entry_dust_threshold(symbol, last_price)
+        return position.quantity > threshold
+
+    def _entry_protectable(
+        self, symbol: str, history_by_symbol: dict[str, list[OHLCVBar]]
+    ) -> bool:
+        """True unless an ATR bracket is configured and ATR cannot be
+        computed yet for ``symbol``, with no trailing stop to fall back on
+        (SY-13a-14, partial -- the ``stop_inside_entry_cost`` drop decision
+        is deferred to WP1.3b/CF-13a-4)."""
+        if self._bracket_exit is None or not self._bracket_exit.requires_atr:
+            return True
+        if self._trailing_stop is not None:
+            return True
+        atr_value = self._compute_atr_for_symbol(symbol, history_by_symbol)
+        return atr_value is not None
+
+    def _log_held_skip(self, signal: Signal) -> None:
+        """Log a suppressed pyramiding add-on.  Deliberately NOT written to
+        ``TradeSkipLogger`` (SY-13a-10): a suppressed add-on is not a missed
+        entry, and a level-triggered strategy (rsi_mean_reversion, dca)
+        would otherwise log one skip per bar and pollute adaptive-learning
+        skip analysis.  Info in paper/live, debug in backtest (lower noise
+        for the hot backtest loop)."""
+        log_fn = (
+            self._log.debug
+            if self._run_mode == RunMode.BACKTEST
+            else self._log.info
+        )
+        log_fn(
+            "engine.entry_skipped_position_held",
+            symbol=signal.symbol,
+            strategy_id=signal.strategy_id,
+        )
 
     def _drop_entry_signals(
         self,

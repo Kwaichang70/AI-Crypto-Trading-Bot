@@ -22,6 +22,7 @@ import { DataTable } from "@/components/ui/data-table";
 import { ParamGridEditor } from "./param-grid-editor";
 import type { ParamGridRow } from "./param-grid-editor";
 import { buildResultColumns } from "./result-columns";
+import { ExitConfigErrorPanel } from "@/components/exit-config-error-panel";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -49,7 +50,11 @@ type PagePhase =
   | { kind: "idle" }
   | { kind: "loading" }
   | { kind: "results"; data: OptimizeResponse }
-  | { kind: "error"; message: string };
+  // WP1.3a (CF-13a-1 item 2): `detail` carries the raw (possibly structured
+  // invalid_exit_config/exit_manager_required) error body so the render
+  // path can try `<ExitConfigErrorPanel variant="optimize">` before falling
+  // back to `message`.
+  | { kind: "error"; message: string; detail?: unknown };
 
 // ---------------------------------------------------------------------------
 // Optimization history component
@@ -321,7 +326,11 @@ export default function OptimizePage() {
     if (result.ok) {
       setPhase({ kind: "results", data: result.data });
     } else {
-      setPhase({ kind: "error", message: result.error.message });
+      // WP1.3a (CF-13a-1 item 2): keep the raw detail so the render path can
+      // try the structured invalid_exit_config/exit_manager_required panel
+      // (SY-13a-17: pre-validated before any bar fetch) before falling back
+      // to the generic message.
+      setPhase({ kind: "error", message: result.error.message, detail: result.error.detail });
     }
   }
 
@@ -577,11 +586,13 @@ export default function OptimizePage() {
           </div>
         </div>
 
-        {/* Error banner */}
+        {/* Error banner — WP1.3a (CF-13a-1 item 2): structured 422 first */}
         {phase.kind === "error" && (
-          <div className="rounded-lg border border-red-300 bg-red-50 p-3 text-sm text-red-600 dark:border-red-700/50 dark:bg-red-900/20 dark:text-red-400">
-            {phase.message}
-          </div>
+          <ExitConfigErrorPanel
+            detail={phase.detail}
+            fallbackMessage={phase.message}
+            variant="optimize"
+          />
         )}
 
         {/* Submit */}

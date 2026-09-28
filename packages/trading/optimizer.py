@@ -28,6 +28,7 @@ import structlog
 from common.models import OHLCVBar
 from common.types import TimeFrame
 from trading.backtest import BacktestRunner
+from trading.exit_config import validate_param_grid_exit_config
 from trading.metrics import BacktestResult
 from trading.strategy import BaseStrategy
 from trading.walk_forward import (
@@ -186,6 +187,12 @@ class ParameterOptimizer:
                 f"exceeding max_combinations={max_combinations}. "
                 f"Reduce the grid or increase max_combinations."
             )
+
+        # WP1.3a (SY-13a-17): defence in depth -- the router already
+        # pre-validates the whole grid before the bar fetch; this covers any
+        # caller that builds a ``ParameterOptimizer`` directly (a script,
+        # or a future non-HTTP caller).
+        validate_param_grid_exit_config(self._strategy_cls, param_grid)
 
         self._log = structlog.get_logger(__name__).bind(
             component="parameter_optimizer",
@@ -466,12 +473,38 @@ class ParameterOptimizer:
         strategy_id: str,
         bars_by_symbol: dict[str, list[OHLCVBar]],
     ) -> BacktestResult:
-        """Instantiate a strategy + runner for one backtest pass."""
+        """Instantiate a strategy + runner for one backtest pass.
+
+        WP1.3a (SY-13a-17, fixes A-07): ``bracket_*`` keys must be split out
+        of ``combo_params`` and forwarded to ``BacktestRunner`` exactly like
+        ``apps.api.routers.runs._extract_bracket_config`` does for a live
+        request -- previously only ``trailing_stop_pct`` was forwarded, so
+        every momentum_breakout/sl_tp_reversion optimisation ran with NO
+        bracket exit at all.  ``allow_pyramiding`` is read the same way, if
+        the grid includes it.
+        """
+        strategy_params = dict(combo_params)
+        bracket_config: dict[str, object] = {}
+        for key in (
+            "bracket_mode",
+            "bracket_stop_loss_pct",
+            "bracket_take_profit_pct",
+            "bracket_atr_sl_multiplier",
+            "bracket_atr_tp_multiplier",
+            "bracket_atr_period",
+        ):
+            if key in strategy_params:
+                bracket_config[key] = strategy_params.pop(key)
+        trailing_stop_pct: float | None = strategy_params.get("trailing_stop_pct")
+        raw_allow_pyramiding = strategy_params.pop("allow_pyramiding", None)
+        allow_pyramiding = (
+            raw_allow_pyramiding if isinstance(raw_allow_pyramiding, bool) else None
+        )
+
         strategy = self._strategy_cls(
             strategy_id=strategy_id,
-            params=combo_params,
+            params=strategy_params,
         )
-        trailing_stop_pct: float | None = combo_params.get("trailing_stop_pct")
         runner = BacktestRunner(
             strategies=[strategy],
             symbols=self._symbols,
@@ -481,6 +514,8 @@ class ParameterOptimizer:
             taker_fee_bps=self._taker_fee_bps,
             slippage_bps=self._slippage_bps,
             trailing_stop_pct=trailing_stop_pct,
+            bracket_config=bracket_config,
+            allow_pyramiding=allow_pyramiding,
             seed=42,
         )
         return await runner.run(bars_by_symbol)

@@ -92,6 +92,8 @@ class _RepeatedBuyStrategy(BaseStrategy):
         description="WP1.4 harness-only: a scripted sequence of BUY signals.",
         tags=["test-only"],
     )
+    # WP1.3a (SY-13a-06): test-only double, no bracket/trailing configured.
+    requires_exit_manager = False
 
     def __init__(self, strategy_id: str, params: dict[str, Any] | None = None) -> None:
         super().__init__(strategy_id, params)
@@ -223,7 +225,13 @@ async def test_h2_two_30pct_buys_both_fill_at_relaxed_cap(exchange: FakeCCXTExch
         max_portfolio_exposure_pct=0.7,
         max_cluster_exposure_pct=0.7,
     )
-    stack = await _build_and_warm(exchange, strategy, risk_params=risk_params)
+    # WP1.3a (A-36/ST-44): this harness is deliberately about library-level
+    # sizing mechanics across TWO same-symbol BUYs -- the new default
+    # no-pyramiding held gate would otherwise drop the second one before it
+    # ever reaches the sizing/exposure checks under test here.
+    stack = await _build_and_warm(
+        exchange, strategy, risk_params=risk_params, engine_config={"allow_pyramiding": True}
+    )
 
     await step_bar(stack, SYMBOL, PRICE, timeframe=TIMEFRAME_STR)
     await step_bar(stack, SYMBOL, PRICE, timeframe=TIMEFRAME_STR)
@@ -253,7 +261,10 @@ async def test_h3_second_900_buy_capped_to_remaining_run_cash(exchange: FakeCCXT
         per_trade_risk_pct=0.05,
         max_order_size_quote=Decimal("100000"),
     )
-    stack = await _build_and_warm(exchange, strategy, risk_params=risk_params)
+    # WP1.3a (A-36/ST-44): same rationale as H2 -- two same-symbol BUYs.
+    stack = await _build_and_warm(
+        exchange, strategy, risk_params=risk_params, engine_config={"allow_pyramiding": True}
+    )
 
     await step_bar(stack, SYMBOL, PRICE, timeframe=TIMEFRAME_STR)
     cash_after_first_buy = stack.portfolio.cash
@@ -308,6 +319,11 @@ async def test_h4_resumed_peak_hint_trips_drawdown_gate(exchange: FakeCCXTExchan
         "h4-post-resume-buy",
         {"direction": "buy", "call_index": 0, "target_notional": "50"},
     )
+    # WP1.3a (ST-44): the resumed portfolio already holds a position from
+    # ``fills`` -- the new default no-pyramiding held gate would otherwise
+    # drop this BUY as an already-held add-on before it ever reaches the
+    # drawdown gate this test is actually about (ST-42 covers the held-gate
+    # case itself, in test_live_protective_paths.py).
     stack = await build_resumed_live_stack(
         exchange=exchange,
         strategy=strategy,
@@ -317,6 +333,7 @@ async def test_h4_resumed_peak_hint_trips_drawdown_gate(exchange: FakeCCXTExchan
         run_id=run_id,
         fills=[fill],
         peak_equity_hint=Decimal("1500"),
+        engine_config={"allow_pyramiding": True},
     )
     assert stack.portfolio.current_equity == Decimal("1000")
     assert stack.portfolio.get_peak_equity() == Decimal("1500")

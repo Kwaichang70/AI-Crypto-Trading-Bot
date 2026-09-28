@@ -12,6 +12,12 @@ import { Header } from "@/components/layout/header";
 import { useToast } from "@/components/ui/toast";
 import { LiveBanner } from "@/components/live-banner";
 import { LiveConfirmDialog } from "@/components/live-confirm-dialog";
+import { ExitConfigErrorPanel } from "@/components/exit-config-error-panel";
+import {
+  describeConfigWarning,
+  isPyramidingByDesignStrategy,
+  strategyDefaultAllowPyramiding,
+} from "@/lib/exit-config";
 
 const TIMEFRAMES = ["1m", "5m", "15m", "1h", "4h", "1d"];
 const COMMON_SYMBOLS = ["BTC/EUR", "ETH/EUR", "SOL/EUR", "XRP/EUR", "ADA/EUR"];
@@ -135,8 +141,15 @@ function NewRunInner() {
   const [backtestEnd, setBacktestEnd] = useState("2024-12-31T23:59");
   const [enableLearning, setEnableLearning] = useState(false);
   const [autoApplyLearning, setAutoApplyLearning] = useState(false);
+  // WP1.3a (SY-13a-08, CF-13a-1 item 4): the paper/backtest checkbox value.
+  // Re-initialised to the strategy's own default whenever the strategy
+  // changes (see the effect below) -- this is what gets sent verbatim for
+  // paper/backtest; LIVE always forces/sends `false` regardless of this
+  // state (see handleSubmit).
+  const [allowPyramiding, setAllowPyramiding] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
+  const [submitErrorDetail, setSubmitErrorDetail] = useState<unknown>(undefined);
   const [isLoadingStrategies, setIsLoadingStrategies] = useState(true);
   // WP1.7a/1.7b (SY-10, S13): the live confirmation token is NEVER held in
   // page-level state — only inside <LiveConfirmDialog>'s own transient
@@ -183,7 +196,30 @@ function NewRunInner() {
   function initDefaults(strategy: Strategy) {
     const defaults: Record<string, unknown> = {};
     for (const [key, prop] of Object.entries(strategy.parameterSchema.properties)) {
-      defaults[key] = prop.default ?? (prop.type === "integer" || prop.type === "number" ? 0 : "");
+      if (prop.default !== undefined) {
+        defaults[key] = prop.default;
+        continue;
+      }
+      const isNullable =
+        prop.nullable === true || (prop.anyOf?.some((s) => s.type === "null") ?? false);
+      if (isNullable) {
+        // WP1.3a (SY-13a-02, CF-13a-1 item 1): this used to send a literal
+        // `0` for every nullable numeric field with no explicit default
+        // (bracket_stop_loss_pct, bracket_take_profit_pct,
+        // bracket_atr_sl_multiplier/tp_multiplier, trailing_stop_pct). The
+        // backend now treats bare `0`/`""`/`null` as "unset" for those
+        // fields, but rsi_mean_reversion/dca_rsi_hybrid/grid_trading's
+        // `trailing_stop_pct` schema minimum is 0.005 — sending `0` was
+        // fragile (G-1: it happened to coerce to "unset" only because the
+        // pre-1.3a backend zero-normalised it too) and, more importantly,
+        // no longer expresses intent. `null` is unambiguous: the operator
+        // never touched this field.
+        defaults[key] = null;
+      } else if (prop.type === "integer" || prop.type === "number") {
+        defaults[key] = 0;
+      } else {
+        defaults[key] = "";
+      }
     }
     setStrategyParams(defaults);
   }
@@ -204,6 +240,15 @@ function NewRunInner() {
     // mode intentionally omitted: we only react to strategy/allowed changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedStrategy, allowedModes]);
+
+  // WP1.3a (SY-13a-08, CF-13a-1 item 4): re-seed the paper/backtest checkbox
+  // to the newly-selected strategy's own default (dca_rsi_hybrid/
+  // grid_trading -> true, everything else -> false) every time the
+  // strategy changes. Mirrors the mode auto-correct effect above.
+  useEffect(() => {
+    setAllowPyramiding(strategyDefaultAllowPyramiding(selectedStrategy));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedStrategy]);
 
   async function handleStrategyChange(name: string) {
     const result = await fetchStrategySchema(name);
@@ -235,8 +280,22 @@ function NewRunInner() {
     const result = await createRun(body, liveConfirmToken);
 
     if (result.ok) {
-      toast("Run started successfully", "success");
       setPendingLiveBody(null);
+      // WP1.3a (CF-13a-1 item 3): surface `configWarnings[]` from the 201
+      // body as toasts BEFORE navigating away -- <ToastProvider> lives in
+      // the root layout so these survive the client-side route change.
+      const warnings = result.data.configWarnings ?? [];
+      if (warnings.length === 0) {
+        toast("Run started successfully", "success");
+      } else {
+        toast("Run started with warnings", "warning");
+        for (const w of warnings) {
+          toast(
+            describeConfigWarning(w),
+            w.code === "no_downside_exit" ? "error" : "warning",
+          );
+        }
+      }
       router.push(`/runs/${result.data.id}`);
     } else {
       // WP17b-S-10 (round 2): a failed live create used to leave
@@ -246,6 +305,7 @@ function NewRunInner() {
       // (the operator can simply reopen it by clicking Start Run again).
       setPendingLiveBody(null);
       setSubmitError(result.error.message);
+      setSubmitErrorDetail(result.error.detail);
       setIsSubmitting(false);
     }
   }
@@ -253,6 +313,7 @@ function NewRunInner() {
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setSubmitError(null);
+    setSubmitErrorDetail(undefined);
 
     if (symbols.length === 0) {
       setSubmitError("Select at least one symbol.");
@@ -275,6 +336,13 @@ function NewRunInner() {
       return;
     }
 
+    // WP1.3a (SY-13a-08/09, CF-13a-1 item 4): LIVE always sends an explicit
+    // `false` -- never editable in the form, and never omitted (so a live
+    // dca_rsi_hybrid/grid_trading request never resolves to the strategy's
+    // own `true` default and 422s with `live_pyramiding_forbidden`). Paper
+    // and backtest send the checkbox's current value explicitly.
+    const resolvedAllowPyramiding = mode === "live" ? false : allowPyramiding;
+
     const body = {
       strategyName: selectedStrategy.name,
       strategyParams,
@@ -286,6 +354,7 @@ function NewRunInner() {
       backtestEnd: mode === "backtest" ? new Date(backtestEnd).toISOString() : null,
       enableAdaptiveLearning: mode !== "backtest" ? enableLearning : undefined,
       autoApplyLearning: mode === "paper" && enableLearning ? autoApplyLearning : undefined,
+      allowPyramiding: resolvedAllowPyramiding,
     };
 
     if (mode === "live") {
@@ -297,6 +366,8 @@ function NewRunInner() {
 
     void submitCreateRun(body);
   }
+
+  const isPyramidingByDesign = isPyramidingByDesignStrategy(selectedStrategy?.name);
 
   return (
     <div className="space-y-6">
@@ -422,6 +493,63 @@ function NewRunInner() {
                 )}
               </div>
             )}
+        </div>
+
+        {/* WP1.3a (CF-13a-1 item 4): allow-pyramiding control */}
+        <div className="card space-y-3">
+          <h2 className="text-sm font-semibold text-slate-800 dark:text-slate-200">Pyramiding</h2>
+          {mode === "live" ? (
+            <div className="space-y-2">
+              <div className="flex items-center justify-between opacity-60">
+                <label className="text-sm text-slate-700 dark:text-slate-300">
+                  Allow Pyramiding
+                </label>
+                <input
+                  type="checkbox"
+                  checked={false}
+                  disabled
+                  aria-label="Allow Pyramiding (disabled in live mode)"
+                  className="h-4 w-4 rounded border-slate-300 bg-white accent-indigo-500 dark:border-slate-700 dark:bg-slate-800"
+                />
+              </div>
+              <p className="text-xs text-amber-600 dark:text-amber-400">
+                Live pyramiding is disabled until WP1.3b/WP1.10.
+              </p>
+              {isPyramidingByDesign && selectedStrategy && (
+                <p className="text-xs text-amber-600 dark:text-amber-400">
+                  Accumulation disabled: single-entry variant, not validated.
+                  {" "}
+                  {selectedStrategy.displayName} normally accumulates
+                  (pyramids) into a held position — running it live single-entry
+                  is unvalidated but is allowed because it has strictly less
+                  exposure than its designed behaviour.
+                </p>
+              )}
+            </div>
+          ) : (
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <label
+                  htmlFor="allow-pyramiding-checkbox"
+                  className="text-sm text-slate-700 dark:text-slate-300"
+                >
+                  Allow Pyramiding
+                </label>
+                <input
+                  id="allow-pyramiding-checkbox"
+                  type="checkbox"
+                  checked={allowPyramiding}
+                  onChange={(e) => setAllowPyramiding(e.target.checked)}
+                  className="h-4 w-4 rounded border-slate-300 bg-white accent-indigo-500 dark:border-slate-700 dark:bg-slate-800"
+                />
+              </div>
+              <p className="text-xs text-slate-500">
+                When on, the strategy may submit a new BUY into an already-held
+                position (repeat entries). Defaults to{" "}
+                {isPyramidingByDesign ? "ON" : "OFF"} for this strategy.
+              </p>
+            </div>
+          )}
         </div>
 
         {/* Symbols */}
@@ -610,9 +738,7 @@ function NewRunInner() {
         )}
 
         {submitError && (
-          <div className="rounded-lg border border-red-300 bg-red-50 px-4 py-3 text-sm text-red-600 dark:border-red-800 dark:bg-red-900/20 dark:text-red-400">
-            {submitError}
-          </div>
+          <ExitConfigErrorPanel detail={submitErrorDetail} fallbackMessage={submitError} />
         )}
 
         <button

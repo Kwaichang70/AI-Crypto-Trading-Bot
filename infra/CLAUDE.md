@@ -38,3 +38,31 @@ Deployment configuration and database migrations.
   Tailscale FQDN and running containers, not a syntax check. Caddyfile
   route-order changes are covered instead by the static
   `tests/unit/test_wp17b_infra_config.py` suite.
+- pytest for these static infra-config tests needs the repo's `.venv`
+  (`structlog` and friends are not on the bare system `python3` in this
+  sandbox); run `.venv/bin/python -m pytest tests/unit/test_wp17b_infra_config.py
+  tests/unit/test_wp13a_infra_body_limit.py --no-cov` rather than a bare
+  `pytest` invocation.
+
+### Caddyfile `request_body` / `max_size` gotchas (WP1.3a, confirmed against
+### upstream Caddy docs/issue tracker — see `tests/unit/test_wp13a_infra_body_limit.py`)
+- `request_body { max_size <size> }` **must use the block form**. An
+  inline `request_body max_size 1MB` on one line is silently accepted by
+  the Caddyfile parser but the `max_size` value is never applied — Caddy
+  only reads it from inside the `{ }` block
+  (caddyserver/caddy is the module; see rybbit-io/rybbit#1136 for a
+  real-world instance of this exact mistake). Any future edit that
+  "simplifies" this to one line is a silent regression, not a no-op.
+- The `caddyhttp.requestbody` module (and its Caddyfile `request_body`
+  directive) has shipped in Caddy's standard distribution since 2.0, so
+  the `caddy:2-alpine` tag pinned in `docker-compose.yml` supports it with
+  no image bump.
+- Caddy documents 413 (Payload Too Large) as the response when `max_size`
+  is exceeded, but with `reverse_proxy` in front of an upstream that reads
+  the request body itself (as here — api:8000 / ui:3000), an oversized
+  request can occasionally surface as 502 (Bad Gateway) instead, per a
+  still-open upstream race (caddyserver/caddy#4558, #5652 as of Caddy
+  2.11.x). Do not treat an observed 502 on an oversized-body probe as a
+  broken limit — treat a plain 200 as the failure signal instead. This
+  Caddy-level cap is defence in depth; the FastAPI app enforces its own
+  independent ASGI-level body-size limit regardless of what Caddy returns.

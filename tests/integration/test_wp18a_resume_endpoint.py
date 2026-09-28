@@ -463,3 +463,126 @@ class TestResumeStubAndHappyPath:
         body = resp.json()
         assert body["status"] == "running"
         assert str(RUN_ID) in runs_module._RUN_TASKS
+
+
+
+# ---------------------------------------------------------------------------
+# WP13a-S-01 (security round 2): a protective resume of a BUY-only run
+# with NO exit config at all, or a TP-only one, must not crash the engine.
+# Regression for the gap where the waiver was only granted when salvage
+# actually DROPPED something invalid -- an entirely-absent or TP-only
+# bracket produces ZERO salvage issues (there is nothing invalid to drop),
+# so the old code granted no waiver, the engine's own
+# require_exit_manager(...) raised, the background task died, and the run
+# went to 'error' -- making flatten() (which requires a running engine)
+# unreachable for exactly the legacy runs WP1.3a newly refuses.
+# ---------------------------------------------------------------------------
+
+
+def _make_momentum_run_row(*, bracket_config: dict[str, object] | None) -> Any:
+    """A legacy orphaned live momentum_breakout run (BUY-only,
+    requires_exit_manager=True) with either no persisted bracket_config at
+    all (``bracket_config=None``) or a TP-only one."""
+    from types import SimpleNamespace
+
+    config: dict[str, Any] = {
+        "strategy_name": "momentum_breakout",
+        "symbols": ["BTC/USD"],
+        "timeframe": "1h",
+        "initial_capital": "10000",
+        "strategy_params": {"lookback": 5, "trend_sma_period": 5, "position_size": 100.0},
+    }
+    if bracket_config is not None:
+        config["bracket_config"] = bracket_config
+
+    return SimpleNamespace(
+        id=RUN_ID,
+        run_mode="live",
+        status="orphaned",
+        config=config,
+        started_at=datetime(2026, 1, 1, tzinfo=UTC),
+        stopped_at=None,
+        created_at=datetime(2026, 1, 1, tzinfo=UTC),
+        updated_at=datetime(2026, 1, 1, tzinfo=UTC),
+        n_closed_trades=None,
+        metrics_v2_backfilled=False,
+        entries_latch_reason=None,
+        entries_latched_at=None,
+    )
+
+
+class TestProtectiveResumeWaiverWP13aS01:
+    """WP13a-S-01: exit_config_waived must be set even when salvage found
+    NOTHING invalid to drop (no bracket at all, or TP-only) but the
+    strategy still requires a downside exit that isn't there."""
+
+    @pytest.fixture(autouse=True)
+    def _register_real_momentum_strategy(self) -> Any:
+        """Overrides the module-autouse ``_reset_strategy_registry`` fixture
+        (a MagicMock stub) with the REAL ``MomentumBreakoutStrategy`` --
+        ``strategy_requires_exit_manager`` needs a real class, not a mock,
+        to exercise the fixed branch."""
+        from trading.strategies import MomentumBreakoutStrategy
+
+        original = runs_module._STRATEGY_REGISTRY
+        runs_module._STRATEGY_REGISTRY = {"momentum_breakout": MomentumBreakoutStrategy}
+        yield
+        runs_module._STRATEGY_REGISTRY = original
+
+    def _resume_protective(self, resume_app: Any, run_row: Any) -> Any:
+        session = _DispatchSession(run_row=run_row, runs_update_rowcounts=[1, 1])
+        client = _client(resume_app, session)
+
+        async def _fake_scan_and_import(
+            db: Any, run: Any, exchange: Any, *, fence: Any = None
+        ) -> ImportReport:
+            return ImportReport()
+
+        import api.services.run_recovery as run_recovery_module
+
+        original_scan = run_recovery_module.scan_and_import
+        run_recovery_module.scan_and_import = _fake_scan_and_import
+        try:
+            with patch("api.routers.runs._run_live_engine", AsyncMock()):
+                resp = client.post(
+                    f"/api/v1/runs/{RUN_ID}/resume?mode=protective",
+                    headers={"X-Live-Confirm-Token": CONFIRM_TOKEN, "X-Admin-Key": ADMIN_KEY},
+                )
+        finally:
+            run_recovery_module.scan_and_import = original_scan
+        return resp
+
+    def test_no_bracket_at_all_returns_200_with_waiver(self, resume_app: Any) -> None:
+        run_row = _make_momentum_run_row(bracket_config=None)
+        resp = self._resume_protective(resume_app, run_row)
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["exitConfigWaived"] == {"code": "exit_manager_required", "errors": []}
+        assert body["exitManagerMissing"] is True
+        assert str(RUN_ID) in runs_module._RUN_TASKS
+
+    def test_tp_only_returns_200_with_waiver(self, resume_app: Any) -> None:
+        run_row = _make_momentum_run_row(
+            bracket_config={"bracket_mode": "fixed", "bracket_take_profit_pct": 0.1}
+        )
+        resp = self._resume_protective(resume_app, run_row)
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["exitConfigWaived"] == {"code": "exit_manager_required", "errors": []}
+        assert body["exitManagerMissing"] is True
+
+    def test_valid_bracket_grants_no_waiver(self, resume_app: Any) -> None:
+        """Control: a legacy run with a VALID SL survives salvage with
+        has_downside_exit=True -- no waiver at all, matching pre-fix
+        behaviour for the case that already worked."""
+        run_row = _make_momentum_run_row(
+            bracket_config={"bracket_mode": "fixed", "bracket_stop_loss_pct": 0.05}
+        )
+        resp = self._resume_protective(resume_app, run_row)
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["exitConfigWaived"] is None
+        assert body["exitManagerMissing"] is False

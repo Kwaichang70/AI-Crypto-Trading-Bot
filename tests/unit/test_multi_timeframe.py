@@ -184,6 +184,9 @@ class _PassthroughStrategy(BaseStrategy):
     passes through.
     """
 
+    # WP1.3a (SY-13a-06): test-only double, no bracket/trailing configured.
+    requires_exit_manager = False
+
     def __init__(self, strategy_id: str = "passthrough") -> None:
         super().__init__(strategy_id=strategy_id)
         self.received_mtf_contexts: list[MultiTimeframeContext | None] = []

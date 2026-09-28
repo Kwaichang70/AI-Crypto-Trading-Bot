@@ -947,6 +947,41 @@ class LiveExecutionEngine(BaseExecutionEngine):
         amount step, or 1e-8 when the step is unknown."""
         return self._amount_step(symbol)
 
+    def entry_dust_threshold(self, symbol: str, last: Decimal | None) -> Decimal:
+        """WP1.3a (SY-13a-12): the residual quantity at or below which a
+        ledger position is NOT treated as "held" by ``StrategyEngine``'s
+        no-pyramiding gate.
+
+        ``max(amount_step, min_amount, min_cost/last)`` -- a residual below
+        the exchange's minimum notional is unsellable
+        (``live.below_min_cost``), so without the ``min_cost`` term A-29's
+        plain ``max(step, min_amount)`` would block that symbol's entries
+        forever.  Returns ``Decimal(0)`` whenever :meth:`ledger_doubt` is
+        True for ``symbol`` (fail-closed, R-D9 ordering): any non-zero
+        ledger quantity then counts as held, exactly like the flatten path.
+        Suppressing exits for a dust residual (5a/5b) is explicitly deferred
+        (CF-13a-5) -- this threshold governs entries only.
+        """
+        if self._ledger_doubt(symbol):
+            return Decimal("0")
+        threshold = self._amount_step(symbol)
+        markets: dict[str, Any] = getattr(self._exchange, "markets", {}) or {}
+        market = markets.get(symbol) or {}
+        limits: dict[str, Any] = market.get("limits") or {}
+        min_amount = (limits.get("amount") or {}).get("min")
+        if min_amount is not None:
+            try:
+                threshold = max(threshold, Decimal(str(min_amount)))
+            except (ArithmeticError, ValueError, TypeError):
+                pass
+        min_cost = (limits.get("cost") or {}).get("min")
+        if min_cost is not None and last is not None and last > Decimal("0"):
+            try:
+                threshold = max(threshold, Decimal(str(min_cost)) / last)
+            except (ArithmeticError, ValueError, TypeError):
+                pass
+        return threshold
+
     def _base_asset(self, symbol: str) -> str | None:
         """``market["base"]`` for ``symbol``, or None if the market/base is
         unknown. Pure lookup -- callers decide whether a missing market

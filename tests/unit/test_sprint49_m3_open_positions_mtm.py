@@ -112,6 +112,8 @@ class _BuyNeverSellStrategy(BaseStrategy):
         description="Always holds an open position",
         version="1.0.0",
     )
+    # WP1.3a (SY-13a-06): test-only double, no bracket/trailing configured.
+    requires_exit_manager = False
 
     @classmethod
     def parameter_schema(cls) -> dict[str, Any]:

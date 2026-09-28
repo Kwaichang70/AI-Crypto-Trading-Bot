@@ -16,9 +16,14 @@ import structlog
 from common.types import SignalDirection
 from trading.models import Position, Signal
 
-__all__ = ["TrailingStopManager"]
+__all__ = ["TRAILING_PCT_RANGE", "TrailingStopManager"]
 
 logger = structlog.get_logger(__name__)
+
+# WP1.3a (SY-13a-01): exported so ``packages/trading/exit_config.py`` is the
+# single source of truth for the *policy* bounds layered on top of this
+# mechanical constructor range (see that module's docstring).
+TRAILING_PCT_RANGE: tuple[float, float] = (0.005, 0.50)
 
 
 class TrailingStopManager:
@@ -54,9 +59,10 @@ class TrailingStopManager:
         strategy_id: str = "trailing_stop",
         pending_stop_ttl: int = 3,
     ) -> None:
-        if not (0.005 <= trailing_stop_pct <= 0.50):
+        _lo, _hi = TRAILING_PCT_RANGE
+        if not (_lo <= trailing_stop_pct <= _hi):
             raise ValueError(
-                f"trailing_stop_pct must be in [0.005, 0.50], got {trailing_stop_pct}"
+                f"trailing_stop_pct must be in [{_lo}, {_hi}], got {trailing_stop_pct}"
             )
         if pending_stop_ttl < 1:
             raise ValueError(

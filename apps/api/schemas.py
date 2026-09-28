@@ -26,7 +26,15 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any, Generic, Literal, Self, TypeVar
 
-from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 from pydantic.alias_generators import to_camel
 
 from common.types import OrderSide, OrderStatus, OrderType, RunMode, TimeFrame
@@ -259,6 +267,18 @@ class RunCreateRequest(BaseModel):
             "Auto-generated (and logged) when not provided. "
             "Range: 0 to 2147483647 (inclusive). "
             "Ignored for paper and live modes."
+        ),
+    )
+    allow_pyramiding: StrictBool | None = Field(
+        default=None,
+        description=(
+            "WP1.3a: whether the engine may submit another BUY for a symbol "
+            "it already holds a position in. None (the default) resolves to "
+            "the strategy's own default (False, except dca_rsi_hybrid and "
+            "grid_trading, which accumulate by design). An explicit value "
+            "always wins. LIVE mode rejects a resolved value of True with "
+            "422 'live_pyramiding_forbidden' (D-13a-1) -- pyramiding is not "
+            "yet supported in live trading."
         ),
     )
 
@@ -544,6 +564,25 @@ class BacktestMetricsResponse(BaseModel):
         return v
 
 
+class ExitConfigWarningResponse(BaseModel):
+    """WP1.3a: one non-blocking exit-config warning (W1-W8)."""
+
+    model_config = _API_MODEL_CONFIG
+
+    code: str
+    field: str | None = None
+    message: str
+
+
+class ExitConfigWaivedResponse(BaseModel):
+    """WP1.3a (SY-13a-16): protective-resume salvage summary."""
+
+    model_config = _API_MODEL_CONFIG
+
+    code: str
+    errors: list[dict[str, Any]] = Field(default_factory=list)
+
+
 class RunDetailResponse(RunResponse):
     """
     Extended run response that includes backtest metrics when available.
@@ -557,6 +596,24 @@ class RunDetailResponse(RunResponse):
     backtest_metrics: BacktestMetricsResponse | None = Field(
         default=None,
         description="Populated for mode=backtest after successful execution",
+    )
+    config_warnings: list[ExitConfigWarningResponse] = Field(
+        default_factory=list,
+        description="WP1.3a: non-blocking exit-config warnings (W1-W8) for this run.",
+    )
+    exit_config_waived: ExitConfigWaivedResponse | None = Field(
+        default=None,
+        description=(
+            "WP1.3a (SY-13a-16): set only on a protective resume that "
+            "salvaged a partially-invalid exit config."
+        ),
+    )
+    exit_manager_missing: bool | None = Field(
+        default=None,
+        description=(
+            "WP1.3a: True when a protective resume left the run with no "
+            "downside exit at all. Always None outside a protective resume."
+        ),
     )
 
 

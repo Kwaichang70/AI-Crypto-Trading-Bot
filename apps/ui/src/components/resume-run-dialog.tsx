@@ -16,6 +16,17 @@
  * Uses the admin proxy `/api/admin/runs/[id]/resume` (server-side
  * X-Admin-Key injection) and forwards the typed token unchanged as
  * `X-Live-Confirm-Token`.
+ *
+ * WP1.3a (CF-13a-1 item 2, synthesis-spec.md §5/§9/SY-13a-18): a 422 on
+ * NORMAL-mode resume may carry the same structured exit-config/pyramiding
+ * envelope as create/promote (`invalid_exit_config` / `exit_manager_required`
+ * / `live_pyramiding_forbidden`) — rendered with the shared
+ * `<ExitConfigErrorPanel>`, generic message as fallback. A successful
+ * PROTECTIVE resume's `exitConfigWaived`/`exitManagerMissing` fields travel
+ * back on the returned `Run` via `onResumed` — rendering those is the
+ * caller's responsibility (see `app/runs/[id]/page.tsx`'s
+ * `<ProtectiveResumeBanner>`), not this dialog's, since they must persist
+ * after the dialog closes.
  */
 
 "use client";
@@ -24,6 +35,7 @@ import { useState } from "react";
 import { adminFetch, RESUME_TIMEOUT_MS } from "@/lib/admin-fetch";
 import type { Run } from "@/lib/types";
 import { LiveConfirmDialog } from "@/components/live-confirm-dialog";
+import { ExitConfigErrorPanel } from "@/components/exit-config-error-panel";
 
 interface ResumeRunDialogProps {
   runId: string;
@@ -36,10 +48,12 @@ export function ResumeRunDialog({ runId, onClose, onResumed }: ResumeRunDialogPr
   const [tokenDialogOpen, setTokenDialogOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [errorDetail, setErrorDetail] = useState<unknown>(undefined);
 
   async function submit(liveConfirmToken: string) {
     setLoading(true);
     setErrorMessage(null);
+    setErrorDetail(undefined);
     const result = await adminFetch<Run>(
       `/api/admin/runs/${runId}/resume?mode=${mode}`,
       {
@@ -59,6 +73,7 @@ export function ResumeRunDialog({ runId, onClose, onResumed }: ResumeRunDialogPr
       onClose();
     } else {
       setErrorMessage(result.error.message);
+      setErrorDetail(result.error.detail);
     }
   }
 
@@ -95,7 +110,10 @@ export function ResumeRunDialog({ runId, onClose, onResumed }: ResumeRunDialogPr
             <span>
               <span className="font-medium">Protective</span> — exempt from
               the global/per-run entries latch; always starts latched
-              in-process either way (recommended default).
+              in-process either way (recommended default). An invalid or
+              incomplete exit config is salvaged rather than rejected — see
+              the run page after resuming for any waiver/missing-exit
+              warning.
             </span>
           </label>
           <label className="flex items-start gap-2 text-sm text-slate-300">
@@ -109,14 +127,15 @@ export function ResumeRunDialog({ runId, onClose, onResumed }: ResumeRunDialogPr
             <span>
               <span className="font-medium">Normal</span> — rejected with 409
               if the global kill switch or this run&apos;s own entries latch
-              is active.
+              is active. Also rejected with 422 if the run&apos;s exit config
+              or pyramiding setting is now invalid.
             </span>
           </label>
         </fieldset>
 
         {errorMessage && (
-          <div className="mt-3 rounded-lg border border-red-300 bg-red-50 px-3 py-2 text-xs text-red-600 dark:border-red-800 dark:bg-red-900/20 dark:text-red-400">
-            {errorMessage}
+          <div className="mt-3">
+            <ExitConfigErrorPanel detail={errorDetail} fallbackMessage={errorMessage} />
           </div>
         )}
 

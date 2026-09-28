@@ -142,6 +142,24 @@ class Settings(BaseSettings):
             "proxy-appended rightmost entries are trustworthy. (CR-RL-002)"
         ),
     )
+    max_request_body_bytes: int = Field(
+        default=1_048_576,  # 1 MiB
+        ge=1024,
+        description=(
+            "WP1.3a round 6 (user decision): hard cap on every request body "
+            "size, in bytes, enforced by BodySizeLimitMiddleware BEFORE "
+            "routing, rate-limiting or any request-body parsing. Applies to "
+            "every method that can carry a body (POST/PUT/PATCH/DELETE); "
+            "GET/HEAD/OPTIONS and health/metrics endpoints are unaffected. "
+            "Enforced both via Content-Length (fast-path, before any body "
+            "is read) and while streaming (for chunked requests or requests "
+            "with no Content-Length), without buffering the whole body. "
+            "There are no upload endpoints in apps/api, so 1 MiB comfortably "
+            "covers every legitimate request (create/optimize/promote/"
+            "resume bodies) while bounding the amplification class closed "
+            "by WP1.3a's exit-config fixes at the transport layer too."
+        ),
+    )
 
     # ------------------------------------------------------------------
     # Observability — Prometheus

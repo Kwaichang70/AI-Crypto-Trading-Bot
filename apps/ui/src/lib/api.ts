@@ -102,6 +102,13 @@ export interface HealthResponse {
 export const STOP_TIMEOUT_MS = 65_000;
 /** POST /api/v1/runs/{id}/emergency-stop — same flatten budget as stop. */
 export const EMERGENCY_STOP_TIMEOUT_MS = 65_000;
+/**
+ * POST /api/v1/runs/{id}/promote-to-live — WP1.3a (CF-13a-1): a plain 20s
+ * fallback is too tight for a cold-DB promotion-gate query; use the same
+ * budget as createRun's backtest-eligible timeout (120s) since promotion
+ * also runs the full exit-config/pyramiding validator before any DB write.
+ */
+export const PROMOTE_TIMEOUT_MS = 120_000;
 
 // ---------------------------------------------------------------------------
 // Core fetch wrapper
@@ -279,6 +286,13 @@ export async function fetchRun(id: string): Promise<ApiResult<Run>> {
  * UI must never populate; see the field's own deprecation note in
  * `./types`). The backend already prefers the header over the deprecated
  * body field (`runs.py:515`).
+ *
+ * WP1.3a (CF-13a-1): `body.allowPyramiding` is always sent explicitly by the
+ * new-run form now (never omitted) — see `strategyDefaultAllowPyramiding` in
+ * `./exit-config`. A 201 here may carry `configWarnings[]` (SY-13a-18/§5);
+ * a 422 may carry the structured `invalid_exit_config` /
+ * `exit_manager_required` / `live_pyramiding_forbidden` envelope, unwrap
+ * with `unwrapExitConfigDetail` from `./exit-config`.
  */
 export async function createRun(
   body: RunCreateRequest,
@@ -297,6 +311,35 @@ export async function createRun(
         : {}),
     },
     120_000,
+  );
+}
+
+/**
+ * POST /api/v1/runs/{id}/promote-to-live — promote a stopped, eligible paper
+ * run to a new live run (apps/api/routers/runs.py `promote_to_live`).
+ *
+ * Unlike `resume_run`, this endpoint requires only the live-trading
+ * confirmation header (`X-Live-Confirm-Token`) — no `X-Admin-Key` — so it is
+ * called directly here rather than through an `/api/admin/*` proxy.
+ *
+ * WP1.3a (CF-13a-1, SY-13a-18): a 422 here may carry the same structured
+ * `invalid_exit_config` / `exit_manager_required` / `live_pyramiding_forbidden`
+ * envelope as `createRun` — render with `<ExitConfigErrorPanel>`.
+ */
+export async function promoteRun(
+  sourceRunId: string,
+  liveConfirmToken?: string,
+): Promise<ApiResult<Run>> {
+  return apiFetch<Run>(
+    `/api/v1/runs/${sourceRunId}/promote-to-live`,
+    {
+      method: "POST",
+      body: JSON.stringify({}),
+      ...(liveConfirmToken
+        ? { headers: { "X-Live-Confirm-Token": liveConfirmToken } }
+        : {}),
+    },
+    PROMOTE_TIMEOUT_MS,
   );
 }
 

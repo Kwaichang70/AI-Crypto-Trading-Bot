@@ -86,6 +86,26 @@ class BaseStrategy(abc.ABC):
     #: Subclasses SHOULD override this with a StrategyMetadata instance.
     metadata: ClassVar[StrategyMetadata] = StrategyMetadata(name="BaseStrategy")
 
+    #: WP1.3a (SY-13a-06): fail-closed by default -- a strategy that never
+    #: emits its own SELL signal (a "BUY-only" strategy) MUST be paired with
+    #: an engine-level bracket or trailing stop, or ``StrategyEngine``
+    #: refuses to start it (``exit_config.require_exit_manager``).  Every
+    #: registry strategy declares this explicitly in its own class body
+    #: (test-enforced, ST-27) -- the fail-closed default here exists so a
+    #: *new*, not-yet-classified strategy can never silently run with no
+    #: downside exit, mirroring the ``strategy_availability`` fail-closed
+    #: precedent.  Set ``False`` only for a strategy whose own SELL logic
+    #: is a complete, validated exit strategy in its own right.
+    requires_exit_manager: ClassVar[bool] = True
+
+    #: WP1.3a (SY-13a-08): resolved only when the API/engine caller does not
+    #: pass an explicit ``allow_pyramiding``.  ``False`` for every strategy
+    #: except the two that accumulate by design (``DCARSIHybridStrategy``,
+    #: ``GridTradingStrategy``), which set this ``True`` in their own class
+    #: body.  Live pyramiding is forbidden regardless of this default
+    #: (SY-13a-08/E11, D-13a-1).
+    default_allow_pyramiding: ClassVar[bool] = False
+
     def __init__(self, strategy_id: str, params: dict[str, Any] | None = None) -> None:
         self._strategy_id = strategy_id
         self._params: dict[str, Any] = self._validate_params(params or {})

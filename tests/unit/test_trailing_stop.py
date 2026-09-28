@@ -74,6 +74,7 @@ import pytest
 from common.models import OHLCVBar
 from common.types import OrderSide, OrderType, RunMode, SignalDirection, TimeFrame
 from trading.models import Fill, Order, Position, Signal
+from trading.exit_config import ExitConfigError
 from trading.strategy_engine import StrategyEngine
 from trading.trailing_stop import TrailingStopManager
 
@@ -827,16 +828,28 @@ class TestTrailingStopInStrategyEngine:
         assert not hasattr(engine, "_trailing_stop") or \
                engine._trailing_stop is None  # type: ignore[attr-defined]
 
-    async def test_engine_with_invalid_trailing_stop_pct_disables_gracefully(self) -> None:
+    async def test_engine_with_zero_trailing_stop_pct_means_unset(self) -> None:
         """
-        When trailing_stop_pct has an invalid value (e.g. 0 or negative),
-        the engine must log a warning and disable trailing stop instead of
-        crashing during construction (CR-001).
+        WP1.3a (SY-13a-02): ``trailing_stop_pct=0`` now means "unset" (the
+        UI sends 0 for every blank nullable numeric field), not an error --
+        the engine builds no manager and does NOT raise.
         """
         engine, _ = _make_engine(trailing_stop_pct=0.0)
         await engine.start("run-001")
 
         assert engine._trailing_stop is None  # type: ignore[attr-defined]
+
+    async def test_engine_with_invalid_trailing_stop_pct_raises(self) -> None:
+        """
+        WP1.3a (ST-25/A-36): the engine no longer warns-and-disables an
+        out-of-range trailing_stop_pct -- it raises at construction
+        (SY-13a-01/22).  0.6 is genuinely out of range ([0.005, 0.50]),
+        unlike 0.0 which now means "unset" (see the test above).
+        """
+        with pytest.raises(ExitConfigError) as excinfo:
+            _make_engine(trailing_stop_pct=0.6)
+        assert excinfo.value.code == "invalid_exit_config"
+        assert any(i.reason == "out_of_range" for i in excinfo.value.issues)
 
     async def test_engine_with_trailing_stop_pct_creates_manager(self) -> None:
         """
@@ -1129,9 +1142,13 @@ class TestTrailingStopInStrategyEngine:
         mocks["strategy"].on_bar = MagicMock(return_value=[eth_buy_signal])
         mocks["execution"].process_signal = AsyncMock(return_value=[])
 
-        # BTC has an open position that will trigger the trailing stop
+        # BTC has an open position that will trigger the trailing stop.
+        # WP1.3a (ST-44): ETH must be FLAT, not merely "a different symbol"
+        # -- the new no-pyramiding held gate (default allow_pyramiding=False)
+        # now blocks a BUY for a symbol the ledger already shows a position
+        # in, and this test's own premise is an unrelated, fresh ETH entry.
         btc_pos = _make_position(symbol="BTC/USD")
-        eth_pos = _make_position(symbol="ETH/USD")
+        eth_pos = _flat_position(symbol="ETH/USD")
 
         def _get_pos(symbol: str) -> Position | None:
             return {"BTC/USD": btc_pos, "ETH/USD": eth_pos}.get(symbol)

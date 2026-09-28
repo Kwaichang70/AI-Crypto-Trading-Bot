@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Annotated, Any, Literal
@@ -56,6 +57,8 @@ from api.deps import require_admin
 from api.schemas import (
     EntriesLatchClearResponse,
     ErrorResponse,
+    ExitConfigWaivedResponse,
+    ExitConfigWarningResponse,
     FlattenResultResponse,
     RunCreateRequest,
     RunDetailResponse,
@@ -86,6 +89,11 @@ from api.services.run_persistence import (
     run_orm_to_response as _run_orm_to_response,
 )
 from common.types import OrderSide, RunMode, TimeFrame
+from trading.exit_config import (
+    ExitConfigError,
+    strategy_requires_exit_manager,
+    validate_run_exit_config,
+)
 from trading.recovery import ResumeRejected, check_fill_integrity, replay_sort_key
 from trading.strategy_availability import get_availability, is_mode_allowed
 from trading.strategy_engine import FlattenResult, build_synthetic_flatten_result
@@ -158,6 +166,37 @@ _BRACKET_FLOAT_KEYS = (
 )
 
 
+def _exit_config_error_detail(exc: ExitConfigError) -> dict[str, Any]:
+    """WP1.3a (SY-13a-18): build the 422 ``detail`` envelope for any
+    ``ExitConfigError``.  Shared by create/promote/resume so the wire
+    format is identical everywhere."""
+    detail: dict[str, Any] = {
+        "code": exc.code,
+        "errors": [
+            {
+                "field": issue.field,
+                "reason": issue.reason,
+                "value": issue.value,
+                "min": issue.min,
+                "max": issue.max,
+                "message": issue.message,
+            }
+            for issue in exc.issues
+        ],
+        "warnings": [
+            {"code": w.code, "field": w.field, "message": w.message}
+            for w in exc.warnings
+        ],
+    }
+    if exc.strategy is not None:
+        detail["strategy"] = exc.strategy
+    if exc.requires_one_of is not None:
+        detail["requires_one_of"] = list(exc.requires_one_of)
+    if exc.hint is not None:
+        detail["hint"] = exc.hint
+    return detail
+
+
 def _extract_bracket_config(strategy_params: dict[str, Any]) -> dict[str, object]:
     """
     Pop ``bracket_*`` exit keys out of ``strategy_params`` in place.
@@ -169,22 +208,85 @@ def _extract_bracket_config(strategy_params: dict[str, Any]) -> dict[str, object
     cleanly against the strategy schema (bracket settings are engine-level,
     not strategy params).  The ``bracket_`` prefix guarantees no collision
     with any strategy's native parameter names.
+
+    WP1.3a (SY-13a-01/02): a value that is *not* cleanly coercible (a bool,
+    a non-numeric string, a non-integral ``bracket_atr_period``) is no
+    longer silently coerced (``float(True) == 1.0``) or allowed to raise an
+    uncaught ``ValueError`` (a 500, R-05) here.  It is preserved verbatim so
+    ``trading.exit_config.validate_run_exit_config`` -- called immediately
+    after this, before the strategy-schema check -- can classify it
+    (``invalid_type`` / ``not_a_number`` / ``not_finite``) and return a
+    clean 422.  Every value this function DOES coerce (a valid numeric
+    string, an integral float) keeps its exact historical return contract
+    (``test_bracket_exit.py`` ``TestRunsBracketExtraction``).
     """
     bracket: dict[str, object] = {}
     for key in _BRACKET_FLOAT_KEYS:
         if key in strategy_params:
             raw = strategy_params.pop(key)
             if raw is not None and raw != "":
-                bracket[key] = float(raw)
+                if isinstance(raw, bool):
+                    bracket[key] = raw
+                else:
+                    try:
+                        bracket[key] = float(raw)
+                    except (TypeError, ValueError, OverflowError):
+                        # WP13a-S-R5-03 (security round 5, AC3): a Python
+                        # ``int`` far outside float range (e.g. a
+                        # ~4000-digit JSON integer) makes ``float(raw)``
+                        # RAISE ``OverflowError`` rather than clamping to
+                        # inf -- preserve the raw value verbatim, exactly
+                        # like the TypeError/ValueError cases, so
+                        # ``validate_run_exit_config`` (called right after
+                        # this) classifies it as a clean 422, not a 500.
+                        bracket[key] = raw
     if "bracket_atr_period" in strategy_params:
         raw_period = strategy_params.pop("bracket_atr_period")
         if raw_period is not None and raw_period != "":
-            bracket["bracket_atr_period"] = int(raw_period)
+            if isinstance(raw_period, bool):
+                bracket["bracket_atr_period"] = raw_period
+            else:
+                try:
+                    _period_float = float(raw_period)
+                except (TypeError, ValueError, OverflowError):
+                    # WP13a-S-R5-03 (security round 5, AC3): same
+                    # OverflowError class as the float keys above.
+                    bracket["bracket_atr_period"] = raw_period
+                else:
+                    bracket["bracket_atr_period"] = (
+                        int(_period_float)
+                        if _period_float.is_integer()
+                        else raw_period
+                    )
     if "bracket_mode" in strategy_params:
         raw_mode = strategy_params.pop("bracket_mode")
         if raw_mode is not None and raw_mode != "":
-            bracket["bracket_mode"] = str(raw_mode)
+            bracket["bracket_mode"] = raw_mode if isinstance(raw_mode, bool) else str(raw_mode)
     return bracket
+
+
+def _build_promoted_strategy_params(
+    source_strategy_params: Mapping[str, Any] | None,
+    trailing_stop_pct: object,
+) -> dict[str, Any]:
+    """WP13a-S-07 (security round 2, extracted for WP13a-C-R2-09 unit
+    coverage): build the ``strategy_params`` dict for a promoted live run,
+    mirroring ``create_run`` -- the NORMALISED ``trailing_stop_pct`` (from
+    ``ExitConfigVerdict.config.trailing_stop_pct``) is written back, or
+    popped when unset, instead of leaving the raw source value in place
+    while the spawned engine itself runs with the normalised one.
+
+    Always returns a FRESH dict copy -- ``source_strategy_params`` (which
+    belongs to the source paper run, still attached to the DB session) is
+    never mutated in place, and the returned dict is never the same object
+    as the input.
+    """
+    promoted_strategy_params: dict[str, Any] = dict(source_strategy_params or {})
+    if trailing_stop_pct is None:
+        promoted_strategy_params.pop("trailing_stop_pct", None)
+    else:
+        promoted_strategy_params["trailing_stop_pct"] = trailing_stop_pct
+    return promoted_strategy_params
 
 
 # ---------------------------------------------------------------------------
@@ -460,22 +562,60 @@ async def create_run(
 
     # Extract trailing_stop_pct from strategy params BEFORE schema validation.
     # The UI may submit trailing_stop_pct as an empty string when the field is
-    # left blank.  If it reaches the Pydantic schema validator while still a
-    # string, validation raises HTTP 400 because the strategy schemas expect a
-    # float.  Stripping it here ensures the validator sees a clean params dict.
-    _trailing_stop_pct: float | None = None
-    if "trailing_stop_pct" in body.strategy_params:
-        raw_tsp = body.strategy_params.get("trailing_stop_pct")
-        if raw_tsp is not None and raw_tsp != "":
-            _trailing_stop_pct = float(raw_tsp)
-        else:
-            del body.strategy_params["trailing_stop_pct"]
+    # left blank.  Peeked here (not yet deleted/coerced) -- the WP1.3a
+    # validator below decides unset vs. invalid vs. valid; only THEN do we
+    # mutate ``strategy_params`` (SY-13a-02).
+    _raw_trailing_stop_pct: object = body.strategy_params.get("trailing_stop_pct")
 
     # Extract fixed/ATR bracket exit config (stop-loss + take-profit) from
     # strategy params BEFORE schema validation.  These are engine-level
     # settings consumed by the StrategyEngine, not strategy params, so they
     # are always stripped out (a blank UI field arrives as "" and is dropped).
     _bracket_config = _extract_bracket_config(body.strategy_params)
+
+    # ------------------------------------------------------------------
+    # WP1.3a (SY-13a-01/15): validate the exit config + allow_pyramiding
+    # BEFORE the strategy-schema check, any audit row, db.add, or the
+    # backtest bar fetch.  A failure here leaves no RunORM row and no audit
+    # row (I6).
+    # ------------------------------------------------------------------
+    try:
+        _verdict = validate_run_exit_config(
+            strategy_cls,
+            bracket=_bracket_config,
+            trailing_stop_pct=_raw_trailing_stop_pct,
+            mode=body.mode,
+            allow_pyramiding=body.allow_pyramiding,
+            timeframe=str(body.timeframe),
+        )
+    except ExitConfigError as exc:
+        log.warning(
+            "runs.exit_config_invalid",
+            code=exc.code,
+            reasons=[i.reason for i in exc.issues],
+        )
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=_exit_config_error_detail(exc),
+        ) from exc
+
+    _bracket_config = dict(_verdict.config.bracket)
+    _trailing_stop_pct: float | None = _verdict.config.trailing_stop_pct
+    _allow_pyramiding: bool = _verdict.allow_pyramiding
+    for _w in _verdict.warnings:
+        log.info(
+            "runs.exit_config_warning",
+            code=_w.code,
+            field=_w.field,
+        )
+    # An unset trailing_stop_pct is removed from strategy_params exactly
+    # like a blank one always was; a valid, normalised value is written
+    # back so a strategy that declares its own ``trailing_stop_pct`` field
+    # (for the UI/schema range check) still sees the same clean value.
+    if _trailing_stop_pct is None:
+        body.strategy_params.pop("trailing_stop_pct", None)
+    else:
+        body.strategy_params["trailing_stop_pct"] = _trailing_stop_pct
 
     # Validate strategy parameters against the declared parameter_schema
     schema = strategy_cls.parameter_schema()
@@ -622,6 +762,9 @@ async def create_run(
     # promotion can re-apply it.
     if _bracket_config:
         config_snapshot["bracket_config"] = _bracket_config
+    # WP1.3a (SY-13a-08/I8): the RESOLVED bool is always persisted so a
+    # run's pyramiding behaviour is visible and stays fixed for its lifetime.
+    config_snapshot["allow_pyramiding"] = _allow_pyramiding
     if body.backtest_start is not None:
         config_snapshot["backtest_start"] = body.backtest_start.isoformat()
     if body.backtest_end is not None:
@@ -710,6 +853,7 @@ async def create_run(
                 initial_capital=Decimal(body.initial_capital),
                 trailing_stop_pct=_trailing_stop_pct,
                 bracket_config=_bracket_config,
+                allow_pyramiding=_allow_pyramiding,
                 seed=body.seed,
             )
             # M7 (Sprint 49 INF-9): persist the resolved seed (auto-generated or
@@ -817,6 +961,7 @@ async def create_run(
                 bracket_config=_bracket_config,
                 enable_adaptive_learning=body.enable_adaptive_learning,
                 auto_apply_learning=body.auto_apply_learning,
+                allow_pyramiding=_allow_pyramiding,
             ),
             name=f"paper-engine-{run_id}",
         )
@@ -840,13 +985,24 @@ async def create_run(
                 trailing_stop_pct=_trailing_stop_pct,
                 bracket_config=_bracket_config,
                 enable_adaptive_learning=body.enable_adaptive_learning,
+                allow_pyramiding=_allow_pyramiding,
             ),
             name=f"live-engine-{run_id}",
         )
         _RUN_TASKS[str(run_id)] = task
         log.info("runs.live_engine_task_created", run_id=str(run_id))
 
-    return _run_orm_to_detail_response(run_orm)
+    response = _run_orm_to_detail_response(run_orm)
+    if _verdict.warnings:
+        response = response.model_copy(
+            update={
+                "config_warnings": [
+                    ExitConfigWarningResponse(code=w.code, field=w.field, message=w.message)
+                    for w in _verdict.warnings
+                ]
+            }
+        )
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -2076,7 +2232,14 @@ async def get_promotion_eligibility(
         400: {"description": "Paper run not eligible (gate criteria not met)"},
         403: {"description": "Live trading safety gate failed"},
         404: {"description": "Source paper run not found"},
-        422: {"description": "Strategy not available for live trading (demoted)"},
+        422: {
+            "description": (
+                "Strategy not available for live trading (demoted), OR the source "
+                "run's exit config is invalid (invalid_exit_config / "
+                "exit_manager_required), OR the resolved allow_pyramiding is True "
+                "for live (live_pyramiding_forbidden, WP1.3a)."
+            )
+        },
     },
 )
 async def promote_to_live(
@@ -2154,6 +2317,41 @@ async def promote_to_live(
                 f"be promoted to live. {availability.demotion_reason}".strip()
             ),
         )
+
+    # ------------------------------------------------------------------
+    # WP1.3a (SY-13a-15/17): validate the SOURCE config for LIVE mode
+    # (E11 included) right after the availability check, before the
+    # promotion-gate evidence check, the 3-layer safety gate, and the audit
+    # SAVEPOINT.  A legacy paper run predates this validator; a failure
+    # here means "you can only promote what you validated" (SY-13a-09).
+    # ------------------------------------------------------------------
+    promotion_strategy_cls = _get_strategy_registry().get(promotion_strategy_name)
+    if promotion_strategy_cls is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Strategy {promotion_strategy_name!r} from source run is no longer registered.",
+        )
+    _source_strategy_params: dict[str, Any] = source_run.config.get("strategy_params", {}) or {}
+    try:
+        _promote_verdict = validate_run_exit_config(
+            promotion_strategy_cls,
+            bracket=source_run.config.get("bracket_config") or {},
+            trailing_stop_pct=_source_strategy_params.get("trailing_stop_pct"),
+            mode=RunMode.LIVE,
+            allow_pyramiding=source_run.config.get("allow_pyramiding"),
+            timeframe=str(source_run.config.get("timeframe", "1h")),
+        )
+    except ExitConfigError as exc:
+        log.warning(
+            "runs.promote_exit_config_invalid",
+            source_run_id=str(run_id),
+            code=exc.code,
+            reasons=[i.reason for i in exc.issues],
+        )
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=_exit_config_error_detail(exc),
+        ) from exc
 
     # Step 2: Promotion gate (data-volume only)
     eligibility = await evaluate_paper_run_eligibility(
@@ -2255,13 +2453,30 @@ async def promote_to_live(
     for _key in ("backtest_start", "backtest_end", "seed", "backtest_metrics"):
         promoted_config.pop(_key, None)
 
-    strategy_name = source_run.config.get("strategy_name", "")
-    strategy_cls = _get_strategy_registry().get(strategy_name)
-    if strategy_cls is None:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Strategy '{strategy_name}' from source run is no longer registered.",
-        )
+    # WP1.3a (I8): persist the NORMALISED bracket config and the RESOLVED
+    # allow_pyramiding bool, exactly like create_run -- a promoted run's
+    # persisted config is never the raw legacy source.
+    if _promote_verdict.config.bracket:
+        promoted_config["bracket_config"] = dict(_promote_verdict.config.bracket)
+    else:
+        promoted_config.pop("bracket_config", None)
+    promoted_config["allow_pyramiding"] = _promote_verdict.allow_pyramiding
+    # WP13a-S-07 (security round 2): mirror create_run -- persist the
+    # NORMALISED trailing_stop_pct into strategy_params (or remove it when
+    # unset), instead of leaving the raw source value in place while the
+    # spawned engine itself gets the normalised one.  Extracted to
+    # ``_build_promoted_strategy_params`` (WP13a-C-R2-09) for direct unit
+    # coverage: it always returns a fresh dict, never mutating
+    # ``source_run.config["strategy_params"]`` in place (it belongs to the
+    # SOURCE paper run, still attached to this session).
+    _promoted_strategy_params = _build_promoted_strategy_params(
+        source_run.config.get("strategy_params"),
+        _promote_verdict.config.trailing_stop_pct,
+    )
+    promoted_config["strategy_params"] = _promoted_strategy_params
+
+    strategy_name = promotion_strategy_name
+    strategy_cls = promotion_strategy_cls
 
     timeframe_val = TimeFrame(str(source_run.config.get("timeframe", "1h")))
 
@@ -2288,15 +2503,14 @@ async def promote_to_live(
             run_id_str=str(new_run_id),
             strategy_cls=strategy_cls,
             strategy_name=strategy_name,
-            strategy_params=source_run.config.get("strategy_params", {}),
+            strategy_params=_promoted_strategy_params,
             symbols=source_run.config.get("symbols", []),
             timeframe=timeframe_val,
             initial_capital=source_run.config.get("initial_capital", "10000"),
-            trailing_stop_pct=source_run.config.get("strategy_params", {}).get(
-                "trailing_stop_pct"
-            ),
-            bracket_config=source_run.config.get("bracket_config") or {},
+            trailing_stop_pct=_promote_verdict.config.trailing_stop_pct,
+            bracket_config=dict(_promote_verdict.config.bracket),
             enable_adaptive_learning=False,
+            allow_pyramiding=_promote_verdict.allow_pyramiding,
         ),
         name=f"live-engine-promoted-{new_run_id}",
     )
@@ -2525,23 +2739,111 @@ async def resume_run(
             detail="invalid_strategy_params",
         )
 
-    trailing_pct: float | None = None
-    raw_tsp = strategy_params.get("trailing_stop_pct")
-    if raw_tsp is not None:
-        try:
-            trailing_pct = float(raw_tsp)
-        except (TypeError, ValueError) as exc:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="invalid_trailing_stop_pct",
-            ) from exc
-
-    bracket_config: dict[str, object] = orphan_config.get("bracket_config") or {}
-    if not isinstance(bracket_config, dict):
+    _bracket_config_raw: dict[str, object] = orphan_config.get("bracket_config") or {}
+    if not isinstance(_bracket_config_raw, dict):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="invalid_bracket_config",
         )
+    _raw_trailing_for_validation = strategy_params.get("trailing_stop_pct")
+
+    # ------------------------------------------------------------------
+    # WP1.3a (SY-13a-16/SY-13a-15): replaces the old plain type-only checks.
+    # Normal mode: full validation, 422 before the CAS (I6) -- the run
+    # stays orphaned, untouched. Protective mode: "salvage with explicit
+    # waiver" -- each component (bracket, trailing) is validated
+    # INDEPENDENTLY; only the valid one(s) survive. Never raises. This is
+    # the only route to a running engine that can reach
+    # ``stop_run?flatten=true`` for a run whose persisted config has gone
+    # stale/invalid.
+    # ------------------------------------------------------------------
+    exit_config_waived_payload: dict[str, Any] | None = None
+    exit_manager_missing: bool | None = None
+    if mode == "normal":
+        try:
+            _resume_verdict = validate_run_exit_config(
+                strategy_cls,
+                bracket=_bracket_config_raw,
+                trailing_stop_pct=_raw_trailing_for_validation,
+                mode=RunMode.LIVE,
+                allow_pyramiding=orphan_config.get("allow_pyramiding"),
+                timeframe=str(timeframe),
+            )
+        except ExitConfigError as exc:
+            log.warning(
+                "runs.resume_exit_config_invalid",
+                code=exc.code,
+                reasons=[i.reason for i in exc.issues],
+            )
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=_exit_config_error_detail(exc),
+            ) from exc
+        bracket_config: dict[str, object] = dict(_resume_verdict.config.bracket)
+        trailing_pct: float | None = _resume_verdict.config.trailing_stop_pct
+        resolved_allow_pyramiding: bool = _resume_verdict.allow_pyramiding
+    else:  # protective
+        from trading.exit_config import salvage_exit_config
+
+        _salvaged_config, _salvage_issues = salvage_exit_config(
+            bracket=_bracket_config_raw,
+            trailing_stop_pct=_raw_trailing_for_validation,
+        )
+        bracket_config = dict(_salvaged_config.bracket)
+        trailing_pct = _salvaged_config.trailing_stop_pct
+        # Entries are already fully blocked in protective mode
+        # (_drop_entry_signals) -- never persisted (SY-13a-16).
+        resolved_allow_pyramiding = False
+        exit_manager_missing = not _salvaged_config.has_downside_exit
+        # WP13a-S-01 (security round 2): a BUY-only run resumed protectively
+        # with NO exit config at all, or a TP-only one, produces ZERO
+        # salvage issues (there is nothing invalid to drop -- the bracket
+        # dict is simply empty, or has only a TP key that parses fine on
+        # its own). Gating the waiver on "salvage produced issues" alone
+        # therefore missed exactly the case SY-13a-16 exists for: the
+        # engine's own require_exit_manager(...) still raises
+        # exit_manager_required with no waiver granted, the background
+        # task dies, the run goes to 'error', and flatten (which requires
+        # a running engine) becomes unreachable -- the one in-platform
+        # unwind route for this exact class of legacy run is lost. The
+        # waiver must also cover "no issues, but the strategy requires an
+        # exit and none survived salvage."
+        _needs_waiver = bool(_salvage_issues) or (
+            strategy_requires_exit_manager(strategy_cls) and exit_manager_missing
+        )
+        if _salvage_issues:
+            exit_config_waived_payload = {
+                "code": "invalid_exit_config",
+                "errors": [
+                    {
+                        "field": i.field,
+                        "reason": i.reason,
+                        "value": i.value,
+                        "min": i.min,
+                        "max": i.max,
+                        "message": i.message,
+                    }
+                    for i in _salvage_issues
+                ],
+            }
+            log.warning(
+                "resume.protective_exit_config_waived",
+                errors=exit_config_waived_payload["errors"],
+            )
+        elif _needs_waiver:
+            # No salvage issues (nothing was invalid to drop), but the
+            # strategy requires an exit manager and none survived --
+            # still an explicit waiver, with an empty errors[] list.
+            exit_config_waived_payload = {
+                "code": "exit_manager_required",
+                "errors": [],
+            }
+            log.warning("resume.protective_exit_config_waived", errors=[])
+        if exit_manager_missing:
+            log.critical(
+                "resume.protective_without_exit_manager",
+                run_id=str(run_id),
+            )
 
     initial_capital = str(orphan_config.get("initial_capital", "10000"))
     try:
@@ -2708,29 +3010,49 @@ async def resume_run(
         # Transaction (c): S4 re-check already done above; audit + the
         # conditional final CAS + commit, all in one short transaction --
         # no row lock is held any longer than this.
+        _resumed_audit_payload: dict[str, Any] = {
+            "mode": mode,
+            "previous_status": "orphaned",
+            "kill_switch_after_start": kill_switch_after_start,
+            "fill_count": fill_count,
+            "rebuilt_qty_by_symbol": rebuilt_qty_by_symbol,
+            "peak_equity_hint": (
+                str(snapshot.peak_equity_hint) if snapshot.peak_equity_hint is not None else None
+            ),
+            "elapsed_seconds": elapsed_seconds,
+        }
+        if exit_config_waived_payload is not None:
+            # WP1.3a (SY-13a-16): protective salvage summary.
+            _resumed_audit_payload["exit_config_waived"] = exit_config_waived_payload
+        if mode == "protective":
+            # WP13a-S-01 (security round 2): always record whether the
+            # resumed engine has a downside exit, even in the (secondary
+            # finding) case where exit_config_waived_payload is None
+            # (normal mode never reaches this branch).
+            _resumed_audit_payload["exit_manager_missing"] = exit_manager_missing
         await record_audit_event(
             db,
             event_type="run_resumed",
             resource_type="run",
             resource_id=str(run_id),
             request=request,
-            payload={
-                "mode": mode,
-                "previous_status": "orphaned",
-                "kill_switch_after_start": kill_switch_after_start,
-                "fill_count": fill_count,
-                "rebuilt_qty_by_symbol": rebuilt_qty_by_symbol,
-                "peak_equity_hint": (
-                    str(snapshot.peak_equity_hint) if snapshot.peak_equity_hint is not None else None
-                ),
-                "elapsed_seconds": elapsed_seconds,
-            },
+            payload=_resumed_audit_payload,
         )
 
         # WP1.8a-round2 (S-10): persist protective_mode onto the run's own
         # config so it survives process restarts and is visible on GET.
         updated_config = dict(orphan_config)
         updated_config["protective_mode"] = mode == "protective"
+        # WP1.3a (I8): a NORMAL resume persists the normalised bracket
+        # config and the resolved allow_pyramiding bool -- exactly like
+        # create/promote.  A PROTECTIVE resume never persists the salvaged
+        # (possibly reduced) config or the forced-False pyramiding value:
+        # the waiver must never leak into a later normal resume, which
+        # re-reads and re-validates the ORIGINAL persisted config
+        # (SY-13a-16).
+        if mode == "normal":
+            updated_config["bracket_config"] = bracket_config
+            updated_config["allow_pyramiding"] = resolved_allow_pyramiding
 
         final_now = datetime.now(tz=UTC)
         final_result = await db.execute(
@@ -2845,6 +3167,8 @@ async def resume_run(
                 protective_mode=(mode == "protective"),
                 elapsed_seconds=elapsed_seconds,
                 entries_latch_reason=run.entries_latch_reason,
+                allow_pyramiding=resolved_allow_pyramiding,
+                exit_config_waived=exit_config_waived_payload is not None,
             ),
             name=f"live-engine-resumed-{run_id}",
         )
@@ -2877,7 +3201,19 @@ async def resume_run(
         ) from exc
 
     log.info("runs.resumed", run_id=str(run_id), mode=mode)
-    return _run_orm_to_detail_response(run)
+    response = _run_orm_to_detail_response(run)
+    if mode == "protective":
+        response = response.model_copy(
+            update={
+                "exit_config_waived": (
+                    ExitConfigWaivedResponse(**exit_config_waived_payload)
+                    if exit_config_waived_payload is not None
+                    else None
+                ),
+                "exit_manager_missing": exit_manager_missing,
+            }
+        )
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -3252,6 +3588,36 @@ async def recover_orphaned_runs() -> int:
                         log.debug("recovery.live_already_orphaned", run_id=run_id_str)
                 except Exception:
                     log.exception("recovery.run_failed", run_id=run_id_str)
+                # WP1.3a (SY-13a-19): live boot recovery NEVER validates or
+                # crashes (orphan-only) -- but a config the operator would
+                # otherwise have to discover the hard way, at resume time,
+                # is worth surfacing now.  Best-effort: never let this
+                # affect the orphan transition above.
+                try:
+                    _live_strategy_name = str(
+                        run_config.get("strategy_name", "")
+                    ).lower().replace("-", "_")
+                    _live_strategy_cls = _get_strategy_registry().get(_live_strategy_name)
+                    if _live_strategy_cls is not None:
+                        validate_run_exit_config(
+                            _live_strategy_cls,
+                            bracket=run_config.get("bracket_config") or {},
+                            trailing_stop_pct=(
+                                run_config.get("strategy_params") or {}
+                            ).get("trailing_stop_pct"),
+                            mode=RunMode.LIVE,
+                            allow_pyramiding=run_config.get("allow_pyramiding"),
+                            timeframe=str(run_config.get("timeframe", "1h")),
+                        )
+                except ExitConfigError as exc:
+                    log.error(
+                        "recovery.live_exit_config_invalid",
+                        run_id=run_id_str,
+                        code=exc.code,
+                        reasons=[i.reason for i in exc.issues],
+                    )
+                except Exception:
+                    log.debug("recovery.live_exit_config_check_failed", run_id=run_id_str)
                 continue
 
             # -------------------------------------------------------------
@@ -3318,6 +3684,36 @@ async def recover_orphaned_runs() -> int:
                     await _mark_run_error(factory, run_id, log, reason=exc.reason)
                     continue
 
+                # WP1.3a (SY-13a-19, fixes A-10/R-11): validate the exit
+                # config BEFORE the running commit below -- previously the
+                # trailing_stop_pct float() parse ran AFTER the commit, so a
+                # non-numeric legacy value left a ghost 'running' row with
+                # no task (the commit had already happened; the exception
+                # was only logged by the outer except-block).  A failure
+                # here marks the run 'error' and moves on to the next
+                # candidate, never touching 'running'.
+                try:
+                    _recovery_verdict = validate_run_exit_config(
+                        strategy_cls,
+                        bracket=bracket_config,
+                        trailing_stop_pct=strategy_params.get("trailing_stop_pct"),
+                        mode=RunMode.PAPER,
+                        allow_pyramiding=run_config.get("allow_pyramiding"),
+                        timeframe=timeframe_str,
+                    )
+                except ExitConfigError as exc:
+                    log.warning(
+                        "runs.recovery_exit_config_invalid",
+                        run_id=run_id_str,
+                        code=exc.code,
+                        reasons=[i.reason for i in exc.issues],
+                    )
+                    await _mark_run_error(factory, run_id, log, reason=exc.code)
+                    continue
+                bracket_config = dict(_recovery_verdict.config.bracket)
+                trailing_pct: float | None = _recovery_verdict.config.trailing_stop_pct
+                resolved_allow_pyramiding: bool = _recovery_verdict.allow_pyramiding
+
                 async with factory() as session:
                     result2 = await session.execute(select(RunORM).where(RunORM.id == run_id))
                     stale = result2.scalar_one_or_none()
@@ -3331,6 +3727,10 @@ async def recover_orphaned_runs() -> int:
                     now = datetime.now(tz=UTC)
                     updated_config = dict(stale.config or {})
                     updated_config["resume_count"] = resume_count
+                    # WP1.3a (I8): a missing legacy allow_pyramiding is
+                    # resolved and persisted (SY-13a-19).
+                    updated_config["bracket_config"] = bracket_config
+                    updated_config["allow_pyramiding"] = resolved_allow_pyramiding
                     stale.config = updated_config
                     stale.status = "running"
                     stale.updated_at = now
@@ -3342,10 +3742,6 @@ async def recover_orphaned_runs() -> int:
                     await session.commit()
 
                 elapsed_seconds = max((datetime.now(tz=UTC) - started_at).total_seconds(), 0.0)
-                trailing_pct: float | None = None
-                raw_tsp = strategy_params.get("trailing_stop_pct")
-                if raw_tsp is not None:
-                    trailing_pct = float(raw_tsp)
 
                 task = asyncio.create_task(
                     _run_paper_engine(
@@ -3362,6 +3758,7 @@ async def recover_orphaned_runs() -> int:
                         resume=snapshot,
                         elapsed_seconds=elapsed_seconds,
                         entries_latch_reason=entries_latch_reason,
+                        allow_pyramiding=resolved_allow_pyramiding,
                     ),
                     name=f"recovery-paper-{run_id_str[:8]}",
                 )

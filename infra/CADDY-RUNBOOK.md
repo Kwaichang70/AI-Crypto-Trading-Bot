@@ -211,6 +211,68 @@ Only the hashes are ever displayed, never `$ADMIN_API_KEY` or
 `$INTERNAL_ADMIN_API_KEY` themselves. If you see `MISMATCH`, fix `.env` and
 re-run both S-08 and this check before proceeding to STEP 3.
 
+### S-10 — request-body size limit (WP1.3a defence in depth)
+
+Security found repeated event-loop DoS via large request bodies on
+`/api/v1/optimize` (`reports/vp2-wp1.3a/security-report-r4.md` and
+`-r5.md`). `infra/Caddyfile` now caps every proxied `/api/*` handle block
+(`/api/auth/*`, `/api/admin/*`, and the generic `/api/*` → `api:8000`
+block) at **1 MB** via:
+
+```
+request_body {
+    max_size 1MB
+}
+```
+
+Note the block form is required — `request_body max_size 1MB` written
+inline on one line is silently ignored by Caddy.
+
+This is **defence in depth, not the primary control**: the FastAPI app
+enforces its own independent 1 MiB ASGI-level body-size limit (413) on
+every request, regardless of whether it arrives through Caddy or directly
+against `api:8000` (the operator curl fallback described in the
+`handle /api/admin/*` comment in `infra/Caddyfile`). Caddy rejecting the
+body first just means the oversized request never reaches the application
+process at all, saving the parse/validation cost that the security reports
+measured pinning the event loop.
+
+Caddy returns **413 Payload Too Large** when a body exceeds `max_size`.
+
+> [!NOTE]
+> Known Caddy upstream nuance (caddyserver/caddy#4558, #5652 — open as of
+> Caddy 2.11.x): with `reverse_proxy`, if the upstream service starts
+> reading the request body before Caddy finishes enforcing `max_size`, an
+> oversized request can occasionally surface to the client as **502 Bad
+> Gateway** instead of 413. Either code means the oversized body was
+> rejected before the application processed it — a plain `200` is the only
+> outcome that means this control is not working. The independent
+> API-level limit is what actually guarantees rejection regardless of
+> which status code Caddy itself returns.
+
+**Verify after any Caddyfile or `.env` change that touches routing:**
+
+```bash
+# 2 MB of zero bytes, well over the 1 MB cap
+head -c 2000000 /dev/zero > /tmp/oversized-body.bin
+
+# Through Caddy, against the generic /api/* block:
+curl -sS -o /dev/null -w '%{http_code}\n' \
+  --data-binary @/tmp/oversized-body.bin \
+  -H 'Content-Type: application/json' \
+  https://server-name.tail12345.ts.net/api/v1/optimize
+
+# Expected: 413 (occasionally 502, see the note above — either is a PASS).
+# A 200, or the request hanging/timing out, is a FAIL: investigate before
+# considering the deploy complete.
+
+rm -f /tmp/oversized-body.bin
+```
+
+Repeat against `/api/auth/*` and `/api/admin/*` if you changed either of
+those blocks specifically; all three should reject the same 2 MB body the
+same way.
+
 ---
 
 ## STEP 3 — Deploy the updated Docker stack

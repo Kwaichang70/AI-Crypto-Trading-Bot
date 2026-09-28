@@ -57,6 +57,8 @@ class ScriptedSignalStrategy(BaseStrategy):
         description="WP1.0 harness-only strategy: one scripted BUY/SELL, HOLD otherwise.",
         tags=["test-only"],
     )
+    # WP1.3a (SY-13a-06): test-only double, no bracket/trailing configured.
+    requires_exit_manager = False
 
     def __init__(self, strategy_id: str, params: dict[str, Any] | None = None) -> None:
         super().__init__(strategy_id, params)

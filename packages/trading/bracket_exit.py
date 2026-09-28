@@ -53,11 +53,27 @@ import structlog
 from common.types import SignalDirection
 from trading.models import Position, Signal
 
-__all__ = ["BracketExitManager"]
+__all__ = [
+    "ATR_MULTIPLIER_RANGE",
+    "ATR_PERIOD_MIN",
+    "FIXED_PCT_RANGE",
+    "VALID_BRACKET_MODES",
+    "BracketExitManager",
+]
 
 logger = structlog.get_logger(__name__)
 
 _VALID_MODES = frozenset({"fixed", "atr"})
+
+# WP1.3a (SY-13a-01): mechanical constructor ranges, exported so
+# ``packages/trading/exit_config.py`` is the single source of truth for the
+# *policy* bounds layered on top (see that module's module docstring).  These
+# constants are also used directly below, so the constructor and the shared
+# validator can never drift out of sync.
+VALID_BRACKET_MODES: frozenset[str] = _VALID_MODES
+FIXED_PCT_RANGE: tuple[float, float] = (0.001, 0.95)
+ATR_MULTIPLIER_RANGE: tuple[float, float] = (0.1, 20.0)
+ATR_PERIOD_MIN: int = 2
 
 
 class BracketExitManager:
@@ -103,8 +119,13 @@ class BracketExitManager:
     Raises
     ------
     ValueError
-        On any invalid configuration.  The engine wraps construction in a
-        try/except so a bad config disables brackets rather than crashing.
+        On any invalid configuration.  WP1.3a (SY-13a-22): the engine no
+        longer catches this to warn-and-disable brackets -- an invalid
+        config is rejected at run creation by
+        ``packages/trading/exit_config.py`` and, defensively, raises here
+        straight into ``StrategyEngine.__init__`` (``ExitConfigError``,
+        a ``ValueError`` subclass) so a bad config can never silently run
+        with no exit.
     """
 
     def __init__(
@@ -142,9 +163,10 @@ class BracketExitManager:
                 ("stop_loss_pct", stop_loss_pct),
                 ("take_profit_pct", take_profit_pct),
             ):
-                if value is not None and not (0.001 <= value <= 0.95):
+                _lo, _hi = FIXED_PCT_RANGE
+                if value is not None and not (_lo <= value <= _hi):
                     raise ValueError(
-                        f"{name} must be in [0.001, 0.95], got {value}"
+                        f"{name} must be in [{_lo}, {_hi}], got {value}"
                     )
         else:  # atr
             if atr_sl_multiplier is None and atr_tp_multiplier is None:
@@ -156,12 +178,13 @@ class BracketExitManager:
                 ("atr_sl_multiplier", atr_sl_multiplier),
                 ("atr_tp_multiplier", atr_tp_multiplier),
             ):
-                if value is not None and not (0.1 <= value <= 20.0):
+                _lo, _hi = ATR_MULTIPLIER_RANGE
+                if value is not None and not (_lo <= value <= _hi):
                     raise ValueError(
-                        f"{name} must be in [0.1, 20.0], got {value}"
+                        f"{name} must be in [{_lo}, {_hi}], got {value}"
                     )
-            if atr_period < 2:
-                raise ValueError(f"atr_period must be >= 2, got {atr_period}")
+            if atr_period < ATR_PERIOD_MIN:
+                raise ValueError(f"atr_period must be >= {ATR_PERIOD_MIN}, got {atr_period}")
 
         self._mode = bracket_mode
         self._stop_loss_pct = (
