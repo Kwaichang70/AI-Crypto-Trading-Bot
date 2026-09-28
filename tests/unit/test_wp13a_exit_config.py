@@ -315,6 +315,9 @@ class TestRequiresExitManager:
         require_exit_manager([_NotRequires("s")], cfg)  # must not raise
 
     def test_registry_declarations(self) -> None:
+        """ST-27 (WP-SMOKE, reports/vp2-smoke/synthesis-spec.md section 8):
+        SmokeRoundtripStrategy declares requires_exit_manager=True
+        explicitly, exactly like every other registry strategy."""
         from trading.strategies import (
             BreakoutStrategy,
             DCARSIHybridStrategy,
@@ -324,9 +327,10 @@ class TestRequiresExitManager:
             MomentumBreakoutStrategy,
             RSIMeanReversionStrategy,
             SLTPReversionStrategy,
+            SmokeRoundtripStrategy,
         )
 
-        requires_true = {MomentumBreakoutStrategy, SLTPReversionStrategy}
+        requires_true = {MomentumBreakoutStrategy, SLTPReversionStrategy, SmokeRoundtripStrategy}
         pyramiding_true = {DCARSIHybridStrategy, GridTradingStrategy}
         every_cls = {
             MACrossoverStrategy,
@@ -337,6 +341,7 @@ class TestRequiresExitManager:
             GridTradingStrategy,
             SLTPReversionStrategy,
             MomentumBreakoutStrategy,
+            SmokeRoundtripStrategy,
         }
         for cls in every_cls:
             assert "requires_exit_manager" in cls.__dict__, cls

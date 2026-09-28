@@ -48,6 +48,7 @@ from api.services.audit_log import record_audit_event
 from common.types import TimeFrame
 from trading.exit_config import ExitConfigError
 from trading.recovery import ResumeSnapshot
+from trading.smoke_guard import SMOKE_STRATEGY_NAMES, SmokeGuardError, validate_smoke_run
 
 __all__ = [
     "_IncrementalFlushState",
@@ -911,7 +912,17 @@ async def run_paper_engine(
     # WP1.3a (SY-13a-19): a construction-time ExitConfigError is a
     # deterministic config problem, never a transient one -- retrying it
     # would just crash again, three times, for nothing.
-    _skip_auto_retry = False
+    # WP-SMOKE fix F-5 (SMK-SEC-04): a smoke_roundtrip paper run must
+    # never auto-retry after ANY crash, not just an ExitConfigError/
+    # SmokeGuardError. A fresh SmokeRoundtripStrategy instance re-emits
+    # its single BUY on its first on_bar -- the exact path class G-12
+    # already closes for boot recovery -- so an auto-retried crash would
+    # silently spawn a second BUY-latch and corrupt the SMK-T-34 paper
+    # rehearsal used as a pre-flight gate for live. Non-smoke behaviour
+    # is unchanged: _skip_auto_retry stays False for every other
+    # strategy, and the :1271-area gate below still honours whatever
+    # this flag ends up as. See SMK-T-42.
+    _skip_auto_retry = strategy_name in SMOKE_STRATEGY_NAMES
     engine: StrategyEngine | None = None
     portfolio: Any = None
     execution: Any = None
@@ -930,6 +941,26 @@ async def run_paper_engine(
     auto_stop_task: asyncio.Task[None] | None = None
 
     try:
+        # WP-SMOKE (synthesis-spec.md section 7, G-13): defence in depth --
+        # a no-op for every strategy except smoke_roundtrip. create_run
+        # already rejects a violating config before this coroutine is ever
+        # spawned; this call exists so the ban holds even for a caller that
+        # bypasses the router (mirrors the allow_pyramiding check in
+        # run_live_engine). SmokeGuardError IS a ValueError, so it is
+        # caught by the except clauses below and the run ends in 'error'.
+        validate_smoke_run(
+            strategy_name=strategy_name,
+            mode="paper",
+            symbols=symbols,
+            timeframe=str(timeframe),
+            initial_capital=initial_capital,
+            strategy_params=strategy_params,
+            bracket=bracket_config,
+            trailing_stop_pct=trailing_stop_pct,
+            allow_pyramiding=allow_pyramiding,
+            enable_adaptive_learning=enable_adaptive_learning,
+        )
+
         settings = get_settings()
         capital = Decimal(initial_capital)
 
@@ -1098,6 +1129,25 @@ async def run_paper_engine(
         log.error(
             "runs.paper_engine_exit_config_invalid",
             code=exc.code,
+            reasons=[i.reason for i in exc.issues],
+        )
+        await _cancel_engine_side_tasks(
+            auto_stop_task=auto_stop_task,
+            learning_task=learning_task,
+            learning_stop_event=learning_stop_event,
+            flush_task=flush_task,
+        )
+
+    except SmokeGuardError as exc:
+        # WP-SMOKE (synthesis-spec.md section 7, G-13): the same
+        # deterministic-config-error treatment as ExitConfigError above --
+        # create_run already validates this before spawning the task, so
+        # reaching here means a caller bypassed the router. Never retried
+        # (a retry would just violate the same guardrail again).
+        final_status = "error"
+        _skip_auto_retry = True
+        log.error(
+            "runs.paper_engine_smoke_guardrail_violation",
             reasons=[i.reason for i in exc.issues],
         )
         await _cancel_engine_side_tasks(
@@ -1370,6 +1420,31 @@ async def run_live_engine(
         # goes through this coroutine.
         if allow_pyramiding:
             raise ValueError("live_pyramiding_forbidden")
+
+        # WP-SMOKE (synthesis-spec.md section 7, G-13): defence in depth --
+        # a no-op for every strategy except smoke_roundtrip. create_run
+        # already rejects a violating config before this coroutine is ever
+        # spawned; this call exists so the ban holds even for a caller that
+        # bypasses the router. Skipped for a protective resume (G-10
+        # already forces every smoke resume through mode=protective, and
+        # protective mode salvages/waives exit config by design -- it must
+        # not be re-validated against the fresh-create bounds). Raised
+        # BEFORE the exchange build, mirroring the pyramiding check above.
+        # SmokeGuardError IS a ValueError, so it is caught by the except
+        # clause below and the run ends in 'error'.
+        if not protective_mode:
+            validate_smoke_run(
+                strategy_name=strategy_name,
+                mode="live",
+                symbols=symbols,
+                timeframe=str(timeframe),
+                initial_capital=initial_capital,
+                strategy_params=strategy_params,
+                bracket=bracket_config,
+                trailing_stop_pct=trailing_stop_pct,
+                allow_pyramiding=allow_pyramiding,
+                enable_adaptive_learning=enable_adaptive_learning,
+            )
 
         settings = get_settings()
         capital = Decimal(initial_capital)

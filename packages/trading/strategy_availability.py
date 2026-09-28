@@ -44,6 +44,16 @@ class StrategyStatus(StrEnum):
     ACTIVE = "active"
     DEMOTED = "demoted"
     EXPERIMENTAL = "experimental"
+    # WP-SMOKE (reports/vp2-smoke/synthesis-spec.md, C-5): a strategy that
+    # exists purely to exercise order-round-trip mechanics against a real
+    # exchange, with no trading edge. Hidden from `GET /strategies` by
+    # default (opt-in via `?include_diagnostic=true`, API layer) so the
+    # UI's run-creation form never lists it by accident. `smoke_guard.py`
+    # keys its own guardrails by STRATEGY NAME
+    # (`SMOKE_STRATEGY_NAMES`), never by this status, so a status change
+    # can never silently disable the guard (C-4) -- SMK-T-07 pins
+    # `{names with DIAGNOSTIC} == SMOKE_STRATEGY_NAMES`.
+    DIAGNOSTIC = "diagnostic"
 
 
 @dataclass(frozen=True)
@@ -163,6 +173,22 @@ _AVAILABILITY: dict[str, StrategyAvailability] = {
     "momentum_breakout": StrategyAvailability(
         allowed_modes=_ALL_MODES,
         status=StrategyStatus.ACTIVE,
+    ),
+    # ---- DIAGNOSTIC -> all three modes, but never promotable ------------
+    # WP-SMOKE (reports/vp2-smoke/synthesis-spec.md): a mechanics-test
+    # instrument, not a trading strategy. `allowed_modes=_ALL_MODES` so
+    # backtest/paper rehearsal (SMK-T-30/34) and the two live acceptance
+    # runs (Run A, Run B) are all possible -- the live blast radius is
+    # bounded independently by `smoke_guard.validate_smoke_run` (G-1..G-8)
+    # and the existing default risk-manager caps, never by this registry.
+    "smoke_roundtrip": StrategyAvailability(
+        allowed_modes=_ALL_MODES,
+        status=StrategyStatus.DIAGNOSTIC,
+        demotion_reason=(
+            "Mechanics-test instrument (VP2 D2); no edge; live only within "
+            "smoke_guard bounds."
+        ),
+        promotion_requirements=["never_promotable"],
     ),
 }
 

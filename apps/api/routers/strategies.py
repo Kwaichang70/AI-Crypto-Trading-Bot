@@ -25,14 +25,14 @@ from __future__ import annotations
 from typing import Any
 
 import structlog
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Query, status
 
 from api.schemas import (
     ErrorResponse,
     StrategyInfoResponse,
     StrategyListResponse,
 )
-from trading.strategy_availability import get_availability
+from trading.strategy_availability import StrategyStatus, get_availability
 
 __all__ = ["router"]
 
@@ -70,6 +70,7 @@ def _build_registry() -> dict[str, dict[str, Any]]:
         MomentumBreakoutStrategy,
         RSIMeanReversionStrategy,
         SLTPReversionStrategy,
+        SmokeRoundtripStrategy,
     )
 
     strategies: dict[str, dict[str, Any]] = {}
@@ -83,6 +84,10 @@ def _build_registry() -> dict[str, dict[str, Any]]:
         ("grid_trading", GridTradingStrategy),
         ("sl_tp_reversion", SLTPReversionStrategy),
         ("momentum_breakout", MomentumBreakoutStrategy),
+        # WP-SMOKE (reports/vp2-smoke/synthesis-spec.md section 8): a
+        # diagnostic mechanics-test instrument, hidden from the default
+        # list view (C-5) -- see list_strategies' include_diagnostic filter.
+        ("smoke_roundtrip", SmokeRoundtripStrategy),
     ]
 
     for name, cls in entries:
@@ -166,23 +171,47 @@ def _to_strategy_info(entry: dict[str, Any]) -> StrategyInfoResponse:
     summary="List available strategies",
     description=(
         "Returns all strategy implementations available for use in a trading run. "
-        "Each entry includes metadata and the JSON Schema for its parameters."
+        "Each entry includes metadata and the JSON Schema for its parameters. "
+        "DIAGNOSTIC-status strategies (mechanics-test instruments, no trading "
+        "edge) are omitted by default -- pass ?include_diagnostic=true to see them."
     ),
 )
-async def list_strategies() -> StrategyListResponse:
+async def list_strategies(
+    include_diagnostic: bool = Query(
+        False,
+        description=(
+            "Include DIAGNOSTIC-status strategies (e.g. smoke_roundtrip) in the "
+            "list. Defaults to False so the UI run-creation form never lists "
+            "them by accident (WP-SMOKE, synthesis-spec.md C-5)."
+        ),
+    ),
+) -> StrategyListResponse:
     """
     List all available trading strategies.
+
+    Parameters
+    ----------
+    include_diagnostic:
+        When ``False`` (the default), strategies whose availability status
+        is :attr:`StrategyStatus.DIAGNOSTIC` are omitted from the list.
 
     Returns
     -------
     StrategyListResponse
         All available strategies with their metadata and parameter schemas.
     """
-    log = logger.bind(endpoint="list_strategies")
+    log = logger.bind(endpoint="list_strategies", include_diagnostic=include_diagnostic)
     log.info("strategies.list_requested")
 
     registry = _get_registry()
-    strategies = [_to_strategy_info(entry) for entry in registry.values()]
+    entries: list[dict[str, Any]] = list(registry.values())
+    if not include_diagnostic:
+        entries = [
+            entry
+            for entry in entries
+            if entry["status"] != StrategyStatus.DIAGNOSTIC.value
+        ]
+    strategies = [_to_strategy_info(entry) for entry in entries]
 
     log.info("strategies.listed", total=len(strategies))
 

@@ -292,6 +292,17 @@ class RunCreateRequest(BaseModel):
             raise ValueError(
                 f"initial_capital must be a valid decimal string, got: {v!r}"
             ) from exc
+        # WP-SMOKE fix F-2 (SMK-SEC-03): Decimal("NaN") / Decimal("sNaN")
+        # parse successfully above but make the "<= 0" comparison below
+        # raise decimal.InvalidOperation (an uncaught ArithmeticError,
+        # 500) instead of a clean Pydantic 422; Decimal("Infinity") /
+        # Decimal("-Infinity") parse AND compare cleanly, so today they
+        # silently PASS this validator. Reject every non-finite value
+        # here, before the "<= 0" comparison, so all four cases become a
+        # normal Pydantic 422 like any other invalid initial_capital.
+        # See SMK-T-39.
+        if not amount.is_finite():
+            raise ValueError("initial_capital must be a finite decimal")
         if amount <= Decimal("0"):
             raise ValueError("initial_capital must be greater than zero")
         return v
@@ -1108,7 +1119,13 @@ class StrategyInfoResponse(BaseModel):
     )
     status: str = Field(
         default="active",
-        description="Strategy lifecycle status: active | demoted | experimental.",
+        description=(
+            "Strategy lifecycle status: active | demoted | experimental | "
+            "diagnostic. 'diagnostic' strategies are mechanics-test "
+            "instruments with no trading edge (e.g. smoke_roundtrip); they "
+            "are omitted from GET /strategies unless "
+            "?include_diagnostic=true."
+        ),
     )
     demotion_reason: str | None = Field(
         default=None,

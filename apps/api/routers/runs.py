@@ -36,12 +36,12 @@ import uuid
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Final, Literal
 
 import structlog
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import String, cast, func, select, update
+from sqlalchemy import String, cast, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import noload
 
@@ -107,6 +107,7 @@ from trading.exit_config import (
     validate_run_exit_config,
 )
 from trading.recovery import ResumeRejected, check_fill_integrity, replay_sort_key
+from trading.smoke_guard import SMOKE_STRATEGY_NAMES, SmokeGuardError, validate_smoke_run
 from trading.strategy_availability import get_availability, is_mode_allowed
 from trading.strategy_engine import FlattenResult, build_synthetic_flatten_result
 
@@ -129,6 +130,33 @@ logger = structlog.get_logger(__name__)
 
 _STRATEGY_REGISTRY: dict[str, Any] | None = None
 
+# WP-SMOKE fix F-1 (SMK-SEC-01, final-synthesis-smoke.md section 5):
+# transaction-scoped Postgres advisory-lock key that serialises the G-9
+# smoke-live-exclusivity check against its own check-then-insert TOCTOU
+# race. Fixed bigint, NOT hashtext(...) (undocumented, not guaranteed
+# stable across major Postgres versions):
+#   0x534D4B4C49564531 == ASCII "SMKLIVE1" == 6002536669374727473.
+# Namespace reserved for WP-SMOKE live-create serialization; do not reuse
+# for anything else.
+_SMOKE_LIVE_CREATE_LOCK_KEY: Final[int] = 6002536669374727473
+
+
+def _is_postgresql(db: AsyncSession) -> bool:
+    """WP-SMOKE fix F-1: True only when ``db`` is bound to a PostgreSQL
+    engine. Never raises -- any missing/odd attribute on a test double
+    (``AsyncMock``, a dispatcher-fake session, SQLite) falls through to
+    False, so ``pg_advisory_xact_lock`` (Postgres-only) is issued in
+    production only. Test doubles' ``bind.dialect.name`` is either a
+    ``Mock`` (not ``== "postgresql"``) or absent -- both take the safe
+    False branch. See SMK-T-36(d)."""
+    try:
+        bind = getattr(db, "bind", None)
+        dialect = getattr(bind, "dialect", None)
+        return getattr(dialect, "name", None) == "postgresql"
+    except Exception:
+        return False
+
+
 
 def _get_strategy_registry() -> dict[str, Any]:
     """
@@ -150,6 +178,7 @@ def _get_strategy_registry() -> dict[str, Any]:
             MomentumBreakoutStrategy,
             RSIMeanReversionStrategy,
             SLTPReversionStrategy,
+            SmokeRoundtripStrategy,
         )
 
         _STRATEGY_REGISTRY = {
@@ -161,6 +190,11 @@ def _get_strategy_registry() -> dict[str, Any]:
             "grid_trading": GridTradingStrategy,
             "sl_tp_reversion": SLTPReversionStrategy,
             "momentum_breakout": MomentumBreakoutStrategy,
+            # WP-SMOKE (reports/vp2-smoke/synthesis-spec.md section 8): a
+            # diagnostic mechanics-test instrument, not a trading strategy.
+            # Blast radius is bounded by smoke_guard.validate_smoke_run
+            # (G-1..G-8), never by omission from this registry.
+            "smoke_roundtrip": SmokeRoundtripStrategy,
         }
     return _STRATEGY_REGISTRY
 
@@ -207,6 +241,27 @@ def _exit_config_error_detail(exc: ExitConfigError) -> dict[str, Any]:
     if exc.hint is not None:
         detail["hint"] = exc.hint
     return detail
+
+
+def _smoke_guard_error_detail(exc: SmokeGuardError) -> dict[str, Any]:
+    """WP-SMOKE (synthesis-spec.md section 7): build the 422 ``detail``
+    envelope for a :class:`SmokeGuardError`, mirroring
+    ``_exit_config_error_detail``'s ``errors[]`` shape exactly (minus the
+    ``warnings`` key, which smoke_guard has no concept of)."""
+    return {
+        "code": exc.code,
+        "errors": [
+            {
+                "field": issue.field,
+                "reason": issue.reason,
+                "value": issue.value,
+                "min": issue.min,
+                "max": issue.max,
+                "message": issue.message,
+            }
+            for issue in exc.issues
+        ],
+    }
 
 
 def _extract_bracket_config(strategy_params: dict[str, Any]) -> dict[str, object]:
@@ -631,6 +686,38 @@ async def create_run(
     _bracket_config = _extract_bracket_config(body.strategy_params)
 
     # ------------------------------------------------------------------
+    # WP-SMOKE (synthesis-spec.md section 7, G-1..G-8): a no-op for every
+    # strategy except smoke_roundtrip.  Placed AFTER _extract_bracket_config
+    # (so ``bracket`` below is the resolved bracket_* mapping) and BEFORE
+    # validate_run_exit_config (so a smoke-specific reason wins over the
+    # generic WP1.3a one, e.g. a missing SL reads "stop_loss_required" not
+    # "exit_manager_required"). Runs before the idempotency claim (I2):
+    # a rejection here touches no store, no DB row and no audit row.
+    # ------------------------------------------------------------------
+    try:
+        validate_smoke_run(
+            strategy_name=strategy_name,
+            mode=body.mode,
+            symbols=body.symbols,
+            timeframe=str(body.timeframe),
+            initial_capital=body.initial_capital,
+            strategy_params=body.strategy_params,
+            bracket=_bracket_config,
+            trailing_stop_pct=_raw_trailing_stop_pct,
+            allow_pyramiding=body.allow_pyramiding,
+            enable_adaptive_learning=body.enable_adaptive_learning,
+        )
+    except SmokeGuardError as exc:
+        log.warning(
+            "runs.smoke_guardrail_violation",
+            reasons=[i.reason for i in exc.issues],
+        )
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=_smoke_guard_error_detail(exc),
+        ) from exc
+
+    # ------------------------------------------------------------------
     # WP1.3a (SY-13a-01/15): validate the exit config + allow_pyramiding
     # BEFORE the strategy-schema check, any audit row, db.add, or the
     # backtest bar fetch.  A failure here leaves no RunORM row and no audit
@@ -828,6 +915,61 @@ async def create_run(
         response.headers["Idempotent-Replay"] = "true"
         log.info("runs.idempotency_replayed", run_id=str(_claim.run_id))
         return _run_orm_to_detail_response(_replayed_run)
+
+    # ------------------------------------------------------------------
+    # WP-SMOKE (synthesis-spec.md section 7, G-9): live exclusivity for a
+    # smoke_roundtrip LIVE run. Placed AFTER the Replay branch (C-3) so a
+    # network retry of the SAME smoke create replays cleanly instead of
+    # 409-ing against its own prior attempt, and on the Owned path only
+    # -- i.e. only ever reached once, per claim. On violation the claim
+    # is released via store.fail() BEFORE raising, so a corrected retry
+    # (a different key) is never blocked by a stale in_progress claim,
+    # and no RunORM row / audit row is written (this runs before both).
+    # ------------------------------------------------------------------
+    if strategy_name in SMOKE_STRATEGY_NAMES and body.mode == "live":
+        # WP-SMOKE fix F-1 (SMK-SEC-01): serialise the check-then-insert
+        # race below with a transaction-scoped Postgres advisory lock,
+        # taken BEFORE the conflict SELECT. SELECT ... FOR UPDATE cannot
+        # close this race: the race exists exactly when the SELECT below
+        # returns ZERO rows (no live run exists yet), and FOR UPDATE only
+        # locks EXISTING rows -- it cannot block a phantom concurrent
+        # insert. pg_advisory_xact_lock is held until this transaction
+        # ends: on success that is db.commit() below (WP7.0
+        # commit-before-spawn is unchanged); on the 409 path immediately
+        # below it is get_db's rollback; on a later failure it is the
+        # db.rollback() in the OwnershipLost/BaseException recovery
+        # branches. Under READ COMMITTED (no isolation_level override in
+        # db/session.py), a second request that waits on this lock re-runs
+        # its SELECT against a fresh snapshot once it acquires the lock,
+        # so it sees the winner's committed row and takes the 409 branch
+        # below instead of also succeeding. Dialect-gated: SQLite and the
+        # AsyncMock/dispatcher-fake sessions used by the existing hermetic
+        # tests never issue this statement (SMK-T-36).
+        if _is_postgresql(db):
+            await db.execute(
+                text("SELECT pg_advisory_xact_lock(:k)"),
+                {"k": _SMOKE_LIVE_CREATE_LOCK_KEY},
+            )
+        _conflicting = await db.execute(
+            select(RunORM.id).where(
+                RunORM.run_mode == "live",
+                RunORM.status.in_(("running", "orphaned", "resuming")),
+            )
+        )
+        _conflicting_ids = [str(_cid) for _cid in _conflicting.scalars().all()]
+        if _conflicting_ids:
+            log.warning(
+                "runs.smoke_requires_exclusive_live",
+                conflicting_run_ids=_conflicting_ids,
+            )
+            await store.fail(key=_idempotency_key, claimed_run_id=_claim.claimed_run_id)
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "smoke_requires_exclusive_live",
+                    "conflicting_run_ids": _conflicting_ids,
+                },
+            )
 
     # SY-70-12: use the claimed id, not a fresh uuid4() -- I4 requires
     # RunORM.id == idempotency_keys.claimed_run_id for this request.
@@ -2581,6 +2723,24 @@ async def promote_to_live(
         )
 
     # ------------------------------------------------------------------
+    # WP-SMOKE (synthesis-spec.md section 7, G-11): promote-to-live is
+    # forbidden for smoke_roundtrip -- promotion copies capital from the
+    # source paper run's config, bypassing the live capital band (D-SMK-1)
+    # entirely. Keyed by NAME (C-4), immediately after the availability
+    # check this sits next to.
+    # ------------------------------------------------------------------
+    if promotion_strategy_name in SMOKE_STRATEGY_NAMES:
+        log.warning(
+            "runs.smoke_promotion_forbidden",
+            source_run_id=str(run_id),
+            strategy_name=promotion_strategy_name,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "smoke_promotion_forbidden"},
+        )
+
+    # ------------------------------------------------------------------
     # WP1.3a (SY-13a-15/17): validate the SOURCE config for LIVE mode
     # (E11 included) right after the availability check, before the
     # promotion-gate evidence check, the 3-layer safety gate, and the audit
@@ -3067,6 +3227,23 @@ async def resume_run(
     orphan_config = dict(run.config or {})
 
     strategy_name = (str(orphan_config.get("strategy_name", "")).lower().replace("-", "_"))
+
+    # ------------------------------------------------------------------
+    # WP-SMOKE (synthesis-spec.md section 7, G-10): a smoke_roundtrip run
+    # may only come back via mode=protective (C-2) -- a normal resume would
+    # let a fresh strategy instance re-emit its BUY-once latch, defeating
+    # the round-trip guard. Checked BEFORE the orphaned->resuming CAS (the
+    # run stays 'orphaned', untouched) and NOT re-run on protective salvage
+    # -- mode=protective already drops every entry signal at both the
+    # strategy and risk layers (existing behaviour), so it is unaffected.
+    # ------------------------------------------------------------------
+    if mode == "normal" and strategy_name in SMOKE_STRATEGY_NAMES:
+        log.warning("runs.smoke_resume_protective_only", strategy_name=strategy_name)
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "smoke_resume_protective_only"},
+        )
+
     if not is_mode_allowed(strategy_name, RunMode.LIVE):
         availability = get_availability(strategy_name)
         raise HTTPException(
@@ -4022,6 +4199,19 @@ async def recover_orphaned_runs() -> int:
                 normalized_strategy_name = strategy_name.lower().replace("-", "_")
                 if not is_mode_allowed(normalized_strategy_name, RunMode.PAPER):
                     await _mark_run_error(factory, run_id, log, reason="strategy_mode_not_allowed")
+                    continue
+
+                # WP-SMOKE (synthesis-spec.md section 7, G-12): a
+                # smoke_roundtrip paper run is never auto-recovered at API
+                # boot -- a fresh strategy instance rebuilt here would
+                # replay IDLE and re-emit its BUY-once latch against
+                # whatever the ledger looks like post-restart, outside any
+                # operator-observed round trip. Marked 'error' instead, the
+                # same closed path as every other non-recoverable paper run.
+                if normalized_strategy_name in SMOKE_STRATEGY_NAMES:
+                    await _mark_run_error(
+                        factory, run_id, log, reason="smoke_not_auto_recoverable"
+                    )
                     continue
 
                 resume_count = int(run_config.get("resume_count", 0)) + 1
