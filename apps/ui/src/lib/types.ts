@@ -244,10 +244,12 @@ export interface RunCreateRequest {
    * WP1.7a/SY-10 (S13): deprecated body-field fallback only. The UI never
    * populates this — a live-mode confirmation is sent EXCLUSIVELY via the
    * `X-Live-Confirm-Token` request header (see `createRun()` in `./api`),
-   * so real callers pass the token as a `createRun(body, token)` argument,
-   * never as part of this object. Kept typed (rather than removed) purely
-   * so any not-yet-migrated caller/fixture that still sets it continues to
-   * compile; the backend accepts the header only from this UI going forward.
+   * so real callers pass the token via `createRun(body, {idempotencyKey,
+   * liveConfirmToken})` (WP7.0, SY-70-18 -- an options object, never a bare
+   * positional string; see `RunSubmitOptions`), never as part of this
+   * object. Kept typed (rather than removed) purely so any not-yet-migrated
+   * caller/fixture that still sets it continues to compile; the backend
+   * accepts the header only from this UI going forward.
    */
   confirmToken?: string | undefined;
 }

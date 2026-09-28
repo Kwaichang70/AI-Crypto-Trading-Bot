@@ -18,13 +18,14 @@
 
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useState } from "react";
 import { fetchKillSwitchStatus } from "@/lib/api";
 import { adminFetch, KILL_SWITCH_TIMEOUT_MS } from "@/lib/admin-fetch";
 import type { KillSwitchClearResponse, KillSwitchStatus } from "@/lib/types";
 import { AdminOnly } from "@/components/admin-only";
 import { KillSwitchButton } from "@/components/kill-switch-button";
 import { useToast } from "@/components/ui/toast";
+import { usePolling } from "@/hooks/use-polling";
 
 const POLL_INTERVAL_MS = 15_000;
 
@@ -178,31 +179,26 @@ function ClearModal({
 }
 
 export function KillSwitchPanel() {
-  const [status, setStatus] = useState<KillSwitchStatus | null>(null);
-  const [unavailable, setUnavailable] = useState(false);
   const [clearOpen, setClearOpen] = useState(false);
   const { toast } = useToast();
 
-  const poll = useCallback(() => {
-    void fetchKillSwitchStatus().then((res) => {
-      if (res.ok) {
-        setStatus(res.data);
-        setUnavailable(false);
-      } else {
-        setUnavailable(true);
-      }
-    });
-  }, []);
-
-  useEffect(() => {
-    poll();
-    const intervalId = setInterval(poll, POLL_INTERVAL_MS);
-    return () => clearInterval(intervalId);
-  }, [poll]);
+  // WP7.0 (SY-70-25, G-6): `usePolling` replaces the bespoke
+  // `setInterval`/no-guard `poll()` -- this now pauses in a hidden tab,
+  // refreshes immediately on becoming visible, backs off up to 60s while
+  // the API is unavailable, and `refetch()` (used after clear) supersedes
+  // any in-flight tick instead of being dropped by an in-flight guard.
+  const poll = usePolling<KillSwitchStatus>({
+    fetcher: fetchKillSwitchStatus,
+    intervalMs: POLL_INTERVAL_MS,
+    enabled: true,
+    immediate: true,
+  });
+  const status = poll.data ?? null;
+  const unavailable = poll.error !== null;
 
   function handleCleared(result: KillSwitchClearResponse) {
     setClearOpen(false);
-    poll();
+    void poll.refetch();
     if (result.runsKeptLatched.length > 0) {
       toast(
         `Cleared. ${result.runsKeptLatched.length} run(s) remain latched for other reasons.`,
@@ -222,7 +218,7 @@ export function KillSwitchPanel() {
         <StatusPill status={status} unavailable={unavailable} />
       </div>
       <div className="flex flex-col gap-2">
-        <KillSwitchButton />
+        <KillSwitchButton onPressed={() => void poll.refetch()} />
         <AdminOnly>
           <button
             type="button"

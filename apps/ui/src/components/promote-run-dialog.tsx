@@ -31,6 +31,15 @@ import { promoteRun } from "@/lib/api";
 import type { Run } from "@/lib/types";
 import { LiveConfirmDialog } from "@/components/live-confirm-dialog";
 import { ExitConfigErrorPanel } from "@/components/exit-config-error-panel";
+import {
+  classifyIdempotencyError,
+  getStructuredErrorCode,
+  IDEMPOTENCY_CLIENT_ERROR_MESSAGE,
+  IDEMPOTENCY_IN_PROGRESS_MESSAGE,
+  IDEMPOTENCY_REUSED_MESSAGE,
+  useIdempotencyKey,
+  useSubmitLock,
+} from "@/lib/idempotency";
 
 interface PromoteRunDialogProps {
   sourceRunId: string;
@@ -43,21 +52,86 @@ export function PromoteRunDialog({ sourceRunId, onClose, onPromoted }: PromoteRu
   const [loading, setLoading] = useState(false);
   const [errorDetail, setErrorDetail] = useState<unknown>(undefined);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  // WP7.0 (SY-70-21/C-13): a 409 idempotency_in_progress renders a neutral
+  // notice, distinct from the generic ExitConfigErrorPanel fallback below.
+  const [inProgressNotice, setInProgressNotice] = useState(false);
+  // WP7.0 (SY-70-19): snapshot = sourceRunId — the same key is reused across
+  // every retry of promoting THIS source run, including a live-timeout retry
+  // that re-opens the token dialog (G-13: the token itself is never kept).
+  const idempotency = useIdempotencyKey();
+  const submitLock = useSubmitLock();
 
   async function submit(liveConfirmToken: string) {
+    if (!submitLock.tryAcquire()) return;
     setLoading(true);
     setErrorMessage(null);
     setErrorDetail(undefined);
-    const result = await promoteRun(sourceRunId, liveConfirmToken);
-    setLoading(false);
-    if (result.ok) {
+    setInProgressNotice(false);
+
+    try {
+      const idempotencyKey = idempotency.keyFor(sourceRunId);
+      const result = await promoteRun(sourceRunId, { idempotencyKey, liveConfirmToken });
+
+      if (result.ok) {
+        idempotency.reset();
+        setTokenDialogOpen(false);
+        onPromoted(result.data);
+        onClose();
+        return;
+      }
+
+      // WP70-S-03 (round 2): close the token dialog on EVERY settled non-OK
+      // branch, not just success/in-progress. `<LiveConfirmDialog>` only
+      // clears its typed token on an `open` transition (mount effect), so
+      // leaving `tokenDialogOpen` true after a failure both (a) keeps the
+      // stale token sitting in the DOM after the attempt has settled (I9),
+      // and (b) visually hides the error panel behind the still-open z-50
+      // overlay. Closing it here, unconditionally, before the per-code
+      // branches below, fixes both: the panel renders on the now-visible
+      // underlying dialog, and clicking "Promote…" again reopens
+      // `<LiveConfirmDialog>` fresh (its own `open`-transition effect wipes
+      // the field) for a same-key (or freshly-reset-key) retry.
       setTokenDialogOpen(false);
-      onPromoted(result.data);
-      onClose();
-    } else {
+
+      if (result.error.status === 0) {
+        // SY-70-19: status 0 keeps the key — a same-key retry is safe.
+        setErrorMessage(result.error.message);
+        setErrorDetail(result.error.detail);
+        return;
+      }
+
+      const outcome = classifyIdempotencyError(result.error.detail);
+      if (outcome.kind === "in_progress") {
+        setInProgressNotice(true);
+        return;
+      }
+      if (outcome.kind === "reused") {
+        idempotency.reset();
+        setErrorMessage(IDEMPOTENCY_REUSED_MESSAGE);
+        return;
+      }
+      if (outcome.kind === "client_error") {
+        console.error("idempotency client error", getStructuredErrorCode(result.error.detail));
+        idempotency.reset();
+        setErrorMessage(IDEMPOTENCY_CLIENT_ERROR_MESSAGE);
+        return;
+      }
+
+      // Every other code (403, WP1.3a 422, 404 source not found, ...) keeps
+      // the key and falls through to the existing panel.
       setErrorMessage(result.error.message);
       setErrorDetail(result.error.detail);
+    } finally {
+      setLoading(false);
+      submitLock.release();
     }
+  }
+
+  // SY-70-22: reopens the token dialog for a fresh, retyped token, reusing
+  // the same key (G-13 — never a retained token).
+  function retry() {
+    setInProgressNotice(false);
+    setTokenDialogOpen(true);
   }
 
   return (
@@ -81,7 +155,24 @@ export function PromoteRunDialog({ sourceRunId, onClose, onPromoted }: PromoteRu
           Requires the live-trading confirmation token.
         </p>
 
-        {errorMessage && (
+        {inProgressNotice && (
+          <div
+            role="status"
+            aria-live="polite"
+            className="mt-3 space-y-2 rounded-lg border border-amber-700/60 bg-amber-900/20 px-4 py-3 text-sm text-amber-400"
+          >
+            <p>{IDEMPOTENCY_IN_PROGRESS_MESSAGE}</p>
+            <button
+              type="button"
+              onClick={retry}
+              className="rounded-lg border border-amber-600 bg-transparent px-3 py-1.5 text-xs font-medium text-amber-400 hover:bg-amber-900/40"
+            >
+              Check again
+            </button>
+          </div>
+        )}
+
+        {errorMessage && !inProgressNotice && (
           <div className="mt-3">
             <ExitConfigErrorPanel detail={errorDetail} fallbackMessage={errorMessage} />
           </div>

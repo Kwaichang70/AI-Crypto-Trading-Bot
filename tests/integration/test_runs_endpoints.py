@@ -263,7 +263,10 @@ class TestCreateRun:
             "initialCapital": "10000.00",
         }
 
-        resp = client_dev_with_db.post("/api/v1/runs", json=payload)
+        resp = client_dev_with_db.post(
+            "/api/v1/runs", json=payload,
+            headers={"Idempotency-Key": str(uuid.uuid4())},
+        )
 
         assert resp.status_code == 201
         body = resp.json()
@@ -364,7 +367,10 @@ class TestStrategyAvailabilityLockdown:
                 detail="patched: no network in tests",
             ),
         ):
-            resp = client_dev_with_db.post("/api/v1/runs", json=payload)
+            resp = client_dev_with_db.post(
+                "/api/v1/runs", json=payload,
+                headers={"Idempotency-Key": str(uuid.uuid4())},
+            )
 
         assert resp.status_code != 422, (
             f"{strategy} backtest must NOT be blocked by the availability "
@@ -389,7 +395,10 @@ class TestStrategyAvailabilityLockdown:
             "mode": "paper",
             "initialCapital": "10000.00",
         }
-        resp = client_dev_with_db.post("/api/v1/runs", json=payload)
+        resp = client_dev_with_db.post(
+            "/api/v1/runs", json=payload,
+            headers={"Idempotency-Key": str(uuid.uuid4())},
+        )
 
         assert resp.status_code == 201, (
             f"grid_trading paper run must be accepted; got {resp.status_code}: "
@@ -1015,7 +1024,10 @@ class TestPaperEngineTaskWiring:
                 raise
 
         with patch("api.routers.runs._run_paper_engine", side_effect=_sleeping_engine):
-            resp = client_dev_with_db.post("/api/v1/runs", json=_PAPER_PAYLOAD)
+            resp = client_dev_with_db.post(
+                "/api/v1/runs", json=_PAPER_PAYLOAD,
+                headers={"Idempotency-Key": str(uuid.uuid4())},
+            )
 
         assert resp.status_code == 201
         run_id_str = resp.json()["id"]
@@ -1045,7 +1057,10 @@ class TestPaperEngineTaskWiring:
                 raise
 
         with patch("api.routers.runs._run_paper_engine", side_effect=_sleeping_engine):
-            resp = client_dev_with_db.post("/api/v1/runs", json=_PAPER_PAYLOAD)
+            resp = client_dev_with_db.post(
+                "/api/v1/runs", json=_PAPER_PAYLOAD,
+                headers={"Idempotency-Key": str(uuid.uuid4())},
+            )
 
         assert resp.status_code == 201
         run_id_str = resp.json()["id"]
@@ -1189,7 +1204,10 @@ class TestPaperEngineTaskWiring:
             _RUN_TASKS.pop(kwargs["run_id_str"], None)
 
         with patch("api.routers.runs._run_paper_engine", side_effect=_immediate_engine):
-            resp = client_dev_with_db.post("/api/v1/runs", json=_PAPER_PAYLOAD)
+            resp = client_dev_with_db.post(
+                "/api/v1/runs", json=_PAPER_PAYLOAD,
+                headers={"Idempotency-Key": str(uuid.uuid4())},
+            )
             assert resp.status_code == 201
             run_id_str = resp.json()["id"]
 
@@ -1224,8 +1242,14 @@ class TestPaperEngineTaskWiring:
                 raise
 
         with patch("api.routers.runs._run_paper_engine", side_effect=_sleeping_engine):
-            resp_a = client_dev_with_db.post("/api/v1/runs", json=_PAPER_PAYLOAD)
-            resp_b = client_dev_with_db.post("/api/v1/runs", json=_PAPER_PAYLOAD)
+            resp_a = client_dev_with_db.post(
+                "/api/v1/runs", json=_PAPER_PAYLOAD,
+                headers={"Idempotency-Key": str(uuid.uuid4())},
+            )
+            resp_b = client_dev_with_db.post(
+                "/api/v1/runs", json=_PAPER_PAYLOAD,
+                headers={"Idempotency-Key": str(uuid.uuid4())},
+            )
 
         assert resp_a.status_code == 201
         assert resp_b.status_code == 201

@@ -209,7 +209,12 @@ def test_018_upgrade_downgrade_upgrade_round_trip() -> None:
     assert latch["entries_latched_at"] is not None
 
     # --- 2. Downgrade one revision: 018 -> 017 ---
-    command.downgrade(cfg, "-1")
+    # WP7.0 (WP70-P-03): explicit target, not "-1" -- "-1" is relative to
+    # the CURRENT head, which migration 019 moved past 018. An explicit
+    # "017" keeps this test correct regardless of how many migrations
+    # land on top of 018 in the future (mirrors test_017_orphaned_status
+    # .py's own explicit-target pattern one revision down).
+    command.downgrade(cfg, "017")
 
     kill_switch_row_after_downgrade = asyncio.run(_fetch_kill_switch_row(dsn))
     assert kill_switch_row_after_downgrade is None, (

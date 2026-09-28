@@ -60,6 +60,7 @@ __all__ = [
     "OptimizationRunORM",
     "OptimizationEntryORM",
     "AuditEventORM",
+    "IdempotencyKeyORM",
     "KillSwitchStateORM",
 ]
 
@@ -1542,6 +1543,109 @@ class AuditEventORM(Base):
             f"<AuditEventORM ts={self.timestamp.isoformat()} "
             f"actor={self.actor} event={self.event_type} "
             f"resource={self.resource_type}:{self.resource_id}>"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 12b. idempotency_keys  -- WP7.0 dedup table for POST /runs and promote
+# ---------------------------------------------------------------------------
+
+class IdempotencyKeyORM(Base):
+    """Dedup state for ``Idempotency-Key`` on run creation and promotion.
+
+    See ``reports/vp2-wp7.0/synthesis-spec.md`` SY-70-05/SY-70-13 and
+    ``infra/alembic/versions/019_add_idempotency_keys.py``.
+
+    ``claimed_run_id`` deliberately has NO foreign key (WP70-DB-01): it is
+    written at claim time, before the corresponding ``runs`` row is
+    guaranteed to exist (or exist AT ALL, if the claimant crashes before
+    ever inserting one). ``run_id`` IS a real FK, written only in the same
+    transaction as (immediately before committing) the ``runs`` INSERT
+    itself, at which point same-transaction MVCC guarantees the target
+    row is visible.
+
+    ``updated_at`` is the staleness clock for case-8 reconciliation and
+    the TTL prune -- NOT ``created_at``, which never changes and would
+    make a just-reclaimed row look permanently stale to the next reader.
+    """
+
+    __tablename__ = "idempotency_keys"
+
+    key: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        comment="The client-supplied Idempotency-Key, canonicalised to lowercase.",
+    )
+
+    endpoint: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        comment="Logical endpoint name, e.g. 'POST /runs'.",
+    )
+
+    request_fingerprint: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        comment="sha256 hex digest of {endpoint, path_params, body} (SY-70-06).",
+    )
+
+    status: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        server_default="in_progress",
+        comment="One of 'in_progress', 'completed', 'failed'.",
+    )
+
+    claimed_run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        nullable=False,
+        comment=(
+            "Provisional run id written at claim time. No FK (WP70-DB-01) -- "
+            "the referenced runs row may not exist yet, or ever."
+        ),
+    )
+
+    run_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("runs.id", ondelete="SET NULL"),
+        nullable=True,
+        comment=(
+            "Confirmed run id, written only by complete() in the same "
+            "transaction as the runs INSERT."
+        ),
+    )
+
+    response_status_code: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        server_default="201",
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        comment="Staleness clock (case 8) and TTL-prune clock -- bumped on every transition.",
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('in_progress', 'completed', 'failed')",
+            name="ck_idempotency_keys_status",
+        ),
+        Index("ix_idempotency_keys_updated_at", "updated_at"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<IdempotencyKeyORM key={self.key} status={self.status} "
+            f"claimed_run_id={self.claimed_run_id} run_id={self.run_id}>"
         )
 
 

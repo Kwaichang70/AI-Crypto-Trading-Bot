@@ -23,6 +23,15 @@ import { ParamGridEditor } from "./param-grid-editor";
 import type { ParamGridRow } from "./param-grid-editor";
 import { buildResultColumns } from "./result-columns";
 import { ExitConfigErrorPanel } from "@/components/exit-config-error-panel";
+import {
+  classifyIdempotencyError,
+  getStructuredErrorCode,
+  IDEMPOTENCY_CLIENT_ERROR_MESSAGE,
+  IDEMPOTENCY_IN_PROGRESS_MESSAGE,
+  IDEMPOTENCY_REUSED_MESSAGE,
+  useIdempotencyKey,
+  useSubmitLock,
+} from "@/lib/idempotency";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -193,6 +202,12 @@ export default function OptimizePage() {
   const [launchingRank, setLaunchingRank] = useState<number | null>(null);
   const [launchError, setLaunchError] = useState<string | null>(null);
   const [actualCombinations, setActualCombinations] = useState(0);
+  // WP7.0 (SY-70-19/20, C-2): each entry's `createRun` body is a distinct
+  // snapshot, so a different entry always mints a different key; a lock
+  // (shared across all entries, mirroring `launchingRank`'s "one launch at a
+  // time" invariant) closes the synchronous double-click race.
+  const launchIdempotency = useIdempotencyKey();
+  const launchSubmitLock = useSubmitLock();
 
   // Load strategies on mount
   useEffect(() => {
@@ -336,28 +351,54 @@ export default function OptimizePage() {
 
   async function handleLaunchRun(entry: OptimizeEntry) {
     if (phase.kind !== "results") return;
+    if (!launchSubmitLock.tryAcquire()) return;
     setLaunchingRank(entry.rank);
     setLaunchError(null);
 
     const startIso = toUtcIso(backtestStart);
     const endIso = toUtcIso(backtestEnd);
 
-    const result = await createRun({
+    const body = {
       strategyName: selectedStrategy?.name ?? phase.data.strategyName,
       strategyParams: entry.params,
       symbols: [...phase.data.symbols],
       timeframe: phase.data.timeframe,
-      mode: "backtest",
+      mode: "backtest" as const,
       initialCapital,
       backtestStart: startIso,
       backtestEnd: endIso,
-    });
+    };
 
-    setLaunchingRank(null);
-    if (result.ok) {
-      router.push(`/runs/${result.data.id}`);
-    } else {
+    try {
+      const idempotencyKey = launchIdempotency.keyFor(JSON.stringify(body));
+      const result = await createRun(body, { idempotencyKey });
+
+      if (result.ok) {
+        launchIdempotency.reset();
+        router.push(`/runs/${result.data.id}`);
+        return;
+      }
+
+      const outcome = classifyIdempotencyError(result.error.detail);
+      if (outcome.kind === "in_progress") {
+        setLaunchError(IDEMPOTENCY_IN_PROGRESS_MESSAGE);
+        return;
+      }
+      if (outcome.kind === "reused") {
+        launchIdempotency.reset();
+        setLaunchError(IDEMPOTENCY_REUSED_MESSAGE);
+        return;
+      }
+      if (outcome.kind === "client_error") {
+        console.error("idempotency client error", getStructuredErrorCode(result.error.detail));
+        launchIdempotency.reset();
+        setLaunchError(IDEMPOTENCY_CLIENT_ERROR_MESSAGE);
+        return;
+      }
       setLaunchError(`Failed to launch run: ${result.error.message}`);
+    } finally {
+      setLaunchingRank(null);
+      launchSubmitLock.release();
     }
   }
 

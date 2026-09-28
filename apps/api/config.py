@@ -416,6 +416,29 @@ class Settings(BaseSettings):
         description="Days to keep raw equity snapshots before pruning. "
                     "Snapshots older than this are deleted daily at UTC midnight.",
     )
+    idempotency_key_ttl_hours: int = Field(
+        default=24,
+        ge=1,
+        le=168,
+        description=(
+            "WP7.0 (SY-70-14): hours an idempotency_keys row survives before "
+            "the daily prune loop deletes it. The staleness clock is "
+            "updated_at, not created_at (a just-reclaimed row must not look "
+            "permanently stale)."
+        ),
+    )
+    idempotency_stale_after_seconds: int = Field(
+        default=240,
+        ge=150,
+        le=3600,
+        description=(
+            "WP7.0 (SY-70-10): seconds an idempotency_keys row may sit "
+            "'in_progress' before a retry with the same key is allowed to "
+            "reconcile/reclaim it (case 8). 150 is above the UI's 120s poll "
+            "timeout so a client-side timeout never races a legitimate "
+            "in-flight request. Tests may set this as low as 1s."
+        ),
+    )
     max_run_duration_hours: int = Field(
         default=168,  # 7 days
         ge=1,

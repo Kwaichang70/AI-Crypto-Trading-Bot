@@ -101,6 +101,12 @@ def create_engine_from_url(
         pool_pre_ping=True,      # Validate connection health before use
         pool_recycle=3600,       # Recycle connections every hour (avoids stale connections)
         echo=echo,
+        # WP7.0 round 2 (WP70-S-02): never render bound parameters into a
+        # DBAPIError's message/repr. Without this, any exception raised on
+        # a statement carrying an Idempotency-Key (or any other sensitive
+        # bound value) would leak the full value into logs/tracebacks --
+        # a global defence covering every table, not just idempotency_keys.
+        hide_parameters=True,
         **kwargs,
     )
 

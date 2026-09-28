@@ -1,7 +1,8 @@
 "use client";
 
-import { Suspense, useEffect, useState } from "react";
+import { Suspense, useEffect, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
+import Link from "next/link";
 import {
   fetchStrategies,
   fetchStrategySchema,
@@ -18,6 +19,15 @@ import {
   isPyramidingByDesignStrategy,
   strategyDefaultAllowPyramiding,
 } from "@/lib/exit-config";
+import {
+  classifyIdempotencyError,
+  getStructuredErrorCode,
+  IDEMPOTENCY_CLIENT_ERROR_MESSAGE,
+  IDEMPOTENCY_IN_PROGRESS_MESSAGE,
+  IDEMPOTENCY_REUSED_MESSAGE,
+  useIdempotencyKey,
+  useSubmitLock,
+} from "@/lib/idempotency";
 
 const TIMEFRAMES = ["1m", "5m", "15m", "1h", "4h", "1d"];
 const COMMON_SYMBOLS = ["BTC/EUR", "ETH/EUR", "SOL/EUR", "XRP/EUR", "ADA/EUR"];
@@ -150,7 +160,18 @@ function NewRunInner() {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [submitErrorDetail, setSubmitErrorDetail] = useState<unknown>(undefined);
+  // WP7.0 (SY-70-21/22): the 409 idempotency_in_progress neutral notice and
+  // the status-0 "retry with the same key" affordance render distinct UI
+  // from the generic ExitConfigErrorPanel fallback below.
+  const [inProgressNotice, setInProgressNotice] = useState(false);
+  const [canRetrySameKey, setCanRetrySameKey] = useState(false);
   const [isLoadingStrategies, setIsLoadingStrategies] = useState(true);
+  // WP7.0 (SY-70-19/22): the exact body of the last attempt, so a same-key
+  // retry (status 0 or 409 in-progress) or a live-token re-prompt resubmits
+  // byte-for-byte the same snapshot the key was minted for.
+  const lastBodyRef = useRef<RunCreateRequest | null>(null);
+  const idempotency = useIdempotencyKey();
+  const submitLock = useSubmitLock();
   // WP1.7a/1.7b (SY-10, S13): the live confirmation token is NEVER held in
   // page-level state — only inside <LiveConfirmDialog>'s own transient
   // state, cleared on close. This page only remembers WHETHER the dialog
@@ -275,38 +296,107 @@ function NewRunInner() {
   // WP1.7a/SY-10 (S13): submits an already-validated body, optionally with a
   // live confirmation token sent ONLY as the `X-Live-Confirm-Token` header
   // (never in the body — see `createRun` in `@/lib/api`).
+  //
+  // WP7.0 (SY-70-19/20/21/22): mints/reuses an `Idempotency-Key` for this
+  // exact body, acquires a synchronous submit lock as the FIRST statement
+  // (closes the double-click race a React state flag alone cannot), and
+  // applies the reset/keep matrix per error code on failure.
   async function submitCreateRun(body: RunCreateRequest, liveConfirmToken?: string) {
-    setIsSubmitting(true);
-    const result = await createRun(body, liveConfirmToken);
+    if (!submitLock.tryAcquire()) return;
 
-    if (result.ok) {
-      setPendingLiveBody(null);
-      // WP1.3a (CF-13a-1 item 3): surface `configWarnings[]` from the 201
-      // body as toasts BEFORE navigating away -- <ToastProvider> lives in
-      // the root layout so these survive the client-side route change.
-      const warnings = result.data.configWarnings ?? [];
-      if (warnings.length === 0) {
-        toast("Run started successfully", "success");
-      } else {
-        toast("Run started with warnings", "warning");
-        for (const w of warnings) {
-          toast(
-            describeConfigWarning(w),
-            w.code === "no_downside_exit" ? "error" : "warning",
-          );
+    lastBodyRef.current = body;
+    setSubmitError(null);
+    setSubmitErrorDetail(undefined);
+    setInProgressNotice(false);
+    setCanRetrySameKey(false);
+    setIsSubmitting(true);
+
+    try {
+      const idempotencyKey = idempotency.keyFor(JSON.stringify(body));
+      const result = await createRun(body, {
+        idempotencyKey,
+        ...(liveConfirmToken ? { liveConfirmToken } : {}),
+      });
+
+      if (result.ok) {
+        idempotency.reset();
+        setPendingLiveBody(null);
+        // WP1.3a (CF-13a-1 item 3): surface `configWarnings[]` from the 201
+        // body as toasts BEFORE navigating away -- <ToastProvider> lives in
+        // the root layout so these survive the client-side route change.
+        const warnings = result.data.configWarnings ?? [];
+        if (warnings.length === 0) {
+          toast("Run started successfully", "success");
+        } else {
+          toast("Run started with warnings", "warning");
+          for (const w of warnings) {
+            toast(
+              describeConfigWarning(w),
+              w.code === "no_downside_exit" ? "error" : "warning",
+            );
+          }
         }
+        router.push(`/runs/${result.data.id}`);
+        return;
       }
-      router.push(`/runs/${result.data.id}`);
-    } else {
+
       // WP17b-S-10 (round 2): a failed live create used to leave
       // `submitError` set behind the still-open <LiveConfirmDialog>
       // overlay -- fully hidden from the operator, who saw nothing happen.
       // Closing the dialog here surfaces the error in the underlying form
       // (the operator can simply reopen it by clicking Start Run again).
       setPendingLiveBody(null);
+
+      if (result.error.status === 0) {
+        // SY-70-19: status 0 (timeout/network) keeps the key — the claim
+        // either never happened or was marked failed, so a same-key retry
+        // is always safe.
+        setSubmitError(result.error.message);
+        setCanRetrySameKey(true);
+        return;
+      }
+
+      const outcome = classifyIdempotencyError(result.error.detail);
+      if (outcome.kind === "in_progress") {
+        // SY-70-21/C-13: neutral notice, key kept, "Check again" same-key.
+        setInProgressNotice(true);
+        return;
+      }
+      if (outcome.kind === "reused") {
+        idempotency.reset();
+        setSubmitError(IDEMPOTENCY_REUSED_MESSAGE);
+        return;
+      }
+      if (outcome.kind === "client_error") {
+        // 428/400 idempotency codes are programming errors, never surfaced
+        // as a retriable condition — SY-70-21.
+        console.error("idempotency client error", getStructuredErrorCode(result.error.detail));
+        idempotency.reset();
+        setSubmitError(IDEMPOTENCY_CLIENT_ERROR_MESSAGE);
+        return;
+      }
+
+      // Every other code (403, kill_switch_active 409, WP1.3a 422, 400/502/5xx)
+      // keeps the key (SY-70-19) and falls through to the existing panel.
       setSubmitError(result.error.message);
       setSubmitErrorDetail(result.error.detail);
+    } finally {
       setIsSubmitting(false);
+      submitLock.release();
+    }
+  }
+
+  // SY-70-22: retries the last attempted body with the SAME key. A live
+  // body re-opens <LiveConfirmDialog> so the operator retypes the token
+  // (G-13 — the token is never retained); a paper/backtest body resubmits
+  // directly.
+  function retryLastSubmission() {
+    const body = lastBodyRef.current;
+    if (!body) return;
+    if (body.mode === "live") {
+      setPendingLiveBody(body);
+    } else {
+      void submitCreateRun(body);
     }
   }
 
@@ -737,7 +827,47 @@ function NewRunInner() {
           </div>
         )}
 
-        {submitError && (
+        {inProgressNotice && (
+          <div
+            role="status"
+            aria-live="polite"
+            className="space-y-2 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-700 dark:border-amber-800 dark:bg-amber-900/20 dark:text-amber-400"
+          >
+            <p>{IDEMPOTENCY_IN_PROGRESS_MESSAGE}</p>
+            <div className="flex gap-3">
+              <button
+                type="button"
+                onClick={retryLastSubmission}
+                className="rounded-lg border border-amber-400 bg-white px-3 py-1.5 text-xs font-medium text-amber-700 hover:bg-amber-100 dark:border-amber-700 dark:bg-transparent dark:text-amber-400 dark:hover:bg-amber-900/40"
+              >
+                Check again
+              </button>
+              <Link href="/runs" className="text-xs font-medium text-amber-700 underline dark:text-amber-400">
+                Runs list
+              </Link>
+            </div>
+          </div>
+        )}
+
+        {canRetrySameKey && submitError && (
+          <div className="space-y-2 rounded-lg border border-red-300 bg-red-50 px-4 py-3 text-sm text-red-600 dark:border-red-800 dark:bg-red-900/20 dark:text-red-400">
+            <p>{submitError}</p>
+            <div className="flex gap-3">
+              <button
+                type="button"
+                onClick={retryLastSubmission}
+                className="rounded-lg border border-red-400 bg-white px-3 py-1.5 text-xs font-medium text-red-600 hover:bg-red-100 dark:border-red-700 dark:bg-transparent dark:text-red-400 dark:hover:bg-red-900/40"
+              >
+                Retry with the same key
+              </button>
+              <Link href="/runs" className="text-xs font-medium text-red-600 underline dark:text-red-400">
+                Check runs list
+              </Link>
+            </div>
+          </div>
+        )}
+
+        {submitError && !canRetrySameKey && !inProgressNotice && (
           <ExitConfigErrorPanel detail={submitErrorDetail} fallbackMessage={submitError} />
         )}
 

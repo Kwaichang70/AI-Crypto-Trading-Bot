@@ -104,6 +104,7 @@ _whale_alert_client: Any = None
 # container.background_tasks.equity_prune_task — sunset by Sprint 41
 # ---------------------------------------------------------------------------
 _equity_prune_task: Any = None
+_idempotency_prune_task: Any = None  # WP7.0 (SY-70-14)
 
 # S47-1: history cache warmer — keeps FGI + BTC-dom history caches warm
 # for the v2 feature pipeline's synchronous accessors.
@@ -165,6 +166,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     global _retraining_service, _telegram_notifier
     global _coingecko_client, _fred_client, _whale_alert_client
     global _fgi_client, _equity_prune_task, _history_cache_warmer
+    global _idempotency_prune_task
 
     settings = get_settings()
 
@@ -372,6 +374,58 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
 
     # ------------------------------------------------------------------
+    # 6a. Idempotency-key pruning (WP7.0, SY-70-14) -- daily, same shape
+    # as _equity_prune_loop above.
+    # ------------------------------------------------------------------
+    async def _idempotency_prune_loop() -> None:
+        """Delete idempotency_keys rows whose updated_at is older than the
+        configured TTL, once per day."""
+        from api.db.session import get_session_factory as _get_sf_idem
+        from api.services.idempotency import prune_expired_idempotency_keys
+
+        _sf_idem = _get_sf_idem()
+
+        try:
+            await _asyncio.sleep(60)
+        except _asyncio.CancelledError:
+            return
+
+        while True:
+            try:
+                deleted = await prune_expired_idempotency_keys(
+                    _sf_idem,
+                    ttl_hours=settings.idempotency_key_ttl_hours,
+                )
+                if deleted > 0:
+                    log.info(
+                        "idempotency_prune.completed",
+                        deleted=deleted,
+                        ttl_hours=settings.idempotency_key_ttl_hours,
+                    )
+            except _asyncio.CancelledError:
+                break
+            except Exception:
+                log.warning("idempotency_prune.error", exc_info=True)
+
+            try:
+                await _asyncio.sleep(86400)
+            except _asyncio.CancelledError:
+                break
+
+    _idempotency_prune_task = _asyncio.create_task(
+        _idempotency_prune_loop(), name="idempotency_prune"
+    )
+    # NOTE: tracked via the module-level global only (like the pre-existing
+    # _equity_prune_task belt-and-suspenders pattern below), NOT via
+    # container.background_tasks -- BackgroundTaskRegistry (container.py)
+    # declares a fixed set of dataclass fields and adding a new one is out
+    # of WP7.0's scope. Cancelled explicitly in the shutdown sequence below.
+    log.info(
+        "idempotency_prune.scheduled",
+        ttl_hours=settings.idempotency_key_ttl_hours,
+    )
+
+    # ------------------------------------------------------------------
     # 6b. Orphan-holding alert repeater (WP1.8a S8)
     # ------------------------------------------------------------------
     from api.services.run_recovery import orphan_holding_repeater
@@ -556,6 +610,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         _equity_prune_task.cancel()
         await asyncio.gather(_equity_prune_task, return_exceptions=True)
 
+    # WP7.0 (SY-70-14): same belt-and-suspenders shutdown as the equity
+    # prune task above.
+    if _idempotency_prune_task is not None and not _idempotency_prune_task.done():
+        _idempotency_prune_task.cancel()
+        await asyncio.gather(_idempotency_prune_task, return_exceptions=True)
+
     # Close FearGreedClient session (Sprint 32)
     if _fgi_client is not None:
         try:
@@ -678,8 +738,11 @@ def create_app() -> FastAPI:
         allow_origins=settings.allowed_origins,
         allow_credentials=True,
         allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-        allow_headers=["Content-Type", "Accept", "Authorization", "X-API-Key", "X-Requested-With"],
-        expose_headers=["X-Process-Time"],
+        allow_headers=[
+            "Content-Type", "Accept", "Authorization", "X-API-Key", "X-Requested-With",
+            "Idempotency-Key",  # WP7.0 (SY-70-15)
+        ],
+        expose_headers=["X-Process-Time", "Idempotency-Key", "Idempotent-Replay"],
     )
 
     application.middleware("http")(_request_timing_middleware)

@@ -39,7 +39,7 @@ from decimal import Decimal
 from typing import Annotated, Any, Literal
 
 import structlog
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import String, cast, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -54,6 +54,18 @@ from api.db.models import (
 )
 from api.db.session import get_db
 from api.deps import require_admin
+from api.services.idempotency import (
+    CREATE_ENDPOINT,
+    PROMOTE_ENDPOINT,
+    IdempotencyStore,
+    Owned,
+    OwnershipLost,
+    Replay,
+    compute_fingerprint,
+    get_idempotency_store,
+    idempotency_http_error,
+    parse_idempotency_key,
+)
 from api.schemas import (
     EntriesLatchClearResponse,
     ErrorResponse,
@@ -448,9 +460,28 @@ async def _fetch_bars_for_backtest(
     status_code=status.HTTP_201_CREATED,
     response_model=RunDetailResponse,
     responses={
-        400: {"model": ErrorResponse, "description": "Invalid request (unknown strategy, bad params)"},
+        400: {
+            "model": ErrorResponse,
+            "description": (
+                "Invalid request (unknown strategy, bad params, or "
+                "idempotency_key_invalid_format -- WP7.0)"
+            ),
+        },
         403: {"description": "Live trading gate check failed (one or more safety layers not satisfied)"},
-        422: {"model": ErrorResponse, "description": "Validation error"},
+        409: {
+            "description": (
+                "kill_switch_active, OR a request with the same "
+                "Idempotency-Key is already in progress (idempotency_in_progress, WP7.0)"
+            )
+        },
+        422: {
+            "model": ErrorResponse,
+            "description": (
+                "Validation error, OR the same Idempotency-Key was already "
+                "used for a different request (idempotency_key_reused, WP7.0)"
+            ),
+        },
+        428: {"description": "Idempotency-Key header is required (WP7.0, SY-70-01)"},
         502: {"model": ErrorResponse, "description": "Exchange unreachable (backtest data fetch)"},
     },
     summary="Start a new trading run",
@@ -469,7 +500,10 @@ async def create_run(
     body: RunCreateRequest,
     db: Annotated[AsyncSession, Depends(get_db)],
     request: Request,
+    response: Response,
+    store: Annotated[IdempotencyStore, Depends(get_idempotency_store)],
     x_live_confirm_token: Annotated[str | None, Header()] = None,
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> RunDetailResponse:
     """
     Start a new trading run.
@@ -486,6 +520,11 @@ async def create_run(
         — header transport keeps the secret out of request-body logs that some
         APM/proxy stacks capture.  Body-field still accepted as deprecated
         fallback until all clients migrate.
+    idempotency_key:
+        WP7.0 (SY-70-01): required in ALL modes, via the ``Idempotency-Key``
+        header. Validated and claimed AFTER every rejection below (SY-70-02).
+        A retried/duplicate request with the same key and body replays the
+        original run instead of creating a second one.
 
     Returns
     -------
@@ -500,9 +539,27 @@ async def create_run(
         validation, or backtest data is unavailable for the date range.
     HTTPException 403:
         When live trading gate check fails (one or more safety layers not satisfied).
+    HTTPException 428:
+        When the ``Idempotency-Key`` header is missing.
+    HTTPException 409:
+        When a request with the same key is already in progress.
+    HTTPException 422:
+        When the same key was already used for a request with a different
+        body (``idempotency_key_reused``), among other validation failures.
     HTTPException 502:
         When the configured exchange cannot be reached to fetch historical data.
     """
+    # WP7.0 (SY-70-06/G-8): the fingerprint MUST be taken from the raw body
+    # at handler entry -- create_run mutates body.strategy_params below
+    # (bracket keys popped, trailing_stop_pct rewritten) before the claim
+    # point, and a fingerprint taken after that mutation would not match a
+    # byte-identical retry.
+    _idempotency_fingerprint = compute_fingerprint(
+        CREATE_ENDPOINT,
+        {},
+        body.model_dump(mode="json", exclude={"confirm_token"}),
+    )
+
     log = logger.bind(
         endpoint="create_run",
         strategy_name=body.strategy_name,
@@ -747,8 +804,38 @@ async def create_run(
                 ),
             )
 
+    # ------------------------------------------------------------------
+    # WP7.0 (SY-70-02): the idempotency claim point. Placed AFTER every
+    # rejection above (pydantic 422, unknown-strategy 400, WP1.3a 422, the
+    # live gate 403, kill_switch_active 409, the concurrency cap 503, and
+    # the backtest-dates 400) so none of them ever touches the store (I2).
+    # ------------------------------------------------------------------
+    _idempotency_key = parse_idempotency_key(idempotency_key)
+    _claim: Owned | Replay = await store.claim(
+        key=_idempotency_key,
+        endpoint=CREATE_ENDPOINT,
+        fingerprint=_idempotency_fingerprint,
+    )
+    if isinstance(_claim, Replay):
+        _replayed = await db.execute(select(RunORM).where(RunORM.id == _claim.run_id))
+        _replayed_run = _replayed.scalar_one_or_none()
+        if _replayed_run is None:
+            # SY-70-07 case (5): the target run was hard-deleted after the
+            # store already validated run_id is not NULL -- treat exactly
+            # like a fingerprint/target mismatch.
+            raise idempotency_http_error("idempotency_key_reused", key=_idempotency_key)
+        response.headers["Idempotency-Key"] = str(_idempotency_key)
+        response.headers["Idempotent-Replay"] = "true"
+        log.info("runs.idempotency_replayed", run_id=str(_claim.run_id))
+        return _run_orm_to_detail_response(_replayed_run)
+
+    # SY-70-12: use the claimed id, not a fresh uuid4() -- I4 requires
+    # RunORM.id == idempotency_keys.claimed_run_id for this request.
+    run_id: uuid.UUID = _claim.claimed_run_id
+    response.headers["Idempotency-Key"] = str(_idempotency_key)
+    response.headers["Idempotent-Replay"] = "false"
+
     # Build the config snapshot stored immutably on the run record
-    run_id = uuid.uuid4()
     config_snapshot: dict[str, Any] = {
         "strategy_name": strategy_name,
         "strategy_params": body.strategy_params,
@@ -804,197 +891,342 @@ async def create_run(
             },
         )
 
-    db.add(run_orm)
-    await db.flush()  # Assign the PK within the transaction without committing
+    # WP7.0 round 2 (WP70-S-01): set True only once store.complete() has
+    # itself returned successfully -- i.e. the fencing UPDATE is applied
+    # in this transaction and the ONLY remaining step is the commit
+    # itself (or the task spawn right after it). From that point on, ANY
+    # exception (including one raised by db.commit() after the server
+    # has already applied it -- a socket reset while reading the reply,
+    # or a CancelledError delivered mid-await) is ambiguous: the run row
+    # may already be durably 'running' with no engine ever spawned. See
+    # the except BaseException branch below.
+    _completed_before_commit = False
 
-    log.info(
-        "runs.created",
-        run_id=str(run_id),
-        mode=mode_value,
-        strategy=strategy_name,
-    )
+    try:
+        db.add(run_orm)
+        await db.flush()  # Assign the PK within the transaction without committing
 
-    # CR-007 (M7): warn if caller supplied a seed for paper/live — it is silently
-    # ignored because BacktestRunner is only constructed for backtest mode.
-    if body.seed is not None and not is_backtest:
-        log.warning(
-            "runs.seed_ignored_for_non_backtest_mode",
-            seed=body.seed,
+        log.info(
+            "runs.created",
+            run_id=str(run_id),
             mode=mode_value,
+            strategy=strategy_name,
         )
 
-    # ------------------------------------------------------------------
-    # BACKTEST MODE  -- execute synchronously, persist results, finish run
-    # ------------------------------------------------------------------
-    if is_backtest:
-        try:
-            # Step 1: Fetch historical OHLCV bars
-            bars_by_symbol = await _fetch_bars_for_backtest(
-                symbols=body.symbols,
-                timeframe=timeframe,
-                start=body.backtest_start,  # type: ignore[arg-type]
-                end=body.backtest_end,       # type: ignore[arg-type]
-                log=log,
-            )
-
-            # Step 2: Instantiate strategy
-            strategy_instance = strategy_cls(
-                strategy_id=f"{strategy_name}-{run_id.hex[:8]}",
-                params=body.strategy_params,
-            )
-
-            # Step 3: Instantiate and run BacktestRunner
-            from trading.backtest import BacktestRunner
-
-            runner = BacktestRunner(
-                strategies=[strategy_instance],
-                symbols=body.symbols,
-                timeframe=timeframe,
-                initial_capital=Decimal(body.initial_capital),
-                trailing_stop_pct=_trailing_stop_pct,
-                bracket_config=_bracket_config,
-                allow_pyramiding=_allow_pyramiding,
-                seed=body.seed,
-            )
-            # M7 (Sprint 49 INF-9): persist the resolved seed (auto-generated or
-            # caller-supplied) into the config dict.  Seed mutation here is captured
-            # by _persist_backtest_results() below, which rebuilds config from
-            # run_orm.config (including this mutation) and writes the complete
-            # merged block back to the DB.
-            config_snapshot["seed"] = runner.seed
-
-            log.info("runs.backtest_execution_starting", run_id=str(run_id))
-            result = await runner.run(bars_by_symbol)
-
-            # Step 4: Persist results (trades + equity curve + metrics in config)
-            await _persist_backtest_results(
-                db=db,
-                run_id=run_id,
-                run_orm=run_orm,
-                result=result,
-                log=log,
-                execution_engine=runner.last_execution_engine,
-                portfolio=runner.last_portfolio,
-            )
-
-            # Step 5: Mark run as stopped
-            finish_time = datetime.now(tz=UTC)
-            run_orm.status = "stopped"
-            run_orm.stopped_at = finish_time
-            run_orm.updated_at = finish_time
-
-            await db.flush()
-
-            log.info(
-                "runs.backtest_completed",
-                run_id=str(run_id),
-                total_return=f"{result.total_return_pct:.4%}",
-                sharpe=f"{result.sharpe_ratio:.3f}",
-                total_trades=result.total_trades,
-            )
-
-        except HTTPException:
-            # Data fetch errors (400, 502)  -- mark run as error and re-raise
-            error_time = datetime.now(tz=UTC)
-            run_orm.status = "error"
-            run_orm.stopped_at = error_time
-            run_orm.updated_at = error_time
-            await db.flush()
-            raise
-
-        except ValueError as exc:
-            # BacktestRunner._validate_bars raised a data-quality error
-            # (empty bars, insufficient warm-up, non-chronological data).
-            error_time = datetime.now(tz=UTC)
-            run_orm.status = "error"
-            run_orm.stopped_at = error_time
-            run_orm.updated_at = error_time
-            await db.flush()
-
+        # CR-007 (M7): warn if caller supplied a seed for paper/live — it is silently
+        # ignored because BacktestRunner is only constructed for backtest mode.
+        if body.seed is not None and not is_backtest:
             log.warning(
-                "runs.backtest_data_quality_error",
-                run_id=str(run_id),
-                error=str(exc),
+                "runs.seed_ignored_for_non_backtest_mode",
+                seed=body.seed,
+                mode=mode_value,
             )
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=(
-                    f"Backtest data quality check failed: {exc}. "
-                    "Verify your date range provides sufficient bars "
-                    "for the requested strategy."
+
+        # ------------------------------------------------------------------
+        # BACKTEST MODE  -- execute synchronously, persist results, finish run
+        # ------------------------------------------------------------------
+        if is_backtest:
+            try:
+                # Step 1: Fetch historical OHLCV bars
+                bars_by_symbol = await _fetch_bars_for_backtest(
+                    symbols=body.symbols,
+                    timeframe=timeframe,
+                    start=body.backtest_start,  # type: ignore[arg-type]
+                    end=body.backtest_end,       # type: ignore[arg-type]
+                    log=log,
+                )
+
+                # Step 2: Instantiate strategy
+                strategy_instance = strategy_cls(
+                    strategy_id=f"{strategy_name}-{run_id.hex[:8]}",
+                    params=body.strategy_params,
+                )
+
+                # Step 3: Instantiate and run BacktestRunner
+                from trading.backtest import BacktestRunner
+
+                runner = BacktestRunner(
+                    strategies=[strategy_instance],
+                    symbols=body.symbols,
+                    timeframe=timeframe,
+                    initial_capital=Decimal(body.initial_capital),
+                    trailing_stop_pct=_trailing_stop_pct,
+                    bracket_config=_bracket_config,
+                    allow_pyramiding=_allow_pyramiding,
+                    seed=body.seed,
+                )
+                # M7 (Sprint 49 INF-9): persist the resolved seed (auto-generated or
+                # caller-supplied) into the config dict.  Seed mutation here is captured
+                # by _persist_backtest_results() below, which rebuilds config from
+                # run_orm.config (including this mutation) and writes the complete
+                # merged block back to the DB.
+                config_snapshot["seed"] = runner.seed
+
+                log.info("runs.backtest_execution_starting", run_id=str(run_id))
+                result = await runner.run(bars_by_symbol)
+
+                # Step 4: Persist results (trades + equity curve + metrics in config)
+                await _persist_backtest_results(
+                    db=db,
+                    run_id=run_id,
+                    run_orm=run_orm,
+                    result=result,
+                    log=log,
+                    execution_engine=runner.last_execution_engine,
+                    portfolio=runner.last_portfolio,
+                )
+
+                # Step 5: Mark run as stopped
+                finish_time = datetime.now(tz=UTC)
+                run_orm.status = "stopped"
+                run_orm.stopped_at = finish_time
+                run_orm.updated_at = finish_time
+
+                await db.flush()
+
+                log.info(
+                    "runs.backtest_completed",
+                    run_id=str(run_id),
+                    total_return=f"{result.total_return_pct:.4%}",
+                    sharpe=f"{result.sharpe_ratio:.3f}",
+                    total_trades=result.total_trades,
+                )
+
+            except HTTPException:
+                # Data fetch errors (400, 502)  -- mark run as error and re-raise
+                error_time = datetime.now(tz=UTC)
+                run_orm.status = "error"
+                run_orm.stopped_at = error_time
+                run_orm.updated_at = error_time
+                await db.flush()
+                raise
+
+            except ValueError as exc:
+                # BacktestRunner._validate_bars raised a data-quality error
+                # (empty bars, insufficient warm-up, non-chronological data).
+                error_time = datetime.now(tz=UTC)
+                run_orm.status = "error"
+                run_orm.stopped_at = error_time
+                run_orm.updated_at = error_time
+                await db.flush()
+
+                log.warning(
+                    "runs.backtest_data_quality_error",
+                    run_id=str(run_id),
+                    error=str(exc),
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=(
+                        f"Backtest data quality check failed: {exc}. "
+                        "Verify your date range provides sufficient bars "
+                        "for the requested strategy."
+                    ),
+                ) from exc
+
+            except Exception as exc:
+                # Unexpected backtest execution errors
+                error_time = datetime.now(tz=UTC)
+                run_orm.status = "error"
+                run_orm.stopped_at = error_time
+                run_orm.updated_at = error_time
+                await db.flush()
+
+                log.error(
+                    "runs.backtest_execution_error",
+                    run_id=str(run_id),
+                    error=str(exc),
+                    exc_info=True,
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Backtest execution failed. See server logs for details.",
+                ) from exc
+
+
+        # ------------------------------------------------------------------
+        # WP7.0 (SY-70-08/12): fence-and-complete the idempotency claim IN this
+        # same transaction, then commit BEFORE any engine task is spawned or
+        # the response leaves this process. FastAPI 0.134's get_db (a request-
+        # scoped, async-generator Depends with no declared `scope=`) only
+        # commits AFTER the response has already been sent (verified against
+        # fastapi/routing.py:104-110 + dependencies/utils.py:664-667) -- relying
+        # on that implicit commit would let a client observe 201 for a run that
+        # is neither durable yet nor protected by a completed idempotency claim.
+        # ------------------------------------------------------------------
+        await store.complete(
+            db,
+            key=_idempotency_key,
+            claimed_run_id=run_id,
+            status_code=status.HTTP_201_CREATED,
+        )
+        _completed_before_commit = True
+        await db.commit()
+
+        # ------------------------------------------------------------------
+        # PAPER MODE  -- launch StrategyEngine as a background asyncio.Task
+        # ------------------------------------------------------------------
+        if mode_value == "paper":
+            task = asyncio.create_task(
+                _run_paper_engine(
+                    run_id_str=str(run_id),
+                    strategy_cls=strategy_cls,
+                    strategy_name=strategy_name,
+                    strategy_params=body.strategy_params,
+                    symbols=body.symbols,
+                    timeframe=timeframe,
+                    initial_capital=body.initial_capital,
+                    trailing_stop_pct=_trailing_stop_pct,
+                    bracket_config=_bracket_config,
+                    enable_adaptive_learning=body.enable_adaptive_learning,
+                    auto_apply_learning=body.auto_apply_learning,
+                    allow_pyramiding=_allow_pyramiding,
                 ),
-            ) from exc
-
-        except Exception as exc:
-            # Unexpected backtest execution errors
-            error_time = datetime.now(tz=UTC)
-            run_orm.status = "error"
-            run_orm.stopped_at = error_time
-            run_orm.updated_at = error_time
-            await db.flush()
-
-            log.error(
-                "runs.backtest_execution_error",
-                run_id=str(run_id),
-                error=str(exc),
-                exc_info=True,
+                name=f"paper-engine-{run_id}",
             )
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Backtest execution failed. See server logs for details.",
-            ) from exc
+            # WP7.0 round 3 (WP70-S-R2-01): reset the ambiguous-commit flag
+            # THE INSTANT the engine task exists -- before the _RUN_TASKS
+            # registration below or any log call. Both of those are the
+            # only statements left between the spawn and the end of the
+            # try block; if either somehow raised, the exception handler
+            # must never flip a run whose engine is already scheduled to
+            # 'error' (WP70-S-R2-01: "started: True, task registered, run
+            # flipped to error" was the exact bug this closes). Also
+            # registers the task in _RUN_TASKS as the VERY NEXT statement
+            # after create_task() -- nothing fallible sits between spawn
+            # and registration (a bare boolean assignment cannot raise),
+            # so the task is never orphaned from _RUN_TASKS either.
+            _completed_before_commit = False
+            _RUN_TASKS[str(run_id)] = task
+            log.info("runs.paper_engine_task_created", run_id=str(run_id))
 
-    # ------------------------------------------------------------------
-    # PAPER MODE  -- launch StrategyEngine as a background asyncio.Task
-    # ------------------------------------------------------------------
-    elif mode_value == "paper":
-        task = asyncio.create_task(
-            _run_paper_engine(
-                run_id_str=str(run_id),
-                strategy_cls=strategy_cls,
-                strategy_name=strategy_name,
-                strategy_params=body.strategy_params,
-                symbols=body.symbols,
-                timeframe=timeframe,
-                initial_capital=body.initial_capital,
-                trailing_stop_pct=_trailing_stop_pct,
-                bracket_config=_bracket_config,
-                enable_adaptive_learning=body.enable_adaptive_learning,
-                auto_apply_learning=body.auto_apply_learning,
-                allow_pyramiding=_allow_pyramiding,
-            ),
-            name=f"paper-engine-{run_id}",
+        # ------------------------------------------------------------------
+        # LIVE MODE  -- launch LiveExecutionEngine as a background asyncio.Task
+        # The 3-layer LiveTradingGate is enforced above before reaching here.
+        # ------------------------------------------------------------------
+        elif mode_value == "live":
+            task = asyncio.create_task(
+                _run_live_engine(
+                    run_id_str=str(run_id),
+                    strategy_cls=strategy_cls,
+                    strategy_name=strategy_name,
+                    strategy_params=body.strategy_params,
+                    symbols=body.symbols,
+                    timeframe=timeframe,
+                    initial_capital=body.initial_capital,
+                    trailing_stop_pct=_trailing_stop_pct,
+                    bracket_config=_bracket_config,
+                    enable_adaptive_learning=body.enable_adaptive_learning,
+                    allow_pyramiding=_allow_pyramiding,
+                ),
+                name=f"live-engine-{run_id}",
+            )
+            # WP7.0 round 3 (WP70-S-R2-01): see the identical paper-mode
+            # comment above -- same rationale, same ordering.
+            _completed_before_commit = False
+            _RUN_TASKS[str(run_id)] = task
+            log.info("runs.live_engine_task_created", run_id=str(run_id))
+
+    except OwnershipLost as _ownership_lost_exc:
+        # WP7.0 (SY-70-08/G-2): a stale reclaim by another request won
+        # the race for this key between our claim and our completion
+        # attempt. Roll back the run row (and any live audit row) --
+        # neither is durable yet and no engine task exists -- and fail
+        # with 409 instead of a phantom 201. store.fail() is NOT called:
+        # there is no owned claim left to mark failed (DB-02 fence,
+        # overriding its own "still return 201" recommendation -- G-2).
+        await db.rollback()
+        log.warning(
+            "idempotency.ownership_lost",
+            key_prefix=str(_idempotency_key)[:8],
+            run_id=str(run_id),
         )
-        _RUN_TASKS[str(run_id)] = task
-        log.info("runs.paper_engine_task_created", run_id=str(run_id))
+        raise idempotency_http_error(
+            "idempotency_in_progress", key=_idempotency_key
+        ) from _ownership_lost_exc
 
-    # ------------------------------------------------------------------
-    # LIVE MODE  -- launch LiveExecutionEngine as a background asyncio.Task
-    # The 3-layer LiveTradingGate is enforced above before reaching here.
-    # ------------------------------------------------------------------
-    elif mode_value == "live":
-        task = asyncio.create_task(
-            _run_live_engine(
-                run_id_str=str(run_id),
-                strategy_cls=strategy_cls,
-                strategy_name=strategy_name,
-                strategy_params=body.strategy_params,
-                symbols=body.symbols,
-                timeframe=timeframe,
-                initial_capital=body.initial_capital,
-                trailing_stop_pct=_trailing_stop_pct,
-                bracket_config=_bracket_config,
-                enable_adaptive_learning=body.enable_adaptive_learning,
-                allow_pyramiding=_allow_pyramiding,
-            ),
-            name=f"live-engine-{run_id}",
-        )
-        _RUN_TASKS[str(run_id)] = task
-        log.info("runs.live_engine_task_created", run_id=str(run_id))
+    except BaseException:
+        # WP7.0 (SY-70-09/G-12): roll back FIRST -- this releases any row
+        # lock store.complete() may have taken -- THEN mark the claim
+        # failed in a dedicated session so a retry can reclaim it once
+        # stale. store.fail() never raises; the original exception that
+        # triggered this branch always propagates unchanged.
+        #
+        # WP7.0 round 4 (WP70-S-R3-02): the rollback ITSELF now runs
+        # INSIDE the shielded coroutine below, not before it. In the
+        # genuinely ambiguous case the driver is still waiting on the
+        # COMMIT reply, so SQLAlchemy still believes a transaction is
+        # open and db.rollback() has to talk to the database -- i.e. it
+        # can need real I/O, not just local bookkeeping. Under
+        # LEVEL-TRIGGERED cancellation (e.g. an anyio CancelScope, which
+        # keeps re-raising Cancelled at every checkpoint until the scope
+        # itself exits) an unshielded rollback here would be re-cancelled
+        # before `asyncio.shield(...)` below is ever reached, so the rest
+        # of recovery (marking the run 'error', failing the claim) never
+        # ran -- exactly what the security report's "rollback needs I/O"
+        # probe reproduced, leaving the row 'running' with the key
+        # 'completed' and no engine. shield() runs the whole closure
+        # (rollback included) as one independent inner Task; even if the
+        # `await asyncio.shield(...)` below is itself re-cancelled, the
+        # inner task keeps running to completion in the background --
+        # the same fire-and-forget property `resume_run`'s own
+        # `_shielded_cancelled_revert` already relies on (runs.py
+        # ~3358-3389).
+        async def _shielded_recovery() -> None:
+            # A failure or cancellation of the rollback call itself must
+            # never prevent the rest of recovery (mark-error, fail) from
+            # running -- it is deliberately swallowed here rather than
+            # left to propagate out of this coroutine.
+            try:
+                await db.rollback()
+            except BaseException:
+                log.warning(
+                    "runs.rollback_failed_in_recovery",
+                    run_id=str(run_id),
+                    exc_info=False,
+                )
+            if _completed_before_commit:
+                # WP7.0 round 2 (WP70-S-01): the ambiguous-commit window
+                # -- complete() had already fenced successfully in this
+                # same transaction, so this exception came from
+                # db.commit() itself or from the task-spawn code right
+                # after it (but BEFORE the engine task existed -- see the
+                # WP70-S-R2-01 flag reset right after each
+                # asyncio.create_task() above, which guarantees this
+                # branch is never reached once an engine is actually
+                # running). Defensively flip a possibly-durable 'running'
+                # row to 'error' so no phantom live/paper run with no
+                # engine survives, and so a replay of this key reports
+                # 'error' instead of 'running'. Safe to call
+                # unconditionally: if the commit never actually landed,
+                # this is a no-op (see the function's own docstring).
+                from api.db.session import get_session_factory as _get_session_factory
+                from api.services.idempotency import (
+                    mark_run_error_after_ambiguous_commit,
+                )
 
-    response = _run_orm_to_detail_response(run_orm)
+                await mark_run_error_after_ambiguous_commit(
+                    _get_session_factory(), run_id
+                )
+            await store.fail(key=_idempotency_key, claimed_run_id=run_id)
+
+        try:
+            await asyncio.shield(_shielded_recovery())
+        except asyncio.CancelledError:
+            # Our OWN await on the shield was re-cancelled (level-
+            # triggered scope) -- the inner task above is unaffected and
+            # keeps running to completion independently. Nothing more to
+            # do here; fall through to re-raising the original exception.
+            pass
+        raise
+
+    # NOTE: named result_response (not "response") -- the FastAPI-injected
+    # ``response: Response`` header-mutation parameter above must not be
+    # shadowed by the RunDetailResponse payload (mypy strict would also
+    # reject reassigning a Response-typed parameter to a different type).
+    result_response = _run_orm_to_detail_response(run_orm)
     if _verdict.warnings:
-        response = response.model_copy(
+        result_response = result_response.model_copy(
             update={
                 "config_warnings": [
                     ExitConfigWarningResponse(code=w.code, field=w.field, message=w.message)
@@ -1002,7 +1234,7 @@ async def create_run(
                 ]
             }
         )
-    return response
+    return result_response
 
 
 # ---------------------------------------------------------------------------
@@ -2232,21 +2464,33 @@ async def get_promotion_eligibility(
         400: {"description": "Paper run not eligible (gate criteria not met)"},
         403: {"description": "Live trading safety gate failed"},
         404: {"description": "Source paper run not found"},
+        409: {
+            "description": (
+                "kill_switch_active, OR a request with the same "
+                "Idempotency-Key is already in progress (idempotency_in_progress, WP7.0)"
+            )
+        },
         422: {
             "description": (
                 "Strategy not available for live trading (demoted), OR the source "
                 "run's exit config is invalid (invalid_exit_config / "
                 "exit_manager_required), OR the resolved allow_pyramiding is True "
-                "for live (live_pyramiding_forbidden, WP1.3a)."
+                "for live (live_pyramiding_forbidden, WP1.3a), OR the same "
+                "Idempotency-Key was already used for a different request "
+                "(idempotency_key_reused, WP7.0)."
             )
         },
+        428: {"description": "Idempotency-Key header is required (WP7.0, SY-70-01)"},
     },
 )
 async def promote_to_live(
     run_id: uuid.UUID,
     db: Annotated[AsyncSession, Depends(get_db)],
     request: Request,
+    response: Response,
+    store: Annotated[IdempotencyStore, Depends(get_idempotency_store)],
     x_live_confirm_token: Annotated[str | None, Header()] = None,
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> RunDetailResponse:
     """Promote a stopped paper run to a new live run.
 
@@ -2259,6 +2503,10 @@ async def promote_to_live(
     x_live_confirm_token:
         Live-mode confirmation token via X-Live-Confirm-Token header
         (SEC-004 mandatory -- no body fallback for promotion endpoint).
+    idempotency_key:
+        WP7.0 (SY-70-01): required, via the ``Idempotency-Key`` header.
+        Claimed after the 404 source-run lookup and every other rejection
+        below (SY-70-02).
 
     Returns
     -------
@@ -2273,11 +2521,25 @@ async def promote_to_live(
         Promotion gate criteria not met (data-volume insufficient).
     HTTPException 403:
         Live trading safety gate failed.
+    HTTPException 428:
+        ``Idempotency-Key`` header missing.
+    HTTPException 409:
+        A request with the same key is already in progress.
+    HTTPException 422:
+        The same key was already used for a request with a different
+        source run (``idempotency_key_reused``), among other validation
+        failures.
     """
     from api.config import get_settings
     from api.services.audit_log import record_audit_event
     from api.services.promotion_gate import evaluate_paper_run_eligibility
     from trading.safety import LiveTradingGate
+
+    # WP7.0 (SY-70-06): computed as the first statement, from the path
+    # param alone -- promote's request body is empty.
+    _idempotency_fingerprint = compute_fingerprint(
+        PROMOTE_ENDPOINT, {"run_id": str(run_id)}, {}
+    )
 
     log = logger.bind(endpoint="promote_to_live", source_run_id=str(run_id))
     settings = get_settings()
@@ -2421,107 +2683,213 @@ async def promote_to_live(
             ),
         )
 
-    # Step 4: Write audit row BEFORE creating the live run (SEC-002 + SAVEPOINT pattern).
-    # async with db.begin_nested() creates a SAVEPOINT so the audit insert is independently
-    # durable -- even if the outer transaction rolls back, the audit trail is preserved.
-    new_run_id = uuid.uuid4()
-    async with db.begin_nested():
-        await record_audit_event(
-            db,
-            event_type="paper_promoted_to_live",
-            resource_type="run",
-            resource_id=str(new_run_id),
-            request=request,
-            payload={
-                "source_paper_run_id": str(run_id),
-                "strategy_name": source_run.config.get("strategy_name"),
-                "symbols": source_run.config.get("symbols"),
-                "timeframe": source_run.config.get("timeframe"),
-            },
+    # ------------------------------------------------------------------
+    # WP7.0 (SY-70-02): claim point -- after the 404 source-run lookup
+    # above and every other rejection (availability 422, exit-config 422,
+    # the live gate 403, kill_switch_active 409, the concurrency cap 503),
+    # replacing the bare `uuid.uuid4()`.
+    # ------------------------------------------------------------------
+    _idempotency_key = parse_idempotency_key(idempotency_key)
+    _claim: Owned | Replay = await store.claim(
+        key=_idempotency_key,
+        endpoint=PROMOTE_ENDPOINT,
+        fingerprint=_idempotency_fingerprint,
+    )
+    if isinstance(_claim, Replay):
+        _replayed = await db.execute(select(RunORM).where(RunORM.id == _claim.run_id))
+        _replayed_run = _replayed.scalar_one_or_none()
+        if _replayed_run is None:
+            raise idempotency_http_error("idempotency_key_reused", key=_idempotency_key)
+        response.headers["Idempotency-Key"] = str(_idempotency_key)
+        response.headers["Idempotent-Replay"] = "true"
+        log.info("runs.idempotency_replayed", run_id=str(_claim.run_id))
+        return _run_orm_to_detail_response(_replayed_run)
+
+    # SY-70-12: use the claimed id, not a fresh uuid4().
+    new_run_id = _claim.claimed_run_id
+    response.headers["Idempotency-Key"] = str(_idempotency_key)
+    response.headers["Idempotent-Replay"] = "false"
+
+    # WP7.0 round 2 (WP70-S-01): see create_run's identical flag for the
+    # full rationale -- set True only once store.complete() has itself
+    # returned successfully.
+    _completed_before_commit = False
+
+    try:
+        # Step 4: Write audit row BEFORE creating the live run (SEC-002 + SAVEPOINT pattern).
+        # async with db.begin_nested() creates a SAVEPOINT so the audit insert is independently
+        # durable -- even if the outer transaction rolls back, the audit trail is preserved.
+        async with db.begin_nested():
+            await record_audit_event(
+                db,
+                event_type="paper_promoted_to_live",
+                resource_type="run",
+                resource_id=str(new_run_id),
+                request=request,
+                payload={
+                    "source_paper_run_id": str(run_id),
+                    "strategy_name": source_run.config.get("strategy_name"),
+                    "symbols": source_run.config.get("symbols"),
+                    "timeframe": source_run.config.get("timeframe"),
+                },
+            )
+        # SAVEPOINT released: audit row is now independently committed.
+        # The outer transaction continues for RunORM creation below.
+
+        # Step 5: Reconstruct config from source paper run, override mode.
+        now = datetime.now(tz=UTC)
+        promoted_config: dict[str, Any] = {
+            **source_run.config,
+            "mode": "live",
+            "promoted_from_run_id": str(run_id),
+        }
+        # Remove backtest-specific keys that have no meaning for live mode.
+        for _key in ("backtest_start", "backtest_end", "seed", "backtest_metrics"):
+            promoted_config.pop(_key, None)
+
+        # WP1.3a (I8): persist the NORMALISED bracket config and the RESOLVED
+        # allow_pyramiding bool, exactly like create_run -- a promoted run's
+        # persisted config is never the raw legacy source.
+        if _promote_verdict.config.bracket:
+            promoted_config["bracket_config"] = dict(_promote_verdict.config.bracket)
+        else:
+            promoted_config.pop("bracket_config", None)
+        promoted_config["allow_pyramiding"] = _promote_verdict.allow_pyramiding
+        # WP13a-S-07 (security round 2): mirror create_run -- persist the
+        # NORMALISED trailing_stop_pct into strategy_params (or remove it when
+        # unset), instead of leaving the raw source value in place while the
+        # spawned engine itself gets the normalised one.  Extracted to
+        # ``_build_promoted_strategy_params`` (WP13a-C-R2-09) for direct unit
+        # coverage: it always returns a fresh dict, never mutating
+        # ``source_run.config["strategy_params"]`` in place (it belongs to the
+        # SOURCE paper run, still attached to this session).
+        _promoted_strategy_params = _build_promoted_strategy_params(
+            source_run.config.get("strategy_params"),
+            _promote_verdict.config.trailing_stop_pct,
         )
-    # SAVEPOINT released: audit row is now independently committed.
-    # The outer transaction continues for RunORM creation below.
+        promoted_config["strategy_params"] = _promoted_strategy_params
 
-    # Step 5: Reconstruct config from source paper run, override mode.
-    now = datetime.now(tz=UTC)
-    promoted_config: dict[str, Any] = {
-        **source_run.config,
-        "mode": "live",
-        "promoted_from_run_id": str(run_id),
-    }
-    # Remove backtest-specific keys that have no meaning for live mode.
-    for _key in ("backtest_start", "backtest_end", "seed", "backtest_metrics"):
-        promoted_config.pop(_key, None)
+        strategy_name = promotion_strategy_name
+        strategy_cls = promotion_strategy_cls
 
-    # WP1.3a (I8): persist the NORMALISED bracket config and the RESOLVED
-    # allow_pyramiding bool, exactly like create_run -- a promoted run's
-    # persisted config is never the raw legacy source.
-    if _promote_verdict.config.bracket:
-        promoted_config["bracket_config"] = dict(_promote_verdict.config.bracket)
-    else:
-        promoted_config.pop("bracket_config", None)
-    promoted_config["allow_pyramiding"] = _promote_verdict.allow_pyramiding
-    # WP13a-S-07 (security round 2): mirror create_run -- persist the
-    # NORMALISED trailing_stop_pct into strategy_params (or remove it when
-    # unset), instead of leaving the raw source value in place while the
-    # spawned engine itself gets the normalised one.  Extracted to
-    # ``_build_promoted_strategy_params`` (WP13a-C-R2-09) for direct unit
-    # coverage: it always returns a fresh dict, never mutating
-    # ``source_run.config["strategy_params"]`` in place (it belongs to the
-    # SOURCE paper run, still attached to this session).
-    _promoted_strategy_params = _build_promoted_strategy_params(
-        source_run.config.get("strategy_params"),
-        _promote_verdict.config.trailing_stop_pct,
-    )
-    promoted_config["strategy_params"] = _promoted_strategy_params
+        timeframe_val = TimeFrame(str(source_run.config.get("timeframe", "1h")))
 
-    strategy_name = promotion_strategy_name
-    strategy_cls = promotion_strategy_cls
+        live_run_orm = RunORM(
+            id=new_run_id,
+            run_mode="live",
+            status="running",
+            config=promoted_config,
+            started_at=now,
+            created_at=now,
+            updated_at=now,
+            promoted_from_run_id=run_id,
+        )
+        db.add(live_run_orm)
+        await db.flush()
 
-    timeframe_val = TimeFrame(str(source_run.config.get("timeframe", "1h")))
+        # ------------------------------------------------------------------
+        # WP7.0 (SY-70-08/12): fence-and-complete the idempotency claim IN
+        # this same transaction, then commit -- the live engine must find
+        # BOTH the RunORM row AND the completed claim on its first DB read.
+        # ------------------------------------------------------------------
+        await store.complete(
+            db,
+            key=_idempotency_key,
+            claimed_run_id=new_run_id,
+            status_code=status.HTTP_201_CREATED,
+        )
+        _completed_before_commit = True
+        await db.commit()
 
-    live_run_orm = RunORM(
-        id=new_run_id,
-        run_mode="live",
-        status="running",
-        config=promoted_config,
-        started_at=now,
-        created_at=now,
-        updated_at=now,
-        promoted_from_run_id=run_id,
-    )
-    db.add(live_run_orm)
-    await db.flush()
+        # Step 7: Launch live engine background task AFTER commit (CR5-003).
+        task = asyncio.create_task(
+            _run_live_engine(
+                run_id_str=str(new_run_id),
+                strategy_cls=strategy_cls,
+                strategy_name=strategy_name,
+                strategy_params=_promoted_strategy_params,
+                symbols=source_run.config.get("symbols", []),
+                timeframe=timeframe_val,
+                initial_capital=source_run.config.get("initial_capital", "10000"),
+                trailing_stop_pct=_promote_verdict.config.trailing_stop_pct,
+                bracket_config=dict(_promote_verdict.config.bracket),
+                enable_adaptive_learning=False,
+                allow_pyramiding=_promote_verdict.allow_pyramiding,
+            ),
+            name=f"live-engine-promoted-{new_run_id}",
+        )
+        # WP7.0 round 3 (WP70-S-R2-01): see create_run's identical
+        # comment -- reset the ambiguous-commit flag the instant the
+        # engine task exists, before _RUN_TASKS registration or any log
+        # call, and register the task as the VERY NEXT statement after
+        # create_task() so it is never orphaned from _RUN_TASKS.
+        _completed_before_commit = False
+        _RUN_TASKS[str(new_run_id)] = task
 
-    # Step 6: Commit FIRST -- the live engine must find the RunORM row on its
-    # first DB read, so the row must be durable before the task starts.
-    await db.commit()
+        log.info(
+            "runs.promoted_to_live",
+            source_run_id=str(run_id),
+            new_run_id=str(new_run_id),
+            strategy=strategy_name,
+        )
 
-    # Step 7: Launch live engine background task AFTER commit (CR5-003).
-    task = asyncio.create_task(
-        _run_live_engine(
-            run_id_str=str(new_run_id),
-            strategy_cls=strategy_cls,
-            strategy_name=strategy_name,
-            strategy_params=_promoted_strategy_params,
-            symbols=source_run.config.get("symbols", []),
-            timeframe=timeframe_val,
-            initial_capital=source_run.config.get("initial_capital", "10000"),
-            trailing_stop_pct=_promote_verdict.config.trailing_stop_pct,
-            bracket_config=dict(_promote_verdict.config.bracket),
-            enable_adaptive_learning=False,
-            allow_pyramiding=_promote_verdict.allow_pyramiding,
-        ),
-        name=f"live-engine-promoted-{new_run_id}",
-    )
-    _RUN_TASKS[str(new_run_id)] = task
+    except OwnershipLost as _ownership_lost_exc:
+        # WP7.0 (SY-70-08/G-2): a stale reclaim by another request won
+        # the race for this key -- roll back (the audit SAVEPOINT and the
+        # live run row are both undone; neither is durable and no engine
+        # task exists) and fail with 409. store.fail() is NOT called:
+        # there is no owned claim left to mark failed.
+        await db.rollback()
+        log.warning(
+            "idempotency.ownership_lost",
+            key_prefix=str(_idempotency_key)[:8],
+            run_id=str(new_run_id),
+        )
+        raise idempotency_http_error(
+            "idempotency_in_progress", key=_idempotency_key
+        ) from _ownership_lost_exc
 
-    log.info(
-        "runs.promoted_to_live",
-        source_run_id=str(run_id),
-        new_run_id=str(new_run_id),
-        strategy=strategy_name,
-    )
+    except BaseException:
+        # WP7.0 (SY-70-09/G-12): roll back FIRST, then mark the claim
+        # failed in a dedicated session so a retry can reclaim it once
+        # stale. store.fail() never raises.
+        #
+        # WP7.0 round 4 (WP70-S-R3-02): see create_run's identical
+        # comment for the full rationale -- the rollback now runs INSIDE
+        # the shielded coroutine (it can need real DB I/O in the
+        # genuinely ambiguous case, and an unshielded await here is
+        # re-cancelled under level-triggered cancellation before the
+        # shield below is ever reached).
+        async def _shielded_recovery() -> None:
+            try:
+                await db.rollback()
+            except BaseException:
+                log.warning(
+                    "runs.rollback_failed_in_recovery",
+                    run_id=str(new_run_id),
+                    exc_info=False,
+                )
+            if _completed_before_commit:
+                # WP7.0 round 2 (WP70-S-01): ambiguous-commit window --
+                # see create_run's identical branch for the full
+                # rationale. The WP70-S-R2-01 flag reset right after
+                # asyncio.create_task() above guarantees this branch is
+                # never reached once the live engine task actually exists.
+                from api.db.session import get_session_factory as _get_session_factory
+                from api.services.idempotency import (
+                    mark_run_error_after_ambiguous_commit,
+                )
+
+                await mark_run_error_after_ambiguous_commit(
+                    _get_session_factory(), new_run_id
+                )
+            await store.fail(key=_idempotency_key, claimed_run_id=new_run_id)
+
+        try:
+            await asyncio.shield(_shielded_recovery())
+        except asyncio.CancelledError:
+            pass
+        raise
 
     return _run_orm_to_detail_response(live_run_orm)
 

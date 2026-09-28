@@ -162,9 +162,21 @@ def mock_db_session() -> AsyncMock:
 
 
 @pytest.fixture()
+def idempotency_store() -> Any:
+    """WP7.0 (SY-70-13): the hermetic in-memory store installed by default
+    on ``client_dev_with_db`` below. Exposed as its own fixture so a test
+    can grab it (via this fixture, requested alongside ``client_dev_with_db``)
+    to seed rows or inspect claim state directly."""
+    from tests.integration.fakes.idempotency_store import InMemoryIdempotencyStore
+
+    return InMemoryIdempotencyStore(stale_after_seconds=240.0)
+
+
+@pytest.fixture()
 def client_dev_with_db(
     app_dev_mode: Any,
     mock_db_session: AsyncMock,
+    idempotency_store: Any,
 ) -> Generator[TestClient, None, None]:
     """
     TestClient wired to a dev-mode app with the get_db dependency overridden.
@@ -174,22 +186,30 @@ def client_dev_with_db(
     use this fixture can inspect mock_db_session call history after the
     request is made.
 
-    Cleanup: the dependency override is removed from the app after the test
-    to prevent cross-test contamination (important since app_dev_mode is
+    WP7.0 (SY-70-13): also overrides ``get_idempotency_store`` with an
+    ``InMemoryIdempotencyStore`` -- the real ``PostgresIdempotencyStore``
+    would otherwise try to reach real Postgres via ``get_session_factory()``
+    (B-04 case 7's pattern), which does not exist in this hermetic suite.
+
+    Cleanup: both dependency overrides are removed from the app after the
+    test to prevent cross-test contamination (important since app_dev_mode is
     a function-scoped fixture that creates a fresh app per test, but the
     override dict persists on the object for the fixture's lifetime).
     """
     from api.db.session import get_db
+    from api.services.idempotency import get_idempotency_store
 
     async def _override_get_db() -> AsyncGenerator[AsyncMock, None]:
         yield mock_db_session
 
     app_dev_mode.dependency_overrides[get_db] = _override_get_db
+    app_dev_mode.dependency_overrides[get_idempotency_store] = lambda: idempotency_store
 
     with TestClient(app_dev_mode, raise_server_exceptions=False) as c:
         # WP1.7a round 2 (S-02): see client_dev for rationale.
         _kill_switch.reset_state_for_tests()
         yield c
 
-    # Teardown: remove override so subsequent fixtures see a clean app
+    # Teardown: remove overrides so subsequent fixtures see a clean app
     app_dev_mode.dependency_overrides.pop(get_db, None)
+    app_dev_mode.dependency_overrides.pop(get_idempotency_store, None)

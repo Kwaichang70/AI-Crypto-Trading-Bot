@@ -208,6 +208,15 @@ async def _cleanup_migrations_db() -> None:
         if await _table_exists(conn, "audit_events"):
             await conn.execute("DELETE FROM audit_events")
 
+        # WP7.0 (DB-06): idempotency_keys.run_id has a real FK to runs.id
+        # (ON DELETE SET NULL) -- deleted AFTER runs above is fine either
+        # way, but doing it explicitly here (rather than relying on the
+        # FK's SET NULL side effect leaving stale rows behind) keeps this
+        # suite's shared scratch DB fully empty between tests, exactly
+        # like every other table in this fixture.
+        if await _table_exists(conn, "idempotency_keys"):
+            await conn.execute("DELETE FROM idempotency_keys")
+
         if await _table_exists(conn, "kill_switch_state"):
             await conn.execute(
                 """

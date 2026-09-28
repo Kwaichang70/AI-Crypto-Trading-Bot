@@ -299,7 +299,17 @@ function KillSwitchModal({ onClose, onConfirm, loading, result }: ModalProps) {
 // Main export
 // ---------------------------------------------------------------------------
 
-export function KillSwitchButton() {
+interface KillSwitchButtonProps {
+  /**
+   * WP70-C-03 (round 2, optional carry-forward wired up): invoked once,
+   * right after a successful press (regardless of `errors.length`), so a
+   * parent panel can refresh its own latch-status poll immediately rather
+   * than waiting for the next scheduled tick.
+   */
+  onPressed?: () => void;
+}
+
+export function KillSwitchButton({ onPressed }: KillSwitchButtonProps = {}) {
   const [modalOpen, setModalOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<KillSwitchPressResponse | null>(null);
@@ -342,6 +352,9 @@ export function KillSwitchButton() {
               "success",
             );
           }
+          // WP70-C-03: let the parent panel refresh its own latch-status
+          // poll right away instead of waiting for the next scheduled tick.
+          onPressed?.();
         } else {
           toast(apiResult.error.message, "error");
         }
@@ -349,7 +362,7 @@ export function KillSwitchButton() {
         setLoading(false);
       }
     },
-    [toast],
+    [toast, onPressed],
   );
 
   return (

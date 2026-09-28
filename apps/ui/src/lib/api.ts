@@ -278,14 +278,37 @@ export async function fetchRun(id: string): Promise<ApiResult<Run>> {
 }
 
 /**
+ * WP7.0 (SY-70-18, G-4): options object for `createRun`/`promoteRun`.
+ *
+ * G-4 (security): the pre-WP7.0 signature `createRun(body, liveConfirmToken?)`
+ * let an existing call such as `createRun(BODY, "typed-secret-token")` keep
+ * type-checking after an `idempotencyKey` parameter was inserted
+ * positionally — the token would silently be sent as `Idempotency-Key`
+ * instead of `X-Live-Confirm-Token`. An options object closes that hole:
+ * every caller must name both fields, so a bare string second argument no
+ * longer type-checks (AC8 greps for exactly this pattern).
+ */
+export interface RunSubmitOptions {
+  /** Canonical (lowercase, hyphenated) UUID — mint with `newIdempotencyKey()`/`useIdempotencyKey()` from `./idempotency`. */
+  idempotencyKey: string;
+  /**
+   * WP1.7a/SY-10 (S13): a live-mode confirmation, sent EXCLUSIVELY via the
+   * `X-Live-Confirm-Token` request header, never in the JSON body — never on
+   * `body.confirmToken` (which the UI must never populate; see the field's
+   * own deprecation note in `./types`).
+   */
+  liveConfirmToken?: string;
+}
+
+/**
  * POST /api/v1/runs — create / start a new run (120 s timeout for backtests).
  *
- * WP1.7a/SY-10 (S13): a live-mode confirmation is sent EXCLUSIVELY via the
- * `X-Live-Confirm-Token` request header, never in the JSON body — pass the
- * typed token as `liveConfirmToken`, not on `body.confirmToken` (which the
- * UI must never populate; see the field's own deprecation note in
- * `./types`). The backend already prefers the header over the deprecated
- * body field (`runs.py:515`).
+ * WP7.0 (SY-70-01/18): `Idempotency-Key` is REQUIRED by the backend in every
+ * mode (backtest/paper/live) — a missing/malformed header returns 428/400
+ * before any run is created (§5 of reports/vp2-wp7.0/synthesis-spec.md).
+ * Mint the key with `newIdempotencyKey()`/`useIdempotencyKey()` from
+ * `./idempotency` and reuse the SAME key across a retry of the same logical
+ * submission (SY-70-19) — never a fresh key per retry.
  *
  * WP1.3a (CF-13a-1): `body.allowPyramiding` is always sent explicitly by the
  * new-run form now (never omitted) — see `strategyDefaultAllowPyramiding` in
@@ -296,19 +319,22 @@ export async function fetchRun(id: string): Promise<ApiResult<Run>> {
  */
 export async function createRun(
   body: RunCreateRequest,
-  liveConfirmToken?: string,
+  opts: RunSubmitOptions,
 ): Promise<ApiResult<Run>> {
   return apiFetch<Run>(
     "/api/v1/runs",
     {
       method: "POST",
       body: JSON.stringify(body),
-      // Conditional spread (not `headers: token ? {...} : undefined`) so no
-      // property is ever explicitly assigned `undefined` under this repo's
-      // `exactOptionalPropertyTypes` tsconfig.
-      ...(liveConfirmToken
-        ? { headers: { "X-Live-Confirm-Token": liveConfirmToken } }
-        : {}),
+      headers: {
+        "Idempotency-Key": opts.idempotencyKey,
+        // Conditional spread (not `headers: token ? {...} : undefined`) so no
+        // property is ever explicitly assigned `undefined` under this repo's
+        // `exactOptionalPropertyTypes` tsconfig.
+        ...(opts.liveConfirmToken
+          ? { "X-Live-Confirm-Token": opts.liveConfirmToken }
+          : {}),
+      },
     },
     120_000,
   );
@@ -322,22 +348,28 @@ export async function createRun(
  * confirmation header (`X-Live-Confirm-Token`) — no `X-Admin-Key` — so it is
  * called directly here rather than through an `/api/admin/*` proxy.
  *
+ * WP7.0 (SY-70-01/18): `Idempotency-Key` is REQUIRED here too — see
+ * `createRun` above for the minting/reuse rules.
+ *
  * WP1.3a (CF-13a-1, SY-13a-18): a 422 here may carry the same structured
  * `invalid_exit_config` / `exit_manager_required` / `live_pyramiding_forbidden`
  * envelope as `createRun` — render with `<ExitConfigErrorPanel>`.
  */
 export async function promoteRun(
   sourceRunId: string,
-  liveConfirmToken?: string,
+  opts: RunSubmitOptions,
 ): Promise<ApiResult<Run>> {
   return apiFetch<Run>(
     `/api/v1/runs/${sourceRunId}/promote-to-live`,
     {
       method: "POST",
       body: JSON.stringify({}),
-      ...(liveConfirmToken
-        ? { headers: { "X-Live-Confirm-Token": liveConfirmToken } }
-        : {}),
+      headers: {
+        "Idempotency-Key": opts.idempotencyKey,
+        ...(opts.liveConfirmToken
+          ? { "X-Live-Confirm-Token": opts.liveConfirmToken }
+          : {}),
+      },
     },
     PROMOTE_TIMEOUT_MS,
   );

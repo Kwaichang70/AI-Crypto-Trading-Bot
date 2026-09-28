@@ -482,6 +482,57 @@ Never assume a clear succeeded just because the request returned 200.
   partial result; retry the stop, or stop with `flatten=false` to abandon
   the position tracking (it stays on the exchange, unmanaged).
 
+### DC-8 -- WP7.0: a run in `error` with no engine (ambiguous commit)
+
+> Note: this is a backend (WP7.0 idempotency) operator note, not a Caddy
+> item -- it is filed here because this is the runbook's existing home
+> for operator-facing run-status behaviour changes (see DC-7 above), and
+> a single note did not warrant a new document.
+
+- `POST /api/v1/runs` and `POST /api/v1/runs/{id}/promote-to-live` are
+  idempotent (`Idempotency-Key` header). In the rare case where the
+  server-side database COMMIT for a new run actually succeeds but the
+  request then fails anyway (e.g. a socket reset while reading the
+  server's own reply), the run row is durably created but no engine task
+  was ever started. The API detects this itself and marks the run
+  `error` instead of leaving it looking like a healthy `running` run.
+- **How to recognise it:** the run's status is `error`, and the API log
+  around that time contains `idempotency.ambiguous_commit_marked_error`
+  (the run id only -- never the Idempotency-Key value).
+- **What it means:** no engine ever ran for this run, live or paper.
+  `create_run`/`promote_to_live` place no exchange orders before the
+  engine task is spawned, so **there is no open position and nothing to
+  flatten** for this specific run.
+- **What to do:** verify on the exchange that there is no open position
+  for the symbol(s) involved (this should always be the case, per the
+  above, but confirm rather than assume), then re-submit the same
+  request with a **new** `Idempotency-Key` to start a fresh run. Do not
+  reuse the old key -- it will keep replaying the `error` run instead of
+  starting a new one.
+  - **The dashboard UI keeps the same key after a failed submit and has
+    no button to pick a new one.** Simply pressing "submit" again on the
+    same open form replays the old `error` run, not a fresh request.
+    Reload the page, or otherwise re-open/re-fill the form from scratch,
+    before re-submitting -- a fresh page load mints a new
+    `Idempotency-Key` (CF-70-8). Do not just retry in place.
+- **If the log instead shows `idempotency.ambiguous_commit_mark_error_failed`**
+  (the defensive UPDATE above itself could not run, e.g. it hit its 2s
+  lock timeout): the run is stuck `running` with no engine, rather than
+  `error` -- the mark-as-error step did not complete, but the claim is
+  still failed either way. Treat this exactly like the `error` case above
+  (no position exists, same "new key" re-submit instructions apply) --
+  the status label is misleading, not the underlying safety. Separately,
+  and regardless of whether an operator has intervened: on the API's
+  next restart, boot recovery (`recover_orphaned_runs`) treats any
+  `running` live run the same way it treats a hard-killed one -- it
+  transitions it to `orphaned` (never starts a task for it), after which
+  it is visible on the dashboard as needing a decision and can only be
+  picked back up via `POST /runs/{id}/resume`, which will find no
+  in-flight orders/fills to reconcile for this specific case.
+- Per-run `stop`/`emergency-stop` reject a non-`running`/`orphaned`/
+  `resuming` status, so they cannot be used on an `error` run; this is
+  expected and not itself a symptom of anything wrong (see WP70-S-R2-03).
+
 ---
 
 ## Rollback procedure

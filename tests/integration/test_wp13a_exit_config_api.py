@@ -18,6 +18,7 @@ gate, and the "two breakouts" harness are covered in:
 from __future__ import annotations
 
 from unittest.mock import patch
+from uuid import uuid4
 
 from fastapi.testclient import TestClient
 
@@ -52,11 +53,17 @@ def _base_payload(**overrides: object) -> dict:
 
 
 def _post(client: TestClient, payload: dict):
+    # WP7.0 (SY-70-01/§4c): Idempotency-Key is required on every
+    # POST /api/v1/runs call, including backtest. A fresh UUID per call
+    # avoids any accidental idempotency_key_reused/replay across the
+    # distinct payloads this module posts.
     with patch(
         "api.routers.runs._fetch_bars_for_backtest",
         return_value=_BARS_BY_SYMBOL,
     ):
-        return client.post(_URL, json=payload)
+        return client.post(
+            _URL, json=payload, headers={"Idempotency-Key": str(uuid4())}
+        )
 
 
 def _post_never_fetches(client: TestClient, payload: dict):
@@ -65,7 +72,9 @@ def _post_never_fetches(client: TestClient, payload: dict):
         "api.routers.runs._fetch_bars_for_backtest",
         side_effect=AssertionError("bar fetch must not be reached"),
     ):
-        return client.post(_URL, json=payload)
+        return client.post(
+            _URL, json=payload, headers={"Idempotency-Key": str(uuid4())}
+        )
 
 
 # ---------------------------------------------------------------------------
