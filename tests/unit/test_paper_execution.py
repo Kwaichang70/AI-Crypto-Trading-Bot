@@ -1278,3 +1278,75 @@ class TestQT001VolumeParticipationSlippage:
         engine, _ = _make_engine()
         with pytest.raises(ValueError, match="volume must be >= 0"):
             engine.set_last_bar(_SYMBOL, Decimal("100"), Decimal("-1"))
+
+
+# ---------------------------------------------------------------------------
+# restore_from_fills (WP1.8a S6/C-07, test follow-up carried into WP1.8b):
+# the rebuilt position must be stamped with the FILL's own executed_at,
+# never the wall-clock time of the resume/rebuild.
+# ---------------------------------------------------------------------------
+
+
+class TestRestoreFromFillsTimestamp:
+    def test_restored_position_uses_fill_executed_at_not_now(self) -> None:
+        from trading.models import Fill
+
+        engine, _ = _make_engine()
+        historical_time = datetime(2020, 1, 1, tzinfo=UTC)
+        fill = Fill(
+            order_id=uuid4(),
+            symbol=_SYMBOL,
+            side=OrderSide.BUY,
+            quantity=Decimal("0.1"),
+            price=Decimal("50000"),
+            fee=Decimal("30"),
+            fee_currency="USDT",
+            executed_at=historical_time,
+        )
+
+        before_call = datetime.now(tz=UTC)
+        engine.restore_from_fills([fill])
+        after_call = datetime.now(tz=UTC)
+
+        position = engine.positions[_SYMBOL]
+        assert position.opened_at == historical_time
+        assert not (before_call <= position.opened_at <= after_call), (
+            "restore_from_fills must stamp the position with the fill's "
+            "own executed_at, not the wall-clock time of the rebuild"
+        )
+
+    def test_restore_from_fills_replays_in_buy_before_sell_tie_break_order(self) -> None:
+        """S2-02: two fills sharing the exact same executed_at replay
+        BUY-before-SELL, matching trading.recovery.replay_sort_key."""
+        from trading.models import Fill
+
+        engine, _ = _make_engine()
+        same_instant = datetime(2020, 1, 1, tzinfo=UTC)
+        buy = Fill(
+            order_id=uuid4(),
+            symbol=_SYMBOL,
+            side=OrderSide.BUY,
+            quantity=Decimal("0.1"),
+            price=Decimal("50000"),
+            fee=Decimal("30"),
+            fee_currency="USDT",
+            executed_at=same_instant,
+        )
+        sell = Fill(
+            order_id=uuid4(),
+            symbol=_SYMBOL,
+            side=OrderSide.SELL,
+            quantity=Decimal("0.1"),
+            price=Decimal("51000"),
+            fee=Decimal("30"),
+            fee_currency="USDT",
+            executed_at=same_instant,
+        )
+
+        # Deliberately fed SELL-first -- restore_from_fills must still
+        # replay BUY-before-SELL internally (a SELL-first replay would
+        # otherwise oversell against a flat position).
+        engine.restore_from_fills([sell, buy])
+
+        position = engine.positions.get(_SYMBOL)
+        assert position is not None and position.is_flat

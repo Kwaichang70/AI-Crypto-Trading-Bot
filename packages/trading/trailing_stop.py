@@ -16,9 +16,14 @@ import structlog
 from common.types import SignalDirection
 from trading.models import Position, Signal
 
-__all__ = ["TrailingStopManager"]
+__all__ = ["TRAILING_PCT_RANGE", "TrailingStopManager"]
 
 logger = structlog.get_logger(__name__)
+
+# WP1.3a (SY-13a-01): exported so ``packages/trading/exit_config.py`` is the
+# single source of truth for the *policy* bounds layered on top of this
+# mechanical constructor range (see that module's docstring).
+TRAILING_PCT_RANGE: tuple[float, float] = (0.005, 0.50)
 
 
 class TrailingStopManager:
@@ -54,9 +59,10 @@ class TrailingStopManager:
         strategy_id: str = "trailing_stop",
         pending_stop_ttl: int = 3,
     ) -> None:
-        if not (0.005 <= trailing_stop_pct <= 0.50):
+        _lo, _hi = TRAILING_PCT_RANGE
+        if not (_lo <= trailing_stop_pct <= _hi):
             raise ValueError(
-                f"trailing_stop_pct must be in [0.005, 0.50], got {trailing_stop_pct}"
+                f"trailing_stop_pct must be in [{_lo}, {_hi}], got {trailing_stop_pct}"
             )
         if pending_stop_ttl < 1:
             raise ValueError(
@@ -209,6 +215,41 @@ class TrailingStopManager:
             )
 
         return None
+
+    def seed_peak(self, symbol: str, peak: Decimal) -> None:
+        """
+        Seed the trailing high-water mark for ``symbol`` after a resume
+        rebuild (WP1.8a A-09/R§3).
+
+        Called once, at the end of ``StrategyEngine._warmup_bar_windows``,
+        for every symbol with an open position restored via
+        ``PortfolioAccounting.from_fills``.  The in-memory peak is always
+        lost on restart; seeding it from the current price alone would
+        loosen the stop (a resumed position could sit further from its
+        true historical peak than before the restart).  The caller passes
+        ``max(entry_price, max close since opened_at)`` so the seeded peak
+        is never below the entry.
+
+        Never lowers an already-tracked peak -- idempotent/safe to call
+        more than once for the same symbol.
+
+        Parameters
+        ----------
+        symbol:
+            The trading pair being seeded.
+        peak:
+            The peak price to seed, typically
+            ``max(entry_price, max close since opened_at)``.
+        """
+        current = self._peak_prices.get(symbol)
+        if current is None or peak > current:
+            self._peak_prices[symbol] = peak
+        self._log.info(
+            "trailing_stop.peak_seeded",
+            symbol=symbol,
+            seeded_peak=str(peak),
+            effective_peak=str(self._peak_prices[symbol]),
+        )
 
     def _clear_pending(self, symbol: str) -> None:
         """Drop all pending-stop tracking for ``symbol``."""

@@ -43,6 +43,9 @@ def _bars_by_symbol(n: int = 200) -> dict[str, list[OHLCVBar]]:
 class _DummyStrategy(BaseStrategy):
     """Minimal strategy that always holds — for testing optimizer mechanics."""
 
+    # WP1.3a (SY-13a-06): test-only double, no bracket/trailing configured.
+    requires_exit_manager = False
+
     def on_bar(
         self,
         bars: Any,

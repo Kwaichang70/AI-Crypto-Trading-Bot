@@ -72,6 +72,8 @@ class _AlwaysHoldStrategy(BaseStrategy):
         version="1.0.0",
         description="never trades",
     )
+    # WP1.3a (SY-13a-06): test-only double, no bracket/trailing configured.
+    requires_exit_manager = False
 
     @classmethod
     def parameter_schema(cls) -> dict[str, Any]:
@@ -99,6 +101,8 @@ class _BuyAtBarStrategy(BaseStrategy):
         version="1.0.0",
         description="one in-sample BUY then hold",
     )
+    # WP1.3a (SY-13a-06): test-only double, no bracket/trailing configured.
+    requires_exit_manager = False
 
     @classmethod
     def parameter_schema(cls) -> dict[str, Any]:

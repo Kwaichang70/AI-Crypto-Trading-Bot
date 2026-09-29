@@ -30,6 +30,7 @@ from common.types import (
     TimeFrame,
 )
 from trading.bracket_exit import BracketExitManager
+from trading.exit_config import ExitConfigError
 from trading.models import Fill, Order, Position
 from trading.strategy_engine import StrategyEngine
 from trading.trade_journal import ExitReasonDetector
@@ -511,14 +512,18 @@ class TestBracketExitInStrategyEngine:
         await engine.start("run-001")
         assert engine._bracket_exit is None  # type: ignore[attr-defined]
 
-    async def test_invalid_atr_config_disables_gracefully(self) -> None:
-        # ATR mode but no multipliers -> ValueError -> disabled, not crash.
-        engine, _ = _make_engine(config={
-            "bracket_mode": "atr",
-            "bracket_stop_loss_pct": 0.02,  # presence triggers construction attempt
-        })
-        await engine.start("run-001")
-        assert engine._bracket_exit is None  # type: ignore[attr-defined]
+    async def test_invalid_atr_config_raises(self) -> None:
+        # WP1.3a (ST-25/A-36): the engine no longer warns-and-disables an
+        # invalid exit config -- it raises at construction (SY-13a-01/22).
+        # ATR mode with a *non-zero* fixed SL is an inactive-mode value
+        # (E3, "inactive_mode_value"), not a "no bracket at all" no-op.
+        with pytest.raises(ExitConfigError) as excinfo:
+            _make_engine(config={
+                "bracket_mode": "atr",
+                "bracket_stop_loss_pct": 0.02,
+            })
+        assert excinfo.value.code == "invalid_exit_config"
+        assert any(i.reason == "inactive_mode_value" for i in excinfo.value.issues)
 
     async def test_stop_loss_sell_submitted_to_execution(self) -> None:
         engine, mocks = _make_engine(config={"bracket_stop_loss_pct": 0.05})

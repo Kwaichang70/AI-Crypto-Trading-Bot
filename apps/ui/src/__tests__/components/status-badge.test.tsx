@@ -78,6 +78,20 @@ describe("StatusBadge", () => {
     expect(container.firstChild).toHaveClass("badge-neutral");
   });
 
+  // ---- RunStatus: orphaned / resuming (WP1.7b RUN_STATUS_VARIANTS fix) ----
+
+  it("applies badge-warning class for orphaned status (WP1.8a/WP1.7b)", () => {
+    const { container } = render(<StatusBadge status="orphaned" />);
+    expect(container.firstChild).toHaveClass("badge-warning");
+  });
+
+  it("applies the info variant class for resuming status (WP1.8a/WP1.7b)", () => {
+    const { container } = render(<StatusBadge status="resuming" />);
+    expect(container.firstChild).toHaveClass(
+      "inline-flex",
+    );
+  });
+
   // ---- Unknown status fallback ---------------------------------------------
 
   it("renders unknown status text without throwing", () => {

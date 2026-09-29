@@ -52,6 +52,7 @@ Design notes
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -60,6 +61,7 @@ from uuid import UUID, uuid4
 
 import ccxt.async_support as ccxt_async
 import pytest
+from structlog.testing import capture_logs
 
 from common.types import OrderSide, OrderStatus, OrderType, SignalDirection
 from trading.engines.live import LiveExecutionEngine
@@ -147,6 +149,11 @@ def _make_mock_exchange(
     exchange.fetch_my_trades = AsyncMock(
         return_value=fetch_my_trades_response if fetch_my_trades_response is not None else []
     )
+    # WP1.4b: the idempotent-submit cid lookup (``_lookup_by_cid``) calls
+    # ``fetch_orders`` whenever create_order's outcome is ambiguous --
+    # default to "nothing found" so a test that doesn't care about this
+    # path doesn't have to configure it explicitly.
+    exchange.fetch_orders = AsyncMock(return_value=[])
 
     return exchange
 
@@ -512,13 +519,26 @@ class TestSubmitOrder:
         assert result.average_fill_price == Decimal("49500")
 
     @pytest.mark.asyncio
-    async def test_network_error_transitions_to_rejected(self) -> None:
-        """A ccxt NetworkError during create_order transitions the order to REJECTED."""
+    async def test_network_error_is_ambiguous_not_rejected(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """WP1.4b (D3): a ccxt NetworkError during create_order is
+        AMBIGUOUS (the order may have executed anyway on the exchange
+        side), never "not placed" -- it is resolved via an exact
+        client-order-id lookup (D4/D5), not rejected outright. With no
+        matching order found (the mock's default ``fetch_orders`` returns
+        ``[]``), the order stays PENDING_SUBMIT as an unknown submit and
+        its symbol is flagged ``buy_submit_unknown`` (W1: still only ONE
+        create_order call, ever)."""
+        monkeypatch.setattr(asyncio, "sleep", AsyncMock())
         engine, _, ex = _make_engine()
         ex.create_order.side_effect = ccxt_async.NetworkError("connection refused")
         order = _make_market_order()
         result = await engine.submit_order(order)
-        assert result.status == OrderStatus.REJECTED
+        assert result.status == OrderStatus.PENDING_SUBMIT
+        assert result.exchange_order_id is None
+        assert engine.reconcile_required.get(_SYMBOL) == "buy_submit_unknown"
+        ex.create_order.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_authentication_error_transitions_to_rejected(self) -> None:
@@ -539,22 +559,40 @@ class TestSubmitOrder:
         assert result.status == OrderStatus.REJECTED
 
     @pytest.mark.asyncio
-    async def test_exchange_error_transitions_to_rejected(self) -> None:
-        """A generic ccxt ExchangeError during create_order transitions the order to REJECTED."""
+    async def test_exact_class_exchange_error_is_ambiguous_not_rejected(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """WP1.4b (D3): an exact-class ``ccxt.ExchangeError`` (Coinbase's
+        fallback for ``internal_server_error``/an unmapped error body) is
+        AMBIGUOUS, not "not placed" -- unlike every named ``ExchangeError``
+        subclass this module tests separately (AuthenticationError,
+        InsufficientFunds, ...), which stay "not placed" -> REJECTED."""
+        monkeypatch.setattr(asyncio, "sleep", AsyncMock())
         engine, _, ex = _make_engine()
         ex.create_order.side_effect = ccxt_async.ExchangeError("order rejected by exchange")
         order = _make_market_order()
         result = await engine.submit_order(order)
-        assert result.status == OrderStatus.REJECTED
+        assert result.status == OrderStatus.PENDING_SUBMIT
+        assert engine.reconcile_required.get(_SYMBOL) == "buy_submit_unknown"
 
     @pytest.mark.asyncio
-    async def test_unexpected_error_reraises(self) -> None:
-        """An unexpected exception (not a ccxt error) is re-raised without being absorbed."""
+    async def test_unexpected_error_is_ambiguous_not_reraised(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """WP1.4b (D3): a non-ccxt exception (e.g. a parse failure after
+        the exchange actually accepted the order) is AMBIGUOUS too -- it
+        is classified and resolved via the cid lookup exactly like any
+        ccxt error, never bare-re-raised past submit_order (the pre-WP1.4b
+        behaviour, which risked a caller resubmitting under a NEW cid on
+        top of an order that may have already been placed)."""
+        monkeypatch.setattr(asyncio, "sleep", AsyncMock())
         engine, _, ex = _make_engine()
         ex.create_order.side_effect = RuntimeError("unexpected internal failure")
         order = _make_market_order()
-        with pytest.raises(RuntimeError, match="unexpected internal failure"):
-            await engine.submit_order(order)
+        result = await engine.submit_order(order)
+        assert result.status == OrderStatus.PENDING_SUBMIT
+        assert engine.reconcile_required.get(_SYMBOL) == "buy_submit_unknown"
+        ex.create_order.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_create_order_called_with_correct_parameters(self) -> None:
@@ -569,7 +607,11 @@ class TestSubmitOrder:
             "buy",
             str(qty),
             None,
-            params={"clientOrderId": order.client_order_id},
+            # WP1.4b round 2 (S-06): every call also carries
+            # maxRetriesOnFailure=0 -- ccxt's fetch2 strips it before
+            # signing, so it never reaches the wire, but it IS part of the
+            # params dict create_order itself receives.
+            params={"maxRetriesOnFailure": 0, "clientOrderId": order.client_order_id},
         )
 
 
@@ -583,19 +625,52 @@ class TestCancelOrder:
 
     @pytest.mark.asyncio
     async def test_cancel_open_order_transitions_to_canceled(self) -> None:
-        """Cancelling an OPEN order transitions it to CANCELED status."""
-        engine, _, _ = _make_engine()
+        """Cancelling an OPEN order transitions it to CANCELED status.
+
+        WP1.11a (D5(b)): the cancel ack alone is not evidence of the
+        order's true final fill, so cancel_order also re-reconciles once
+        against the exchange -- here it stubs a confirmed
+        (terminal-status, finite-``filled``) response, so
+        ``_cancel_unconfirmed`` clears immediately.
+        """
+        engine, _, _ = _make_engine(
+            exchange_kwargs={
+                "fetch_order_response": {
+                    "id": "exch-001",
+                    "status": "canceled",
+                    "filled": "0",
+                    "average": None,
+                    "price": str(_LAST_PRICE),
+                },
+            }
+        )
         order = _make_market_order()
         submitted = await engine.submit_order(order)
         assert submitted.status == OrderStatus.OPEN
 
         canceled = await engine.cancel_order(submitted.order_id)
         assert canceled.status == OrderStatus.CANCELED
+        assert submitted.order_id not in engine._cancel_unconfirmed
 
     @pytest.mark.asyncio
     async def test_cancel_order_calls_exchange_cancel(self) -> None:
-        """cancel_order() calls exchange.cancel_order with the exchange order ID."""
-        engine, _, ex = _make_engine()
+        """cancel_order() calls exchange.cancel_order with the exchange order ID.
+
+        WP1.11a (D5(b)): stubs a confirmed cancel response so the
+        post-cancel reconcile this method now performs doesn't leave the
+        order in ``_cancel_unconfirmed`` and mask what this test targets.
+        """
+        engine, _, ex = _make_engine(
+            exchange_kwargs={
+                "fetch_order_response": {
+                    "id": "exch-001",
+                    "status": "canceled",
+                    "filled": "0",
+                    "average": None,
+                    "price": str(_LAST_PRICE),
+                },
+            }
+        )
         order = _make_market_order()
         submitted = await engine.submit_order(order)
         exchange_order_id = submitted.exchange_order_id
@@ -653,8 +728,12 @@ class TestCancelOrder:
     @pytest.mark.asyncio
     async def test_cancel_order_without_exchange_id_transitions_locally(self) -> None:
         """
-        If no exchange_order_id is mapped (order never reached exchange), cancel_order
-        transitions locally to CANCELED without calling the exchange.
+        WP1.11a (D5(a)/W3): if no exchange_order_id is mapped, create_order's
+        outcome for this order is STILL AMBIGUOUS (it may have been accepted
+        anyway) -- cancel_order must NOT locally CANCEL it (that would
+        release the I5b(a) unknown-submit reserve on the strength of a
+        cancel alone, with no exchange evidence either way). The order is
+        left exactly as PENDING_SUBMIT, and the exchange is never called.
         """
         engine, _, ex = _make_engine()
         # Manually register an order that was never submitted to the exchange
@@ -663,12 +742,13 @@ class TestCancelOrder:
         engine._orders[order.order_id] = order_in_pending
         # Deliberately leave _exchange_order_map empty for this order
 
-        canceled = await engine.cancel_order(order.order_id)
+        with capture_logs() as cap:
+            canceled = await engine.cancel_order(order.order_id)
 
-        assert canceled.status == OrderStatus.CANCELED
+        assert canceled.status == OrderStatus.PENDING_SUBMIT
         # exchange.cancel_order must not have been invoked
         ex.cancel_order.assert_not_called()
-
+        assert any(e.get("event") == "live.cancel_skipped_unknown_submit" for e in cap)
 
 # ===========================================================================
 # Group 7: Get Order
@@ -1258,6 +1338,23 @@ class TestLifecycle:
     async def test_on_start_calls_load_markets_when_enabled(self) -> None:
         """on_start() calls exchange.load_markets() when live trading is enabled."""
         engine, _, ex = _make_engine(enable_live_trading=True)
+        # WP1.1 round 2 (S-09): on_start() now fails closed without a
+        # position source attached -- this test is about load_markets(),
+        # so attach a minimal stub (returning None/empty/zero, matching an
+        # empty PortfolioAccounting) to reach that code path.
+        stub_source = MagicMock(
+            get_position=MagicMock(return_value=None),
+            get_open_positions=MagicMock(return_value=[]),
+            get_daily_pnl=MagicMock(return_value=Decimal("0")),
+            # WP1.4: LivePositionSource grew cash/initial_cash/
+            # current_equity/get_peak_equity() -- match an empty
+            # PortfolioAccounting (zero everywhere).
+            cash=Decimal("0"),
+            initial_cash=Decimal("0"),
+            current_equity=Decimal("0"),
+            get_peak_equity=MagicMock(return_value=Decimal("0")),
+        )
+        engine.attach_position_source(stub_source, symbols=[_SYMBOL])
 
         await engine.on_start()
 
@@ -1274,8 +1371,24 @@ class TestLifecycle:
 
     @pytest.mark.asyncio
     async def test_on_stop_cancels_open_orders_on_exchange(self) -> None:
-        """on_stop() calls exchange.cancel_order for each open order that has an exchange ID."""
-        engine, _, ex = _make_engine()
+        """on_stop() calls exchange.cancel_order for each open order that has an exchange ID.
+
+        WP1.11a (D5(b)): on_stop's cancel loop also re-reconciles once per
+        cancelled order (same evidence-based confirmation as
+        cancel_order()) -- stubs a confirmed cancel response so
+        ``_cancel_unconfirmed`` clears for both orders.
+        """
+        engine, _, ex = _make_engine(
+            exchange_kwargs={
+                "fetch_order_response": {
+                    "id": "exch-001",
+                    "status": "canceled",
+                    "filled": "0",
+                    "average": None,
+                    "price": str(_LAST_PRICE),
+                },
+            }
+        )
         # Submit two orders that remain OPEN
         o1 = await engine.submit_order(_make_market_order())
         o2 = await engine.submit_order(_make_market_order())
@@ -1289,6 +1402,7 @@ class TestLifecycle:
 
         # cancel_order should have been called once for each open order
         assert ex.cancel_order.call_count == 2
+        assert not engine._cancel_unconfirmed
 
     @pytest.mark.asyncio
     async def test_on_stop_continues_despite_cancel_failure(self) -> None:
@@ -1314,6 +1428,22 @@ class TestLifecycle:
     @pytest.mark.asyncio
     async def test_on_start_reraises_load_markets_failure(self) -> None:
         engine, _, ex = _make_engine(enable_live_trading=True)
+        # WP1.1 round 2 (S-09): attach a stub source so this test still
+        # reaches load_markets() (the behaviour under test) rather than
+        # failing closed at the missing-source gate.
+        stub_source = MagicMock(
+            get_position=MagicMock(return_value=None),
+            get_open_positions=MagicMock(return_value=[]),
+            get_daily_pnl=MagicMock(return_value=Decimal("0")),
+            # WP1.4: LivePositionSource grew cash/initial_cash/
+            # current_equity/get_peak_equity() -- match an empty
+            # PortfolioAccounting (zero everywhere).
+            cash=Decimal("0"),
+            initial_cash=Decimal("0"),
+            current_equity=Decimal("0"),
+            get_peak_equity=MagicMock(return_value=Decimal("0")),
+        )
+        engine.attach_position_source(stub_source, symbols=[_SYMBOL])
         ex.load_markets.side_effect = Exception("exchange down")
         with pytest.raises(Exception, match="exchange down"):
             await engine.on_start()
@@ -1496,3 +1626,110 @@ class TestGetAllFills:
         assert result[0].executed_at < result[1].executed_at, (
             "Fills must be sorted ascending by executed_at"
         )
+
+
+# ===========================================================================
+# WP1.8b: _parse_ccxt_trades (shared trade-parse helper) + dedup
+# ===========================================================================
+
+
+class TestParseCcxtTradesHelper:
+    """Unit tests for the module-level ``_parse_ccxt_trades`` (extracted
+    from ``get_fills`` so ``apps.api.services.run_recovery.scan_and_import``
+    shares it -- WP1.8b)."""
+
+    def test_parses_a_single_trade_into_one_fill(self) -> None:
+        from trading.engines.live import _parse_ccxt_trades
+
+        order = _make_market_order(side=OrderSide.BUY, quantity=Decimal("0.1"))
+        trade = _make_ccxt_trade(amount="0.1", price="50000", fee_cost="0.5")
+
+        fills, gross, keys = _parse_ccxt_trades(
+            order, [trade], base_asset="BTC", quote_currency="USDT"
+        )
+
+        assert len(fills) == 1
+        assert fills[0].quantity == Decimal("0.1")
+        assert fills[0].price == Decimal("50000")
+        assert fills[0].fee == Decimal("0.5")
+        assert gross == Decimal("0.1")
+        assert len(keys) == 1
+
+    def test_already_routed_trade_is_deduped(self) -> None:
+        """I9: a trade whose key is already in ``already_routed`` is
+        skipped -- the same idempotency guarantee ``get_fills`` relies on
+        so a repeated poll never double-routes a fill."""
+        from trading.engines.live import _parse_ccxt_trades, _trade_key
+
+        order = _make_market_order()
+        trade = _make_ccxt_trade()
+        trade["id"] = "dedup-trade-1"
+
+        first_fills, _gross, first_keys = _parse_ccxt_trades(
+            order, [trade], base_asset="BTC", quote_currency="USDT"
+        )
+        assert len(first_fills) == 1
+
+        second_fills, second_gross, second_keys = _parse_ccxt_trades(
+            order, [trade], already_routed=first_keys, base_asset="BTC", quote_currency="USDT"
+        )
+        assert second_fills == []
+        assert second_gross == Decimal("0")
+        assert second_keys == set()
+        assert first_keys == {_trade_key(trade)}
+
+    def test_duplicate_trades_within_one_batch_are_deduped(self) -> None:
+        """The SAME trade record appearing twice in one ``trades`` batch
+        (e.g. a paginated fetch returning overlap) must only produce one
+        fill."""
+        from trading.engines.live import _parse_ccxt_trades
+
+        order = _make_market_order()
+        trade = _make_ccxt_trade()
+        trade["id"] = "dupe-in-batch"
+
+        fills, gross, keys = _parse_ccxt_trades(
+            order, [trade, dict(trade)], base_asset="BTC", quote_currency="USDT"
+        )
+        assert len(fills) == 1
+        assert gross == Decimal(trade["amount"])
+        assert len(keys) == 1
+
+    def test_invalid_price_is_skipped_not_raised(self) -> None:
+        """I3: a non-positive price is a business case (flagged via
+        on_skip), not a parse error that aborts the batch."""
+        from trading.engines.live import _parse_ccxt_trades
+
+        order = _make_market_order()
+        bad_trade = _make_ccxt_trade(price="0")
+        good_trade = _make_ccxt_trade(amount="0.05")
+        good_trade["id"] = "good-1"
+
+        skipped: list[str] = []
+        fills, gross, _keys = _parse_ccxt_trades(
+            order,
+            [bad_trade, good_trade],
+            base_asset="BTC",
+            quote_currency="USDT",
+            on_skip=skipped.append,
+        )
+        assert len(fills) == 1
+        assert fills[0].quantity == Decimal("0.05")
+        assert gross == Decimal("0.05")
+        assert "fill_price_invalid" in skipped
+
+    def test_base_currency_fee_is_normalized_into_quote(self) -> None:
+        """D6: a fee charged in the base asset is netted out of the
+        returned Fill.quantity and re-expressed in quote currency."""
+        from trading.engines.live import _parse_ccxt_trades
+
+        order = _make_market_order(side=OrderSide.BUY, quantity=Decimal("0.1"))
+        trade = _make_ccxt_trade(amount="0.1", price="50000", fee_cost="0.001", fee_currency="BTC")
+
+        fills, _gross, _keys = _parse_ccxt_trades(
+            order, [trade], base_asset="BTC", quote_currency="USDT"
+        )
+        assert len(fills) == 1
+        assert fills[0].quantity == Decimal("0.099")
+        assert fills[0].fee_currency == "USDT"
+        assert fills[0].fee == Decimal("50")  # 0.001 BTC * 50000

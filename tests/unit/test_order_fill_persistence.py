@@ -319,6 +319,8 @@ class _AlwaysHoldStrategy(BaseStrategy):
         version="1.0.0",
         description="Stub strategy for order/fill persistence tests",
     )
+    # WP1.3a (SY-13a-06): test-only double, no bracket/trailing configured.
+    requires_exit_manager = False
 
     def on_bar(self, bars: Sequence[OHLCVBar], *, mtf_context: MultiTimeframeContext | None = None) -> list[Signal]:
         return []

@@ -235,6 +235,11 @@ class ModelStrategy(BaseStrategy):
     # Parameter validation
     # ------------------------------------------------------------------ #
 
+    # WP1.3a (SY-13a-06/08): explicit per-strategy declaration --
+    # Emits its own SELL when the model predicts SELL (D-13a-2: LIVE
+    # warning W8 only, pending CF-13a-6).
+    requires_exit_manager: ClassVar[bool] = False
+
     def _validate_params(self, params: dict[str, Any]) -> dict[str, Any]:
         """Validate and coerce parameters via the Pydantic schema."""
         validated = _ModelStrategyParams(**params)

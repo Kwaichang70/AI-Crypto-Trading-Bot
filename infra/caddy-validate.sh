@@ -29,9 +29,9 @@ else
 fi
 
 # --- Test 2: API proxy reachable via Tailscale FQDN ---
-echo -n "[2] API proxy (https://${TAILSCALE_FQDN}/api/v1/health)... "
+echo -n "[2] API proxy (https://${TAILSCALE_FQDN}/api/v1/health/background)... "
 HTTP_CODE=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" \
-    "https://${TAILSCALE_FQDN}/api/v1/health")
+    "https://${TAILSCALE_FQDN}/api/v1/health/background")
 if [[ "${HTTP_CODE}" == "200" || "${HTTP_CODE}" == "401" ]]; then
     echo "OK (HTTP ${HTTP_CODE} — 401 expected when REQUIRE_API_AUTH=true)"
 else

@@ -14,6 +14,7 @@ Concrete subclasses:
 from __future__ import annotations
 
 import abc
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -27,6 +28,7 @@ from trading.risk import BaseRiskManager
 
 __all__ = [
     "BaseExecutionEngine",
+    "EquitySnapshot",
     "InvalidOrderTransitionError",
     "ORDER_STATE_MACHINE",
 ]
@@ -112,6 +114,52 @@ def validate_transition(order: Order, to_status: OrderStatus) -> None:
     allowed = ORDER_STATE_MACHINE.get(order.status, frozenset())
     if to_status not in allowed:
         raise InvalidOrderTransitionError(order.order_id, order.status, to_status)
+
+
+# ---------------------------------------------------------------------------
+# WP1.4 (Verbeterplan v2 §4 row 1.4, D5) -- live NAV / sizing-basis helpers
+# ---------------------------------------------------------------------------
+#
+# Pure, read-only value object + helpers shared by every concrete engine
+# (S-06): today only ``LiveExecutionEngine`` computes an ``EquitySnapshot``,
+# but ``_sizing_basis``/``_cap_buy_quantity`` live here (not on
+# ``LiveExecutionEngine``) so WP4.1's shared ``process_signal`` can reuse
+# them without duplicating the arithmetic.
+#
+@dataclass(frozen=True)
+class EquitySnapshot:
+    """A read-only NAV/peak/cash/basis snapshot at one instant.
+
+    Computing one never mutates the ``LivePositionSource`` it was derived
+    from (I-6 -- no equity-curve point is added, no peak is bumped): every
+    field is either copied straight from the source or a pure arithmetic
+    combination of source fields and the fresh ticker price.
+
+    Attributes
+    ----------
+    nav:
+        Run NAV (``source.current_equity`` adjusted for the signal's own
+        symbol against the fresh ticker price). Feeds
+        ``RiskManager.pre_trade_check``'s ``current_equity`` (I-3).
+    peak:
+        ``max(source.get_peak_equity(), nav)`` -- the portfolio is the
+        sole peak owner (A-05); this only guards against ``nav`` itself
+        being a new high the portfolio hasn't observed yet (it hasn't
+        written this bar's mark back). Feeds ``pre_trade_check``'s
+        ``peak_equity`` (I-3).
+    cash:
+        ``source.cash`` (run cash), the BUY affordability cap's numerator
+        (I-4).
+    sizing_basis:
+        ``max(0, min(nav, initial_cash))`` (D5) -- fed to
+        ``_resolve_order_quantity(equity=...)`` (I-2). Never the raw NAV
+        and never the exchange balance.
+    """
+
+    nav: Decimal
+    peak: Decimal
+    cash: Decimal
+    sizing_basis: Decimal
 
 
 class BaseExecutionEngine(abc.ABC):
@@ -399,6 +447,37 @@ class BaseExecutionEngine(abc.ABC):
             return held
         base_qty = (signal.target_position / last_price) * conf
         return min(base_qty, held)
+
+    # ------------------------------------------------------------------
+    # NAV / sizing-basis helpers (WP1.4, D5, S-06)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _sizing_basis(nav: Decimal, initial_cash: Decimal) -> Decimal:
+        """D5: the live sizing basis is ``max(0, min(nav, initial_cash))``
+        -- run capital, never the whole account. A profit (``nav`` above
+        ``initial_cash``) still sizes at ``initial_cash`` (no
+        compounding, I-8); only a loss shrinks it. Pure, no I/O.
+        """
+        return max(Decimal("0"), min(nav, initial_cash))
+
+    @staticmethod
+    def _cap_buy_quantity(
+        qty: Decimal,
+        price: Decimal,
+        available: Decimal,
+        buf: Decimal,
+    ) -> Decimal:
+        """WP1.4 (I-4): cap a BUY ``qty`` so its notional, inflated by a
+        ``buf`` safety margin (the market's taker fee), never exceeds
+        ``available`` quote currency: ``qty <= available / (price * (1 +
+        buf))``. Pure Decimal arithmetic; never up-sizes ``qty``. Returns
+        ``0`` when ``qty``, ``price`` or ``available`` is non-positive.
+        """
+        if qty <= Decimal("0") or price <= Decimal("0") or available <= Decimal("0"):
+            return Decimal("0")
+        max_qty = available / (price * (Decimal("1") + buf))
+        return min(qty, max_qty)
 
     # ------------------------------------------------------------------
     # Lifecycle

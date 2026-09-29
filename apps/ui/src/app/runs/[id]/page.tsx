@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState } from "react";
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import {
@@ -13,11 +13,11 @@ import {
   fetchPositions,
   fetchDiagnostics,
   fetchLearningState,
-  stopRun,
   archiveRun,
   formatCurrency,
   formatPct,
 } from "@/lib/api";
+import type { ApiResult } from "@/lib/api";
 import type { Run, Portfolio, EquityPoint, Trade, Order, Fill, Position, LearningState, OpenPositionMTM } from "@/lib/types";
 import type { CsvColumn } from "@/lib/csv-export";
 import { ExportCsvButton } from "@/components/ui/export-csv-button";
@@ -31,6 +31,13 @@ import { EquityCurveChart } from "@/components/charts/equity-curve";
 import { aggregateTradesBySymbol } from "@/lib/aggregate";
 import { quoteCurrencyPrefix } from "@/lib/currency";
 import { useToast } from "@/components/ui/toast";
+import { LiveBanner } from "@/components/live-banner";
+import { StopRunDialog } from "@/components/stop-run-dialog";
+import { ResumeRunDialog } from "@/components/resume-run-dialog";
+import { PromoteRunDialog } from "@/components/promote-run-dialog";
+import { ConfigWarningsBanner, ProtectiveResumeBanner } from "@/components/config-warnings-banner";
+import { AdminOnly } from "@/components/admin-only";
+import { usePolling } from "@/hooks/use-polling";
 
 // ---------------------------------------------------------------------------
 // Trade columns
@@ -383,6 +390,57 @@ const EQUITY_CSV_COLUMNS: CsvColumn<EquityPoint>[] = [
 ];
 
 // ---------------------------------------------------------------------------
+// WP7.0 (SY-70-24): a single bundled fetch shared by the initial load and
+// the main poll. `ok` mirrors `fetchRun`'s own result exactly (I10: a
+// sub-fetch failure never fails the whole bundle). Every sub-result is
+// `data | undefined` on failure (so `applyBundle` leaves that slice's
+// existing state untouched) EXCEPT `learning`, which keeps today's exact
+// pre-WP7.0 semantics of unconditionally resetting to `null` on failure.
+// ---------------------------------------------------------------------------
+
+interface RunDetailBundle {
+  run: Run;
+  portfolio: Portfolio | undefined;
+  equityPoints: readonly EquityPoint[] | undefined;
+  trades: readonly Trade[] | undefined;
+  orders: readonly Order[] | undefined;
+  fills: readonly Fill[] | undefined;
+  positions: readonly Position[] | undefined;
+  learning: LearningState | null;
+}
+
+async function loadAllRunData(id: string): Promise<ApiResult<RunDetailBundle>> {
+  const [runRes, portRes, curveRes, tradesRes, ordersRes, fillsRes, posRes, learnRes] = await Promise.all([
+    fetchRun(id),
+    fetchPortfolio(id),
+    fetchEquityCurve(id, 500),
+    fetchTrades(id, { limit: 100 }),
+    fetchOrders(id, { limit: 100 }),
+    fetchFills(id, { limit: 100 }),
+    fetchPositions(id),
+    fetchLearningState(id),
+  ]);
+
+  if (!runRes.ok) {
+    return { ok: false, error: runRes.error };
+  }
+
+  return {
+    ok: true,
+    data: {
+      run: runRes.data,
+      portfolio: portRes.ok ? portRes.data : undefined,
+      equityPoints: curveRes.ok ? curveRes.data.points : undefined,
+      trades: tradesRes.ok ? tradesRes.data.items : undefined,
+      orders: ordersRes.ok ? ordersRes.data.items : undefined,
+      fills: fillsRes.ok ? fillsRes.data.items : undefined,
+      positions: posRes.ok ? posRes.data.positions : undefined,
+      learning: learnRes.ok ? learnRes.data : null,
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Page
 // ---------------------------------------------------------------------------
 
@@ -400,96 +458,112 @@ export default function RunDetailPage() {
   const [fills, setFills] = useState<readonly Fill[]>([]);
   const [positions, setPositions] = useState<readonly Position[]>([]);
   const [learning, setLearning] = useState<LearningState | null>(null);
-  const [diagnostics, setDiagnostics] = useState<Record<string, unknown> | null>(null);
   const [isLoading, setIsLoading] = useState(true);
-  const [isStopping, setIsStopping] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  // WP7.0 (SY-70-24): the ONE-SHOT initial-load failure that drives the
+  // full-page error branch below. A later POLL failure never touches this
+  // state — it only ever renders the U-03 stale banner, so the page (and
+  // any open dialog) never goes blank on a transient failure (I10).
+  const [initialLoadError, setInitialLoadError] = useState<string | null>(null);
+  // WP1.7a/1.7b (CF-B3, S13): replaces the old one-click handleStop for
+  // running runs — a live running run now goes through <StopRunDialog>,
+  // which forces an explicit flatten/keep-positions choice before it calls
+  // stopRun(). An 'orphaned' live run instead offers <ResumeRunDialog>.
+  const [stopDialogOpen, setStopDialogOpen] = useState(false);
+  const [resumeDialogOpen, setResumeDialogOpen] = useState(false);
+  // WP1.3a (CF-13a-1 item 2): promote a stopped, eligible paper run to live.
+  const [promoteDialogOpen, setPromoteDialogOpen] = useState(false);
 
-  const loadData = useCallback(async () => {
-    const [runRes, portRes, curveRes, tradesRes, ordersRes, fillsRes, posRes, learnRes] = await Promise.all([
-      fetchRun(id),
-      fetchPortfolio(id),
-      fetchEquityCurve(id, 500),
-      fetchTrades(id, { limit: 100 }),
-      fetchOrders(id, { limit: 100 }),
-      fetchFills(id, { limit: 100 }),
-      fetchPositions(id),
-      fetchLearningState(id),
-    ]);
+  // WP7.0 (SY-70-24): applies a bundle exactly like the old inline
+  // `loadData` did per-slice — `run` is unconditional, every other slice is
+  // skipped (existing state kept) when its own sub-fetch failed, and
+  // `learning` keeps its pre-WP7.0 "always overwrite, even to null" quirk.
+  function applyBundle(bundle: RunDetailBundle) {
+    setRun(bundle.run);
+    if (bundle.portfolio !== undefined) setPortfolio(bundle.portfolio);
+    if (bundle.equityPoints !== undefined) setEquityPoints(bundle.equityPoints);
+    if (bundle.trades !== undefined) setTrades(bundle.trades);
+    if (bundle.orders !== undefined) setOrders(bundle.orders);
+    if (bundle.fills !== undefined) setFills(bundle.fills);
+    if (bundle.positions !== undefined) setPositions(bundle.positions);
+    setLearning(bundle.learning);
+  }
 
-    if (!runRes.ok) {
-      setError(runRes.error.message);
-      return;
-    }
-
-    setRun(runRes.data);
-    if (portRes.ok) setPortfolio(portRes.data);
-    setLearning(learnRes.ok ? learnRes.data : null);
-    if (curveRes.ok) setEquityPoints(curveRes.data.points);
-    if (tradesRes.ok) setTrades(tradesRes.data.items);
-    if (ordersRes.ok) setOrders(ordersRes.data.items);
-    if (fillsRes.ok) setFills(fillsRes.data.items);
-    if (posRes.ok) setPositions(posRes.data.positions);
+  // One-shot initial load. A `cancelled` flag (not `usePolling`, which is
+  // reserved for the recurring main/diagnostics polls below) guards against
+  // applying a stale result after a fast unmount/remount (e.g. id change).
+  useEffect(() => {
+    let cancelled = false;
+    setIsLoading(true);
+    setInitialLoadError(null);
+    void loadAllRunData(id).then((result) => {
+      if (cancelled) return;
+      if (result.ok) {
+        applyBundle(result.data);
+      } else {
+        setInitialLoadError(result.error.message);
+      }
+      setIsLoading(false);
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [id]);
 
-  useEffect(() => {
-    setIsLoading(true);
-    void loadData().finally(() => setIsLoading(false));
-  }, [loadData]);
+  // WP7.0 (SY-70-24, G-6): the main poll. `immediate: false` — the initial
+  // load above already fetched this data, so enabling the poll (as soon as
+  // `run.status` becomes "running"/"resuming") must not immediately re-fetch
+  // it a second time. WP17b-S-02: also polls while 'resuming' -- a live run
+  // stuck showing this stale status must refresh promptly once the backend
+  // moves it to 'running' again, otherwise StopRunDialog could be shown a
+  // stale status that hides the mandatory flatten choice. A poll failure
+  // (including a 404) never clears `run`/etc — only the stale banner below
+  // reacts to it (I10).
+  const mainPoll = usePolling<RunDetailBundle>({
+    fetcher: () => loadAllRunData(id),
+    intervalMs: 5000,
+    enabled: run?.status === "running" || run?.status === "resuming",
+    immediate: false,
+    onSuccess: applyBundle,
+  });
 
-  // Poll every 5 seconds for active runs, pausing when the browser tab is hidden.
-  useEffect(() => {
-    // Only poll while the run is in an active state.
-    if (run?.status !== "running") return;
+  // WP7.0 (SY-70-24, G-6): the diagnostics poll is independent of the main
+  // poll -- its own failure gets a card-scoped badge (UT-14), never the
+  // page-level stale banner. `immediate: true` because `loadAllRunData`
+  // never fetches diagnostics itself, so nothing else will populate it.
+  const diagPoll = usePolling<Record<string, unknown>>({
+    fetcher: () => fetchDiagnostics(id),
+    intervalMs: 10_000,
+    enabled: run?.status === "running",
+    immediate: true,
+  });
 
-    const startPolling = () => setInterval(() => void loadData(), 5000);
+  function handleStopped(updated: Run) {
+    setRun(updated);
+    toast(
+      updated.status === "running" ? "Stop did not complete — see the flatten result." : "Run stopped",
+      updated.status === "running" ? "warning" : "success",
+    );
+    void mainPoll.refetch();
+  }
 
-    let intervalId = startPolling();
-
-    const handleVisibilityChange = () => {
-      if (document.visibilityState === "hidden") {
-        clearInterval(intervalId);
-      } else {
-        // Tab became visible — fetch immediately then restart the interval.
-        void loadData();
-        intervalId = startPolling();
-      }
-    };
-
-    document.addEventListener("visibilitychange", handleVisibilityChange);
-
-    return () => {
-      clearInterval(intervalId);
-      document.removeEventListener("visibilitychange", handleVisibilityChange);
-    };
-  }, [run?.status, loadData]);
-
-  // Poll diagnostics every 10 seconds for running runs
-  useEffect(() => {
-    if (run?.status !== "running") return;
-
-    const fetchAndSet = () => {
-      void fetchDiagnostics(id).then((res) => {
-        if (res.ok) setDiagnostics(res.data);
-      });
-    };
-
-    fetchAndSet(); // immediate fetch on mount / run becoming active
-    const intervalId = setInterval(fetchAndSet, 10_000);
-    return () => clearInterval(intervalId);
-  }, [run?.status, id]);
-
-  async function handleStop() {
-    if (!run) return;
-    setIsStopping(true);
-    const result = await stopRun(run.id);
-    if (result.ok) {
-      setRun(result.data);
-      toast("Run stopped", "success");
-    } else {
-      setError(result.error.message);
+  function handleResumed(updated: Run) {
+    // WP1.3a (CF-13a-1 item 3): `updated` carries `exitConfigWaived`/
+    // `exitManagerMissing` on a protective resume (SY-13a-16) -- storing the
+    // whole object is enough for <ProtectiveResumeBanner> below to render
+    // them; no separate state needed.
+    setRun(updated);
+    toast("Run resumed", "success");
+    if (updated.exitManagerMissing) {
+      toast("Resumed with no downside exit — flatten recommended.", "error");
+    } else if (updated.exitConfigWaived) {
+      toast("Resumed with part of the exit config waived.", "warning");
     }
-    setIsStopping(false);
+    void mainPoll.refetch();
+  }
+
+  function handlePromoted(newLiveRun: Run) {
+    toast("Promoted to a new live run", "success");
+    router.push(`/runs/${newLiveRun.id}`);
   }
 
   // Currency-consistent monetary prefix: derived from the run's quote
@@ -535,14 +609,14 @@ export default function RunDetailPage() {
     );
   }
 
-  if (error ?? !run) {
+  if (initialLoadError ?? !run) {
     return (
       <div className="space-y-4">
         <Link href="/runs" className="text-sm text-indigo-600 dark:text-indigo-400 hover:underline">
           Back to Runs
         </Link>
         <div className="rounded-lg border border-red-300 bg-red-50 px-4 py-3 text-sm text-red-600 dark:border-red-800 dark:bg-red-900/20 dark:text-red-400">
-          {error ?? "Run not found."}
+          {initialLoadError ?? "Run not found."}
         </div>
       </div>
     );
@@ -553,6 +627,12 @@ export default function RunDetailPage() {
 
   const isDone =
     run.status === "stopped" || run.status === "error";
+
+  // WP1.3a (CF-13a-1 item 2): client-side eligibility hint only -- the
+  // backend (`promote_to_live`) is the authority on trade-count/runtime
+  // gates and re-checks everything; this just avoids showing the button on
+  // a run that can obviously never be promoted (wrong mode, still running).
+  const canOfferPromote = run.runMode === "paper" && run.status === "stopped";
 
   return (
     <div className="space-y-6">
@@ -567,14 +647,39 @@ export default function RunDetailPage() {
         subtitle={`${run.runMode} · ${strategyName} · ${symbols}`}
         actions={
           <div className="flex items-center gap-2">
-            {run.status === "running" && (
+            {(run.status === "running" || run.status === "orphaned" || run.status === "resuming") && (
               <button
-                onClick={() => void handleStop()}
-                disabled={isStopping}
+                onClick={() => setStopDialogOpen(true)}
                 className="rounded-lg border border-red-300 bg-red-50 px-4 py-2 text-sm font-medium text-red-600 transition-colors hover:bg-red-100 dark:border-red-700 dark:bg-red-900/20 dark:text-red-400 dark:hover:bg-red-900/40 disabled:opacity-50"
               >
-                {isStopping ? "Stopping…" : "Stop Run"}
+                Stop Run
               </button>
+            )}
+            {run.runMode === "live" && run.status === "orphaned" && (
+              <AdminOnly>
+                <button
+                  onClick={() => setResumeDialogOpen(true)}
+                  className="rounded-lg border border-indigo-300 bg-indigo-50 px-4 py-2 text-sm font-medium text-indigo-600 transition-colors hover:bg-indigo-100 dark:border-indigo-700 dark:bg-indigo-900/20 dark:text-indigo-400 dark:hover:bg-indigo-900/40"
+                >
+                  Resume Run
+                </button>
+              </AdminOnly>
+            )}
+            {canOfferPromote && (
+              // WP13a-S-02 (security round 2): wrapped in <AdminOnly>,
+              // matching Resume Run above -- promotion starts a new LIVE
+              // run, so it gets the same admin-only visibility as Resume,
+              // even though the confirm-token gate (not this) is the real
+              // barrier server-side (promote_to_live has no require_admin
+              // yet; see the WP3.2 carry-forward in the producer report).
+              <AdminOnly>
+                <button
+                  onClick={() => setPromoteDialogOpen(true)}
+                  className="rounded-lg border border-indigo-300 bg-indigo-50 px-4 py-2 text-sm font-medium text-indigo-600 transition-colors hover:bg-indigo-100 dark:border-indigo-700 dark:bg-indigo-900/20 dark:text-indigo-400 dark:hover:bg-indigo-900/40"
+                >
+                  Promote to Live
+                </button>
+              </AdminOnly>
             )}
             {isDone && (
               <button
@@ -596,6 +701,8 @@ export default function RunDetailPage() {
         }
       />
 
+      {run.runMode === "live" && <LiveBanner />}
+
       {/* Status + metadata row */}
       <div className="flex flex-wrap items-center gap-3 text-sm text-slate-500 dark:text-slate-400">
         <RunStatusBadge status={run.status} />
@@ -604,6 +711,71 @@ export default function RunDetailPage() {
           <span>Stopped {new Date(run.stoppedAt).toLocaleString()}</span>
         )}
       </div>
+
+      {/* WP7.0 (SY-70-24, U-03): a main-poll failure (including a 404)
+          NEVER blanks the page -- it only shows this banner, with the last
+          good data still on screen and every dialog still usable (I10). */}
+      {mainPoll.error && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-amber-300 bg-amber-50 px-4 py-2 text-xs text-amber-700 dark:border-amber-800 dark:bg-amber-900/20 dark:text-amber-400"
+        >
+          <span>
+            Stale · since{" "}
+            {mainPoll.lastSuccessAt
+              ? new Date(mainPoll.lastSuccessAt).toLocaleTimeString("en-US", { hour12: false })
+              : "—"}
+          </span>
+          <button
+            type="button"
+            onClick={() => void mainPoll.refetch()}
+            className="rounded-lg border border-amber-400 bg-white px-3 py-1 font-medium text-amber-700 hover:bg-amber-100 dark:border-amber-700 dark:bg-transparent dark:text-amber-400 dark:hover:bg-amber-900/40"
+          >
+            Retry now
+          </button>
+        </div>
+      )}
+
+      {/* WP1.3a (CF-13a-1 item 3): config warnings from a just-completed
+          create, and the protective-resume waiver/missing-exit banner. */}
+      <ConfigWarningsBanner warnings={run.configWarnings} />
+      <ProtectiveResumeBanner
+        exitConfigWaived={run.exitConfigWaived}
+        exitManagerMissing={run.exitManagerMissing}
+      />
+
+      {stopDialogOpen && (
+        <StopRunDialog
+          run={run}
+          positions={positions}
+          onClose={() => setStopDialogOpen(false)}
+          onStopped={handleStopped}
+        />
+      )}
+
+      {resumeDialogOpen && (
+        <ResumeRunDialog
+          runId={run.id}
+          onClose={() => setResumeDialogOpen(false)}
+          onResumed={handleResumed}
+        />
+      )}
+
+      {promoteDialogOpen && (
+        // WP13a-S-02: dialog render also gated, belt-and-suspenders --
+        // promoteDialogOpen can only become true via the AdminOnly-gated
+        // trigger button above, but a viewer session flipping to admin
+        // mid-session (or a future caller of setPromoteDialogOpen) must
+        // not leave this mounted without the same check.
+        <AdminOnly>
+          <PromoteRunDialog
+            sourceRunId={run.id}
+            onClose={() => setPromoteDialogOpen(false)}
+            onPromoted={handlePromoted}
+          />
+        </AdminOnly>
+      )}
 
       {/* Tabs */}
       <Tabs
@@ -732,73 +904,92 @@ export default function RunDetailPage() {
                   </div>
                 )}
 
-                {/* Live Diagnostics -- shown only for running runs */}
-                {run.status === "running" && diagnostics && (
-                  <div className="card">
-                    <h3 className="mb-3 text-sm font-semibold text-slate-700 dark:text-slate-300">
-                      Live Diagnostics
-                    </h3>
-                    <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-                      <StatCard
-                        label="Current Equity"
-                        value={
-                          typeof diagnostics.currentEquity === "string"
-                            ? `${ccy}${formatCurrency(diagnostics.currentEquity)}`
-                            : "--"
-                        }
-                      />
-                      <StatCard
-                        label="Drawdown"
-                        value={
-                          typeof diagnostics.drawdownPct === "number"
-                            ? formatPct(diagnostics.drawdownPct)
-                            : "--"
-                        }
-                        trend={
-                          typeof diagnostics.drawdownPct === "number" && diagnostics.drawdownPct > 0.1
-                            ? "down"
-                            : "neutral"
-                        }
-                      />
-                      <StatCard
-                        label="Trades / Orders"
-                        value={
-                          typeof diagnostics.tradeCount === "number" &&
-                          typeof diagnostics.orderCount === "number"
-                            ? `${String(diagnostics.tradeCount)} / ${String(diagnostics.orderCount)}`
-                            : "--"
-                        }
-                      />
-                      <StatCard
-                        label="Fear and Greed"
-                        value={
-                          typeof diagnostics.fearGreedIndex === "number"
-                            ? String(Math.round(diagnostics.fearGreedIndex))
-                            : "N/A"
-                        }
-                        subValue={
-                          typeof diagnostics.fearGreedRegime === "string"
-                            ? diagnostics.fearGreedRegime
-                            : undefined
-                        }
-                        trend={
-                          typeof diagnostics.fearGreedIndex === "number"
-                            ? diagnostics.fearGreedIndex > 55
-                              ? "up"
-                              : diagnostics.fearGreedIndex < 45
-                                ? "down"
-                                : "neutral"
-                            : "neutral"
-                        }
-                      />
+                {/* Live Diagnostics -- shown only for running runs.
+                    WP7.0 (SY-70-23/24, UT-14): its own failure gets a
+                    card-scoped badge, never the page-level stale banner. */}
+                {run.status === "running" && (() => {
+                  const diagnostics = diagPoll.data;
+                  return (
+                    <div className="card">
+                      <div className="mb-3 flex items-center justify-between">
+                        <h3 className="text-sm font-semibold text-slate-700 dark:text-slate-300">
+                          Live Diagnostics
+                        </h3>
+                        {diagPoll.error && (
+                          <span
+                            role="status"
+                            className="rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-700 dark:bg-amber-900/30 dark:text-amber-400"
+                          >
+                            Diagnostics unavailable
+                          </span>
+                        )}
+                      </div>
+                      {diagnostics && (
+                        <>
+                          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+                            <StatCard
+                              label="Current Equity"
+                              value={
+                                typeof diagnostics.currentEquity === "string"
+                                  ? `${ccy}${formatCurrency(diagnostics.currentEquity)}`
+                                  : "--"
+                              }
+                            />
+                            <StatCard
+                              label="Drawdown"
+                              value={
+                                typeof diagnostics.drawdownPct === "number"
+                                  ? formatPct(diagnostics.drawdownPct)
+                                  : "--"
+                              }
+                              trend={
+                                typeof diagnostics.drawdownPct === "number" && diagnostics.drawdownPct > 0.1
+                                  ? "down"
+                                  : "neutral"
+                              }
+                            />
+                            <StatCard
+                              label="Trades / Orders"
+                              value={
+                                typeof diagnostics.tradeCount === "number" &&
+                                typeof diagnostics.orderCount === "number"
+                                  ? `${String(diagnostics.tradeCount)} / ${String(diagnostics.orderCount)}`
+                                  : "--"
+                              }
+                            />
+                            <StatCard
+                              label="Fear and Greed"
+                              value={
+                                typeof diagnostics.fearGreedIndex === "number"
+                                  ? String(Math.round(diagnostics.fearGreedIndex))
+                                  : "N/A"
+                              }
+                              subValue={
+                                typeof diagnostics.fearGreedRegime === "string"
+                                  ? diagnostics.fearGreedRegime
+                                  : undefined
+                              }
+                              trend={
+                                typeof diagnostics.fearGreedIndex === "number"
+                                  ? diagnostics.fearGreedIndex > 55
+                                    ? "up"
+                                    : diagnostics.fearGreedIndex < 45
+                                      ? "down"
+                                      : "neutral"
+                                  : "neutral"
+                              }
+                            />
+                          </div>
+                          {typeof diagnostics.lastUpdated === "string" && (
+                            <p className="mt-2 text-xs text-slate-500">
+                              Last updated: {new Date(diagnostics.lastUpdated).toLocaleString()}
+                            </p>
+                          )}
+                        </>
+                      )}
                     </div>
-                    {typeof diagnostics.lastUpdated === "string" && (
-                      <p className="mt-2 text-xs text-slate-500">
-                        Last updated: {new Date(diagnostics.lastUpdated).toLocaleString()}
-                      </p>
-                    )}
-                  </div>
-                )}
+                  );
+                })()}
 
                 {/* Backtest performance metrics — shown only for completed backtests */}
                 {run.runMode === "backtest" && run.backtestMetrics && (

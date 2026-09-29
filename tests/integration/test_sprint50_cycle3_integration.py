@@ -64,14 +64,25 @@ def client_admin(app_with_admin: Any) -> Generator[TestClient, None, None]:
 
 @pytest.fixture()
 def mock_db_session() -> AsyncMock:
-    """Mock AsyncSession that returns an empty scalars result by default."""
+    """Mock AsyncSession that returns an empty scalars result by default.
+
+    WP1.8a (S4): the audit row is now written unconditionally, even on the
+    0-running-runs early-return path, so begin_nested() must always be
+    mocked as an async context manager here (previously only needed by
+    the >=1-running-run tests).
+    """
     session = AsyncMock()
     session.add = MagicMock()
     session.flush = AsyncMock()
     session.commit = AsyncMock()
     session.rollback = AsyncMock()
 
-    # Default: no running runs
+    nested_cm = MagicMock()
+    nested_cm.__aenter__ = AsyncMock(return_value=None)
+    nested_cm.__aexit__ = AsyncMock(return_value=False)
+    session.begin_nested = MagicMock(return_value=nested_cm)
+
+    # Default: no running runs, no orphaned live runs either
     mock_result = MagicMock()
     mock_result.scalars.return_value.all.return_value = []
     session.execute = AsyncMock(return_value=mock_result)
@@ -126,25 +137,38 @@ class TestKillSwitchAuth:
     def test_kill_switch_200_no_runs_is_idempotent(
         self, client_admin_with_db: TestClient, mock_db_session: AsyncMock
     ) -> None:
-        """Correct X-Admin-Key + 0 running runs returns 200 with idempotent note.
+        """Correct X-Admin-Key + 0 running runs returns 200 -- latched with
+        an empty runs_latched list (WP1.7a).
 
-        Covers the 0-runs early-return path: no audit row is written (no running
-        runs means no scope to record), response contains note='no active runs to
-        stop', and all numeric fields are zero.  Audit-written-before-stop coverage
-        is handled by the unit test test_kill_switch_audit_written_before_stop.
+        WP1.8a (S4): the audit row IS now written even on the 0-running-runs
+        early-return path (V3 fix -- HEAD returned early with no audit write
+        at all, leaving no trace of a kill-switch press while a run sat
+        orphaned).
         """
-        with patch("api.routers.emergency.record_audit_event", new=AsyncMock()) as mock_audit:
-            response = client_admin_with_db.post(
-                "/api/v1/emergency/kill-switch",
-                headers={"X-Admin-Key": _TEST_ADMIN_KEY},
-            )
+        from api.services import kill_switch as kill_switch_service
 
-        assert response.status_code == 200
-        body = response.json()
-        assert body["runs_stopped"] == []
-        assert body["tasks_cancelled"] == 0
-        assert body["engines_removed"] == 0
-        assert body["errors"] == []
-        assert body["note"] == "no active runs to stop"
-        # Audit must NOT be called when there are no running runs (early-return path)
-        mock_audit.assert_not_called()
+        kill_switch_service.reset_state_for_tests()
+        try:
+            with (
+                patch("api.routers.emergency.record_audit_event", new=AsyncMock()) as mock_audit,
+                patch.object(
+                    kill_switch_service, "activate", new=AsyncMock(return_value=True)
+                ),
+            ):
+                response = client_admin_with_db.post(
+                    "/api/v1/emergency/kill-switch",
+                    headers={"X-Admin-Key": _TEST_ADMIN_KEY},
+                )
+
+            assert response.status_code == 200
+            body = response.json()
+            assert body["latched"] is True
+            # WP1.7a round 2 (C-03): KillSwitchResponse now shares the
+            # project-wide camelCase convention (API_MODEL_CONFIG) --
+            # previously this field was snake_case while the nested
+            # flatten_results values were already camelCase.
+            assert body["runsLatched"] == []
+            assert body["errors"] == []
+            mock_audit.assert_awaited_once()
+        finally:
+            kill_switch_service.reset_state_for_tests()

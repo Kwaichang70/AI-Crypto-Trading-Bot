@@ -12,6 +12,12 @@ const RUN_STATUS_VARIANTS: Record<RunStatus, BadgeVariant> = {
   stopped: "neutral",
   error: "danger",
   archived: "neutral",
+  // WP1.8a/WP1.7b: engine task gone, needs an operator resume -- distinct
+  // from a clean "stopped" so it stands out in the runs list.
+  orphaned: "warning",
+  // WP1.8a/WP1.7b: short-lived compare-and-set lock held while
+  // POST /runs/{id}/resume is in flight.
+  resuming: "info",
 };
 
 const ORDER_STATUS_VARIANTS: Record<OrderStatus, BadgeVariant> = {

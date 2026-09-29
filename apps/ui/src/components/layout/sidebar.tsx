@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { KillSwitchPanel } from "@/components/kill-switch-panel";
 
 interface NavItem {
   href: string;
@@ -132,6 +133,9 @@ export function Sidebar() {
               </button>
             </li>
           </ul>
+          {/* WP1.7b (S13): kill switch relocated here from the homepage so
+              it (and the latch-status badge) is available from every page. */}
+          <KillSwitchPanel />
         </div>
       </nav>
     </aside>

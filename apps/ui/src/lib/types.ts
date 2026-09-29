@@ -17,7 +17,13 @@
 // ---------------------------------------------------------------------------
 
 export type RunMode = "backtest" | "paper" | "live";
-export type RunStatus = "running" | "stopped" | "error" | "archived";
+export type RunStatus =
+  | "running"
+  | "stopped"
+  | "error"
+  | "archived"
+  | "orphaned" // WP1.8a: engine task gone (API restart / graceful shutdown); needs an operator resume
+  | "resuming"; // WP1.8a: short-lived compare-and-set lock held while POST /runs/{id}/resume is in flight
 
 export interface RunConfig {
   strategy_name: string;
@@ -28,6 +34,14 @@ export interface RunConfig {
   initial_capital: string;
   backtest_start?: string;
   backtest_end?: string;
+  /**
+   * WP1.3a (SY-13a-08): resolved (never absent after create/promote/normal
+   * resume/paper recovery) — an explicit `allowPyramiding` on the request
+   * wins, otherwise the strategy's own `default_allow_pyramiding` ClassVar
+   * (`True` only for dca_rsi_hybrid/grid_trading, `False` elsewhere).
+   * Optional here purely for back-compat with pre-WP1.3a persisted configs.
+   */
+  allow_pyramiding?: boolean;
 }
 
 export interface Run {
@@ -69,6 +83,28 @@ export interface Run {
    * Added by M5 backend (Sprint 49).
    */
   leaderboardEligible?: boolean;
+  /**
+   * WP1.3a (SY-13a §5 API contract): warnings emitted by the exit-config /
+   * pyramiding validator on a SUCCESSFUL 201 create. Absent/empty on every
+   * other read of a `Run` (GET /runs/{id} does not replay them) — this is a
+   * create-response-only field, so callers must capture it from the
+   * `createRun()` result at the moment of creation (see CF-13a-1 item 3).
+   */
+  configWarnings?: readonly ConfigWarning[];
+  /**
+   * WP1.3a (SY-13a-16): set on a PROTECTIVE resume (200) when one or more
+   * exit-config components were dropped ("salvaged") to let the resume
+   * proceed under the waiver. `null` when nothing was waived (including
+   * every non-resume read and every normal-mode resume).
+   */
+  exitConfigWaived?: ExitConfigWaived | null;
+  /**
+   * WP1.3a (SY-13a-16): true when, after a protective-resume salvage, the
+   * surviving config has NO downside exit at all (no SL/trailing) — the
+   * critical "flatten recommended" case. `null`/absent outside a protective
+   * resume response.
+   */
+  exitManagerMissing?: boolean | null;
 }
 
 /**
@@ -192,7 +228,304 @@ export interface RunCreateRequest {
   initialCapital: string;
   backtestStart?: string | null;
   backtestEnd?: string | null;
+  /**
+   * WP1.3a (SY-13a-08, CF-13a-1 item 4): `StrictBool` on the wire — never
+   * send a truthy/falsy non-boolean. An explicit value always wins over the
+   * strategy's `default_allow_pyramiding`. The UI always sends this
+   * explicitly (never omitted) so the resolved value the operator saw in
+   * the form is exactly what the backend persists:
+   *   - live mode: always `false` (forced, not editable in the form).
+   *   - paper/backtest: the checkbox value, which itself defaults to the
+   *     strategy's own default (see `strategyDefaultAllowPyramiding` in
+   *     `./exit-config`).
+   */
+  allowPyramiding?: boolean;
+  /**
+   * WP1.7a/SY-10 (S13): deprecated body-field fallback only. The UI never
+   * populates this — a live-mode confirmation is sent EXCLUSIVELY via the
+   * `X-Live-Confirm-Token` request header (see `createRun()` in `./api`),
+   * so real callers pass the token via `createRun(body, {idempotencyKey,
+   * liveConfirmToken})` (WP7.0, SY-70-18 -- an options object, never a bare
+   * positional string; see `RunSubmitOptions`), never as part of this
+   * object. Kept typed (rather than removed) purely so any not-yet-migrated
+   * caller/fixture that still sets it continues to compile; the backend
+   * accepts the header only from this UI going forward.
+   */
   confirmToken?: string | undefined;
+}
+
+// ---------------------------------------------------------------------------
+// WP1.3a: exit-config / pyramiding validator error envelope + warnings
+// -----------------------------------------------------------------------
+// Mirrors packages/trading/exit_config.py's ExitConfigIssue/ExitConfigWarning
+// dataclasses and apps/api's 422 `{"detail": {...}}` envelope for create,
+// promote-to-live, resume and optimize (reports/vp2-wp1.3a/synthesis-spec.md
+// §5/§18). These raw-dict `detail` bodies are NOT pydantic models (same
+// precedent as `FlattenDecisionRequiredDetail.held_symbols` above), so their
+// fields stay snake_case on the wire even though this project's pydantic
+// response MODELS use camelCase — do not "fix" these to camelCase.
+// ---------------------------------------------------------------------------
+
+/** One field-level validation issue from the exit-config/pyramiding validator. */
+export interface ExitConfigIssue {
+  field: string | null;
+  reason: string;
+  /** Stringified, truncated to <=64 chars server-side. */
+  value: string | null;
+  min: number | null;
+  max: number | null;
+  message: string;
+}
+
+/** One non-blocking warning (W1-W5, W7, W8) returned alongside a 2xx. */
+export interface ConfigWarning {
+  code: string;
+  field: string | null;
+  message: string;
+}
+
+export type ExitConfigErrorCode =
+  | "invalid_exit_config"
+  | "exit_manager_required"
+  | "live_pyramiding_forbidden";
+
+/** 422 `detail` when a bracket/trailing value fails validation (E1-E4/E6/E7/E9/E10). */
+export interface InvalidExitConfigDetail {
+  code: "invalid_exit_config";
+  errors: readonly ExitConfigIssue[];
+  warnings?: readonly ConfigWarning[];
+  hint?: string;
+}
+
+/** 422 `detail` when a `requires_exit_manager=True` strategy has no downside exit (E5). */
+export interface ExitManagerRequiredDetail {
+  code: "exit_manager_required";
+  strategy: string;
+  requires_one_of: readonly string[];
+  errors: readonly ExitConfigIssue[];
+  warnings?: readonly ConfigWarning[];
+  hint?: string;
+}
+
+/** 422 `detail` for a resolved-True `allowPyramiding` in LIVE (E11, D-13a-1). */
+export interface LivePyramidingForbiddenDetail {
+  code: "live_pyramiding_forbidden";
+  strategy: string;
+  hint?: string;
+  errors: readonly ExitConfigIssue[];
+  warnings?: readonly ConfigWarning[];
+}
+
+/** Union of every structured 422 body create/promote/resume can return (SY-13a-18). */
+export type ExitConfigErrorDetail =
+  | InvalidExitConfigDetail
+  | ExitManagerRequiredDetail
+  | LivePyramidingForbiddenDetail;
+
+/**
+ * One grid-combination-scoped issue from `POST /api/v1/optimize`'s 422
+ * (WP13a-C-01, round 2): the backend emits EXACTLY this flat shape --
+ * `{combo_index, params, field, reason, value, min, max, message}`, no more
+ * no less. Written out explicitly here (not `extends ExitConfigIssue`,
+ * even though the field set is identical) so this contract is unambiguous
+ * at a glance and does not silently drift if the base `ExitConfigIssue`
+ * ever grows a field the optimize envelope doesn't carry.
+ */
+export interface OptimizeExitConfigIssue {
+  combo_index: number;
+  params: Record<string, unknown>;
+  field: string | null;
+  reason: string;
+  /** Stringified, truncated to <=64 chars server-side. */
+  value: string | null;
+  min: number | null;
+  max: number | null;
+  message: string;
+}
+
+/**
+ * `POST /api/v1/optimize` 422 `detail` — same top-level codes as create/
+ * promote/resume, but `errors[]` items are combination-scoped (`combo_index`,
+ * `params`) and the list is capped at 20, with the top-level `total_invalid`
+ * always present (WP13a-C-01) giving the real count (SY-13a-17/§5).
+ */
+export interface OptimizeExitConfigErrorDetail {
+  code: "invalid_exit_config" | "exit_manager_required";
+  errors: readonly OptimizeExitConfigIssue[];
+  total_invalid: number;
+  warnings?: readonly ConfigWarning[];
+}
+
+/** `exitConfigWaived` on a protective-resume `Run` (SY-13a-16). */
+export interface ExitConfigWaived {
+  code: string;
+  errors: readonly ExitConfigIssue[];
+}
+
+// ---------------------------------------------------------------------------
+// WP1.7a/1.7b: kill switch, per-run entries latch, flatten result envelopes
+// -----------------------------------------------------------------------
+// Mirrors apps/api/routers/emergency.py (KillSwitch*) and the FlattenResult /
+// UnprotectedPosition / RunStopResponse / RunEmergencyStopResponse models in
+// apps/api/schemas.py -- every one of those shares the project's camelCase
+// `API_MODEL_CONFIG`, so every field below is camelCase on the wire too.
+// ---------------------------------------------------------------------------
+
+export type FlattenSymbolStatus =
+  | "no_position"
+  | "flat"
+  | "dust"
+  | "partial"
+  | "in_flight"
+  | "failed";
+
+export type FlattenCause =
+  | "ledger_doubt"
+  | "inflight_other"
+  | "submit_unknown"
+  | "rejected"
+  | "timeout_open"
+  | "lock_timeout"
+  | "live_gate_closed"
+  | "error";
+
+/** One symbol's outcome from a single StrategyEngine.flatten() call. */
+export interface FlattenSymbolResult {
+  symbol: string;
+  status: FlattenSymbolStatus;
+  cause: FlattenCause | null;
+  /** Decimal strings — precision preserved from the backend. */
+  heldBefore: string;
+  soldQty: string;
+  remainingQty: string;
+  orderIds: readonly string[];
+  error: string | null;
+}
+
+export type FlattenOutcome = "noop" | "flattened" | "partial" | "failed";
+
+/** Run-level result from a single StrategyEngine.flatten() call. */
+export interface FlattenResult {
+  runId: string;
+  outcome: FlattenOutcome;
+  complete: boolean;
+  symbols: readonly FlattenSymbolResult[];
+  latchPersisted: boolean;
+}
+
+/** One still-held symbol reported by emergency-stop / stop (SY-07). */
+export interface UnprotectedPosition {
+  symbol: string;
+  /** Decimal string. */
+  qty: string;
+  source: "ledger" | "persisted";
+}
+
+/** DELETE /api/v1/runs/{id} 200 response. */
+export interface RunStopResponse extends Run {
+  flatten: FlattenResult | null;
+  unprotectedPositions: readonly UnprotectedPosition[];
+}
+
+/** POST /api/v1/runs/{id}/emergency-stop 200 response. */
+export interface RunEmergencyStopResponse extends Run {
+  flatten: FlattenResult | null;
+  unprotectedPositions: readonly UnprotectedPosition[];
+  exposureUnknown: boolean;
+}
+
+/**
+ * Error `detail` bodies for stop_run's 422/409s are raw dicts constructed
+ * directly in apps/api/routers/runs.py (NOT pydantic models), so — unlike
+ * every other shape on this page — they bypass `API_MODEL_CONFIG`'s
+ * alias_generator and stay snake_case on the wire. `flatten` is the one
+ * exception: it is a `FlattenResultResponse.model_dump(by_alias=True)`
+ * embedded inside the raw dict, so ITS OWN fields are still camelCase.
+ */
+export interface FlattenDecisionRequiredDetail {
+  code: "flatten_decision_required";
+  held_symbols: readonly string[];
+}
+
+export interface FlattenIncompleteDetail {
+  code: "flatten_incomplete";
+  flatten: FlattenResult;
+}
+
+export interface FlattenRequiresRunningEngineDetail {
+  code: "flatten_requires_running_engine";
+}
+
+export interface KillSwitchActiveDetail {
+  code: "kill_switch_active";
+}
+
+export interface EntriesLatchedDetail {
+  code: "entries_latched";
+  reason: string;
+}
+
+export interface NotLatchedDetail {
+  code: "not_latched";
+}
+
+/** GET /api/v1/emergency/kill-switch — read-only status for the UI badge. */
+export interface KillSwitchStatus {
+  latched: boolean;
+  since: string | null;
+  reason: string | null;
+  /** "unknown" -- the latch could not be read at boot (fail-closed, latched). */
+  source: "db" | "unknown";
+}
+
+export interface KillSwitchRunError {
+  runId: string;
+  error: string;
+}
+
+/** POST /api/v1/emergency/kill-switch 200 response (WP1.7a shape, SY-08). */
+export interface KillSwitchPressResponse {
+  latched: boolean;
+  latchPersisted: boolean;
+  since: string | null;
+  runsLatched: readonly string[];
+  orphanedLiveRunIds: readonly string[];
+  resumingRunIds: readonly string[];
+  flattenResults: Readonly<Record<string, FlattenResult>>;
+  errors: readonly KillSwitchRunError[];
+}
+
+export interface KillSwitchRunKeptLatched {
+  runId: string;
+  reasons: readonly string[];
+}
+
+/** POST /api/v1/emergency/kill-switch/clear 200 response. */
+export interface KillSwitchClearResponse {
+  wasLatched: boolean;
+  runsUnlatched: readonly string[];
+  runsKeptLatched: readonly KillSwitchRunKeptLatched[];
+}
+
+/**
+ * POST /api/v1/runs/{id}/entries-latch/clear 200 response.
+ *
+ * CF-B2 (shipped in this same WP) gave `clear_entries_latch`
+ * (apps/api/routers/runs.py) a proper `API_MODEL_CONFIG` response model --
+ * camelCase on the wire, matching this type field-for-field. `cleared` is
+ * typed as the literal `"flatten_incomplete"` (WP17b-C-03) rather than a
+ * plain `string`: the DB's own `ck_runs_entries_latch_reason` CHECK
+ * constraint (apps/api/db/models.py) means this per-run latch reason can
+ * only ever BE `'flatten_incomplete'` -- the backend's own
+ * `EntriesLatchClearResponse.cleared: str` (apps/api/schemas.py) is looser
+ * only because Pydantic has no equivalent DB-level constraint to mirror;
+ * the UI can and should be stricter here for a stronger compile-time
+ * guarantee against a typo'd comparison.
+ */
+export interface EntriesLatchClearResponse {
+  runId: string;
+  cleared: "flatten_incomplete";
+  stillLatchedBy: readonly string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -426,6 +759,17 @@ export interface Strategy {
   demotionReason?: string | null;
   /** Criteria that must be met before the strategy can be re-promoted. */
   promotionRequirements?: readonly string[];
+  /**
+   * WP1.3a (SY-13a-08): mirrors `strategy_cls.default_allow_pyramiding`
+   * (`True` only for dca_rsi_hybrid/grid_trading, `False` on every other
+   * registry strategy) IF the backend schema endpoint exposes it. This is
+   * NOT part of the WP1.3a backend API contract (§4/§5 only add it as an
+   * internal ClassVar) — absent on every API response as of this WP, so the
+   * UI falls back to `PYRAMIDING_DEFAULT_TRUE_STRATEGIES` in
+   * `./exit-config`. Typed here (optional) purely so a future backend
+   * change that DOES expose it is picked up for free, with no UI change.
+   */
+  defaultAllowPyramiding?: boolean;
 }
 
 export interface StrategyListResponse {

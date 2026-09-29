@@ -55,6 +55,11 @@ from common.models import OHLCVBar
 from data.market_data import BaseMarketDataService
 from common.types import QuoteCurrency, RunMode, TimeFrame
 from trading.engines.paper import PaperExecutionEngine
+from trading.exit_config import (
+    parse_exit_config,
+    require_exit_manager,
+    resolve_allow_pyramiding,
+)
 from trading.metrics import (
     BacktestResult,
     EquityCurvePoint,
@@ -190,6 +195,7 @@ class BacktestRunner:
         seed: int | None = None,
         trailing_stop_pct: float | None = None,
         bracket_config: dict[str, object] | None = None,
+        allow_pyramiding: bool | None = None,
     ) -> None:
         if not strategies:
             raise ValueError("At least one strategy is required")
@@ -218,6 +224,23 @@ class BacktestRunner:
         # (stop_loss_pct, take_profit_pct, bracket_mode, atr_*_multiplier,
         # atr_period).  Passed verbatim into the StrategyEngine config.
         self._bracket_config: dict[str, object] = dict(bracket_config or {})
+
+        # WP1.3a (SY-13a-01/17): validate eagerly at construction (defence
+        # in depth -- create_run already validates before the bar fetch;
+        # this covers any caller that builds a BacktestRunner directly,
+        # e.g. the optimizer or a script) and resolve allow_pyramiding.
+        # Uses the multi-strategy primitives directly (not
+        # ``validate_run_exit_config``, which takes one strategy) so every
+        # strategy in ``self._strategies`` is covered, matching the engine's
+        # own ``require_exit_manager(self._strategies, ...)`` call.
+        _parsed_cfg = parse_exit_config(
+            bracket=self._bracket_config,
+            trailing_stop_pct=self._trailing_stop_pct,
+        )
+        require_exit_manager(self._strategies, _parsed_cfg)
+        self._allow_pyramiding: bool = resolve_allow_pyramiding(
+            allow_pyramiding, self._strategies
+        )
 
         # Build risk parameters with explicit fee overrides
         if risk_params is not None:
@@ -657,7 +680,10 @@ class BacktestRunner:
     def _build_engine_config(self) -> dict[str, object]:
         """Build the StrategyEngine config dict, including optional trailing
         stop and fixed/ATR bracket exits."""
-        config: dict[str, object] = {"warmup_bars": self._warmup_bars}
+        config: dict[str, object] = {
+            "warmup_bars": self._warmup_bars,
+            "allow_pyramiding": self._allow_pyramiding,
+        }
         if self._trailing_stop_pct is not None:
             config["trailing_stop_pct"] = self._trailing_stop_pct
         # Merge bracket-exit keys (stop_loss_pct, take_profit_pct,

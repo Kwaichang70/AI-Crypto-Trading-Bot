@@ -11,14 +11,24 @@ Design principles
 -----------------
 - All checks are additive: multiple rules can fail simultaneously.
   All failures are collected and returned in ``RiskCheckResult.rejection_reasons``.
-- The kill-switch is an emergency override that immediately blocks all orders.
+- The kill-switch is an emergency override that blocks all *new entries*.
 - Position sizing uses fixed-fractional Kelly criterion by default.
 - MVP: spot-only, max_leverage = 1 (no short positions).
+- WP1.2 (side-aware exits): a SELL that only reduces an existing position
+  (``is_exposure_reducing`` -- ``0 < quantity <= held``, derived solely from
+  the order and ``open_positions``, never from a caller flag) bypasses the
+  five entry-only gates (kill switch, cooldown, max open positions, daily
+  loss, drawdown) as non-blocking warnings, and skips the order-size /
+  notional check entirely. A SELL above ``held`` is clamped to ``held``
+  (warning, not a block) and then treated as reducing; a SELL with
+  ``held == 0`` is always rejected (``sell_without_position``). Portfolio /
+  cluster exposure stays BUY-only, unchanged.
 """
 
 from __future__ import annotations
 
 import abc
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
@@ -223,13 +233,43 @@ class BaseRiskManager(abc.ABC):
         Immutable risk parameters for this run.
     """
 
+    #: Rule names that only guard against *opening new risk*.  A SELL that
+    #: :meth:`is_exposure_reducing` classifies as exposure-reducing bypasses
+    #: exactly these five gates (WP1.2 / S2); everything else (portfolio
+    #: exposure, order-size / concentration) either stays BUY-only already
+    #: or is skipped for a different reason (see ``pre_trade_check``).
+    _ENTRY_ONLY_RULES: frozenset[str] = frozenset(
+        {
+            "kill_switch",
+            "loss_cooldown",
+            "max_open_positions",
+            "max_daily_loss",
+            "max_drawdown",
+        }
+    )
+
     def __init__(self, run_id: str, params: RiskParameters) -> None:
         self._run_id = run_id
         self._params = params
-        self._kill_switch_active: bool = False
-        self._kill_switch_reason: str | None = None
+        # WP1.7a (SY-03): a SET of independent latch reasons, not a single
+        # bool + reason string.  ``kill_switch_active`` is derived as
+        # ``bool(reasons)`` so multiple callers (the global kill switch,
+        # an incomplete flatten, a stop in progress, an unreadable
+        # persisted latch at boot) can each hold their own reason without
+        # clobbering one another -- clearing ONE reason (reset_kill_switch)
+        # leaves the others in place. Canonical reasons used elsewhere in
+        # this codebase: 'global_kill_switch', 'latch_state_unknown',
+        # 'stop_in_progress', 'flatten_incomplete'; callers may pass any
+        # other free-text reason too (unchanged from the pre-WP1.7a API).
+        self._kill_switch_reasons: set[str] = set()
         self._consecutive_losses: int = 0
         self._cooldown_bars_remaining: int = 0
+        # WP1.8 S-10: defence-in-depth mirror of a live resume's
+        # ``mode=protective`` flag (WP1.8a O9's strategy-layer
+        # ``_drop_entry_signals`` is the primary gate; this is the
+        # risk-layer backstop so a bug upstream of the strategy filter
+        # still cannot open new BUY risk while a run is protective).
+        self._protective_mode: bool = False
         self._log = structlog.get_logger(__name__).bind(run_id=run_id)
 
     # ------------------------------------------------------------------
@@ -246,7 +286,42 @@ class BaseRiskManager(abc.ABC):
 
     @property
     def kill_switch_active(self) -> bool:
-        return self._kill_switch_active
+        return bool(self._kill_switch_reasons)
+
+    @property
+    def kill_switch_reasons(self) -> frozenset[str]:
+        """WP1.7a: the full set of active latch reasons (SY-03)."""
+        return frozenset(self._kill_switch_reasons)
+
+    @property
+    def kill_switch_reason(self) -> str | None:
+        """Backward-compatible single-reason view: one representative
+        reason (deterministically the lexicographically-first) when the
+        latch is active, else ``None``. Prefer :attr:`kill_switch_reasons`
+        for anything that must see every held reason."""
+        if not self._kill_switch_reasons:
+            return None
+        return sorted(self._kill_switch_reasons)[0]
+
+    @property
+    def protective_mode(self) -> bool:
+        """WP1.8 S-10: True once :meth:`set_protective_mode` has been
+        called with ``True`` -- blocks every BUY at the risk layer."""
+        return self._protective_mode
+
+    def set_protective_mode(self, active: bool) -> None:
+        """WP1.8 S-10: enable/disable the risk-layer BUY block.
+
+        Called once at engine construction time by the live-resume
+        pipeline (``mode=protective``, never toggled mid-run -- switching
+        back to normal requires a fresh orphan + resume per the synthesis
+        spec's out-of-scope list). Exposed as a plain setter (not a
+        one-way trigger like the kill switch) since protective mode is a
+        run-configuration flag, not an incident latch.
+        """
+        self._protective_mode = active
+        if active:
+            self._log.warning("risk.protective_mode_enabled")
 
     @property
     def consecutive_losses(self) -> int:
@@ -259,34 +334,54 @@ class BaseRiskManager(abc.ABC):
 
     def trigger_kill_switch(self, reason: str) -> None:
         """
-        Immediately halt all new order submissions.
+        Add ``reason`` to the set of active latch reasons (WP1.7a, SY-03).
 
-        This is a one-way latch — only ``reset_kill_switch`` can clear it.
-        The reason is logged at CRITICAL severity.
+        Idempotent per reason (adding the same reason twice is a no-op on
+        state, though it is still logged). Only :meth:`reset_kill_switch`
+        can remove a reason. The reason is logged at CRITICAL severity.
 
         Parameters
         ----------
         reason:
-            Human-readable explanation for the halt.
+            Human-readable explanation for the halt. See the reason-set
+            docstring on ``__init__`` for the canonical values used
+            elsewhere in this codebase.
         """
-        self._kill_switch_active = True
-        self._kill_switch_reason = reason
+        self._kill_switch_reasons.add(reason)
         self._log.critical(
             "risk.kill_switch_triggered",
             reason=reason,
+            reasons=sorted(self._kill_switch_reasons),
             alert="TRADING_HALTED",
         )
 
-    def reset_kill_switch(self) -> None:
+    def reset_kill_switch(self, reason: str | None = None) -> None:
         """
-        Clear the kill switch and resume normal operation.
+        Remove one latch reason, or every reason, from the active set.
 
-        This MUST be called explicitly by an operator — it is never
+        WP1.7a (SY-03): passing ``reason=None`` (the default -- preserves
+        every pre-WP1.7a caller's behaviour unchanged) clears the ENTIRE
+        set, exactly like the old single-flag ``reset_kill_switch()``.
+        Passing a specific ``reason`` removes only that one -- the latch
+        stays active (``kill_switch_active`` stays ``True``) if any other
+        reason remains, e.g. clearing ``'flatten_incomplete'`` after a
+        successful retry must not silently also clear an unrelated
+        ``'global_kill_switch'``.
+
+        This MUST be called explicitly by an operator (directly, or via
+        the kill-switch/entries-latch clear endpoints) — it is never
         cleared automatically.
         """
-        self._kill_switch_active = False
-        self._kill_switch_reason = None
-        self._log.warning("risk.kill_switch_reset")
+        if reason is None:
+            self._kill_switch_reasons.clear()
+        else:
+            self._kill_switch_reasons.discard(reason)
+        self._log.warning(
+            "risk.kill_switch_reset",
+            reason=reason,
+            still_active=self.kill_switch_active,
+            remaining_reasons=sorted(self._kill_switch_reasons),
+        )
 
     # ------------------------------------------------------------------
     # Abstract interface
@@ -426,14 +521,85 @@ class BaseRiskManager(abc.ABC):
         return self._cooldown_bars_remaining > 0
 
     # ------------------------------------------------------------------
+    # Side-aware exits (WP1.2 / S1-S4)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _held_for(symbol: str, open_positions: Sequence[Position]) -> Decimal:
+        """Sum of ``quantity`` across all non-flat positions for ``symbol``."""
+        return sum(
+            (p.quantity for p in open_positions if p.symbol == symbol and not p.is_flat),
+            Decimal(0),
+        )
+
+    @staticmethod
+    def is_exposure_reducing(order: Order, open_positions: Sequence[Position]) -> bool:
+        """
+        True when ``order`` is a SELL that does not exceed the quantity
+        currently held for its symbol.
+
+        Reducing status is derived *only* from ``order`` and
+        ``open_positions`` -- never from a caller-supplied flag or
+        ``signal.metadata`` -- because a strategy could fake either of
+        those (WP12-R-01). ``held`` is the sum of ``quantity`` over every
+        non-flat position for ``order.symbol`` in ``open_positions``. A
+        SELL that exceeds ``held`` is NOT reducing by this definition; the
+        caller (``pre_trade_check``) clamps it to ``held`` instead of
+        rejecting it (S3) and treats the clamped order as reducing from
+        that point on.
+
+        Callers must pass at most one Position per symbol. ``_held_for``
+        sums every non-flat entry matching ``order.symbol``, so duplicate
+        entries for the same symbol would inflate ``held`` (WP12-S-02);
+        both engines already build ``open_positions`` from a dict keyed
+        by symbol, so this cannot happen through the production call
+        sites today.
+        """
+        if order.side != OrderSide.SELL or order.quantity <= Decimal(0):
+            return False
+        held = BaseRiskManager._held_for(order.symbol, open_positions)
+        return Decimal(0) < order.quantity <= held
+
+    def _bypass(self, v: RiskViolation) -> RiskViolation:
+        """
+        Downgrade an entry-only violation to a non-blocking warning.
+
+        Used for a SELL order that ``is_exposure_reducing`` (or the S3
+        clamp path) classifies as exposure-reducing: on spot with no
+        leverage such an order can only shrink risk, so it must never be
+        blocked by an entry-only gate. The rule name is preserved -- only
+        ``blocking`` flips and the message gets a prefix identifying it as
+        a bypass, so callers can still tell which gate was involved.
+        """
+        return RiskViolation(
+            rule=v.rule,
+            message=f"bypassed (exposure-reducing SELL): {v.message}",
+            blocking=False,
+        )
+
+    # ------------------------------------------------------------------
     # Shared helper — used by concrete implementations
     # ------------------------------------------------------------------
 
     def _check_kill_switch(self) -> RiskViolation | None:
-        if self._kill_switch_active:
+        if self._kill_switch_reasons:
             return RiskViolation(
                 rule="kill_switch",
-                message=f"Kill switch active: {self._kill_switch_reason}",
+                message=(
+                    f"Kill switch active: {', '.join(sorted(self._kill_switch_reasons))}"
+                ),
+                blocking=True,
+            )
+        return None
+
+    def _check_protective_mode(self, order: Order) -> RiskViolation | None:
+        """WP1.8 S-10: block a BUY at the risk layer while protective mode
+        is active. Never fires for a SELL -- protective mode only ever
+        drops entries, exits keep working (O9)."""
+        if self._protective_mode and order.side == OrderSide.BUY:
+            return RiskViolation(
+                rule="protective_mode",
+                message="Protective mode active: BUY entries are blocked (WP1.8 S-10).",
                 blocking=True,
             )
         return None
@@ -587,5 +753,5 @@ class BaseRiskManager(abc.ABC):
         return (
             f"{self.__class__.__name__}("
             f"run_id={self._run_id!r}, "
-            f"kill_switch={self._kill_switch_active})"
+            f"kill_switch={self.kill_switch_active})"
         )

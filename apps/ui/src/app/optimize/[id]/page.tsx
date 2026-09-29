@@ -8,6 +8,15 @@ import type { OptimizeResponse, OptimizeEntry } from "@/lib/types";
 import { Header } from "@/components/layout/header";
 import { DataTable } from "@/components/ui/data-table";
 import { buildResultColumns } from "../result-columns";
+import {
+  classifyIdempotencyError,
+  getStructuredErrorCode,
+  IDEMPOTENCY_CLIENT_ERROR_MESSAGE,
+  IDEMPOTENCY_IN_PROGRESS_MESSAGE,
+  IDEMPOTENCY_REUSED_MESSAGE,
+  useIdempotencyKey,
+  useSubmitLock,
+} from "@/lib/idempotency";
 
 // ---------------------------------------------------------------------------
 // Page phase discriminated union
@@ -33,6 +42,10 @@ export default function OptimizationRunDetailPage() {
   const [launchingRank, setLaunchingRank] = useState<number | null>(null);
   const [launchError, setLaunchError] = useState<string | null>(null);
   const [launchCapital, setLaunchCapital] = useState("10000");
+  // WP7.0 (SY-70-19/20, C-2): see the sibling optimize list page for the
+  // same-lock-shared-across-entries / distinct-key-per-entry rationale.
+  const launchIdempotency = useIdempotencyKey();
+  const launchSubmitLock = useSubmitLock();
 
   useEffect(() => {
     if (!id) {
@@ -51,25 +64,51 @@ export default function OptimizationRunDetailPage() {
 
   async function handleLaunchRun(entry: OptimizeEntry) {
     if (phase.kind !== "loaded") return;
+    if (!launchSubmitLock.tryAcquire()) return;
     setLaunchingRank(entry.rank);
     setLaunchError(null);
 
-    const result = await createRun({
+    const body = {
       strategyName: phase.data.strategyName,
       strategyParams: entry.params,
       symbols: [...phase.data.symbols],
       timeframe: phase.data.timeframe,
-      mode: "backtest",
+      mode: "backtest" as const,
       initialCapital: launchCapital,
       backtestStart: null,
       backtestEnd: null,
-    });
+    };
 
-    setLaunchingRank(null);
-    if (result.ok) {
-      router.push(`/runs/${result.data.id}`);
-    } else {
+    try {
+      const idempotencyKey = launchIdempotency.keyFor(JSON.stringify(body));
+      const result = await createRun(body, { idempotencyKey });
+
+      if (result.ok) {
+        launchIdempotency.reset();
+        router.push(`/runs/${result.data.id}`);
+        return;
+      }
+
+      const outcome = classifyIdempotencyError(result.error.detail);
+      if (outcome.kind === "in_progress") {
+        setLaunchError(IDEMPOTENCY_IN_PROGRESS_MESSAGE);
+        return;
+      }
+      if (outcome.kind === "reused") {
+        launchIdempotency.reset();
+        setLaunchError(IDEMPOTENCY_REUSED_MESSAGE);
+        return;
+      }
+      if (outcome.kind === "client_error") {
+        console.error("idempotency client error", getStructuredErrorCode(result.error.detail));
+        launchIdempotency.reset();
+        setLaunchError(IDEMPOTENCY_CLIENT_ERROR_MESSAGE);
+        return;
+      }
       setLaunchError(`Failed to launch run: ${result.error.message}`);
+    } finally {
+      setLaunchingRank(null);
+      launchSubmitLock.release();
     }
   }
 

@@ -60,6 +60,8 @@ __all__ = [
     "OptimizationRunORM",
     "OptimizationEntryORM",
     "AuditEventORM",
+    "IdempotencyKeyORM",
+    "KillSwitchStateORM",
 ]
 
 # ---------------------------------------------------------------------------
@@ -113,12 +115,16 @@ class RunORM(Base):
             name="ck_runs_run_mode",
         ),
         CheckConstraint(
-            "status IN ('running', 'stopped', 'error', 'archived')",
+            "status IN ('running', 'stopped', 'error', 'archived', 'orphaned', 'resuming')",
             name="ck_runs_status",
         ),
         CheckConstraint(
             "stopped_at IS NULL OR stopped_at >= started_at",
             name="ck_runs_stopped_after_started",
+        ),
+        CheckConstraint(
+            "entries_latch_reason IS NULL OR entries_latch_reason = 'flatten_incomplete'",
+            name="ck_runs_entries_latch_reason",
         ),
     )
 
@@ -141,7 +147,13 @@ class RunORM(Base):
         String(16),
         nullable=False,
         default="running",
-        comment="Current run state: running | stopped | error | archived",
+        comment=(
+            "Current run state: running | stopped | error | archived | "
+            "orphaned | resuming (WP1.8a: 'orphaned' = the engine task is "
+            "gone -- API restart or graceful shutdown -- and needs an "
+            "operator resume; 'resuming' is the short-lived compare-and-set "
+            "lock held while POST /runs/{id}/resume is in flight)"
+        ),
     )
 
     # Strategy configuration snapshot  -- stored at run creation time.
@@ -209,6 +221,29 @@ class RunORM(Base):
         nullable=False,
         server_default="false",
         comment="True after backfill_metrics_v2.py has populated n_closed_trades for this row.",
+    )
+
+    # WP1.7a: per-run entries latch (SY-02).  Set when a normal stop's
+    # flatten does not complete (D3/D5/D8): entries stay blocked -- exits
+    # keep running -- until an operator clears it via
+    # POST /runs/{id}/entries-latch/clear.  The ONLY reason ever stored
+    # here is 'flatten_incomplete' (enforced by ck_runs_entries_latch_reason)
+    # -- the global kill switch is never mirrored into this column (SY-01:
+    # global state is never copied into per-run columns).
+    entries_latch_reason: Mapped[str | None] = mapped_column(
+        String(32),
+        nullable=True,
+        default=None,
+        comment=(
+            "Per-run entries latch reason. NULL = not latched. The only "
+            "non-NULL value is 'flatten_incomplete' (WP1.7a)."
+        ),
+    )
+    entries_latched_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        default=None,
+        comment="UTC timestamp when entries_latch_reason was last set. NULL when not latched.",
     )
 
     created_at: Mapped[datetime] = mapped_column(
@@ -1489,7 +1524,10 @@ class AuditEventORM(Base):
             "'circuit_breaker_reset', 'emergency_stop', 'kill_switch', "
             "'circuit_breaker_halt_auto_stop', "
             "'paper_promoted_to_live', "
-            "'model_oos_gate_bypassed'"
+            "'model_oos_gate_bypassed', "
+            "'run_orphaned', 'run_resumed', 'run_resume_rejected', "
+            "'resume_orders_imported', "
+            "'kill_switch_cleared', 'run_flatten', 'entries_latch_cleared'"
             ")",
             name="ck_audit_events_event_type",
         ),
@@ -1506,3 +1544,174 @@ class AuditEventORM(Base):
             f"actor={self.actor} event={self.event_type} "
             f"resource={self.resource_type}:{self.resource_id}>"
         )
+
+
+# ---------------------------------------------------------------------------
+# 12b. idempotency_keys  -- WP7.0 dedup table for POST /runs and promote
+# ---------------------------------------------------------------------------
+
+class IdempotencyKeyORM(Base):
+    """Dedup state for ``Idempotency-Key`` on run creation and promotion.
+
+    See ``reports/vp2-wp7.0/synthesis-spec.md`` SY-70-05/SY-70-13 and
+    ``infra/alembic/versions/019_add_idempotency_keys.py``.
+
+    ``claimed_run_id`` deliberately has NO foreign key (WP70-DB-01): it is
+    written at claim time, before the corresponding ``runs`` row is
+    guaranteed to exist (or exist AT ALL, if the claimant crashes before
+    ever inserting one). ``run_id`` IS a real FK, written only in the same
+    transaction as (immediately before committing) the ``runs`` INSERT
+    itself, at which point same-transaction MVCC guarantees the target
+    row is visible.
+
+    ``updated_at`` is the staleness clock for case-8 reconciliation and
+    the TTL prune -- NOT ``created_at``, which never changes and would
+    make a just-reclaimed row look permanently stale to the next reader.
+    """
+
+    __tablename__ = "idempotency_keys"
+
+    key: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        comment="The client-supplied Idempotency-Key, canonicalised to lowercase.",
+    )
+
+    endpoint: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        comment="Logical endpoint name, e.g. 'POST /runs'.",
+    )
+
+    request_fingerprint: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        comment="sha256 hex digest of {endpoint, path_params, body} (SY-70-06).",
+    )
+
+    status: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        server_default="in_progress",
+        comment="One of 'in_progress', 'completed', 'failed'.",
+    )
+
+    claimed_run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        nullable=False,
+        comment=(
+            "Provisional run id written at claim time. No FK (WP70-DB-01) -- "
+            "the referenced runs row may not exist yet, or ever."
+        ),
+    )
+
+    run_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("runs.id", ondelete="SET NULL"),
+        nullable=True,
+        comment=(
+            "Confirmed run id, written only by complete() in the same "
+            "transaction as the runs INSERT."
+        ),
+    )
+
+    response_status_code: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        server_default="201",
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        comment="Staleness clock (case 8) and TTL-prune clock -- bumped on every transition.",
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('in_progress', 'completed', 'failed')",
+            name="ck_idempotency_keys_status",
+        ),
+        Index("ix_idempotency_keys_updated_at", "updated_at"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<IdempotencyKeyORM key={self.key} status={self.status} "
+            f"claimed_run_id={self.claimed_run_id} run_id={self.run_id}>"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 13. kill_switch_state  -- WP1.7a global kill-switch latch (single row)
+# ---------------------------------------------------------------------------
+
+class KillSwitchStateORM(Base):
+    """Single-row table backing the process-wide kill-switch latch (SY-01).
+
+    Read fail-closed at boot by ``api.services.kill_switch.load()`` --
+    deriving the latch from ``audit_events`` was rejected (a flush failure
+    inside ``record_audit_event`` is swallowed, and the audit trail has no
+    natural "clear" row without a synthetic migration step every deploy).
+    The single row (``id`` fixed at 1 via CHECK) is written in the SAME
+    transaction as the ``kill_switch``/``kill_switch_cleared`` audit row.
+    """
+
+    __tablename__ = "kill_switch_state"
+    __table_args__ = (
+        CheckConstraint("id = 1", name="ck_kill_switch_state_singleton"),
+    )
+
+    id: Mapped[int] = mapped_column(
+        Integer(),
+        primary_key=True,
+        comment="Always 1 -- singleton row enforced by ck_kill_switch_state_singleton.",
+    )
+    active: Mapped[bool] = mapped_column(
+        Boolean(),
+        nullable=False,
+        default=False,
+        comment="True while the global kill switch is latched.",
+    )
+    reason: Mapped[str | None] = mapped_column(
+        Text(),
+        nullable=True,
+        default=None,
+        comment="Operator-supplied reason from the most recent activation.",
+    )
+    activated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        default=None,
+    )
+    activated_by: Mapped[str | None] = mapped_column(
+        String(128),
+        nullable=True,
+        default=None,
+        comment="Actor identifier (admin-key hash prefix) that activated the latch.",
+    )
+    cleared_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        default=None,
+    )
+    cleared_by: Mapped[str | None] = mapped_column(
+        String(128),
+        nullable=True,
+        default=None,
+    )
+    clear_reason: Mapped[str | None] = mapped_column(
+        Text(),
+        nullable=True,
+        default=None,
+    )
+
+    def __repr__(self) -> str:
+        return f"<KillSwitchStateORM active={self.active} reason={self.reason!r}>"

@@ -77,11 +77,11 @@ class _MomentumBreakoutParams(BaseModel):
         description="ATR-mode take-profit distance (x ATR above entry). Keep > SL.",
     )
     bracket_atr_period: int = Field(
-        default=14, ge=2, le=500,
+        default=14, ge=2, le=99,
         description="ATR look-back used for ATR-mode brackets.",
     )
     bracket_stop_loss_pct: float | None = Field(
-        default=None, ge=0.001, le=0.95,
+        default=None, ge=0.001, le=0.50,
         description="Fixed-mode stop-loss fraction of entry (used if mode=fixed).",
     )
     bracket_take_profit_pct: float | None = Field(
@@ -103,6 +103,10 @@ class MomentumBreakoutStrategy(BaseStrategy):
         author="quant-strategy-analyst",
         tags=["momentum", "trend", "breakout", "stop-loss", "take-profit", "bracket"],
     )
+
+    # WP1.3a (SY-13a-06/08): explicit per-strategy declaration --
+    # BUY-only; the engine's bracket/trailing exit is mandatory (SY-13a-06).
+    requires_exit_manager: ClassVar[bool] = True
 
     def _validate_params(self, params: dict[str, Any]) -> dict[str, Any]:
         return _MomentumBreakoutParams(**params).model_dump()

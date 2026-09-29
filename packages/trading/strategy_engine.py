@@ -24,7 +24,13 @@ Run modes
 
 Safety invariants
 -----------------
-- In LIVE mode the risk manager kill-switch is checked before each bar
+- In every mode, the risk manager kill-switch blocks new *entries* only
+  (D3, WP1.2): BUY signals are dropped after the strategy loop via
+  ``_drop_entry_signals``; strategy SELLs, bracket exits (5a), trailing
+  stops (5b) and resting-order fills (6) all keep running while it is
+  active. The side-aware ``DefaultRiskManager`` gate is what actually
+  enforces this; the engine-level filter only avoids a pointless
+  downstream attempt for BUYs and keeps the skip audit populated.
 - Strategy exceptions are caught and logged without crashing the bar loop
 - The bar loop never crashes -- all errors are logged and processing continues
 """
@@ -33,6 +39,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum, auto
@@ -47,7 +54,12 @@ from data.indicators import atr as _atr_series
 from data.market_data import BaseMarketDataService, MarketDataError
 from trading.bracket_exit import BracketExitManager
 from trading.execution import BaseExecutionEngine
-from trading.models import Fill, Position, Signal, TradeResult
+from trading.exit_config import (
+    parse_exit_config,
+    require_exit_manager,
+    resolve_allow_pyramiding,
+)
+from trading.models import Fill, Order, Position, Signal, TradeResult
 from trading.portfolio import PortfolioAccounting
 from trading.risk import BaseRiskManager
 from trading.safety import CircuitBreaker, CircuitBreakerResponse
@@ -55,7 +67,13 @@ from trading.strategy import BaseStrategy
 from trading.trade_journal import ExitReasonDetector, TradeExcursionTracker, TradeSkipLogger
 from trading.trailing_stop import TrailingStopManager
 
-__all__ = ["StrategyEngine", "EngineState"]
+__all__ = [
+    "EngineState",
+    "FlattenPreconditionError",
+    "FlattenResult",
+    "FlattenSymbolResult",
+    "StrategyEngine",
+]
 
 logger = structlog.get_logger(__name__)
 
@@ -134,6 +152,154 @@ _TIMEFRAME_SECONDS: dict[TimeFrame, int] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# WP1.7a: flatten (SY-05/SY-12, arch-design WP17-A-02, risk-design WP17-R-05..09)
+# ---------------------------------------------------------------------------
+
+#: A remaining quantity at or below this tolerance after a SELL counts as
+#: fully flattened ("dust") -- the same rounding tolerance the harness uses
+#: (tests/integration/test_live_protective_paths.py::_QTY_TOLERANCE) for a
+#: CCXT float-JSON round trip, and comfortably below any real exchange's
+#: minimum order size.
+_FLATTEN_DUST_TOLERANCE = Decimal("0.00000001")
+#: Wait between re-poll/resend attempts when a SELL attempt produced no
+#: order at all (e.g. transiently in-flight-elsewhere) -- bounded by the
+#: caller's own deadline either way.
+_FLATTEN_POLL_SECONDS = 1.0
+#: WP17-A-02: "re-sends the SELL at most twice" -- three total attempts.
+_FLATTEN_MAX_ATTEMPTS = 3
+
+
+class FlattenPreconditionError(RuntimeError):
+    """Raised by :meth:`StrategyEngine.flatten` when the kill switch is not
+    active (I7) -- flatten never runs while entries are still open."""
+
+
+@dataclass(slots=True)
+class FlattenSymbolResult:
+    """Per-symbol outcome of one :meth:`StrategyEngine.flatten` call (SY-12)."""
+
+    symbol: str
+    #: no_position | flat | dust | partial | in_flight | failed
+    status: str
+    #: None | ledger_doubt | inflight_other | submit_unknown | rejected |
+    #: timeout_open | live_gate_closed | error
+    cause: str | None
+    held_before: Decimal
+    sold_qty: Decimal
+    remaining_qty: Decimal
+    order_ids: list[str] = field(default_factory=list)
+    error: str | None = None
+
+
+@dataclass(slots=True)
+class FlattenResult:
+    """Run-level outcome of one :meth:`StrategyEngine.flatten` call (SY-12)."""
+
+    run_id: str
+    #: noop | flattened | partial | failed
+    outcome: str
+    complete: bool
+    symbols: list[FlattenSymbolResult] = field(default_factory=list)
+    #: Always True at this layer -- the engine itself never persists
+    #: anything.  Callers (stop_run/emergency_stop_run/kill_switch) that
+    #: persist a per-run or global latch overwrite this field with whether
+    #: THEIR OWN write succeeded before returning the result to the API
+    #: caller.
+    latch_persisted: bool = True
+
+
+def build_synthetic_flatten_result(
+    engine: StrategyEngine,
+    *,
+    reason: str,
+    cause: str,
+    error: str | None = None,
+) -> FlattenResult:
+    """WP1.7a round 2 (S-05/S-07): a best-effort ``FlattenResult`` for
+    when ``engine.flatten()`` itself raised, or hung past even the
+    caller's own outer safety-net timeout (S-06 covers the in-process
+    ``_cycle_lock`` timeout case *inside* ``flatten()`` itself; this
+    covers a caller-side ``wait_for``/``except`` wrapper catching
+    something ``flatten()``'s own defences did not).
+
+    Never returns a complete result -- callers (``stop_run``,
+    ``emergency_stop_run``, the kill-switch flatten pass) persist
+    ``flatten_incomplete`` and audit critically exactly as they would
+    for any other incomplete flatten.
+
+    Parameters
+    ----------
+    reason:
+        The same ``reason`` the failed/timed-out ``flatten()`` call was
+        given (echoed for log/audit context only -- not stored on the
+        result itself).
+    cause:
+        ``"timeout_open"`` for a caller-side timeout, ``"error"`` for an
+        exception -- controls whether each held symbol is reported
+        ``"in_flight"`` (timeout: the SELL may still be in flight
+        somewhere) or ``"failed"`` (exception: nothing is known to still
+        be in flight).
+    """
+    symbol_results: list[FlattenSymbolResult] = []
+    for symbol in engine.symbols:
+        try:
+            position = engine.portfolio.get_position(symbol)
+            held = (
+                position.quantity
+                if position is not None and not position.is_flat
+                else Decimal("0")
+            )
+        except Exception:
+            held = Decimal("0")
+
+        if held <= Decimal("0"):
+            symbol_results.append(
+                FlattenSymbolResult(
+                    symbol=symbol,
+                    status="no_position",
+                    cause=None,
+                    held_before=Decimal("0"),
+                    sold_qty=Decimal("0"),
+                    remaining_qty=Decimal("0"),
+                )
+            )
+            continue
+
+        status = "in_flight" if cause == "timeout_open" else "failed"
+        symbol_results.append(
+            FlattenSymbolResult(
+                symbol=symbol,
+                status=status,
+                cause=cause,
+                held_before=held,
+                sold_qty=Decimal("0"),
+                remaining_qty=held,
+                error=error,
+            )
+        )
+
+    non_flat = [r for r in symbol_results if r.status != "no_position"]
+    # WP17a-S-R2-04 (round 3): a caller-side timeout means the SELL
+    # may still be in flight -- reporting it as "failed" (a hard,
+    # known failure) is wrong and could suppress a retry a caller
+    # otherwise gates on outcome. "partial" (never "complete", still
+    # never true -- see ``complete=False`` below) matches every other
+    # in_flight/lock_timeout path's outcome derivation.
+    if not non_flat:
+        outcome = "noop"
+    elif cause == "timeout_open":
+        outcome = "partial"
+    else:
+        outcome = "failed"
+    return FlattenResult(
+        run_id=engine.run_id or "",
+        outcome=outcome,
+        complete=False,
+        symbols=symbol_results,
+    )
+
+
 class StrategyEngine:
     """
     Central orchestrator for a trading run.
@@ -186,6 +352,7 @@ class StrategyEngine:
         run_mode: RunMode,
         config: dict[str, Any] | None = None,
         circuit_breaker: CircuitBreaker | None = None,
+        protective_mode: bool = False,
     ) -> None:
         if not strategies:
             raise ValueError("At least one strategy is required")
@@ -202,6 +369,23 @@ class StrategyEngine:
         self._timeframe = timeframe
         self._run_mode = run_mode
         self._config: dict[str, Any] = config or {}
+        # WP1.8a (S10/O9): a live run resumed with mode=protective drops
+        # every BUY signal (via _drop_entry_signals below) so a rebuilt
+        # position can only shrink -- exits (strategy SELL, bracket,
+        # trailing) keep running exactly as under the kill switch (D3).
+        # Never set outside a resume; always False for a fresh run.
+        self._protective_mode = protective_mode
+
+        # WP1.1 (Verbeterplan v2, C1/C22): attach the portfolio as the
+        # execution engine's live position source. Duck-typed -- only
+        # LiveExecutionEngine implements attach_position_source; paper/
+        # backtest engines have no such method, so this is a no-op there.
+        # This is the ONLY change this WP makes in this file.
+        _attach_position_source = getattr(
+            self._execution_engine, "attach_position_source", None
+        )
+        if callable(_attach_position_source):
+            _attach_position_source(self._portfolio, symbols=self._symbols)
 
         # Derived configuration
         config_warmup = self._config.get("warmup_bars")
@@ -238,6 +422,12 @@ class StrategyEngine:
         self._exposure_bars_total: int = 0
         self._exposure_bars_per_symbol: dict[str, int] = {}
         self._stop_event: asyncio.Event = asyncio.Event()
+        # WP1.7a (SY-04, I6): serialises flatten() against the regular
+        # per-bar pipeline. ``_poll_and_process`` holds it around
+        # ``_process_bar`` (which itself calls ``_check_resting_orders``
+        # and every ``get_fills``); ``flatten`` holds it for its whole
+        # run. Never taken in backtest mode (single-threaded, no flatten).
+        self._cycle_lock: asyncio.Lock = asyncio.Lock()
 
         # Sprint 50 Cycle 4: auto-stop reason set by the engine when it
         # initiates its own shutdown (e.g. graduated circuit breaker HALT).
@@ -255,50 +445,81 @@ class StrategyEngine:
             s: [] for s in self._symbols
         }
 
-        # Trailing stop manager (optional, configured via "trailing_stop_pct")
-        trailing_stop_pct = self._config.get("trailing_stop_pct")
+        # WP1.3a (SY-13a-01/06/22): a bad exit config is now a hard
+        # construction failure everywhere (create/promote/resume already
+        # validated it -- this is defence in depth for any caller that
+        # builds a StrategyEngine directly, e.g. BacktestRunner/tests).  The
+        # previous "warn and disable" behaviour (``engine.trailing_stop_
+        # disabled`` / ``engine.bracket_exit_disabled``) is gone: a run must
+        # never silently trade with no exit (C15).
+        #
+        # A protective resume MAY waive ``require_exit_manager`` (never the
+        # parse itself) via ``exit_config_waived=True``, which is accepted
+        # only together with ``protective_mode=True`` (SY-13a-16) -- entries
+        # are already fully blocked in protective mode (``_drop_entry_
+        # signals``), so a missing exit cannot let a new position open
+        # unprotected; it only lets the operator reach ``flatten=true``.
+        exit_config_waived = bool(self._config.get("exit_config_waived", False))
+        if exit_config_waived and not protective_mode:
+            raise ValueError(
+                "exit_config_waived=True is only accepted with protective_mode=True"
+            )
+
+        _bracket_raw = {
+            k: self._config.get(k)
+            for k in (
+                "bracket_mode",
+                "bracket_stop_loss_pct",
+                "bracket_take_profit_pct",
+                "bracket_atr_sl_multiplier",
+                "bracket_atr_tp_multiplier",
+                "bracket_atr_period",
+            )
+            if k in self._config
+        }
+        _exit_cfg = parse_exit_config(
+            bracket=_bracket_raw,
+            trailing_stop_pct=self._config.get("trailing_stop_pct"),
+        )
+        if not exit_config_waived:
+            require_exit_manager(self._strategies, _exit_cfg)
+
         self._trailing_stop: TrailingStopManager | None = None
-        if trailing_stop_pct is not None:
-            try:
-                self._trailing_stop = TrailingStopManager(
-                    trailing_stop_pct=float(trailing_stop_pct),
-                    strategy_id="trailing_stop",
-                )
-            except (ValueError, TypeError) as exc:
-                structlog.get_logger(__name__).warning(
-                    "engine.trailing_stop_disabled",
-                    reason=str(exc),
-                    trailing_stop_pct=trailing_stop_pct,
-                )
+        if _exit_cfg.trailing_stop_pct is not None:
+            self._trailing_stop = TrailingStopManager(
+                trailing_stop_pct=_exit_cfg.trailing_stop_pct,
+                strategy_id="trailing_stop",
+            )
 
         # Bracket exit manager (optional, fixed/ATR stop-loss + take-profit).
         # Anchored to position entry price; complements the trailing stop.
         # Config keys carry a ``bracket_`` prefix to avoid collision with any
         # strategy's own parameter names.
         self._bracket_exit: BracketExitManager | None = None
-        _bracket_keys = (
-            "bracket_stop_loss_pct",
-            "bracket_take_profit_pct",
-            "bracket_atr_sl_multiplier",
-            "bracket_atr_tp_multiplier",
+        if _exit_cfg.bracket:
+            _raw_atr_period: Any = _exit_cfg.bracket.get("bracket_atr_period")
+            self._bracket_exit = BracketExitManager(
+                stop_loss_pct=_opt_float(_exit_cfg.bracket.get("bracket_stop_loss_pct")),
+                take_profit_pct=_opt_float(_exit_cfg.bracket.get("bracket_take_profit_pct")),
+                bracket_mode=str(_exit_cfg.bracket.get("bracket_mode") or "fixed"),
+                atr_sl_multiplier=_opt_float(_exit_cfg.bracket.get("bracket_atr_sl_multiplier")),
+                atr_tp_multiplier=_opt_float(_exit_cfg.bracket.get("bracket_atr_tp_multiplier")),
+                atr_period=int(_raw_atr_period or 14),
+                strategy_id="bracket_exit",
+            )
+
+        # WP1.3a (SY-13a-08): resolve allow_pyramiding from the (already
+        # type-checked) config, defaulting per-strategy when absent.  A
+        # non-bool value is a construction error (E1-style, but this is the
+        # engine layer -- the API layer never lets a non-bool through).
+        _raw_pyramiding = self._config.get("allow_pyramiding")
+        if _raw_pyramiding is not None and not isinstance(_raw_pyramiding, bool):
+            raise ValueError(
+                f"allow_pyramiding must be a bool, got {_raw_pyramiding!r}"
+            )
+        self._allow_pyramiding: bool = resolve_allow_pyramiding(
+            _raw_pyramiding, self._strategies
         )
-        if any(self._config.get(k) is not None for k in _bracket_keys):
-            try:
-                self._bracket_exit = BracketExitManager(
-                    stop_loss_pct=_opt_float(self._config.get("bracket_stop_loss_pct")),
-                    take_profit_pct=_opt_float(self._config.get("bracket_take_profit_pct")),
-                    bracket_mode=str(self._config.get("bracket_mode") or "fixed"),
-                    atr_sl_multiplier=_opt_float(self._config.get("bracket_atr_sl_multiplier")),
-                    atr_tp_multiplier=_opt_float(self._config.get("bracket_atr_tp_multiplier")),
-                    atr_period=int(self._config.get("bracket_atr_period") or 14),
-                    strategy_id="bracket_exit",
-                )
-            except (ValueError, TypeError) as exc:
-                structlog.get_logger(__name__).warning(
-                    "engine.bracket_exit_disabled",
-                    reason=str(exc),
-                    bracket_mode=self._config.get("bracket_mode"),
-                )
 
         # Higher-timeframe bar data (optional, for multi-TF strategies)
         self._htf_bars: dict[str, dict[str, list[OHLCVBar]]] | None = None
@@ -339,6 +560,22 @@ class StrategyEngine:
     def portfolio(self) -> PortfolioAccounting:
         """Direct access to the portfolio accounting instance."""
         return self._portfolio
+
+    @property
+    def symbols(self) -> list[str]:
+        """WP1.7a: the run's configured trading pairs -- used by the
+        stop-run 422 ``flatten_decision_required`` response to report
+        every currently-held symbol without reaching into a private
+        attribute."""
+        return list(self._symbols)
+
+    @property
+    def risk_manager(self) -> BaseRiskManager:
+        """WP1.7a: read-only access to the engine's risk manager -- used
+        by callers (``apply_latch``, the stop/emergency-stop/kill-switch
+        routers) that need to trigger or inspect the kill-switch latch
+        without reaching into a private attribute."""
+        return self._risk_manager
 
     @property
     def circuit_breaker(self) -> Any:
@@ -615,7 +852,7 @@ class StrategyEngine:
 
         # Reset exposure counters for this backtest run
         self._exposure_bars_total = 0
-        self._exposure_bars_per_symbol = {s: 0 for s in self._symbols}
+        self._exposure_bars_per_symbol = dict.fromkeys(self._symbols, 0)
 
         # Sprint 50 Cycle 6 (IMPL-C6-002): equity-curve length captured at the
         # moment processing crosses into the first OOS bar. Stays None when
@@ -765,7 +1002,7 @@ class StrategyEngine:
                         self._stop_event.wait(),
                         timeout=sleep_time,
                     )
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     # Normal: timeout means the stop event was not set
                     pass
 
@@ -846,25 +1083,14 @@ class StrategyEngine:
         # 2. Tick risk manager cooldown
         self._risk_manager.tick_cooldown()
 
-        # 3. In LIVE mode, check kill switch before processing.
-        # NOTE: PAPER mode deliberately continues through kill-switch events
-        # so strategies can still be monitored and signals recorded. The paper
-        # execution engine's pre_trade_check will block actual order placement.
-        if self._run_mode == RunMode.LIVE and self._risk_manager.kill_switch_active:
-            # Record kill-switch-suppressed trades so the post-run audit shows
-            # exactly which symbols would have entered had the switch been off.
-            if self._skip_logger is not None:
-                for sym, sym_bar in current_bars.items():
-                    self._skip_logger.log_skip(
-                        symbol=sym,
-                        skip_reason="kill_switch",
-                        hypothetical_entry_price=sym_bar.close,
-                    )
-            self._log.warning(
-                "engine.bar_skipped_kill_switch",
-                bar_timestamp=str(bar_timestamp),
-            )
-            return
+        # 3. Kill switch blocks new entries in every mode; exits keep
+        # running (D3, WP1.2). BUY signals are dropped after the strategy
+        # loop below via ``_drop_entry_signals``; SELLs, brackets (5a),
+        # trailing stops (5b) and resting orders (6) are unaffected. `is
+        # True` guards against a MagicMock risk manager in tests -- a mock
+        # attribute is truthy even when a test never sets it explicitly.
+        _kill_switch_engaged = self._risk_manager.kill_switch_active is True
+        entries_blocked = _kill_switch_engaged or self._protective_mode
 
         # Count only bars that reach strategy processing
         self._bar_count += 1
@@ -947,6 +1173,18 @@ class StrategyEngine:
                 )
                 continue
 
+        # WP1.2 (S6): drop BUY-only entries while the kill switch is active.
+        # Runs before the circuit-breaker filter below, which is a
+        # separate, still BUY+SELL-suppressing legacy behaviour for
+        # HALT/DAILY_LIMIT (C23, out of scope for WP1.2 -- see WP1.6).
+        if entries_blocked:
+            _entry_skip_reason = (
+                "kill_switch" if _kill_switch_engaged else "protective_mode"
+            )
+            bar_signals = self._drop_entry_signals(
+                bar_signals, current_bars, skip_reason=_entry_skip_reason
+            )
+
         # C2 (cont.): filter/reduce signals based on graduated CB response
         if _suppress_new_signals:
             if _cb_response == CircuitBreakerResponse.DAILY_LIMIT:
@@ -986,60 +1224,63 @@ class StrategyEngine:
                                 }
                             )
 
+                # WP1.3a (SY-13a-10): per-signal, fail-closed "no pyramiding"
+                # gate.  BUY-only; SELLs are never touched (R-I7/I5).  Runs
+                # after the kill-switch/protective filter and the CB
+                # wipe/REDUCE sizing above, before ``process_signal`` so a
+                # second same-bar BUY sees the first one's fill (paper/
+                # backtest: synchronous MARKET fills) or in-flight state
+                # (live: the existing WP1.4 run-wide block, SY-13a-11).
+                if signal.direction == SignalDirection.BUY and not self._allow_pyramiding:
+                    try:
+                        _held = self._entry_blocked_by_held_position(
+                            signal.symbol, current_bars.get(signal.symbol)
+                        )
+                    except Exception:
+                        self._log.error(
+                            "engine.entry_held_state_unknown",
+                            symbol=signal.symbol,
+                            strategy_id=signal.strategy_id,
+                            exc_info=True,
+                        )
+                        continue
+                    if _held:
+                        self._log_held_skip(signal)
+                        continue
+
+                # WP1.3a (SY-13a-14, partial): a BUY that has an ATR bracket
+                # configured but no computable ATR yet, and no trailing stop
+                # to fall back on, would open with no protectable downside
+                # level this bar.  This IS logged as a missed entry
+                # (TradeSkipLogger) -- unlike the held-skip above, it is not
+                # a suppressed add-on, it is a genuinely dropped entry.
+                if signal.direction == SignalDirection.BUY and not self._entry_protectable(
+                    signal.symbol, history_by_symbol
+                ):
+                    bar_ref = current_bars.get(signal.symbol)
+                    self._skip_logger.log_skip(
+                        symbol=signal.symbol,
+                        skip_reason="exit_level_unavailable",
+                        hypothetical_entry_price=bar_ref.close if bar_ref is not None else None,
+                        signal_context=dict(signal.metadata) if signal.metadata else None,
+                    )
+                    self._log.warning(
+                        "engine.entry_skipped_exit_level_unavailable",
+                        symbol=signal.symbol,
+                        strategy_id=signal.strategy_id,
+                    )
+                    continue
+
                 orders = await self._execution_engine.process_signal(signal)
                 bar_orders += len(orders)
 
-                # Route fills to portfolio and risk manager
-                for order in orders:
-                    fills = await self._execution_engine.get_fills(
-                        order.order_id
-                    )
-                    bar_fills += len(fills)
-
-                    for fill in fills:
-                        symbol_bar = current_bars.get(fill.symbol)
-                        if symbol_bar is None:
-                            self._log.error(
-                                "engine.fill_symbol_not_in_current_bars",
-                                fill_id=str(fill.fill_id),
-                                fill_symbol=fill.symbol,
-                                available_symbols=list(current_bars.keys()),
-                            )
-                            continue
-                        current_price = symbol_bar.close
-
-                        # Capture position BEFORE fill for trade recording
-                        pre_fill_pos = self._portfolio.get_position(fill.symbol)
-
-                        self._portfolio.update_position(fill, current_price)
-
-                        # C4: Start excursion tracking when a new BUY fill opens a position (Sprint 32)
-                        if fill.side.value == "buy" or str(fill.side) in ("buy", "BUY"):
-                            post_fill_pos = self._portfolio.get_position(fill.symbol)
-                            if post_fill_pos is not None and not post_fill_pos.is_flat:
-                                fgi_val: int | None = None
-                                if self._last_mtf_context is not None:
-                                    fgi_val = self._last_mtf_context.fear_greed_index
-                                self._excursion_tracker.on_position_open(
-                                    symbol=fill.symbol,
-                                    entry_price=fill.price,
-                                    side="long",
-                                    regime_at_entry=self._fgi_to_regime(fgi_val),
-                                    signal_context=dict(signal.metadata) if signal.metadata else None,
-                                )
-
-                        # Record trade if this fill closed/reduced a position
-                        self._record_trade_if_closed(
-                            fill=fill,
-                            pre_fill_position=pre_fill_pos,
-                            strategy_id=signal.strategy_id,
-                            signal_metadata=dict(signal.metadata) if signal.metadata else None,
-                        )
-
-                        # Determine if this fill closed a position (for risk
-                        # manager loss tracking). A SELL fill on a position
-                        # that is now flat indicates a completed trade.
-                        self._route_fill_to_risk_manager(fill, current_price)
+                # Route fills to portfolio and risk manager (WP1.7a:
+                # extracted into _route_exit_fills, shared with 5a/5b and
+                # flatten()).
+                fill_count, _ = await self._route_exit_fills(
+                    orders, current_bars, signal
+                )
+                bar_fills += fill_count
 
             except Exception:
                 self._log.exception(
@@ -1086,19 +1327,10 @@ class StrategyEngine:
                     if exit_signal is not None:
                         orders = await self._execution_engine.process_signal(exit_signal)
                         bar_orders += len(orders)
-                        for order in orders:
-                            fills = await self._execution_engine.get_fills(order.order_id)
-                            bar_fills += len(fills)
-                            for fill in fills:
-                                pre_fill_pos = self._portfolio.get_position(fill.symbol)
-                                self._portfolio.update_position(fill, bar.close)
-                                self._record_trade_if_closed(
-                                    fill=fill,
-                                    pre_fill_position=pre_fill_pos,
-                                    strategy_id=exit_signal.strategy_id,
-                                    signal_metadata=dict(exit_signal.metadata) if exit_signal.metadata else None,
-                                )
-                                self._route_fill_to_risk_manager(fill, bar.close)
+                        fill_count, _ = await self._route_exit_fills(
+                            orders, current_bars, exit_signal
+                        )
+                        bar_fills += fill_count
                 except Exception:
                     self._log.exception(
                         "engine.bracket_exit_error",
@@ -1118,19 +1350,10 @@ class StrategyEngine:
                     if stop_signal is not None:
                         orders = await self._execution_engine.process_signal(stop_signal)
                         bar_orders += len(orders)
-                        for order in orders:
-                            fills = await self._execution_engine.get_fills(order.order_id)
-                            bar_fills += len(fills)
-                            for fill in fills:
-                                pre_fill_pos = self._portfolio.get_position(fill.symbol)
-                                self._portfolio.update_position(fill, bar.close)
-                                self._record_trade_if_closed(
-                                    fill=fill,
-                                    pre_fill_position=pre_fill_pos,
-                                    strategy_id=stop_signal.strategy_id,
-                                    signal_metadata=dict(stop_signal.metadata) if stop_signal.metadata else None,
-                                )
-                                self._route_fill_to_risk_manager(fill, bar.close)
+                        fill_count, _ = await self._route_exit_fills(
+                            orders, current_bars, stop_signal
+                        )
+                        bar_fills += fill_count
                 except Exception:
                     self._log.exception(
                         "engine.trailing_stop_error",
@@ -1214,6 +1437,129 @@ class StrategyEngine:
             # Metrics must never crash bar processing; surface at debug level
             # so operational regressions are still observable in verbose logs.
             self._log.debug("engine.metrics_update_failed", exc_info=True)
+
+    # ------------------------------------------------------------------
+    # Entry-signal filtering (WP1.2 / S6)
+    # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # WP1.3a: no-pyramiding held gate + entry-protectability gate
+    # ------------------------------------------------------------------
+
+    def _entry_dust_threshold(self, symbol: str, last: Decimal | None) -> Decimal:
+        """Duck-typed: only ``LiveExecutionEngine`` implements
+        ``entry_dust_threshold`` (SY-13a-12).  Paper/backtest have no
+        exchange minimums, so the default is ``Decimal(0)`` (same as
+        ``is_flat``).  Looked up on the *type*, not the instance, so a bare
+        ``MagicMock()`` execution engine in a unit test (which auto-creates
+        any instance attribute on access) is correctly treated as "no
+        accessor" -- only a real ``LiveExecutionEngine`` (or a test double
+        built with ``spec=LiveExecutionEngine``) has this on its class."""
+        accessor = getattr(type(self._execution_engine), "entry_dust_threshold", None)
+        if not callable(accessor):
+            return Decimal("0")
+        bound_accessor: Any = accessor.__get__(self._execution_engine)
+        result = bound_accessor(symbol, last)
+        return result if isinstance(result, Decimal) else Decimal(str(result))
+
+    def _entry_blocked_by_held_position(
+        self, symbol: str, last_bar: OHLCVBar | None
+    ) -> bool:
+        """True iff a BUY for ``symbol`` must be dropped because the ledger
+        already shows more than dust (SY-13a-10/12, R-I2).
+
+        Deliberately does NOT catch exceptions -- the caller wraps this in
+        its own try/except and drops the BUY on ANY exception, fail-closed
+        (R-I6/SY-13a-10), logging ``engine.entry_held_state_unknown``.
+        """
+        position = self._portfolio.get_position(symbol)
+        if position is None:
+            return False
+        if not isinstance(position, Position):
+            # WP13a-S-04 (security round 2): a non-None value that is NOT a
+            # real Position is a ledger-state anomaly (e.g. a broken/mocked
+            # portfolio), not evidence of "flat" -- fail closed (R-I6) by
+            # treating it as held, exactly like the caller's own
+            # try/except treats any exception from this method.
+            return True
+        if position.is_flat:
+            return False
+        last_price = Decimal(str(last_bar.close)) if last_bar is not None else None
+        threshold = self._entry_dust_threshold(symbol, last_price)
+        return position.quantity > threshold
+
+    def _entry_protectable(
+        self, symbol: str, history_by_symbol: dict[str, list[OHLCVBar]]
+    ) -> bool:
+        """True unless an ATR bracket is configured and ATR cannot be
+        computed yet for ``symbol``, with no trailing stop to fall back on
+        (SY-13a-14, partial -- the ``stop_inside_entry_cost`` drop decision
+        is deferred to WP1.3b/CF-13a-4)."""
+        if self._bracket_exit is None or not self._bracket_exit.requires_atr:
+            return True
+        if self._trailing_stop is not None:
+            return True
+        atr_value = self._compute_atr_for_symbol(symbol, history_by_symbol)
+        return atr_value is not None
+
+    def _log_held_skip(self, signal: Signal) -> None:
+        """Log a suppressed pyramiding add-on.  Deliberately NOT written to
+        ``TradeSkipLogger`` (SY-13a-10): a suppressed add-on is not a missed
+        entry, and a level-triggered strategy (rsi_mean_reversion, dca)
+        would otherwise log one skip per bar and pollute adaptive-learning
+        skip analysis.  Info in paper/live, debug in backtest (lower noise
+        for the hot backtest loop)."""
+        log_fn = (
+            self._log.debug
+            if self._run_mode == RunMode.BACKTEST
+            else self._log.info
+        )
+        log_fn(
+            "engine.entry_skipped_position_held",
+            symbol=signal.symbol,
+            strategy_id=signal.strategy_id,
+        )
+
+    def _drop_entry_signals(
+        self,
+        signals: list[Signal],
+        current_bars: dict[str, OHLCVBar],
+        *,
+        skip_reason: str,
+    ) -> list[Signal]:
+        """
+        Drop BUY signals only, logging a skip for each one.
+
+        Called while the kill switch is blocking new entries (D3). SELL
+        signals pass through unchanged -- exits must keep running even
+        while entries are blocked. The side-aware ``DefaultRiskManager``
+        gate is what actually enforces the block; this filter only avoids
+        a pointless downstream order attempt for BUYs and keeps the skip
+        audit populated.
+        """
+        kept: list[Signal] = []
+        dropped_buy_count = 0
+        for signal in signals:
+            if signal.direction != SignalDirection.BUY:
+                kept.append(signal)
+                continue
+            dropped_buy_count += 1
+            if self._skip_logger is not None:
+                bar_ref = current_bars.get(signal.symbol)
+                self._skip_logger.log_skip(
+                    symbol=signal.symbol,
+                    skip_reason=skip_reason,
+                    hypothetical_entry_price=bar_ref.close if bar_ref is not None else None,
+                    signal_context=dict(signal.metadata) if signal.metadata else None,
+                )
+        if dropped_buy_count:
+            _first_bar = next(iter(current_bars.values()), None)
+            self._log.warning(
+                "engine.kill_switch_entries_blocked",
+                bar_timestamp=str(_first_bar.timestamp) if _first_bar is not None else None,
+                dropped_buy_count=dropped_buy_count,
+            )
+        return kept
 
     # ------------------------------------------------------------------
     # Strategy invocation
@@ -1417,6 +1763,92 @@ class StrategyEngine:
     # ------------------------------------------------------------------
     # Fill routing
     # ------------------------------------------------------------------
+
+    async def _route_exit_fills(
+        self,
+        orders: list[Order],
+        current_bars: dict[str, OHLCVBar] | None,
+        signal: Signal,
+    ) -> tuple[int, Decimal]:
+        """Route every fill for ``orders`` to the portfolio, the excursion
+        tracker, trade recording and the risk manager (WP1.7a, extracted
+        unchanged from the pre-WP1.7a inline blocks 5/5a/5b so every
+        caller -- the main signal loop, bracket exits, trailing stops and
+        :meth:`flatten` -- shares byte-for-byte identical fill-routing
+        semantics, arch-design WP17-A-02).
+
+        MUST be called with ``_cycle_lock`` held (I6) whenever
+        ``current_bars`` reflects a live/paper bar in progress --
+        ``_poll_and_process`` holds it around the whole ``_process_bar``
+        call, and ``flatten`` holds it for its whole run, so two callers
+        can never both read the same not-yet-routed
+        ``LiveExecutionEngine._routed_trade_keys`` state for one order.
+
+        Parameters
+        ----------
+        orders:
+            Orders just returned by ``process_signal`` (or a bracket/
+            trailing-stop/flatten exit signal's own call to it).
+        current_bars:
+            The current per-symbol bar snapshot, or ``None`` when no bar
+            context is available (``flatten`` outside a poll cycle) -- a
+            fill priced against a symbol missing from this dict falls
+            back to the fill's own execution price rather than being
+            skipped (unlike the pre-WP1.7a main-loop guard, which only
+            ever fired for pre-existing multi-symbol bugs no test
+            exercises).
+
+        Returns
+        -------
+        tuple[int, Decimal]:
+            ``(fill_count, total_filled_qty)`` across every routed fill.
+        """
+        fill_count = 0
+        total_qty = Decimal("0")
+        for order in orders:
+            fills = await self._execution_engine.get_fills(order.order_id)
+            fill_count += len(fills)
+
+            for fill in fills:
+                symbol_bar = (current_bars or {}).get(fill.symbol)
+                current_price = symbol_bar.close if symbol_bar is not None else fill.price
+
+                # Capture position BEFORE fill for trade recording
+                pre_fill_pos = self._portfolio.get_position(fill.symbol)
+
+                self._portfolio.update_position(fill, current_price)
+
+                # C4: Start excursion tracking when a new BUY fill opens a position (Sprint 32)
+                if fill.side.value == "buy" or str(fill.side) in ("buy", "BUY"):
+                    post_fill_pos = self._portfolio.get_position(fill.symbol)
+                    if post_fill_pos is not None and not post_fill_pos.is_flat:
+                        fgi_val: int | None = None
+                        if self._last_mtf_context is not None:
+                            fgi_val = self._last_mtf_context.fear_greed_index
+                        self._excursion_tracker.on_position_open(
+                            symbol=fill.symbol,
+                            entry_price=fill.price,
+                            side="long",
+                            regime_at_entry=self._fgi_to_regime(fgi_val),
+                            signal_context=dict(signal.metadata) if signal.metadata else None,
+                        )
+
+                # Record trade if this fill closed/reduced a position
+                self._record_trade_if_closed(
+                    fill=fill,
+                    pre_fill_position=pre_fill_pos,
+                    strategy_id=signal.strategy_id,
+                    signal_metadata=dict(signal.metadata) if signal.metadata else None,
+                )
+
+                # Determine if this fill closed a position (for risk
+                # manager loss tracking). A SELL fill on a position
+                # that is now flat indicates a completed trade.
+                self._route_fill_to_risk_manager(fill, current_price)
+
+                total_qty += fill.quantity
+
+        return fill_count, total_qty
 
     def _route_fill_to_risk_manager(
         self,
@@ -1626,6 +2058,332 @@ class StrategyEngine:
                 )
 
     # ------------------------------------------------------------------
+    # WP1.7a: flatten -- sell every held symbol through the same capped
+    # process_signal path a strategy SELL uses (D15/J1/I1). Called by
+    # stop_run (flatten=true), emergency_stop_run (flatten=true) and the
+    # global kill switch's own optional flatten pass.
+    # ------------------------------------------------------------------
+
+    async def flatten(self, reason: str, timeout_s: float = 30.0) -> FlattenResult:
+        """Sell down every symbol this run holds, to flat or dust.
+
+        Precondition (I7): the kill switch MUST already be active (the
+        caller is responsible for latching it -- e.g. via
+        ``risk_manager.trigger_kill_switch("stop_in_progress")`` -- BEFORE
+        calling this) -- flatten never runs while entries are still open,
+        so a fresh BUY can never re-open a position this call is in the
+        middle of closing. Raises :class:`FlattenPreconditionError`
+        otherwise.
+
+        Holds ``_cycle_lock`` for the ENTIRE call (I6/SY-04): waiting for
+        the lock counts against ``timeout_s``, exactly like the
+        arch-design spec requires, so a flatten queued behind an
+        in-progress bar still respects its own deadline rather than
+        blocking indefinitely.
+
+        Every SELL goes through ``process_signal`` with
+        ``strategy_id="operator_flatten"`` and ``target_position=0`` (a
+        full-close signal) -- the WP1.11a external-coin-safe cap, the
+        WP1.4b idempotent submit and the WP1.2 kill-switch bypass all
+        apply unchanged (I1): flatten can never sell more than
+        ``min(own, balance)``, and it never touches a coin the run never
+        bought.
+
+        Parameters
+        ----------
+        reason:
+            Human-readable cause, echoed into the ``run_flatten`` audit
+            row and every per-symbol SELL signal's metadata.
+        timeout_s:
+            Overall wall-clock budget across every symbol (default 30s,
+            matching the UI's own flatten-aware timeout, AC8).
+
+        Returns
+        -------
+        FlattenResult:
+            ``outcome`` is ``"noop"`` when every symbol was already flat,
+            ``"flattened"`` when every symbol reached ``flat``/``dust``,
+            ``"partial"`` when at least one symbol sold something but did
+            not fully clear, and ``"failed"`` when nothing was reduced at
+            all. ``complete`` is the boolean the caller should gate a
+            normal stop on (I8: never cancel the task while incomplete).
+        """
+        if self._risk_manager.kill_switch_active is not True:
+            raise FlattenPreconditionError(
+                "flatten() requires the kill switch to already be active "
+                f"(I7); run_id={self._run_id!r}, reason={reason!r}"
+            )
+
+        deadline = time.monotonic() + timeout_s
+
+        # WP1.7a round 2 (S-06): the deadline covers ACQUIRING the lock,
+        # not just the per-symbol work after it -- a hung _process_bar
+        # (or a hung exchange call inside it) must never let flatten()
+        # block past its own advertised timeout_s. If the lock can't be
+        # acquired in time, nothing below has touched the execution
+        # engine at all, so every held symbol is reported "in_flight"
+        # with cause "lock_timeout" (never "failed": the bot did not
+        # even attempt a SELL, so this is not a hard failure).
+        remaining = max(0.0, deadline - time.monotonic())
+        try:
+            await asyncio.wait_for(self._cycle_lock.acquire(), timeout=remaining)
+        except TimeoutError:
+            symbol_results = [self._lock_timeout_result(symbol) for symbol in self._symbols]
+            return self._finalize_flatten_result(reason, symbol_results)
+
+        try:
+            symbol_results = [
+                await self._flatten_symbol(symbol, reason, deadline)
+                for symbol in self._symbols
+            ]
+        finally:
+            self._cycle_lock.release()
+
+        return self._finalize_flatten_result(reason, symbol_results)
+
+    def _lock_timeout_result(self, symbol: str) -> FlattenSymbolResult:
+        """WP1.7a round 2 (S-06): best-effort per-symbol result when
+        ``_cycle_lock`` could not be acquired before the deadline."""
+        position = self._portfolio.get_position(symbol)
+        held = position.quantity if position is not None and not position.is_flat else Decimal("0")
+        if held <= Decimal("0"):
+            return FlattenSymbolResult(
+                symbol=symbol,
+                status="no_position",
+                cause=None,
+                held_before=Decimal("0"),
+                sold_qty=Decimal("0"),
+                remaining_qty=Decimal("0"),
+            )
+        return FlattenSymbolResult(
+            symbol=symbol,
+            status="in_flight",
+            cause="lock_timeout",
+            held_before=held,
+            sold_qty=Decimal("0"),
+            remaining_qty=held,
+        )
+
+    def _finalize_flatten_result(
+        self, reason: str, symbol_results: list[FlattenSymbolResult]
+    ) -> FlattenResult:
+        """Compute outcome/complete from per-symbol results and log
+        (extracted so both the normal path and the lock-timeout early
+        return in :meth:`flatten` share identical outcome semantics)."""
+        non_flat_results = [r for r in symbol_results if r.status != "no_position"]
+        if not non_flat_results:
+            outcome = "noop"
+            complete = True
+        else:
+            complete = all(r.status in ("flat", "dust") for r in non_flat_results)
+            if complete:
+                outcome = "flattened"
+            else:
+                # "failed" is reserved for a run where NOTHING recognisably
+                # safe happened anywhere -- every other incomplete case
+                # (partial fills, an order still in flight, a ledger-doubt
+                # block) is "partial": the operator can retry or
+                # investigate, but it is not a hard failure (risk-design
+                # WP17-R-08/R-17).
+                outcome = (
+                    "failed"
+                    if all(r.status == "failed" for r in non_flat_results)
+                    else "partial"
+                )
+
+        result = FlattenResult(
+            run_id=self._run_id or "",
+            outcome=outcome,
+            complete=complete,
+            symbols=symbol_results,
+        )
+
+        log_fields = {
+            "reason": reason,
+            "outcome": outcome,
+            "symbols": [
+                {
+                    "symbol": r.symbol,
+                    "status": r.status,
+                    "cause": r.cause,
+                    "held_before": str(r.held_before),
+                    "sold_qty": str(r.sold_qty),
+                    "remaining_qty": str(r.remaining_qty),
+                }
+                for r in symbol_results
+            ],
+        }
+        if not complete:
+            self._log.critical("flatten.incomplete", **log_fields)
+        else:
+            self._log.warning("flatten.complete", **log_fields)
+        return result
+
+    async def _flatten_symbol(
+        self, symbol: str, reason: str, deadline: float
+    ) -> FlattenSymbolResult:
+        """Flatten a single symbol -- see :meth:`flatten` for the contract.
+
+        Re-reads the live position from the portfolio before every
+        attempt (never a cached quantity) so a fill routed by a
+        concurrently-completing order, or a partial fill from this
+        method's own previous attempt, is always reflected.
+        """
+        position = self._portfolio.get_position(symbol)
+        held_before = (
+            position.quantity if position is not None and not position.is_flat else Decimal("0")
+        )
+        if held_before <= Decimal("0"):
+            return FlattenSymbolResult(
+                symbol=symbol,
+                status="no_position",
+                cause=None,
+                held_before=Decimal("0"),
+                sold_qty=Decimal("0"),
+                remaining_qty=Decimal("0"),
+            )
+
+        # Best-effort snapshot of the last known bar per symbol, used only
+        # for fill pricing (P&L bookkeeping) -- flatten can run outside a
+        # poll cycle, so there is no guaranteed "current" bar the way
+        # _process_bar always has one.
+        current_bars = {s: w[-1] for s, w in self._bar_windows.items() if w}
+
+        order_ids: list[str] = []
+        sold_qty = Decimal("0")
+        cause: str | None = None
+        error: str | None = None
+        attempts = 0
+
+        # WP1.7a round 2 (S-15): a public, narrow accessor -- never the
+        # general-purpose reconcile_required dict, which an unrelated
+        # reason (e.g. a stale BUY-side flag) could also set. Engines
+        # that expose no such concept (paper/backtest) never report
+        # ledger doubt.
+        ledger_doubt_fn = getattr(self._execution_engine, "ledger_doubt", None)
+
+        def _ledger_doubt_now() -> bool:
+            if not callable(ledger_doubt_fn):
+                return False
+            try:
+                return bool(ledger_doubt_fn(symbol))
+            except Exception:
+                return False
+
+        while True:
+            position = self._portfolio.get_position(symbol)
+            remaining = (
+                position.quantity
+                if position is not None and not position.is_flat
+                else Decimal("0")
+            )
+            if remaining <= _FLATTEN_DUST_TOLERANCE:
+                status = "flat" if remaining <= Decimal("0") else "dust"
+                return FlattenSymbolResult(
+                    symbol=symbol,
+                    status=status,
+                    # S-15: a complete (flat/dust) result carries no
+                    # cause -- any cause value leftover from an earlier,
+                    # since-resolved attempt this loop made is stale and
+                    # must not be reported as if it were still true.
+                    cause=None,
+                    held_before=held_before,
+                    sold_qty=sold_qty,
+                    remaining_qty=max(remaining, Decimal("0")),
+                    order_ids=order_ids,
+                    error=error,
+                )
+
+            ledger_doubt = _ledger_doubt_now()
+
+            if time.monotonic() >= deadline or attempts >= _FLATTEN_MAX_ATTEMPTS:
+                # S-15: an order-status-derived cause from THIS flatten's
+                # own most recent attempt (rejected/submit_unknown/
+                # timeout_open) is more specific and more actionable than
+                # the engine-level ledger-doubt check, so it always wins
+                # when we have one; ledger_doubt/timeout_open are only
+                # ever a fallback for "we have no specific order to
+                # point at".
+                if cause is None:
+                    cause = "ledger_doubt" if ledger_doubt else "timeout_open"
+                # sold_qty > 0 always wins as "partial" (real progress was
+                # made, whatever blocked the rest). A ledger doubt with
+                # NOTHING sold is still "partial", never "failed" -- the
+                # bot correctly refused to sell against a balance it is
+                # not sure of (risk-design WP17-R-17); "in_flight" covers
+                # an order that genuinely still exists somewhere
+                # (unconfirmed submit, or reserved by another SELL);
+                # "failed" is reserved for a rejected order or a raised
+                # exception with nothing sold.
+                if sold_qty > Decimal("0") or cause == "ledger_doubt":
+                    status = "partial"
+                elif cause in ("timeout_open", "submit_unknown", "inflight_other"):
+                    status = "in_flight"
+                else:
+                    status = "failed"
+                return FlattenSymbolResult(
+                    symbol=symbol,
+                    status=status,
+                    cause=cause,
+                    held_before=held_before,
+                    sold_qty=sold_qty,
+                    remaining_qty=remaining,
+                    order_ids=order_ids,
+                    error=error,
+                )
+
+            attempts += 1
+            signal = Signal(
+                strategy_id="operator_flatten",
+                symbol=symbol,
+                direction=SignalDirection.SELL,
+                target_position=Decimal("0"),
+                confidence=1.0,
+                metadata={"exit_reason": "flatten", "flatten_reason": reason},
+            )
+            try:
+                orders = await self._execution_engine.process_signal(signal)
+            except Exception as exc:  # flatten must never raise
+                self._log.exception(
+                    "engine.flatten_signal_error", symbol=symbol, reason=reason
+                )
+                error = str(exc)
+                cause = "error"
+                orders = []
+
+            if orders:
+                order_ids.extend(str(o.order_id) for o in orders)
+                _, filled_qty = await self._route_exit_fills(orders, current_bars, signal)
+                sold_qty += filled_qty
+                # S-15: derive cause from THIS attempt's order status
+                # first -- overwrite unconditionally (the most recent
+                # attempt is always the most authoritative signal),
+                # never leave a prior attempt's now-stale cause in place.
+                attempt_cause: str | None = None
+                for o in orders:
+                    status_value = o.status.value
+                    if status_value == "rejected":
+                        attempt_cause = "rejected"
+                    elif status_value == "pending_submit":
+                        attempt_cause = attempt_cause or "submit_unknown"
+                    elif status_value in ("open", "partial"):
+                        attempt_cause = attempt_cause or "timeout_open"
+                if attempt_cause is not None:
+                    cause = attempt_cause
+                continue
+
+            # No order was created this attempt: either genuinely blocked
+            # (ledger doubt, another SELL already in flight for this
+            # symbol) or transiently rejected upstream. Wait briefly and
+            # re-read the position rather than busy-looping.
+            cause = "ledger_doubt" if ledger_doubt else "inflight_other"
+
+            remaining_time = deadline - time.monotonic()
+            if remaining_time <= 0:
+                continue
+            await asyncio.sleep(min(_FLATTEN_POLL_SECONDS, remaining_time))
+
+    # ------------------------------------------------------------------
     # Engine price updates (paper engine)
     # ------------------------------------------------------------------
 
@@ -1698,6 +2456,28 @@ class StrategyEngine:
                 self._log.exception(
                     "engine.warmup_unexpected_error",
                     symbol=symbol,
+                )
+
+        # WP1.8a (A-09/R§3): after a resume, seed the trailing-stop peak for
+        # every symbol with an open position -- the in-memory peak is always
+        # lost on restart, and seeding from the current price alone would
+        # loosen the stop.  Uses the just-loaded warmup window to find the
+        # highest close since the (rebuilt) position's opened_at; falls back
+        # to the entry price when no bar in the window is new enough (or the
+        # window is empty).  No-op when no trailing stop is configured or no
+        # symbol has an open position (a fresh run never reaches the `if`).
+        if self._trailing_stop is not None:
+            for symbol in self._symbols:
+                position = self._portfolio.get_position(symbol)
+                if position is None or position.is_flat:
+                    continue
+                bars = self._bar_windows.get(symbol, [])
+                closes_since_open = [
+                    bar.close for bar in bars if bar.timestamp >= position.opened_at
+                ]
+                highest_close = max(closes_since_open, default=position.average_entry_price)
+                self._trailing_stop.seed_peak(
+                    symbol, max(position.average_entry_price, highest_close)
                 )
 
     async def _poll_and_process(self) -> None:
@@ -1774,8 +2554,14 @@ class StrategyEngine:
             s: list(self._bar_windows[s]) for s in self._symbols
         }
 
-        # Process the bar
-        await self._process_bar(current_bars, history_by_symbol)
+        # Process the bar. WP1.7a (I6): held for the WHOLE call (not just
+        # the get_fills sub-steps) so a concurrent flatten() can never
+        # interleave with a bar still mid-flight -- e.g. both reading the
+        # same not-yet-reserved own_avail, or two callers racing
+        # LiveExecutionEngine.get_fills' pre-await already_routed read
+        # (arch-design WP17-A-02).
+        async with self._cycle_lock:
+            await self._process_bar(current_bars, history_by_symbol)
 
     # ------------------------------------------------------------------
     # Summary / status

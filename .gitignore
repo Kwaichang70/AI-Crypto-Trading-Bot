@@ -18,6 +18,15 @@ secrets/
 # Keep .env.example — it documents required variables without real values
 !.env.example
 
+# Coinbase CDP API key download (never commit; delete after pasting into .env)
+cdp_api_key*.json
+# Database dumps and backup folders (keep backups outside the repo; this is a backstop at the repo root only)
+*.dump
+/backups/
+# Operator evidence packs (keep outside the repo; this is a backstop at the repo root only)
+/evidence/
+/smoke-evidence/
+
 # Private project files — not for public repos
 CLAUDE.local.md
 .claude/settings.local.json

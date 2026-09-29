@@ -15,6 +15,7 @@ Available strategies
 - **DCARSIHybridStrategy** -- DCA + RSI hybrid (systematic accumulation)
 - **GridTradingStrategy** -- Grid trading (buy low / sell high at fixed levels)
 - **SLTPReversionStrategy** -- RSI-2 dip entry for fixed/ATR bracket SL+TP exits
+- **SmokeRoundtripStrategy** -- diagnostic BUY-hold-SELL mechanics test (no edge)
 
 Usage::
 
@@ -34,6 +35,7 @@ from trading.strategies.model_strategy import ModelStrategy
 from trading.strategies.momentum_breakout import MomentumBreakoutStrategy
 from trading.strategies.rsi_mean_reversion import RSIMeanReversionStrategy
 from trading.strategies.sl_tp_reversion import SLTPReversionStrategy
+from trading.strategies.smoke_roundtrip import SmokeRoundtripStrategy
 
 __all__ = [
     "MACrossoverStrategy",
@@ -44,4 +46,5 @@ __all__ = [
     "GridTradingStrategy",
     "SLTPReversionStrategy",
     "MomentumBreakoutStrategy",
+    "SmokeRoundtripStrategy",
 ]

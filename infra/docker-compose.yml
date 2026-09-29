@@ -172,6 +172,14 @@ services:
       # -- Authentication --
       REQUIRE_API_AUTH:    ${REQUIRE_API_AUTH:-false}
       API_KEY_HASH:        ${API_KEY_HASH:-}
+      # -- Admin operations (WP1.7b, C21): validated via hmac.compare_digest
+      # in apps/api/deps.py:require_admin. Must equal ui's
+      # INTERNAL_ADMIN_API_KEY below. Reached only via Caddy's
+      # handle /api/admin/* -> ui:3000 proxy route for browser traffic
+      # (infra/Caddyfile); this same value also gates the api:8000 admin
+      # routes directly for the operator curl fallback (see Caddyfile
+      # comment on that block for why that is not a bypass).
+      ADMIN_API_KEY:       ${ADMIN_API_KEY:?ADMIN_API_KEY must be set in .env}
       # -- Reverse proxy: trust Caddy's X-Forwarded-For header (1 hop) --
       TRUSTED_PROXY_COUNT: ${TRUSTED_PROXY_COUNT:-1}
       # -- ML Auto-Retraining --
@@ -251,6 +259,14 @@ services:
       # SR-004: Fail-fast — ADMIN_EMAILS must be explicitly set.
       # Use 'none@example.invalid' if you want zero admin accounts.
       ADMIN_EMAILS: ${ADMIN_EMAILS:?ADMIN_EMAILS must be set in .env (use 'none@example.invalid' if you want zero admins)}
+      # WP1.7b (C21): server-side-only key the Next.js admin proxy
+      # routes (apps/ui/src/app/api/admin/*/route.ts) read after
+      # getServerSession()+isAdmin() pass, and forward as X-Admin-Key to
+      # the FastAPI backend. MUST equal the backend's ADMIN_API_KEY
+      # above. NEVER prefix with NEXT_PUBLIC_ -- read only by Node route
+      # handlers at request time, never by Edge middleware.ts, so it
+      # must stay in environment: only (no Dockerfile.ui build-arg).
+      INTERNAL_ADMIN_API_KEY: ${INTERNAL_ADMIN_API_KEY:?INTERNAL_ADMIN_API_KEY must be set in .env (must equal backend ADMIN_API_KEY)}
     healthcheck:
       test: ["CMD-SHELL",
              "wget -qO- http://localhost:3000/api/health 2>/dev/null || curl -f http://localhost:3000 || exit 1"]

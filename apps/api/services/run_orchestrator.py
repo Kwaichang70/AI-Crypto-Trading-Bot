@@ -45,8 +45,10 @@ from api.db.models import (
     TradeORM,
 )
 from api.services.audit_log import record_audit_event
-from api.services.run_persistence import persist_paper_results as _persist_paper_results
 from common.types import TimeFrame
+from trading.exit_config import ExitConfigError
+from trading.recovery import ResumeSnapshot
+from trading.smoke_guard import SMOKE_STRATEGY_NAMES, SmokeGuardError, validate_smoke_run
 
 __all__ = [
     "_IncrementalFlushState",
@@ -54,8 +56,10 @@ __all__ = [
     "_RUN_ENGINES",
     "_RUN_TASKS",
     "auto_stop_after",
+    "build_live_ccxt_exchange",
     "flush_incremental",
     "incremental_flush_loop",
+    "mark_shutdown_requested",
     "notify_trade_telegram",
     "run_live_engine",
     "run_paper_engine",
@@ -90,6 +94,59 @@ def _normalize_exchange_secret(secret: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# WP1.8b (P-02): shared real-CCXT-exchange construction
+# ---------------------------------------------------------------------------
+
+
+def build_live_ccxt_exchange(settings: Any) -> Any:  # noqa: ANN401
+    """Construct a real ``ccxt.async_support`` exchange instance.
+
+    Extracted from ``_run_live_engine``'s inline construction block so the
+    WP1.8b resume path (``apps.api.routers.runs.resume_run``, which needs
+    a real exchange handle for its exchange-scan BEFORE the live engine
+    itself is spawned -- see ``run_recovery.scan_and_import``) builds the
+    exact same credentials/config as the production engine, from one
+    place, instead of a second hand-maintained copy.
+
+    Pure construction -- no I/O, no network call (``ccxt.async_support``
+    exchange ``__init__`` never opens a connection). Callers own the
+    resulting instance's lifecycle and MUST call ``await exchange.close()``
+    themselves (P-02: guaranteed cleanup) once done with it -- this
+    function never closes anything.
+
+    Raises
+    ------
+    RuntimeError
+        If ``settings.exchange_id`` is not a real CCXT exchange id.
+    """
+    import ccxt.async_support as ccxt_async
+
+    api_key: str | None = None
+    api_secret: str | None = None
+    if settings.exchange_api_key is not None:
+        api_key = settings.exchange_api_key.get_secret_value()
+    if settings.exchange_api_secret is not None:
+        api_secret = settings.exchange_api_secret.get_secret_value()
+    if api_secret is not None:
+        api_secret = _normalize_exchange_secret(api_secret)
+    api_passphrase: str | None = None
+    if settings.exchange_api_passphrase is not None:
+        api_passphrase = settings.exchange_api_passphrase.get_secret_value()
+
+    exchange_cls = getattr(ccxt_async, settings.exchange_id, None)
+    if exchange_cls is None:
+        raise RuntimeError(f"Unsupported CCXT exchange: {settings.exchange_id!r}")
+    exchange_config: dict[str, Any] = {"enableRateLimit": True}
+    if api_key is not None:
+        exchange_config["apiKey"] = api_key
+    if api_secret is not None:
+        exchange_config["secret"] = api_secret
+    if api_passphrase is not None:
+        exchange_config["password"] = api_passphrase
+    return exchange_cls(exchange_config)
+
+
+# ---------------------------------------------------------------------------
 # Named constants
 # ---------------------------------------------------------------------------
 #: Interval (seconds) between incremental DB flushes during paper/live runs.
@@ -100,6 +157,33 @@ _PAPER_FLUSH_INTERVAL_SECONDS: float = 30.0
 # Mirrors trading.strategy_engine._HALT_AUTO_STOP_REASON — duplicated to
 # avoid an api→trading→api import cycle. Both must stay in sync.
 _HALT_AUTO_STOP_REASON_VALUE: str = "circuit_breaker_halt"
+
+# ---------------------------------------------------------------------------
+# WP1.8a (S5): shutdown-vs-crash disambiguation for the engine `finally` blocks
+# ---------------------------------------------------------------------------
+#: Set by ``mark_shutdown_requested()`` in ``main.py``'s lifespan shutdown,
+#: BEFORE ``container.shutdown()`` cancels the run-registry tasks.  A run's
+#: `except asyncio.CancelledError` branch reads this flag to decide whether
+#: a still-`running` row should become `orphaned` (graceful shutdown / API
+#: restart -- WP1.8a S5) instead of `stopped` (a user-initiated stop_run/
+#: emergency_stop already wrote `stopped` to the DB before cancelling the
+#: task, so the `finally` block's `WHERE status == "running"` guard never
+#: overwrites that -- this flag only matters when nothing else has touched
+#: the row yet).  Never reset to False -- once shutdown starts, no run in
+#: this process is coming back without a fresh boot.
+_SHUTDOWN_REQUESTED: bool = False
+
+
+def mark_shutdown_requested() -> None:
+    """Flag that the API process is shutting down (WP1.8a S5).
+
+    Must be called BEFORE the run-registry/``_RUN_TASKS`` cancellation
+    begins so every in-flight ``run_paper_engine``/``run_live_engine``
+    coroutine's ``except asyncio.CancelledError`` branch can tell a
+    graceful shutdown apart from a user-initiated stop.
+    """
+    global _SHUTDOWN_REQUESTED
+    _SHUTDOWN_REQUESTED = True
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +283,12 @@ class _IncrementalFlushState:
     flushed_order_ids: set[uuid.UUID] = field(default_factory=set)
     flushed_fill_ids: set[uuid.UUID] = field(default_factory=set)
     peak_equity: Decimal = field(default_factory=lambda: Decimal("0"))
+    # WP1.8a (O2): a resumed run keeps its equity `bar_index` sequence
+    # continuous across the restart -- seeded with
+    # ``ResumeSnapshot.max_bar_index + 1`` so the first post-resume flush
+    # does not collide with `uq_equity_snapshots_run_bar`.  Zero for a
+    # fresh (non-resumed) run.
+    bar_index_offset: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -296,7 +386,7 @@ async def flush_incremental(
         if equity < Decimal("0"):
             log.warning(
                 "runs.incremental_flush_negative_equity_clamped",
-                bar_index=state.flushed_equity_count + i,
+                bar_index=state.bar_index_offset + state.flushed_equity_count + i,
                 raw_equity=str(equity),
             )
             equity = Decimal("0")
@@ -309,7 +399,7 @@ async def flush_incremental(
                 unrealised_pnl=Decimal("0"), # MVP: per-bar unrealised not tracked
                 realised_pnl=Decimal("0"),   # MVP: per-bar realised not tracked
                 drawdown_pct=dd_pct,
-                bar_index=state.flushed_equity_count + i,
+                bar_index=state.bar_index_offset + state.flushed_equity_count + i,
                 timestamp=timestamp,
             )
         )
@@ -562,9 +652,13 @@ async def auto_stop_after(
 # ---------------------------------------------------------------------------
 # Helper: persist paper engine results to DB
 # ---------------------------------------------------------------------------
-# ``_persist_paper_results`` lives in ``api.services.run_persistence`` since
-# Sprint 40 Stap 2a; the top-level import block re-exports it under the
-# original underscore-prefixed name for backwards compatibility.
+# ``persist_paper_results`` lives in ``api.services.run_persistence`` since
+# Sprint 40 Stap 2a. This module does not re-export it (nothing here calls
+# it and no external consumer imports it under this module's namespace,
+# confirmed WP1.8a C-08) -- callers needing it should import directly from
+# ``api.services.run_persistence``.  ``api.routers.runs`` re-exports several
+# OTHER names from this module (see its own import block) -- that pattern
+# is unrelated to this one.
 
 
 # ---------------------------------------------------------------------------
@@ -596,6 +690,7 @@ async def _auto_retry_paper_run(
     bracket_config: dict[str, object] | None,
     enable_adaptive_learning: bool,
     auto_apply_learning: bool,
+    allow_pyramiding: bool = False,
 ) -> None:
     """Recreate a crashed paper run after a backoff (bounded attempts).
 
@@ -652,6 +747,25 @@ async def _auto_retry_paper_run(
                     crashed_status=crashed.status,
                 )
                 return
+            # WP1.7a round 2 (S-16): a fresh paper run created while the
+            # global kill switch is latched would sit inert from its very
+            # first bar (entries blocked by apply_latch, I5) -- and if the
+            # CRASHED run itself carried a persisted 'flatten_incomplete'
+            # per-run latch, that context would simply be dropped (a new
+            # run has no history to inherit it from). Skip the retry
+            # entirely in either case; the crashed run stays 'error' for
+            # an operator to handle explicitly (matches SY-08's "a
+            # latched new run would sit silently inert" rationale for
+            # create_run's own 409).
+            from api.services import kill_switch as _kill_switch
+
+            if _kill_switch.is_active() or crashed.entries_latch_reason is not None:
+                log.warning(
+                    "runs.auto_retry_skipped_kill_switch_active",
+                    kill_switch_active=_kill_switch.is_active(),
+                    crashed_entries_latch_reason=crashed.entries_latch_reason,
+                )
+                return
             new_config = dict(crashed.config or {})
             # Observability only — orphan recovery reads this back explicitly
             # at its call site; nothing else consumes it (CR-006).
@@ -684,6 +798,7 @@ async def _auto_retry_paper_run(
                 enable_adaptive_learning=enable_adaptive_learning,
                 auto_apply_learning=auto_apply_learning,
                 auto_retry_attempt=next_attempt,
+                allow_pyramiding=allow_pyramiding,
             ),
             name=f"paper-engine-retry-{new_run_id}",
         )
@@ -712,6 +827,10 @@ async def run_paper_engine(
     enable_adaptive_learning: bool = False,
     auto_apply_learning: bool = False,
     auto_retry_attempt: int = 0,
+    resume: ResumeSnapshot | None = None,
+    elapsed_seconds: float = 0.0,
+    entries_latch_reason: str | None = None,
+    allow_pyramiding: bool = False,
 ) -> None:
     """
     Background coroutine that runs a paper trading engine for a single run.
@@ -756,10 +875,29 @@ async def run_paper_engine(
         When ``True`` the adaptive-learning task is allowed to call
         ``strategy.update_params(...)`` directly; when ``False`` the task
         reports suggestions via logs only (dry-run mode, safer default).
+    resume:
+        WP1.8a S6: when set, this run resumes in place under its existing
+        ``run_id`` -- the portfolio is rebuilt via
+        ``PortfolioAccounting.from_fills`` instead of starting flat, and
+        the execution engine's own position/cash cache is restored via
+        ``PaperExecutionEngine.restore_from_fills``.  ``None`` for a fresh
+        run (the default).
+    elapsed_seconds:
+        WP1.8a: seconds already elapsed since the run's *original*
+        ``started_at`` (0.0 for a fresh run).  Subtracted from
+        ``max_run_duration_hours`` so a resumed run's auto-stop still fires
+        relative to when it was first started, not when it was resumed.
+    entries_latch_reason:
+        WP1.7a (SY-02): the run's persisted ``entries_latch_reason`` column
+        (only ever ``'flatten_incomplete'``), when this call is
+        recovering/resuming a run that has one. ``None`` for a fresh run
+        (``create_run`` never sets one -- a brand-new row has no history to
+        latch on).
     """
     from api.config import get_settings
     from api.db.models import RunORM
     from api.db.session import get_session_factory
+    from api.services import kill_switch as _kill_switch
     from common.types import RunMode
     from data.services.ccxt_market_data import CCXTMarketDataService
     from trading.engines.paper import PaperExecutionEngine
@@ -767,10 +905,24 @@ async def run_paper_engine(
     from trading.risk_manager import DefaultRiskManager
     from trading.strategy_engine import StrategyEngine
 
-    log = logger.bind(run_id=run_id_str, mode="paper")
+    log = logger.bind(run_id=run_id_str, mode="paper", resumed=resume is not None)
     log.info("runs.paper_engine_starting")
 
     final_status = "stopped"
+    # WP1.3a (SY-13a-19): a construction-time ExitConfigError is a
+    # deterministic config problem, never a transient one -- retrying it
+    # would just crash again, three times, for nothing.
+    # WP-SMOKE fix F-5 (SMK-SEC-04): a smoke_roundtrip paper run must
+    # never auto-retry after ANY crash, not just an ExitConfigError/
+    # SmokeGuardError. A fresh SmokeRoundtripStrategy instance re-emits
+    # its single BUY on its first on_bar -- the exact path class G-12
+    # already closes for boot recovery -- so an auto-retried crash would
+    # silently spawn a second BUY-latch and corrupt the SMK-T-34 paper
+    # rehearsal used as a pre-flight gate for live. Non-smoke behaviour
+    # is unchanged: _skip_auto_retry stays False for every other
+    # strategy, and the :1271-area gate below still honours whatever
+    # this flag ends up as. See SMK-T-42.
+    _skip_auto_retry = strategy_name in SMOKE_STRATEGY_NAMES
     engine: StrategyEngine | None = None
     portfolio: Any = None
     execution: Any = None
@@ -789,6 +941,26 @@ async def run_paper_engine(
     auto_stop_task: asyncio.Task[None] | None = None
 
     try:
+        # WP-SMOKE (synthesis-spec.md section 7, G-13): defence in depth --
+        # a no-op for every strategy except smoke_roundtrip. create_run
+        # already rejects a violating config before this coroutine is ever
+        # spawned; this call exists so the ban holds even for a caller that
+        # bypasses the router (mirrors the allow_pyramiding check in
+        # run_live_engine). SmokeGuardError IS a ValueError, so it is
+        # caught by the except clauses below and the run ends in 'error'.
+        validate_smoke_run(
+            strategy_name=strategy_name,
+            mode="paper",
+            symbols=symbols,
+            timeframe=str(timeframe),
+            initial_capital=initial_capital,
+            strategy_params=strategy_params,
+            bracket=bracket_config,
+            trailing_stop_pct=trailing_stop_pct,
+            allow_pyramiding=allow_pyramiding,
+            enable_adaptive_learning=enable_adaptive_learning,
+        )
+
         settings = get_settings()
         capital = Decimal(initial_capital)
 
@@ -819,10 +991,24 @@ async def run_paper_engine(
             risk_manager=risk_manager,
             initial_cash=capital,
         )
-        portfolio = PortfolioAccounting(
-            run_id=run_id_str,
-            initial_cash=capital,
-        )
+        if resume is not None:
+            # WP1.8a S6: rebuild the portfolio from persisted fills instead
+            # of starting flat, and keep the execution engine's own
+            # position/cash cache consistent with it.
+            portfolio = PortfolioAccounting.from_fills(
+                run_id=run_id_str,
+                initial_cash=capital,
+                fills=resume.fills,
+                peak_equity_hint=resume.peak_equity_hint,
+            )
+            execution.restore_from_fills(resume.fills)
+            flush_state.bar_index_offset = resume.max_bar_index + 1
+            flush_state.peak_equity = resume.peak_equity_hint or Decimal("0")
+        else:
+            portfolio = PortfolioAccounting(
+                run_id=run_id_str,
+                initial_cash=capital,
+            )
         strategy_instance = strategy_cls(
             strategy_id=f"{strategy_name}-{run_id_str.replace('-', '')[:8]}",
             params=strategy_params,
@@ -848,7 +1034,7 @@ async def run_paper_engine(
             )
 
         # Build engine config  -- include trailing stop if configured
-        engine_config: dict[str, object] = {}
+        engine_config: dict[str, object] = {"allow_pyramiding": allow_pyramiding}
         if trailing_stop_pct is not None:
             engine_config["trailing_stop_pct"] = trailing_stop_pct
         for _bk, _bv in (bracket_config or {}).items():
@@ -864,10 +1050,14 @@ async def run_paper_engine(
             symbols=symbols,
             timeframe=timeframe,
             run_mode=RunMode.PAPER,
-            config=engine_config if engine_config else None,
+            config=engine_config,
         )
 
         _RUN_ENGINES[run_id_str] = engine
+        # WP1.7a (I5): synchronous, no ``await`` in between -- applies the
+        # global latch mirror and/or this run's own persisted latch before
+        # anything else can observe this engine as registered.
+        _kill_switch.apply_latch(engine, entries_latch_reason=entries_latch_reason)
         await engine.start(run_id_str)
         log.info("runs.paper_engine_running")
 
@@ -890,7 +1080,7 @@ async def run_paper_engine(
         auto_stop_task = asyncio.create_task(
             _auto_stop_after(
                 stop_event=engine._stop_event,
-                max_seconds=settings.max_run_duration_hours * 3600.0,
+                max_seconds=max(settings.max_run_duration_hours * 3600.0 - elapsed_seconds, 0.0),
                 run_id=run_id_str,
                 log=log,
             )
@@ -905,7 +1095,15 @@ async def run_paper_engine(
         await engine.run_live_loop()
 
     except asyncio.CancelledError:
-        log.info("runs.paper_engine_cancelled")
+        # WP1.8a S5: a graceful shutdown (API restart) cancels every
+        # _RUN_TASKS entry without first updating the DB row, unlike
+        # stop_run/emergency_stop which write 'stopped' BEFORE cancelling.
+        # _SHUTDOWN_REQUESTED (set by main.py's lifespan before that cancel)
+        # is how this branch tells the two apart: only a still-'running' row
+        # (the WHERE guard below) with the flag set becomes 'orphaned'.
+        if _SHUTDOWN_REQUESTED:
+            final_status = "orphaned"
+        log.info("runs.paper_engine_cancelled", final_status=final_status)
         await _cancel_engine_side_tasks(
             auto_stop_task=auto_stop_task,
             learning_task=learning_task,
@@ -918,6 +1116,46 @@ async def run_paper_engine(
             except Exception:
                 log.exception("runs.paper_engine_stop_error")
         raise  # Must re-raise CancelledError for asyncio bookkeeping
+
+    except ExitConfigError as exc:
+        # WP1.3a (SY-13a-19): the engine constructor rejected the exit
+        # config / allow_pyramiding.  create_run/promote/resume already
+        # validate this before spawning the task, so reaching here means a
+        # legacy/edge path (e.g. paper boot recovery -- which validates
+        # separately and never reaches this branch either, or a caller that
+        # bypassed the router).  error/invalid_exit_config, never retried.
+        final_status = "error"
+        _skip_auto_retry = True
+        log.error(
+            "runs.paper_engine_exit_config_invalid",
+            code=exc.code,
+            reasons=[i.reason for i in exc.issues],
+        )
+        await _cancel_engine_side_tasks(
+            auto_stop_task=auto_stop_task,
+            learning_task=learning_task,
+            learning_stop_event=learning_stop_event,
+            flush_task=flush_task,
+        )
+
+    except SmokeGuardError as exc:
+        # WP-SMOKE (synthesis-spec.md section 7, G-13): the same
+        # deterministic-config-error treatment as ExitConfigError above --
+        # create_run already validates this before spawning the task, so
+        # reaching here means a caller bypassed the router. Never retried
+        # (a retry would just violate the same guardrail again).
+        final_status = "error"
+        _skip_auto_retry = True
+        log.error(
+            "runs.paper_engine_smoke_guardrail_violation",
+            reasons=[i.reason for i in exc.issues],
+        )
+        await _cancel_engine_side_tasks(
+            auto_stop_task=auto_stop_task,
+            learning_task=learning_task,
+            learning_stop_event=learning_stop_event,
+            flush_task=flush_task,
+        )
 
     except Exception:
         final_status = "error"
@@ -996,7 +1234,11 @@ async def run_paper_engine(
                     if run is not None and run.status == "running":
                         now = datetime.now(tz=UTC)
                         run.status = final_status
-                        run.stopped_at = now
+                        # WP1.8a: an orphaned run is not finished -- it is
+                        # waiting for an operator resume -- so stopped_at
+                        # (documented as "NULL = still running") stays NULL.
+                        if final_status != "orphaned":
+                            run.stopped_at = now
                         run.updated_at = now
                         await db.commit()
                         log.info(
@@ -1009,12 +1251,34 @@ async def run_paper_engine(
         except Exception:
             log.exception("runs.paper_engine_db_session_failed")
 
+        # WP1.8a (S5/S8): audit row + structured log for a shutdown-triggered
+        # orphan, mirroring the HALT audit block above.  Best-effort -- a
+        # failure here must never crash the teardown path.
+        if final_status == "orphaned":
+            try:
+                factory_orphan = get_session_factory()
+                async with factory_orphan() as db_orphan:
+                    await record_audit_event(
+                        db_orphan,
+                        event_type="run_orphaned",
+                        resource_type="run",
+                        resource_id=run_id_str,
+                        request=None,
+                        payload={"trigger": "shutdown", "run_mode": "paper"},
+                    )
+                    await db_orphan.commit()
+            except Exception:
+                log.warning("runs.paper_engine_orphan_audit_failed", run_id=run_id_str)
+            log.error("shutdown.run_marked_orphaned", run_id=run_id_str, run_mode="paper")
+
         # Auto-retry crashed paper runs (Sprint 48 D2): only on a genuine
         # error exit — operator stops and graceful shutdowns never reach
         # final_status == "error" (CancelledError re-raises above).  The
         # retry task is fire-and-forget; it sleeps the backoff first so this
         # finally block returns immediately.
-        if final_status == "error":
+        # WP1.3a (SY-13a-19): NEVER retry a deterministic ExitConfigError --
+        # it would just crash again, three times, for nothing.
+        if final_status == "error" and not _skip_auto_retry:
             asyncio.create_task(
                 _auto_retry_paper_run(
                     crashed_run_id=run_id_str,
@@ -1029,6 +1293,7 @@ async def run_paper_engine(
                     bracket_config=bracket_config,
                     enable_adaptive_learning=enable_adaptive_learning,
                     auto_apply_learning=auto_apply_learning,
+                    allow_pyramiding=allow_pyramiding,
                 ),
                 name=f"auto-retry-{run_id_str[:8]}",
             )
@@ -1046,6 +1311,12 @@ async def run_live_engine(
     trailing_stop_pct: float | None = None,
     bracket_config: dict[str, object] | None = None,
     enable_adaptive_learning: bool = False,
+    resume: ResumeSnapshot | None = None,
+    protective_mode: bool = False,
+    elapsed_seconds: float = 0.0,
+    entries_latch_reason: str | None = None,
+    allow_pyramiding: bool = False,
+    exit_config_waived: bool = False,
 ) -> None:
     """
     Background coroutine that runs a live trading engine for a single run.
@@ -1057,12 +1328,35 @@ async def run_live_engine(
 
     This function uses its own database session (not the request session)
     because the POST handler's session is closed before this coroutine runs.
-    """
-    import ccxt.async_support as ccxt_async
 
+    Parameters
+    ----------
+    resume:
+        WP1.8a S2/S6/S10: set only by ``POST /runs/{id}/resume`` after
+        ``prepare_live_resume`` has already validated (and, in WP1.8b,
+        reconciled) the run's exchange state.  When set, the portfolio is
+        rebuilt via ``PortfolioAccounting.from_fills`` instead of starting
+        flat -- the execution engine itself needs no seeding (A-07: its
+        ``_orders``/fill-dedup caches start empty either way, and
+        ``attach_position_source`` wires it to the rebuilt portfolio via
+        the ``StrategyEngine`` constructor below).
+    protective_mode:
+        WP1.8a S10/O9: when ``True`` (a ``mode=protective`` resume), the
+        engine drops every BUY signal for this run's whole lifetime --
+        exits keep running.  Always ``False`` for a fresh run; never
+        switched mid-run (switching back to normal requires a fresh
+        orphan + resume, per the synthesis spec's explicit out-of-scope
+        list).
+    elapsed_seconds:
+        Seconds already elapsed since the run's *original* ``started_at``
+        (0.0 for a fresh run) -- see ``run_paper_engine``.
+    entries_latch_reason:
+        WP1.7a (SY-02) -- see ``run_paper_engine``.
+    """
     from api.config import get_settings
     from api.db.models import RunORM
     from api.db.session import get_session_factory
+    from api.services import kill_switch as _kill_switch
     from common.types import RunMode
     from data.services.ccxt_market_data import CCXTMarketDataService
     from trading.engines.live import LiveExecutionEngine
@@ -1070,7 +1364,7 @@ async def run_live_engine(
     from trading.risk_manager import DefaultRiskManager
     from trading.strategy_engine import StrategyEngine
 
-    log = logger.bind(run_id=run_id_str, mode="live")
+    log = logger.bind(run_id=run_id_str, mode="live", resumed=resume is not None)
     log.info("runs.live_engine_starting")
 
     final_status = "stopped"
@@ -1091,10 +1385,72 @@ async def run_live_engine(
     auto_stop_task: asyncio.Task[None] | None = None
 
     try:
+        if resume is not None:
+            # WP1.8a-round2 (C-01/S-01 item 5): backstop against the
+            # resume-vs-stop/kill-switch race.  This task is spawned right
+            # after the resume endpoint's own commit of status='running';
+            # by the time this coroutine actually runs, a concurrent
+            # stop_run/emergency_stop_run/kill-switch may already have
+            # flipped the row away from 'running' (their own row lock
+            # waits on our committing transaction, then wins once we
+            # commit).  Re-read fresh and abort before ever touching the
+            # exchange.  Inside `try` so a guard-query failure is handled
+            # by the existing except/finally teardown, not left as an
+            # unretrieved task exception.
+            guard_factory = get_session_factory()
+            async with guard_factory() as guard_db:
+                guard_result = await guard_db.execute(
+                    select(RunORM).where(RunORM.id == uuid.UUID(run_id_str))
+                )
+                guard_run = guard_result.scalar_one_or_none()
+            if guard_run is None or guard_run.status != "running":
+                log.warning(
+                    "runs.live_engine_resume_aborted_status_changed",
+                    observed_status=guard_run.status if guard_run is not None else None,
+                )
+                return
+
+        # WP1.3a (SY-13a-20, D-13a-1): live pyramiding is forbidden.  The
+        # API layer (create/promote/resume) already rejects this before
+        # spawning the task; this is defence in depth for every production
+        # live engine, built here, so the ban holds even if a future caller
+        # bypasses the router.  Raised BEFORE StrategyEngine(...) -- library-
+        # mechanics tests construct a StrategyEngine directly with an
+        # explicit, commented allow_pyramiding=True (H2/H3), which never
+        # goes through this coroutine.
+        if allow_pyramiding:
+            raise ValueError("live_pyramiding_forbidden")
+
+        # WP-SMOKE (synthesis-spec.md section 7, G-13): defence in depth --
+        # a no-op for every strategy except smoke_roundtrip. create_run
+        # already rejects a violating config before this coroutine is ever
+        # spawned; this call exists so the ban holds even for a caller that
+        # bypasses the router. Skipped for a protective resume (G-10
+        # already forces every smoke resume through mode=protective, and
+        # protective mode salvages/waives exit config by design -- it must
+        # not be re-validated against the fresh-create bounds). Raised
+        # BEFORE the exchange build, mirroring the pyramiding check above.
+        # SmokeGuardError IS a ValueError, so it is caught by the except
+        # clause below and the run ends in 'error'.
+        if not protective_mode:
+            validate_smoke_run(
+                strategy_name=strategy_name,
+                mode="live",
+                symbols=symbols,
+                timeframe=str(timeframe),
+                initial_capital=initial_capital,
+                strategy_params=strategy_params,
+                bracket=bracket_config,
+                trailing_stop_pct=trailing_stop_pct,
+                allow_pyramiding=allow_pyramiding,
+                enable_adaptive_learning=enable_adaptive_learning,
+            )
+
         settings = get_settings()
         capital = Decimal(initial_capital)
 
-        # Extract exchange credentials
+        # Extract exchange credentials (needed by CCXTMarketDataService
+        # below, which takes them directly rather than a built exchange).
         api_key: str | None = None
         api_secret: str | None = None
         if settings.exchange_api_key is not None:
@@ -1107,20 +1463,9 @@ async def run_live_engine(
         if settings.exchange_api_passphrase is not None:
             api_passphrase = settings.exchange_api_passphrase.get_secret_value()
 
-        # Build CCXT async exchange instance
-        exchange_cls = getattr(ccxt_async, settings.exchange_id, None)
-        if exchange_cls is None:
-            raise RuntimeError(f"Unsupported CCXT exchange: {settings.exchange_id!r}")
-        exchange_config: dict[str, Any] = {
-            "enableRateLimit": True,
-        }
-        if api_key is not None:
-            exchange_config["apiKey"] = api_key
-        if api_secret is not None:
-            exchange_config["secret"] = api_secret
-        if api_passphrase is not None:
-            exchange_config["password"] = api_passphrase
-        exchange = exchange_cls(exchange_config)
+        # Build CCXT async exchange instance (WP1.8b P-02: shared with the
+        # resume endpoint's own pre-spawn exchange scan).
+        exchange = build_live_ccxt_exchange(settings)
 
         # Instantiate components
         market_data = CCXTMarketDataService(
@@ -1131,6 +1476,11 @@ async def run_live_engine(
             cache_ttl_seconds=60,
         )
         risk_manager = DefaultRiskManager(run_id=run_id_str)
+        if protective_mode:
+            # WP1.8 S-10: risk-layer defence-in-depth alongside the
+            # strategy-layer _drop_entry_signals filter (StrategyEngine's
+            # own protective_mode=protective_mode below).
+            risk_manager.set_protective_mode(True)
         execution = LiveExecutionEngine(
             run_id=run_id_str,
             risk_manager=risk_manager,
@@ -1138,10 +1488,27 @@ async def run_live_engine(
             # Gate already enforced by LiveTradingGate in POST handler
             enable_live_trading=True,
         )
-        portfolio = PortfolioAccounting(
-            run_id=run_id_str,
-            initial_cash=capital,
-        )
+        if resume is not None:
+            # WP1.8a S6: rebuild the portfolio from persisted fills instead
+            # of starting flat.  The execution engine needs no separate
+            # seeding (A-07) -- attach_position_source (in the
+            # StrategyEngine constructor below) wires it to this rebuilt
+            # portfolio, so LiveExecutionEngine.on_start's sync_positions()
+            # naturally compares the correct "own" quantity against the
+            # exchange balance and raises WP1.1 D2 flags on a mismatch (S9).
+            portfolio = PortfolioAccounting.from_fills(
+                run_id=run_id_str,
+                initial_cash=capital,
+                fills=resume.fills,
+                peak_equity_hint=resume.peak_equity_hint,
+            )
+            flush_state.bar_index_offset = resume.max_bar_index + 1
+            flush_state.peak_equity = resume.peak_equity_hint or Decimal("0")
+        else:
+            portfolio = PortfolioAccounting(
+                run_id=run_id_str,
+                initial_cash=capital,
+            )
         strategy_instance = strategy_cls(
             strategy_id=f"{strategy_name}-{run_id_str.replace('-', '')[:8]}",
             params=strategy_params,
@@ -1165,7 +1532,12 @@ async def run_live_engine(
             log.info("runs.adaptive_learning_enabled", auto_apply=False)
 
         # Build engine config  -- include trailing stop if configured
-        live_engine_config: dict[str, object] = {}
+        live_engine_config: dict[str, object] = {"allow_pyramiding": allow_pyramiding}
+        if exit_config_waived:
+            # WP1.3a (SY-13a-16): only ever set by a protective resume that
+            # salvaged a partially-invalid exit config -- StrategyEngine
+            # itself re-enforces that this requires protective_mode=True.
+            live_engine_config["exit_config_waived"] = True
         if trailing_stop_pct is not None:
             live_engine_config["trailing_stop_pct"] = trailing_stop_pct
         for _bk, _bv in (bracket_config or {}).items():
@@ -1181,10 +1553,13 @@ async def run_live_engine(
             symbols=symbols,
             timeframe=timeframe,
             run_mode=RunMode.LIVE,
-            config=live_engine_config if live_engine_config else None,
+            config=live_engine_config,
+            protective_mode=protective_mode,
         )
 
         _RUN_ENGINES[run_id_str] = engine
+        # WP1.7a (I5): synchronous, no ``await`` in between.
+        _kill_switch.apply_latch(engine, entries_latch_reason=entries_latch_reason)
         await engine.start(run_id_str)
         log.info("runs.live_engine_running")
 
@@ -1204,7 +1579,7 @@ async def run_live_engine(
         auto_stop_task = asyncio.create_task(
             _auto_stop_after(
                 stop_event=engine._stop_event,
-                max_seconds=settings.max_run_duration_hours * 3600.0,
+                max_seconds=max(settings.max_run_duration_hours * 3600.0 - elapsed_seconds, 0.0),
                 run_id=run_id_str,
                 log=log,
             )
@@ -1219,7 +1594,11 @@ async def run_live_engine(
         await engine.run_live_loop()
 
     except asyncio.CancelledError:
-        log.info("runs.live_engine_cancelled")
+        # WP1.8a S5: see run_paper_engine's identical branch for the full
+        # rationale of the _SHUTDOWN_REQUESTED check.
+        if _SHUTDOWN_REQUESTED:
+            final_status = "orphaned"
+        log.info("runs.live_engine_cancelled", final_status=final_status)
         await _cancel_engine_side_tasks(
             auto_stop_task=auto_stop_task,
             learning_task=learning_task,
@@ -1309,7 +1688,11 @@ async def run_live_engine(
                     if run is not None and run.status == "running":
                         now = datetime.now(tz=UTC)
                         run.status = final_status
-                        run.stopped_at = now
+                        # WP1.8a: an orphaned run is not finished -- it is
+                        # waiting for an operator resume -- so stopped_at
+                        # (documented as "NULL = still running") stays NULL.
+                        if final_status != "orphaned":
+                            run.stopped_at = now
                         run.updated_at = now
                         await db.commit()
                         log.info(
@@ -1321,6 +1704,26 @@ async def run_live_engine(
                     log.exception("runs.live_engine_db_update_failed")
         except Exception:
             log.exception("runs.live_engine_db_session_failed")
+
+        # WP1.8a (S5/S8): audit row + structured log for a shutdown-triggered
+        # orphan, mirroring the HALT audit block above.  Best-effort -- a
+        # failure here must never crash the teardown path.
+        if final_status == "orphaned":
+            try:
+                factory_orphan = get_session_factory()
+                async with factory_orphan() as db_orphan:
+                    await record_audit_event(
+                        db_orphan,
+                        event_type="run_orphaned",
+                        resource_type="run",
+                        resource_id=run_id_str,
+                        request=None,
+                        payload={"trigger": "shutdown", "run_mode": "live"},
+                    )
+                    await db_orphan.commit()
+            except Exception:
+                log.warning("runs.live_engine_orphan_audit_failed", run_id=run_id_str)
+            log.error("shutdown.run_marked_orphaned", run_id=run_id_str, run_mode="live")
 
         # Close exchange connection (belt-and-suspenders; LiveExecutionEngine.on_stop
         # also closes it, but this covers cases where on_stop was never reached)

@@ -38,7 +38,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.db.models import AuditEventORM
 
-__all__ = ["record_audit_event"]
+__all__ = ["record_audit_event", "record_audit_event_strict", "sanitise_reason"]
 
 logger = structlog.get_logger(__name__)
 
@@ -69,6 +69,15 @@ _VALID_EVENT_TYPES: frozenset[str] = frozenset(
         # Sprint 50 Cycle 5 Sub-scope B: OOS gate bypassed by admin.
         # Written before is_active is flipped.
         "model_oos_gate_bypassed",
+        # WP1.8a (Verbeterplan v2): orphan-recovery / resume lifecycle events.
+        "run_orphaned",
+        "run_resumed",
+        "run_resume_rejected",
+        "resume_orders_imported",
+        # WP1.7a: kill-switch latch / flatten lifecycle events.
+        "kill_switch_cleared",
+        "run_flatten",
+        "entries_latch_cleared",
     }
 )
 
@@ -118,6 +127,83 @@ def _resolve_transport(request: Request | None) -> tuple[str | None, str | None]
     except Exception:
         user_agent = None
     return ip, user_agent
+
+
+def sanitise_reason(raw: str | None, *, max_length: int = 500) -> str:
+    """Strip control characters and cap length from an operator-supplied
+    free-text reason (WP1.7a round 2, S-17).
+
+    Shared by every endpoint that stores an operator reason string
+    (X-Emergency-Reason on the kill switch, and the body ``reason`` on
+    both the global and per-run entries-latch clears) -- defensive
+    against log/audit-payload injection via control characters. Allows
+    printable ASCII plus tab/newline; strips all other control
+    characters (0x00-0x1F except 0x09/0x0A, plus 0x7F DEL).
+    """
+    if not raw:
+        return "no reason given"
+    cleaned = "".join(
+        ch for ch in raw if ch == "\t" or ch == "\n" or ord(ch) >= 0x20
+    )
+    if len(cleaned) > max_length:
+        cleaned = cleaned[: max_length - 3] + "..."
+    return cleaned or "no reason given"
+
+
+async def record_audit_event_strict(
+    db: AsyncSession,
+    *,
+    event_type: str,
+    resource_type: str,
+    resource_id: str,
+    request: Request | None = None,
+    payload: dict[str, Any] | None = None,
+    actor_override: str | None = None,
+) -> None:
+    """Identical to :func:`record_audit_event`, except a flush failure is
+    NOT swallowed -- it propagates to the caller (WP1.7a round 2,
+    S-10/S-12).
+
+    Used only by the two "clear the latch" endpoints (global kill-switch
+    clear, per-run entries-latch clear): for those, losing the audit row
+    silently is worse than a 503 -- the operator must know their clear
+    was not durably recorded, and the caller is expected to roll back
+    and keep the latch active until it is. Every other caller in this
+    codebase should keep using :func:`record_audit_event` (availability
+    over perfect auditability remains the right default everywhere
+    else).
+
+    Raises
+    ------
+    ValueError:
+        If ``event_type`` is not one of :data:`_VALID_EVENT_TYPES`.
+    Exception:
+        Whatever ``db.add()``/``db.flush()`` itself raises.
+    """
+    if event_type not in _VALID_EVENT_TYPES:
+        logger.warning(
+            "audit_log.invalid_event_type",
+            event_type=event_type,
+            valid_types=sorted(_VALID_EVENT_TYPES),
+        )
+        raise ValueError(f"invalid audit event_type: {event_type!r}")
+
+    actor = actor_override if actor_override is not None else _resolve_actor(request)
+    ip, user_agent = _resolve_transport(request)
+
+    event = AuditEventORM(
+        id=uuid.uuid4(),
+        timestamp=datetime.now(tz=UTC),
+        actor=actor,
+        event_type=event_type,
+        resource_type=resource_type,
+        resource_id=resource_id,
+        ip_address=ip,
+        user_agent=user_agent,
+        payload=payload,
+    )
+    db.add(event)
+    await db.flush()
 
 
 async def record_audit_event(

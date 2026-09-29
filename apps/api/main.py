@@ -58,6 +58,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from api.auth import require_api_key
+from api.body_size_limit import BodySizeLimitMiddleware
 from api.config import get_settings
 from api.prometheus import setup_prometheus
 from api.rate_limit import setup_rate_limiting
@@ -103,6 +104,7 @@ _whale_alert_client: Any = None
 # container.background_tasks.equity_prune_task — sunset by Sprint 41
 # ---------------------------------------------------------------------------
 _equity_prune_task: Any = None
+_idempotency_prune_task: Any = None  # WP7.0 (SY-70-14)
 
 # S47-1: history cache warmer — keeps FGI + BTC-dom history caches warm
 # for the v2 feature pipeline's synchronous accessors.
@@ -164,6 +166,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     global _retraining_service, _telegram_notifier
     global _coingecko_client, _fred_client, _whale_alert_client
     global _fgi_client, _equity_prune_task, _history_cache_warmer
+    global _idempotency_prune_task
 
     settings = get_settings()
 
@@ -214,6 +217,34 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         pool_size=settings.db_pool_size,
         max_overflow=settings.db_max_overflow,
     )
+
+    # ------------------------------------------------------------------
+    # 3a. WP1.7a (I4): load the persisted kill-switch latch BEFORE
+    #     recovering any orphaned run -- a rebuilt engine's own
+    #     apply_latch() call (inside run_paper_engine/run_live_engine)
+    #     reads this in-memory mirror synchronously, so it MUST already
+    #     reflect the persisted state by the time recovery starts
+    #     spawning tasks below. A read failure leaves the process
+    #     latched (fail-closed) and logs at critical -- recovery still
+    #     proceeds (every recovered run just starts pre-latched).
+    # ------------------------------------------------------------------
+    from api.services import kill_switch as _kill_switch
+
+    try:
+        from api.db.session import get_session_factory as _get_session_factory_ks
+
+        _ks_factory = _get_session_factory_ks()
+        async with _ks_factory() as _ks_db:
+            await _kill_switch.load(_ks_db)
+    except Exception:
+        # WP1.7a round 2 (S-02, WP17a-C-01): this is a WIDER net than
+        # load()'s own internal try/except -- it also catches a failure
+        # in session-factory construction or the ``async with`` context-
+        # manager entry itself, i.e. anything that could prevent load()
+        # from ever running at all. mark_unknown() forces the mirror
+        # fail-closed regardless of which of the two failed.
+        log.critical("kill_switch.boot_load_error", exc_info=True)
+        _kill_switch.mark_unknown()
 
     # ------------------------------------------------------------------
     # 3b. Recover orphaned paper/live runs (Sprint 24)
@@ -341,6 +372,69 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         "equity_prune.scheduled",
         retention_days=settings.equity_snapshot_retention_days,
     )
+
+    # ------------------------------------------------------------------
+    # 6a. Idempotency-key pruning (WP7.0, SY-70-14) -- daily, same shape
+    # as _equity_prune_loop above.
+    # ------------------------------------------------------------------
+    async def _idempotency_prune_loop() -> None:
+        """Delete idempotency_keys rows whose updated_at is older than the
+        configured TTL, once per day."""
+        from api.db.session import get_session_factory as _get_sf_idem
+        from api.services.idempotency import prune_expired_idempotency_keys
+
+        _sf_idem = _get_sf_idem()
+
+        try:
+            await _asyncio.sleep(60)
+        except _asyncio.CancelledError:
+            return
+
+        while True:
+            try:
+                deleted = await prune_expired_idempotency_keys(
+                    _sf_idem,
+                    ttl_hours=settings.idempotency_key_ttl_hours,
+                )
+                if deleted > 0:
+                    log.info(
+                        "idempotency_prune.completed",
+                        deleted=deleted,
+                        ttl_hours=settings.idempotency_key_ttl_hours,
+                    )
+            except _asyncio.CancelledError:
+                break
+            except Exception:
+                log.warning("idempotency_prune.error", exc_info=True)
+
+            try:
+                await _asyncio.sleep(86400)
+            except _asyncio.CancelledError:
+                break
+
+    _idempotency_prune_task = _asyncio.create_task(
+        _idempotency_prune_loop(), name="idempotency_prune"
+    )
+    # NOTE: tracked via the module-level global only (like the pre-existing
+    # _equity_prune_task belt-and-suspenders pattern below), NOT via
+    # container.background_tasks -- BackgroundTaskRegistry (container.py)
+    # declares a fixed set of dataclass fields and adding a new one is out
+    # of WP7.0's scope. Cancelled explicitly in the shutdown sequence below.
+    log.info(
+        "idempotency_prune.scheduled",
+        ttl_hours=settings.idempotency_key_ttl_hours,
+    )
+
+    # ------------------------------------------------------------------
+    # 6b. Orphan-holding alert repeater (WP1.8a S8)
+    # ------------------------------------------------------------------
+    from api.services.run_recovery import orphan_holding_repeater
+
+    _orphan_repeater_task = _asyncio.create_task(
+        orphan_holding_repeater(), name="orphan_holding_repeater"
+    )
+    container.background_tasks.orphan_repeater_task = _orphan_repeater_task  # LS-003
+    log.info("orphan_repeater.scheduled")
 
     # ------------------------------------------------------------------
     # 7. Telegram notifier (optional)
@@ -474,6 +568,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     #    first.  The explicit loops beneath are belt-and-suspenders during
     #    the Stap 1c transition period.
     # ------------------------------------------------------------------
+    from api.services.run_orchestrator import mark_shutdown_requested
+
+    # WP1.8a (S5): set BEFORE container.shutdown() cancels the run-registry
+    # tasks below, so each run's `except asyncio.CancelledError` branch can
+    # tell this graceful shutdown apart from a user-initiated stop_run and
+    # write status='orphaned' instead of 'stopped'.
+    mark_shutdown_requested()
+
     await container.shutdown()
 
     # Cancel all active paper/live trading engine tasks
@@ -507,6 +609,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     if _equity_prune_task is not None and not _equity_prune_task.done():
         _equity_prune_task.cancel()
         await asyncio.gather(_equity_prune_task, return_exceptions=True)
+
+    # WP7.0 (SY-70-14): same belt-and-suspenders shutdown as the equity
+    # prune task above.
+    if _idempotency_prune_task is not None and not _idempotency_prune_task.done():
+        _idempotency_prune_task.cancel()
+        await asyncio.gather(_idempotency_prune_task, return_exceptions=True)
 
     # Close FearGreedClient session (Sprint 32)
     if _fgi_client is not None:
@@ -630,14 +738,26 @@ def create_app() -> FastAPI:
         allow_origins=settings.allowed_origins,
         allow_credentials=True,
         allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-        allow_headers=["Content-Type", "Accept", "Authorization", "X-API-Key", "X-Requested-With"],
-        expose_headers=["X-Process-Time"],
+        allow_headers=[
+            "Content-Type", "Accept", "Authorization", "X-API-Key", "X-Requested-With",
+            "Idempotency-Key",  # WP7.0 (SY-70-15)
+        ],
+        expose_headers=["X-Process-Time", "Idempotency-Key", "Idempotent-Replay"],
     )
 
     application.middleware("http")(_request_timing_middleware)
     setup_rate_limiting(application)
     _register_routes(application)
     setup_prometheus(application)
+
+    # WP1.3a round 6 (user decision): added LAST so it is the OUTERMOST
+    # middleware layer -- Starlette makes the most-recently-added
+    # middleware the outermost one, so this sits outside CORS, request
+    # timing AND rate limiting, and runs long before any dependency
+    # (auth, pydantic body parsing) ever gets a chance to touch the body.
+    application.add_middleware(
+        BodySizeLimitMiddleware, max_bytes=settings.max_request_body_bytes
+    )
 
     return application
 

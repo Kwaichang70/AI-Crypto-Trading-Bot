@@ -58,6 +58,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
+from structlog.testing import capture_logs
 
 
 # ---------------------------------------------------------------------------
@@ -262,7 +263,10 @@ class TestCreateRun:
             "initialCapital": "10000.00",
         }
 
-        resp = client_dev_with_db.post("/api/v1/runs", json=payload)
+        resp = client_dev_with_db.post(
+            "/api/v1/runs", json=payload,
+            headers={"Idempotency-Key": str(uuid.uuid4())},
+        )
 
         assert resp.status_code == 201
         body = resp.json()
@@ -363,7 +367,10 @@ class TestStrategyAvailabilityLockdown:
                 detail="patched: no network in tests",
             ),
         ):
-            resp = client_dev_with_db.post("/api/v1/runs", json=payload)
+            resp = client_dev_with_db.post(
+                "/api/v1/runs", json=payload,
+                headers={"Idempotency-Key": str(uuid.uuid4())},
+            )
 
         assert resp.status_code != 422, (
             f"{strategy} backtest must NOT be blocked by the availability "
@@ -388,7 +395,10 @@ class TestStrategyAvailabilityLockdown:
             "mode": "paper",
             "initialCapital": "10000.00",
         }
-        resp = client_dev_with_db.post("/api/v1/runs", json=payload)
+        resp = client_dev_with_db.post(
+            "/api/v1/runs", json=payload,
+            headers={"Idempotency-Key": str(uuid.uuid4())},
+        )
 
         assert resp.status_code == 201, (
             f"grid_trading paper run must be accepted; got {resp.status_code}: "
@@ -689,6 +699,147 @@ class TestStopRun:
 
         assert resp.status_code == 404
 
+    def test_orphaned_run_is_stopped_returns_200(
+        self, client_dev_with_db: TestClient, mock_db_session: AsyncMock
+    ) -> None:
+        """WP1.8a: an 'orphaned' run (no background task -- O1) must also be
+        stoppable via DELETE /runs/{id}, transitioning to 'stopped'."""
+        run_orm = _make_run_orm(status="orphaned")
+        mock_db_session.execute.return_value = _make_scalar_one_or_none_result(run_orm)
+
+        resp = client_dev_with_db.delete(f"/api/v1/runs/{_FIXED_UUID}")
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "stopped"
+        mock_db_session.flush.assert_called()
+
+    def test_resuming_run_is_stopped_returns_200(
+        self, client_dev_with_db: TestClient, mock_db_session: AsyncMock
+    ) -> None:
+        """WP1.8b (S2-01): a 'resuming' run (a stop issued while its own
+        resume's scan is in flight, no lock held) must also be stoppable
+        via DELETE /runs/{id}, transitioning straight to 'stopped'."""
+        run_orm = _make_run_orm(status="resuming")
+        mock_db_session.execute.return_value = _make_scalar_one_or_none_result(run_orm)
+
+        resp = client_dev_with_db.delete(f"/api/v1/runs/{_FIXED_UUID}")
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "stopped"
+        mock_db_session.flush.assert_called()
+
+    def test_orphaned_run_stop_writes_critical_log_and_audit(
+        self, client_dev_with_db: TestClient, mock_db_session: AsyncMock
+    ) -> None:
+        """WP1.8a-round2 S-08 / WP1.8b S2-03 test follow-up: stopping an
+        'orphaned' run must log at CRITICAL and write an 'emergency_stop'
+        audit row (via ``request``, not ``request=None`` -- S2-03) --
+        closing out a possibly-unprotected position must never be a
+        silent, unaudited transition."""
+        run_orm = _make_run_orm(status="orphaned")
+        mock_db_session.execute.return_value = _make_scalar_one_or_none_result(run_orm)
+
+        with capture_logs() as captured:
+            resp = client_dev_with_db.delete(f"/api/v1/runs/{_FIXED_UUID}")
+
+        assert resp.status_code == 200
+
+        critical_events = [
+            e
+            for e in captured
+            if e.get("log_level") == "critical" and e.get("event") == "runs.orphan_stopped"
+        ]
+        assert critical_events, f"expected a critical orphan_stopped log, got: {captured!r}"
+        assert critical_events[0]["previous_status"] == "orphaned"
+
+        mock_db_session.add.assert_called_once()
+        audit_row = mock_db_session.add.call_args[0][0]
+        assert audit_row.event_type == "emergency_stop"
+        assert audit_row.payload["trigger"] == "stop_run_orphaned"
+        assert audit_row.payload["previous_status"] == "orphaned"
+        # S2-03: request=request (not None) -- ip_address/user_agent are
+        # now populated from the real TestClient request instead of being
+        # unconditionally None.
+        assert audit_row.ip_address is not None
+        assert audit_row.user_agent is not None
+
+
+# ---------------------------------------------------------------------------
+# PATCH /api/v1/runs/{run_id}/archive -- WP1.8a-round2 C-05/S-02 guard
+# (test follow-up: no coverage existed for this endpoint at all before).
+# ---------------------------------------------------------------------------
+
+class TestArchiveRun:
+    """Tests for PATCH /api/v1/runs/{run_id}/archive."""
+
+    def test_archive_stopped_run_returns_200(
+        self, client_dev_with_db: TestClient, mock_db_session: AsyncMock
+    ) -> None:
+        run_orm = _make_run_orm(status="stopped", stopped_at=_FIXED_NOW)
+        mock_db_session.execute.return_value = _make_scalar_one_or_none_result(run_orm)
+
+        resp = client_dev_with_db.patch(f"/api/v1/runs/{_FIXED_UUID}/archive")
+
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "archived"
+
+    def test_archive_error_run_returns_200(
+        self, client_dev_with_db: TestClient, mock_db_session: AsyncMock
+    ) -> None:
+        run_orm = _make_run_orm(status="error", stopped_at=_FIXED_NOW)
+        mock_db_session.execute.return_value = _make_scalar_one_or_none_result(run_orm)
+
+        resp = client_dev_with_db.patch(f"/api/v1/runs/{_FIXED_UUID}/archive")
+
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "archived"
+
+    def test_archive_running_run_returns_400(
+        self, client_dev_with_db: TestClient, mock_db_session: AsyncMock
+    ) -> None:
+        run_orm = _make_run_orm(status="running")
+        mock_db_session.execute.return_value = _make_scalar_one_or_none_result(run_orm)
+
+        resp = client_dev_with_db.patch(f"/api/v1/runs/{_FIXED_UUID}/archive")
+
+        assert resp.status_code == 400
+
+    def test_archive_orphaned_run_returns_400(
+        self, client_dev_with_db: TestClient, mock_db_session: AsyncMock
+    ) -> None:
+        """WP1.8a-round2 (C-05/S-02): an orphaned live run may still hold
+        an unprotected position -- archiving it must be blocked, not
+        silently remove it from the S8 repeater / boot recovery / resume
+        endpoint with zero audit trail."""
+        run_orm = _make_run_orm(status="orphaned")
+        mock_db_session.execute.return_value = _make_scalar_one_or_none_result(run_orm)
+
+        resp = client_dev_with_db.patch(f"/api/v1/runs/{_FIXED_UUID}/archive")
+
+        assert resp.status_code == 400
+
+    def test_archive_resuming_run_returns_400(
+        self, client_dev_with_db: TestClient, mock_db_session: AsyncMock
+    ) -> None:
+        """WP1.8b: 'resuming' must be guarded exactly like 'orphaned'."""
+        run_orm = _make_run_orm(status="resuming")
+        mock_db_session.execute.return_value = _make_scalar_one_or_none_result(run_orm)
+
+        resp = client_dev_with_db.patch(f"/api/v1/runs/{_FIXED_UUID}/archive")
+
+        assert resp.status_code == 400
+
+    def test_archive_nonexistent_run_returns_404(
+        self, client_dev_with_db: TestClient, mock_db_session: AsyncMock
+    ) -> None:
+        mock_db_session.execute.return_value = _make_scalar_one_or_none_result(None)
+
+        resp = client_dev_with_db.patch(f"/api/v1/runs/{_FIXED_UUID}/archive")
+
+        assert resp.status_code == 404
+
 
 # ---------------------------------------------------------------------------
 # Authentication tests (production mode — require_api_auth=True)
@@ -873,7 +1024,10 @@ class TestPaperEngineTaskWiring:
                 raise
 
         with patch("api.routers.runs._run_paper_engine", side_effect=_sleeping_engine):
-            resp = client_dev_with_db.post("/api/v1/runs", json=_PAPER_PAYLOAD)
+            resp = client_dev_with_db.post(
+                "/api/v1/runs", json=_PAPER_PAYLOAD,
+                headers={"Idempotency-Key": str(uuid.uuid4())},
+            )
 
         assert resp.status_code == 201
         run_id_str = resp.json()["id"]
@@ -903,7 +1057,10 @@ class TestPaperEngineTaskWiring:
                 raise
 
         with patch("api.routers.runs._run_paper_engine", side_effect=_sleeping_engine):
-            resp = client_dev_with_db.post("/api/v1/runs", json=_PAPER_PAYLOAD)
+            resp = client_dev_with_db.post(
+                "/api/v1/runs", json=_PAPER_PAYLOAD,
+                headers={"Idempotency-Key": str(uuid.uuid4())},
+            )
 
         assert resp.status_code == 201
         run_id_str = resp.json()["id"]
@@ -1047,7 +1204,10 @@ class TestPaperEngineTaskWiring:
             _RUN_TASKS.pop(kwargs["run_id_str"], None)
 
         with patch("api.routers.runs._run_paper_engine", side_effect=_immediate_engine):
-            resp = client_dev_with_db.post("/api/v1/runs", json=_PAPER_PAYLOAD)
+            resp = client_dev_with_db.post(
+                "/api/v1/runs", json=_PAPER_PAYLOAD,
+                headers={"Idempotency-Key": str(uuid.uuid4())},
+            )
             assert resp.status_code == 201
             run_id_str = resp.json()["id"]
 
@@ -1082,8 +1242,14 @@ class TestPaperEngineTaskWiring:
                 raise
 
         with patch("api.routers.runs._run_paper_engine", side_effect=_sleeping_engine):
-            resp_a = client_dev_with_db.post("/api/v1/runs", json=_PAPER_PAYLOAD)
-            resp_b = client_dev_with_db.post("/api/v1/runs", json=_PAPER_PAYLOAD)
+            resp_a = client_dev_with_db.post(
+                "/api/v1/runs", json=_PAPER_PAYLOAD,
+                headers={"Idempotency-Key": str(uuid.uuid4())},
+            )
+            resp_b = client_dev_with_db.post(
+                "/api/v1/runs", json=_PAPER_PAYLOAD,
+                headers={"Idempotency-Key": str(uuid.uuid4())},
+            )
 
         assert resp_a.status_code == 201
         assert resp_b.status_code == 201

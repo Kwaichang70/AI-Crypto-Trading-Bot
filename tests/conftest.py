@@ -21,6 +21,7 @@ from uuid import uuid4
 
 import pytest
 
+from api.services import kill_switch as _kill_switch
 from common.models import OHLCVBar
 from common.types import (
     OrderSide,
@@ -39,6 +40,27 @@ from trading.models import Fill, Order, Signal
 _FIXED_TIMESTAMP = datetime(2024, 1, 15, 12, 0, 0, tzinfo=UTC)
 _SYMBOL = "BTC/USDT"
 _RUN_ID = "test-run-001"
+
+
+# ---------------------------------------------------------------------------
+# WP1.7a round 2 (S-02): the kill-switch in-process mirror's bare
+# import-time default is fail-closed (latched, ``latch_state_unknown``) --
+# a deliberate security property (I4), but it would otherwise poison
+# every test in the suite that constructs a StrategyEngine or calls
+# create_run/promote_to_live/resume_run without going through
+# ``main.py``'s real lifespan (which is the only place that calls
+# ``kill_switch.load()`` in production). This autouse fixture gives every
+# test a clean, LOADED, un-latched mirror by default; a test that
+# specifically wants the fail-closed/unknown state calls
+# ``kill_switch.mark_unknown()`` itself.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _kill_switch_loaded_unlatched() -> None:
+    _kill_switch.reset_state_for_tests()
+    yield
+    _kill_switch.reset_state_for_tests()
 
 
 # ---------------------------------------------------------------------------

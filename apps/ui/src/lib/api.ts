@@ -14,6 +14,7 @@ import type {
   AggregatePortfolio,
   EquityCurveResponse,
   FillListResponse,
+  KillSwitchStatus,
   LearningState,
   ModelVersion,
   ModelVersionListResponse,
@@ -25,7 +26,9 @@ import type {
   PositionListResponse,
   Run,
   RunCreateRequest,
+  RunEmergencyStopResponse,
   RunListResponse,
+  RunStopResponse,
   Strategy,
   StrategyListResponse,
   TradeListResponse,
@@ -86,6 +89,26 @@ export interface HealthResponse {
   /** Component-level status map, e.g. { db: "ok", redis: "ok" } */
   components?: Record<string, "ok" | "degraded" | "error">;
 }
+
+// ---------------------------------------------------------------------------
+// WP1.7a/1.7b (AC8): timeouts for stop / emergency-stop / kill-switch-shaped
+// requests must allow >= 60s -- flatten can take up to ~30s server-side plus
+// a 5s outer margin. Admin-proxy-route timeouts of the same shape live in
+// ./admin-fetch (kill-switch press/clear, resume, entries-latch clear); these
+// two are for the direct (non-admin, X-API-Key-only) backend calls below.
+// ---------------------------------------------------------------------------
+
+/** DELETE /api/v1/runs/{id} — a flatten pass can take up to ~35s server-side. */
+export const STOP_TIMEOUT_MS = 65_000;
+/** POST /api/v1/runs/{id}/emergency-stop — same flatten budget as stop. */
+export const EMERGENCY_STOP_TIMEOUT_MS = 65_000;
+/**
+ * POST /api/v1/runs/{id}/promote-to-live — WP1.3a (CF-13a-1): a plain 20s
+ * fallback is too tight for a cold-DB promotion-gate query; use the same
+ * budget as createRun's backtest-eligible timeout (120s) since promotion
+ * also runs the full exit-config/pyramiding validator before any DB write.
+ */
+export const PROMOTE_TIMEOUT_MS = 120_000;
 
 // ---------------------------------------------------------------------------
 // Core fetch wrapper
@@ -254,19 +277,155 @@ export async function fetchRun(id: string): Promise<ApiResult<Run>> {
   return apiGet<Run>(`/api/v1/runs/${id}`, { cache: "no-store" });
 }
 
-/** POST /api/v1/runs — create / start a new run (120 s timeout for backtests). */
-export async function createRun(
-  body: RunCreateRequest,
-): Promise<ApiResult<Run>> {
-  return apiFetch<Run>("/api/v1/runs", {
-    method: "POST",
-    body: JSON.stringify(body),
-  }, 120_000);
+/**
+ * WP7.0 (SY-70-18, G-4): options object for `createRun`/`promoteRun`.
+ *
+ * G-4 (security): the pre-WP7.0 signature `createRun(body, liveConfirmToken?)`
+ * let an existing call such as `createRun(BODY, "typed-secret-token")` keep
+ * type-checking after an `idempotencyKey` parameter was inserted
+ * positionally — the token would silently be sent as `Idempotency-Key`
+ * instead of `X-Live-Confirm-Token`. An options object closes that hole:
+ * every caller must name both fields, so a bare string second argument no
+ * longer type-checks (AC8 greps for exactly this pattern).
+ */
+export interface RunSubmitOptions {
+  /** Canonical (lowercase, hyphenated) UUID — mint with `newIdempotencyKey()`/`useIdempotencyKey()` from `./idempotency`. */
+  idempotencyKey: string;
+  /**
+   * WP1.7a/SY-10 (S13): a live-mode confirmation, sent EXCLUSIVELY via the
+   * `X-Live-Confirm-Token` request header, never in the JSON body — never on
+   * `body.confirmToken` (which the UI must never populate; see the field's
+   * own deprecation note in `./types`).
+   */
+  liveConfirmToken?: string;
 }
 
-/** DELETE /api/v1/runs/{id} — stop a running run. */
-export async function stopRun(id: string): Promise<ApiResult<Run>> {
-  return apiDelete<Run>(`/api/v1/runs/${id}`);
+/**
+ * POST /api/v1/runs — create / start a new run (120 s timeout for backtests).
+ *
+ * WP7.0 (SY-70-01/18): `Idempotency-Key` is REQUIRED by the backend in every
+ * mode (backtest/paper/live) — a missing/malformed header returns 428/400
+ * before any run is created (§5 of reports/vp2-wp7.0/synthesis-spec.md).
+ * Mint the key with `newIdempotencyKey()`/`useIdempotencyKey()` from
+ * `./idempotency` and reuse the SAME key across a retry of the same logical
+ * submission (SY-70-19) — never a fresh key per retry.
+ *
+ * WP1.3a (CF-13a-1): `body.allowPyramiding` is always sent explicitly by the
+ * new-run form now (never omitted) — see `strategyDefaultAllowPyramiding` in
+ * `./exit-config`. A 201 here may carry `configWarnings[]` (SY-13a-18/§5);
+ * a 422 may carry the structured `invalid_exit_config` /
+ * `exit_manager_required` / `live_pyramiding_forbidden` envelope, unwrap
+ * with `unwrapExitConfigDetail` from `./exit-config`.
+ */
+export async function createRun(
+  body: RunCreateRequest,
+  opts: RunSubmitOptions,
+): Promise<ApiResult<Run>> {
+  return apiFetch<Run>(
+    "/api/v1/runs",
+    {
+      method: "POST",
+      body: JSON.stringify(body),
+      headers: {
+        "Idempotency-Key": opts.idempotencyKey,
+        // Conditional spread (not `headers: token ? {...} : undefined`) so no
+        // property is ever explicitly assigned `undefined` under this repo's
+        // `exactOptionalPropertyTypes` tsconfig.
+        ...(opts.liveConfirmToken
+          ? { "X-Live-Confirm-Token": opts.liveConfirmToken }
+          : {}),
+      },
+    },
+    120_000,
+  );
+}
+
+/**
+ * POST /api/v1/runs/{id}/promote-to-live — promote a stopped, eligible paper
+ * run to a new live run (apps/api/routers/runs.py `promote_to_live`).
+ *
+ * Unlike `resume_run`, this endpoint requires only the live-trading
+ * confirmation header (`X-Live-Confirm-Token`) — no `X-Admin-Key` — so it is
+ * called directly here rather than through an `/api/admin/*` proxy.
+ *
+ * WP7.0 (SY-70-01/18): `Idempotency-Key` is REQUIRED here too — see
+ * `createRun` above for the minting/reuse rules.
+ *
+ * WP1.3a (CF-13a-1, SY-13a-18): a 422 here may carry the same structured
+ * `invalid_exit_config` / `exit_manager_required` / `live_pyramiding_forbidden`
+ * envelope as `createRun` — render with `<ExitConfigErrorPanel>`.
+ */
+export async function promoteRun(
+  sourceRunId: string,
+  opts: RunSubmitOptions,
+): Promise<ApiResult<Run>> {
+  return apiFetch<Run>(
+    `/api/v1/runs/${sourceRunId}/promote-to-live`,
+    {
+      method: "POST",
+      body: JSON.stringify({}),
+      headers: {
+        "Idempotency-Key": opts.idempotencyKey,
+        ...(opts.liveConfirmToken
+          ? { "X-Live-Confirm-Token": opts.liveConfirmToken }
+          : {}),
+      },
+    },
+    PROMOTE_TIMEOUT_MS,
+  );
+}
+
+/**
+ * DELETE /api/v1/runs/{id} — stop a running run (WP1.7a).
+ *
+ * `flatten` is REQUIRED by the backend for a running LIVE run (omitting it
+ * returns 422 `flatten_decision_required`); optional for paper/orphaned/
+ * resuming (default false there). AC8: >= 60s timeout — an accepted
+ * `flatten=true` can run the engine's flatten pass for up to ~30s plus a 5s
+ * outer margin server-side.
+ */
+export async function stopRun(
+  id: string,
+  opts?: { flatten?: boolean },
+): Promise<ApiResult<RunStopResponse>> {
+  const qs = opts?.flatten === undefined ? "" : `?flatten=${opts.flatten}`;
+  return apiFetch<RunStopResponse>(
+    `/api/v1/runs/${id}${qs}`,
+    { method: "DELETE" },
+    STOP_TIMEOUT_MS,
+  );
+}
+
+/**
+ * POST /api/v1/runs/{id}/emergency-stop — hard-stop, never refuses (SY-07).
+ * `flatten` is optional (default false). AC8: >= 60s timeout, same rationale
+ * as `stopRun`.
+ */
+export async function emergencyStop(
+  id: string,
+  opts?: { flatten?: boolean; reason?: string },
+): Promise<ApiResult<RunEmergencyStopResponse>> {
+  const qs = opts?.flatten === undefined ? "" : `?flatten=${opts.flatten}`;
+  return apiFetch<RunEmergencyStopResponse>(
+    `/api/v1/runs/${id}/emergency-stop${qs}`,
+    {
+      method: "POST",
+      ...(opts?.reason ? { headers: { "X-Emergency-Reason": opts.reason } } : {}),
+    },
+    EMERGENCY_STOP_TIMEOUT_MS,
+  );
+}
+
+/**
+ * GET /api/v1/emergency/kill-switch — read-only global latch status for the
+ * S13 sidebar badge. Requires only X-API-Key (not admin) — called directly,
+ * never through an /api/admin/* proxy (SY-11: only admin-key-gated
+ * endpoints get a proxy; this one doesn't need one).
+ */
+export async function fetchKillSwitchStatus(): Promise<ApiResult<KillSwitchStatus>> {
+  return apiGet<KillSwitchStatus>("/api/v1/emergency/kill-switch", {
+    cache: "no-store",
+  });
 }
 
 /** PATCH /api/v1/runs/{id}/archive — archive a stopped/error run. */

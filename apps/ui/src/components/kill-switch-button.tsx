@@ -1,18 +1,28 @@
 /**
  * apps/ui/src/components/kill-switch-button.tsx
  * -----------------------------------------------
- * Emergency stop control for the operator dashboard.
+ * Global kill-switch PRESS control for the operator dashboard (relocated
+ * from the homepage into the sidebar's "System" section — see
+ * `apps/ui/src/components/layout/sidebar.tsx` — so it is global, not
+ * homepage-only).
  *
  * Visible only to users with role "admin" (wrapped in <AdminOnly>).
  * Clicking the red button opens a confirmation modal that requires:
  *   1. Optional incident reason text (max 500 chars).
- *   2. A hard-typed confirmation string: "EMERGENCY STOP" (14 chars, case-sensitive).
+ *   2. An optional "also flatten every newly-latched running engine" choice.
+ *   3. A hard-typed confirmation string: "EMERGENCY STOP" (14 chars, case-sensitive).
  *
  * On submit, calls POST /api/admin/kill-switch (the Next.js route handler
  * that proxies to FastAPI and keeps INTERNAL_ADMIN_API_KEY server-side).
  *
- * Feedback is delivered via the existing useToast() system (ToastProvider
- * already mounted in layout.tsx).
+ * WP1.7a/1.7b (CF-B1): the response is the WP1.7a camelCase
+ * `KillSwitchPressResponse` shape — this LATCHES every running engine
+ * (blocks new BUYs; exits keep running, D3). It does NOT stop runs and
+ * there is no `runsStopped`/`tasksCancelled` count to report any more.
+ *
+ * AC8: the request timeout is >= 60s (KILL_SWITCH_TIMEOUT_MS) — an optional
+ * flatten pass can run every newly-latched engine's flatten() in parallel,
+ * each bounded at ~30s + a 5s outer margin server-side.
  *
  * Accessibility:
  *   - Modal uses role="dialog" + aria-modal="true" + aria-labelledby.
@@ -26,32 +36,15 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { AdminOnly } from "@/components/admin-only";
 import { useToast } from "@/components/ui/toast";
+import { FlattenResultView } from "@/components/flatten-result-view";
+import { adminFetch, KILL_SWITCH_TIMEOUT_MS } from "@/lib/admin-fetch";
+import type { KillSwitchPressResponse } from "@/lib/types";
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
 const CONFIRMATION_PHRASE = "EMERGENCY STOP" as const;
-
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
-
-interface KillSwitchRunError {
-  run_id: string;
-  error_msg?: string;
-  error?: string;
-}
-
-interface KillSwitchResponse {
-  runs_stopped: string[];
-  tasks_cancelled: number;
-  engines_removed: number;
-  errors: KillSwitchRunError[];
-  note: string | null;
-  // Error path from the route handler
-  error?: string;
-}
 
 // ---------------------------------------------------------------------------
 // Spinner
@@ -88,14 +81,15 @@ function Spinner() {
 
 interface ModalProps {
   onClose: () => void;
-  onConfirm: (reason: string) => Promise<void>;
+  onConfirm: (reason: string, flatten: boolean) => Promise<void>;
   loading: boolean;
+  result: KillSwitchPressResponse | null;
 }
 
-function KillSwitchModal({ onClose, onConfirm, loading }: ModalProps) {
+function KillSwitchModal({ onClose, onConfirm, loading, result }: ModalProps) {
   const [reason, setReason] = useState("");
+  const [flatten, setFlatten] = useState(false);
   const [confirmText, setConfirmText] = useState("");
-  const confirmInputRef = useRef<HTMLInputElement>(null);
   const firstFocusRef = useRef<HTMLTextAreaElement>(null);
 
   const confirmed = confirmText === CONFIRMATION_PHRASE;
@@ -116,7 +110,7 @@ function KillSwitchModal({ onClose, onConfirm, loading }: ModalProps) {
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     if (!confirmed || loading) return;
-    void onConfirm(reason);
+    void onConfirm(reason, flatten);
   }
 
   return (
@@ -152,89 +146,150 @@ function KillSwitchModal({ onClose, onConfirm, loading }: ModalProps) {
               id="kill-switch-dialog-title"
               className="text-base font-semibold text-slate-100"
             >
-              Emergency Stop All Runs
+              Global Kill Switch
             </h2>
             <p className="mt-1 text-sm text-slate-400">
-              This will immediately stop{" "}
-              <span className="font-medium text-red-400">ALL</span> running
-              paper and live trading engines. Open positions will be left
-              as-is — manual reconciliation may be required.
+              Latches every running paper/live engine — blocks new BUYs.
+              Exits (stop-loss, brackets, trailing stops) keep running. No
+              run is stopped and no task is cancelled.
             </p>
           </div>
         </div>
 
-        <form onSubmit={handleSubmit} className="space-y-4">
-          {/* Optional reason */}
-          <div>
-            <label
-              htmlFor="kill-switch-reason"
-              className="mb-1.5 block text-xs font-medium text-slate-400"
-            >
-              Incident note{" "}
-              <span className="font-normal text-slate-500">(optional)</span>
+        {!result && (
+          <form onSubmit={handleSubmit} className="space-y-4">
+            {/* Optional reason */}
+            <div>
+              <label
+                htmlFor="kill-switch-reason"
+                className="mb-1.5 block text-xs font-medium text-slate-400"
+              >
+                Incident note{" "}
+                <span className="font-normal text-slate-500">(optional)</span>
+              </label>
+              <textarea
+                ref={firstFocusRef}
+                id="kill-switch-reason"
+                value={reason}
+                onChange={(e) => setReason(e.target.value)}
+                maxLength={500}
+                placeholder="Incident note (optional)"
+                disabled={loading}
+                rows={3}
+                className="w-full resize-none rounded-lg border border-slate-600 bg-slate-800 px-3 py-2 text-sm text-slate-200 placeholder-slate-500 focus:border-slate-400 focus:outline-none focus:ring-1 focus:ring-slate-400 disabled:opacity-50"
+              />
+              <p className="mt-1 text-right text-xs text-slate-600">
+                {reason.length}/500
+              </p>
+            </div>
+
+            {/* Optional flatten pass */}
+            <label className="flex items-start gap-2 text-sm text-slate-300">
+              <input
+                type="checkbox"
+                checked={flatten}
+                onChange={(e) => setFlatten(e.target.checked)}
+                disabled={loading}
+                className="mt-0.5"
+              />
+              <span>
+                Also flatten every newly-latched running engine (sells every
+                held symbol through the capped exit path; can take up to
+                ~30s per engine, run in parallel).
+              </span>
             </label>
-            <textarea
-              ref={firstFocusRef}
-              id="kill-switch-reason"
-              value={reason}
-              onChange={(e) => setReason(e.target.value)}
-              maxLength={500}
-              placeholder="Incident note (optional)"
-              disabled={loading}
-              rows={3}
-              className="w-full resize-none rounded-lg border border-slate-600 bg-slate-800 px-3 py-2 text-sm text-slate-200 placeholder-slate-500 focus:border-slate-400 focus:outline-none focus:ring-1 focus:ring-slate-400 disabled:opacity-50"
-            />
-            <p className="mt-1 text-right text-xs text-slate-600">
-              {reason.length}/500
+
+            {/* Hard confirmation */}
+            <div>
+              <label
+                htmlFor="kill-switch-confirm"
+                className="mb-1.5 block text-xs font-medium text-slate-400"
+              >
+                Type{" "}
+                <span className="font-mono font-semibold text-red-400">
+                  EMERGENCY STOP
+                </span>{" "}
+                to confirm
+              </label>
+              <input
+                id="kill-switch-confirm"
+                type="text"
+                value={confirmText}
+                onChange={(e) => setConfirmText(e.target.value)}
+                disabled={loading}
+                autoComplete="off"
+                spellCheck={false}
+                className="w-full rounded-lg border border-slate-600 bg-slate-800 px-3 py-2 font-mono text-sm text-slate-200 placeholder-slate-500 focus:border-red-500 focus:outline-none focus:ring-1 focus:ring-red-500 disabled:opacity-50"
+                placeholder="EMERGENCY STOP"
+              />
+            </div>
+
+            {/* Actions */}
+            <div className="flex gap-3 pt-1">
+              <button
+                type="button"
+                onClick={onClose}
+                disabled={loading}
+                className="flex-1 rounded-lg border border-slate-600 bg-slate-800 px-4 py-2 text-sm font-medium text-slate-300 transition-colors hover:bg-slate-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={!confirmed || loading}
+                className="flex flex-1 items-center justify-center gap-2 rounded-lg bg-red-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-red-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {loading && <Spinner />}
+                Activate Kill Switch
+              </button>
+            </div>
+          </form>
+        )}
+
+        {result && (
+          <div className="space-y-3">
+            <p className="text-sm text-slate-300">
+              Latched {result.runsLatched.length} run
+              {result.runsLatched.length !== 1 ? "s" : ""}
+              {result.latchPersisted ? "" : " (WARNING: not persisted — in-memory only)"}.
             </p>
-          </div>
-
-          {/* Hard confirmation */}
-          <div>
-            <label
-              htmlFor="kill-switch-confirm"
-              className="mb-1.5 block text-xs font-medium text-slate-400"
-            >
-              Type{" "}
-              <span className="font-mono font-semibold text-red-400">
-                EMERGENCY STOP
-              </span>{" "}
-              to confirm
-            </label>
-            <input
-              ref={confirmInputRef}
-              id="kill-switch-confirm"
-              type="text"
-              value={confirmText}
-              onChange={(e) => setConfirmText(e.target.value)}
-              disabled={loading}
-              autoComplete="off"
-              spellCheck={false}
-              className="w-full rounded-lg border border-slate-600 bg-slate-800 px-3 py-2 font-mono text-sm text-slate-200 placeholder-slate-500 focus:border-red-500 focus:outline-none focus:ring-1 focus:ring-red-500 disabled:opacity-50"
-              placeholder="EMERGENCY STOP"
-            />
-          </div>
-
-          {/* Actions */}
-          <div className="flex gap-3 pt-1">
+            {result.orphanedLiveRunIds.length > 0 && (
+              <p className="text-xs text-amber-400">
+                {result.orphanedLiveRunIds.length} orphaned live run
+                {result.orphanedLiveRunIds.length !== 1 ? "s" : ""} found.
+              </p>
+            )}
+            {result.resumingRunIds.length > 0 && (
+              <p className="text-xs text-amber-400">
+                {result.resumingRunIds.length} resuming run
+                {result.resumingRunIds.length !== 1 ? "s" : ""} moved to
+                orphaned.
+              </p>
+            )}
+            {Object.entries(result.flattenResults).map(([runId, fr]) => (
+              <div key={runId} className="space-y-1">
+                <p className="font-mono text-xs text-slate-500">{runId}</p>
+                <FlattenResultView result={fr} />
+              </div>
+            ))}
+            {result.errors.length > 0 && (
+              <div className="rounded-lg border border-red-300 bg-red-50 px-3 py-2 text-xs text-red-600 dark:border-red-800 dark:bg-red-900/20 dark:text-red-400">
+                {result.errors.map((e) => (
+                  <p key={e.runId}>
+                    {e.runId.slice(0, 8)}…: {e.error}
+                  </p>
+                ))}
+              </div>
+            )}
             <button
               type="button"
               onClick={onClose}
-              disabled={loading}
-              className="flex-1 rounded-lg border border-slate-600 bg-slate-800 px-4 py-2 text-sm font-medium text-slate-300 transition-colors hover:bg-slate-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400 disabled:cursor-not-allowed disabled:opacity-50"
+              className="w-full rounded-lg bg-slate-700 px-4 py-2 text-sm font-medium text-white hover:bg-slate-600"
             >
-              Cancel
-            </button>
-            <button
-              type="submit"
-              disabled={!confirmed || loading}
-              className="flex flex-1 items-center justify-center gap-2 rounded-lg bg-red-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-red-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500 disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              {loading && <Spinner />}
-              Stop All Runs
+              Done
             </button>
           </div>
-        </form>
+        )}
       </div>
     </div>
   );
@@ -244,79 +299,70 @@ function KillSwitchModal({ onClose, onConfirm, loading }: ModalProps) {
 // Main export
 // ---------------------------------------------------------------------------
 
-export function KillSwitchButton() {
+interface KillSwitchButtonProps {
+  /**
+   * WP70-C-03 (round 2, optional carry-forward wired up): invoked once,
+   * right after a successful press (regardless of `errors.length`), so a
+   * parent panel can refresh its own latch-status poll immediately rather
+   * than waiting for the next scheduled tick.
+   */
+  onPressed?: () => void;
+}
+
+export function KillSwitchButton({ onPressed }: KillSwitchButtonProps = {}) {
   const [modalOpen, setModalOpen] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [result, setResult] = useState<KillSwitchPressResponse | null>(null);
   const { toast } = useToast();
 
   // FE-003: wrap onClose in useCallback so the modal's useEffect dependency
   // array gets a stable reference — avoids spurious effect re-runs.
   const handleClose = useCallback(() => {
-    if (!loading) setModalOpen(false);
+    if (!loading) {
+      setModalOpen(false);
+      setResult(null);
+    }
   }, [loading]);
 
   const handleConfirm = useCallback(
-    async (reason: string) => {
+    async (reason: string, flatten: boolean) => {
       setLoading(true);
       try {
-        const res = await fetch("/api/admin/kill-switch", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ reason: reason.trim() || undefined }),
-        });
+        const apiResult = await adminFetch<KillSwitchPressResponse>(
+          "/api/admin/kill-switch",
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ reason: reason.trim() || undefined, flatten }),
+          },
+          KILL_SWITCH_TIMEOUT_MS,
+        );
 
-        const data = (await res.json()) as KillSwitchResponse;
-
-        if (res.ok) {
-          const runsStopped = data.runs_stopped?.length ?? 0;
-          const tasksCancelled = data.tasks_cancelled ?? 0;
-          const errCount = data.errors?.length ?? 0;
-          const note = data.note ?? null;
-
-          if (note === "no active runs to stop") {
-            toast("No active runs were running — nothing stopped.", "info");
-          } else if (errCount > 0) {
-            // FE-001: list per-run errors in the toast (up to 3, then "…and N more").
-            const errorList = data.errors ?? [];
-            const errSummary =
-              errorList.length > 0
-                ? errorList
-                    .slice(0, 3)
-                    .map(
-                      (e) =>
-                        `${e.run_id.slice(0, 8)} (${e.error_msg ?? e.error ?? "unknown"})`
-                    )
-                    .join(", ") +
-                  (errorList.length > 3
-                    ? `, …and ${errorList.length - 3} more`
-                    : "")
-                : "";
+        if (apiResult.ok) {
+          setResult(apiResult.data);
+          const errCount = apiResult.data.errors.length;
+          if (errCount > 0) {
             toast(
-              `Stopped ${runsStopped} run${runsStopped !== 1 ? "s" : ""}, cancelled ${tasksCancelled} task${tasksCancelled !== 1 ? "s" : ""}. ${errCount} error${errCount !== 1 ? "s" : ""}: ${errSummary}`,
-              "error"
+              `Kill switch latched ${apiResult.data.runsLatched.length} run(s) with ${errCount} error(s).`,
+              "error",
             );
           } else {
             toast(
-              `Emergency stop complete: ${runsStopped} run${runsStopped !== 1 ? "s" : ""} stopped, ${tasksCancelled} task${tasksCancelled !== 1 ? "s" : ""} cancelled.`,
-              "success"
+              `Kill switch latched ${apiResult.data.runsLatched.length} run(s). Entries blocked; exits keep running.`,
+              "success",
             );
           }
-          setModalOpen(false);
+          // WP70-C-03: let the parent panel refresh its own latch-status
+          // poll right away instead of waiting for the next scheduled tick.
+          onPressed?.();
         } else {
-          toast(
-            data.error ?? `Request failed (HTTP ${res.status})`,
-            "error"
-          );
+          toast(apiResult.error.message, "error");
         }
-      } catch (err) {
-        const message =
-          err instanceof Error ? err.message : "Unknown error";
-        toast(`Kill-switch request failed: ${message}`, "error");
       } finally {
         setLoading(false);
       }
     },
-    [toast]
+    [toast, onPressed],
   );
 
   return (
@@ -326,7 +372,7 @@ export function KillSwitchButton() {
         onClick={() => setModalOpen(true)}
         className="rounded-lg bg-red-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-red-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500"
       >
-        Emergency Stop All Runs
+        Global Kill Switch
       </button>
 
       {modalOpen && (
@@ -334,6 +380,7 @@ export function KillSwitchButton() {
           onClose={handleClose}
           onConfirm={handleConfirm}
           loading={loading}
+          result={result}
         />
       )}
     </AdminOnly>

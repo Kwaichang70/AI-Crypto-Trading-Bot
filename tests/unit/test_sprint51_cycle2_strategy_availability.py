@@ -59,10 +59,19 @@ _EXPERIMENTAL_STRATEGIES = {"sl_tp_reversion"}
 # Paper-eligible tier (EXPERIMENTAL status, backtest + paper, NOT live).
 # Currently unoccupied: momentum_breakout was promoted to ACTIVE.
 _PAPER_ELIGIBLE_STRATEGIES: set[str] = set()
+# WP-SMOKE (reports/vp2-smoke/synthesis-spec.md, C-5): DIAGNOSTIC status --
+# a mechanics-test instrument with no trading edge, allowed in every mode
+# (its own blast radius is bounded by smoke_guard.py, not by this
+# registry), but never promotable and hidden from GET /strategies by
+# default.
+_DIAGNOSTIC_STRATEGIES = {"smoke_roundtrip"}
 # Strategies restricted to backtest-only (demoted OR backtest-only experimental).
 _BACKTEST_ONLY_STRATEGIES = _DEMOTED_STRATEGIES | _EXPERIMENTAL_STRATEGIES
 _ALL_STRATEGIES = (
-    _ACTIVE_STRATEGIES | _BACKTEST_ONLY_STRATEGIES | _PAPER_ELIGIBLE_STRATEGIES
+    _ACTIVE_STRATEGIES
+    | _BACKTEST_ONLY_STRATEGIES
+    | _PAPER_ELIGIBLE_STRATEGIES
+    | _DIAGNOSTIC_STRATEGIES
 )
 
 # Exact expected (strategy, mode) -> allowed boolean.
@@ -81,6 +90,10 @@ for _name in _PAPER_ELIGIBLE_STRATEGIES:
     _TRUTH_TABLE[(_name, RunMode.BACKTEST)] = True
     _TRUTH_TABLE[(_name, RunMode.PAPER)] = True
     _TRUTH_TABLE[(_name, RunMode.LIVE)] = False
+for _name in _DIAGNOSTIC_STRATEGIES:
+    _TRUTH_TABLE[(_name, RunMode.BACKTEST)] = True
+    _TRUTH_TABLE[(_name, RunMode.PAPER)] = True
+    _TRUTH_TABLE[(_name, RunMode.LIVE)] = True
 
 
 # ===========================================================================
@@ -302,16 +315,26 @@ class TestKeysetConsistency:
         assert avail == runs == strategies == _ALL_STRATEGIES
 
     def test_active_demoted_partition_is_disjoint_and_exhaustive(self) -> None:
-        """TEST-S51C2-054: status partition is disjoint + covers every strategy."""
+        """TEST-S51C2-054: status partition is disjoint + covers every strategy.
+
+        WP-SMOKE (reports/vp2-smoke/synthesis-spec.md): extended to assert
+        pairwise disjointness of _DIAGNOSTIC_STRATEGIES against every other
+        tier, and that its members carry StrategyStatus.DIAGNOSTIC.
+        """
         # Pairwise disjoint
         assert _ACTIVE_STRATEGIES.isdisjoint(_DEMOTED_STRATEGIES)
         assert _ACTIVE_STRATEGIES.isdisjoint(_EXPERIMENTAL_STRATEGIES)
         assert _DEMOTED_STRATEGIES.isdisjoint(_EXPERIMENTAL_STRATEGIES)
         assert _PAPER_ELIGIBLE_STRATEGIES.isdisjoint(_ACTIVE_STRATEGIES)
         assert _PAPER_ELIGIBLE_STRATEGIES.isdisjoint(_BACKTEST_ONLY_STRATEGIES)
+        assert _DIAGNOSTIC_STRATEGIES.isdisjoint(_ACTIVE_STRATEGIES)
+        assert _DIAGNOSTIC_STRATEGIES.isdisjoint(_BACKTEST_ONLY_STRATEGIES)
+        assert _DIAGNOSTIC_STRATEGIES.isdisjoint(_PAPER_ELIGIBLE_STRATEGIES)
         # Exhaustive over the availability registry
         assert _ALL_STRATEGIES == self._availability_keys()
         # And the recorded status agrees with the partition for each key.
+        for name in _DIAGNOSTIC_STRATEGIES:
+            assert get_availability(name).status is StrategyStatus.DIAGNOSTIC
         for name in _ACTIVE_STRATEGIES:
             assert get_availability(name).status is StrategyStatus.ACTIVE
         for name in _DEMOTED_STRATEGIES:

@@ -405,6 +405,13 @@ class DCARSIHybridStrategy(BaseStrategy):
     # Parameter validation
     # ------------------------------------------------------------------
 
+    # WP1.3a (SY-13a-06/08): explicit per-strategy declaration --
+    # Emits its own SELL take-profit (D-13a-2: LIVE warning W8 only).
+    # Accumulates by design (SY-13a-09) -- live pyramiding is still
+    # forbidden by E11 unless allowPyramiding=false is explicit.
+    requires_exit_manager: ClassVar[bool] = False
+    default_allow_pyramiding: ClassVar[bool] = True
+
     def _validate_params(self, params: dict[str, Any]) -> dict[str, Any]:
         """Validate and coerce parameters via the Pydantic schema."""
         validated = _DCAParams(**params)

@@ -115,6 +115,7 @@ class TestBackgroundHealthEndpoint:
         assert set(body.keys()) == {
             "history_cache_warmer", "retraining_service", "active_runs",
             "fx_cache_warmer",  # M6 (Sprint 49)
+            "orphan_repeater",  # WP1.8b P-06
         }
         assert set(body["history_cache_warmer"].keys()) == {
             "configured", "running", "last_run_at_unix",
@@ -128,3 +129,44 @@ class TestBackgroundHealthEndpoint:
         assert set(body["fx_cache_warmer"].keys()) == {  # M6 (Sprint 49)
             "configured", "running", "last_run_at_unix", "last_rates_cached",
         }
+
+    def test_orphan_repeater_diagnostics_surfaced(self) -> None:
+        """WP1.8b (P-06): the S8 orphan-holding-unprotected alert repeater
+        task's alive/dead state is surfaced."""
+        container = MagicMock()
+        container.background_tasks.history_cache_warmer = None
+        container.services.retraining_service = None
+        container.run_registry.active_run_ids = MagicMock(return_value=[])
+
+        real_task = MagicMock()
+        real_task.done.return_value = False
+        container.background_tasks.orphan_repeater_task = real_task
+
+        client = _make_app(container=container)
+        r = client.get("/api/v1/health/background")
+        body = r.json()
+        assert body["orphan_repeater"]["configured"] is True
+        assert body["orphan_repeater"]["running"] is True
+
+    def test_orphan_repeater_not_configured_when_no_container(self) -> None:
+        client = _make_app(container=None)
+        r = client.get("/api/v1/health/background")
+        body = r.json()
+        assert body["orphan_repeater"]["configured"] is False
+        assert body["orphan_repeater"]["running"] is False
+
+    def test_orphan_repeater_reports_not_running_when_task_done(self) -> None:
+        container = MagicMock()
+        container.background_tasks.history_cache_warmer = None
+        container.services.retraining_service = None
+        container.run_registry.active_run_ids = MagicMock(return_value=[])
+
+        finished_task = MagicMock()
+        finished_task.done.return_value = True
+        container.background_tasks.orphan_repeater_task = finished_task
+
+        client = _make_app(container=container)
+        r = client.get("/api/v1/health/background")
+        body = r.json()
+        assert body["orphan_repeater"]["configured"] is True
+        assert body["orphan_repeater"]["running"] is False

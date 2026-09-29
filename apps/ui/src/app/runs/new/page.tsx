@@ -1,15 +1,33 @@
 "use client";
 
-import { Suspense, useEffect, useState } from "react";
+import { Suspense, useEffect, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
+import Link from "next/link";
 import {
   fetchStrategies,
   fetchStrategySchema,
   createRun,
 } from "@/lib/api";
-import type { Strategy, JsonSchemaProperty, RunMode } from "@/lib/types";
+import type { Strategy, JsonSchemaProperty, RunMode, RunCreateRequest } from "@/lib/types";
 import { Header } from "@/components/layout/header";
 import { useToast } from "@/components/ui/toast";
+import { LiveBanner } from "@/components/live-banner";
+import { LiveConfirmDialog } from "@/components/live-confirm-dialog";
+import { ExitConfigErrorPanel } from "@/components/exit-config-error-panel";
+import {
+  describeConfigWarning,
+  isPyramidingByDesignStrategy,
+  strategyDefaultAllowPyramiding,
+} from "@/lib/exit-config";
+import {
+  classifyIdempotencyError,
+  getStructuredErrorCode,
+  IDEMPOTENCY_CLIENT_ERROR_MESSAGE,
+  IDEMPOTENCY_IN_PROGRESS_MESSAGE,
+  IDEMPOTENCY_REUSED_MESSAGE,
+  useIdempotencyKey,
+  useSubmitLock,
+} from "@/lib/idempotency";
 
 const TIMEFRAMES = ["1m", "5m", "15m", "1h", "4h", "1d"];
 const COMMON_SYMBOLS = ["BTC/EUR", "ETH/EUR", "SOL/EUR", "XRP/EUR", "ADA/EUR"];
@@ -131,12 +149,35 @@ function NewRunInner() {
   const [initialCapital, setInitialCapital] = useState(preCapital || "10000");
   const [backtestStart, setBacktestStart] = useState("2024-01-01T00:00");
   const [backtestEnd, setBacktestEnd] = useState("2024-12-31T23:59");
-  const [confirmToken, setConfirmToken] = useState("");
   const [enableLearning, setEnableLearning] = useState(false);
   const [autoApplyLearning, setAutoApplyLearning] = useState(false);
+  // WP1.3a (SY-13a-08, CF-13a-1 item 4): the paper/backtest checkbox value.
+  // Re-initialised to the strategy's own default whenever the strategy
+  // changes (see the effect below) -- this is what gets sent verbatim for
+  // paper/backtest; LIVE always forces/sends `false` regardless of this
+  // state (see handleSubmit).
+  const [allowPyramiding, setAllowPyramiding] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
+  const [submitErrorDetail, setSubmitErrorDetail] = useState<unknown>(undefined);
+  // WP7.0 (SY-70-21/22): the 409 idempotency_in_progress neutral notice and
+  // the status-0 "retry with the same key" affordance render distinct UI
+  // from the generic ExitConfigErrorPanel fallback below.
+  const [inProgressNotice, setInProgressNotice] = useState(false);
+  const [canRetrySameKey, setCanRetrySameKey] = useState(false);
   const [isLoadingStrategies, setIsLoadingStrategies] = useState(true);
+  // WP7.0 (SY-70-19/22): the exact body of the last attempt, so a same-key
+  // retry (status 0 or 409 in-progress) or a live-token re-prompt resubmits
+  // byte-for-byte the same snapshot the key was minted for.
+  const lastBodyRef = useRef<RunCreateRequest | null>(null);
+  const idempotency = useIdempotencyKey();
+  const submitLock = useSubmitLock();
+  // WP1.7a/1.7b (SY-10, S13): the live confirmation token is NEVER held in
+  // page-level state — only inside <LiveConfirmDialog>'s own transient
+  // state, cleared on close. This page only remembers WHETHER the dialog
+  // that will collect it is open, plus the already-validated body to submit
+  // once the operator types it.
+  const [pendingLiveBody, setPendingLiveBody] = useState<RunCreateRequest | null>(null);
 
   useEffect(() => {
     async function load() {
@@ -176,7 +217,30 @@ function NewRunInner() {
   function initDefaults(strategy: Strategy) {
     const defaults: Record<string, unknown> = {};
     for (const [key, prop] of Object.entries(strategy.parameterSchema.properties)) {
-      defaults[key] = prop.default ?? (prop.type === "integer" || prop.type === "number" ? 0 : "");
+      if (prop.default !== undefined) {
+        defaults[key] = prop.default;
+        continue;
+      }
+      const isNullable =
+        prop.nullable === true || (prop.anyOf?.some((s) => s.type === "null") ?? false);
+      if (isNullable) {
+        // WP1.3a (SY-13a-02, CF-13a-1 item 1): this used to send a literal
+        // `0` for every nullable numeric field with no explicit default
+        // (bracket_stop_loss_pct, bracket_take_profit_pct,
+        // bracket_atr_sl_multiplier/tp_multiplier, trailing_stop_pct). The
+        // backend now treats bare `0`/`""`/`null` as "unset" for those
+        // fields, but rsi_mean_reversion/dca_rsi_hybrid/grid_trading's
+        // `trailing_stop_pct` schema minimum is 0.005 — sending `0` was
+        // fragile (G-1: it happened to coerce to "unset" only because the
+        // pre-1.3a backend zero-normalised it too) and, more importantly,
+        // no longer expresses intent. `null` is unambiguous: the operator
+        // never touched this field.
+        defaults[key] = null;
+      } else if (prop.type === "integer" || prop.type === "number") {
+        defaults[key] = 0;
+      } else {
+        defaults[key] = "";
+      }
     }
     setStrategyParams(defaults);
   }
@@ -197,6 +261,15 @@ function NewRunInner() {
     // mode intentionally omitted: we only react to strategy/allowed changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedStrategy, allowedModes]);
+
+  // WP1.3a (SY-13a-08, CF-13a-1 item 4): re-seed the paper/backtest checkbox
+  // to the newly-selected strategy's own default (dca_rsi_hybrid/
+  // grid_trading -> true, everything else -> false) every time the
+  // strategy changes. Mirrors the mode auto-correct effect above.
+  useEffect(() => {
+    setAllowPyramiding(strategyDefaultAllowPyramiding(selectedStrategy));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedStrategy]);
 
   async function handleStrategyChange(name: string) {
     const result = await fetchStrategySchema(name);
@@ -220,9 +293,117 @@ function NewRunInner() {
     }
   }
 
+  // WP1.7a/SY-10 (S13): submits an already-validated body, optionally with a
+  // live confirmation token sent ONLY as the `X-Live-Confirm-Token` header
+  // (never in the body — see `createRun` in `@/lib/api`).
+  //
+  // WP7.0 (SY-70-19/20/21/22): mints/reuses an `Idempotency-Key` for this
+  // exact body, acquires a synchronous submit lock as the FIRST statement
+  // (closes the double-click race a React state flag alone cannot), and
+  // applies the reset/keep matrix per error code on failure.
+  async function submitCreateRun(body: RunCreateRequest, liveConfirmToken?: string) {
+    if (!submitLock.tryAcquire()) return;
+
+    lastBodyRef.current = body;
+    setSubmitError(null);
+    setSubmitErrorDetail(undefined);
+    setInProgressNotice(false);
+    setCanRetrySameKey(false);
+    setIsSubmitting(true);
+
+    try {
+      const idempotencyKey = idempotency.keyFor(JSON.stringify(body));
+      const result = await createRun(body, {
+        idempotencyKey,
+        ...(liveConfirmToken ? { liveConfirmToken } : {}),
+      });
+
+      if (result.ok) {
+        idempotency.reset();
+        setPendingLiveBody(null);
+        // WP1.3a (CF-13a-1 item 3): surface `configWarnings[]` from the 201
+        // body as toasts BEFORE navigating away -- <ToastProvider> lives in
+        // the root layout so these survive the client-side route change.
+        const warnings = result.data.configWarnings ?? [];
+        if (warnings.length === 0) {
+          toast("Run started successfully", "success");
+        } else {
+          toast("Run started with warnings", "warning");
+          for (const w of warnings) {
+            toast(
+              describeConfigWarning(w),
+              w.code === "no_downside_exit" ? "error" : "warning",
+            );
+          }
+        }
+        router.push(`/runs/${result.data.id}`);
+        return;
+      }
+
+      // WP17b-S-10 (round 2): a failed live create used to leave
+      // `submitError` set behind the still-open <LiveConfirmDialog>
+      // overlay -- fully hidden from the operator, who saw nothing happen.
+      // Closing the dialog here surfaces the error in the underlying form
+      // (the operator can simply reopen it by clicking Start Run again).
+      setPendingLiveBody(null);
+
+      if (result.error.status === 0) {
+        // SY-70-19: status 0 (timeout/network) keeps the key — the claim
+        // either never happened or was marked failed, so a same-key retry
+        // is always safe.
+        setSubmitError(result.error.message);
+        setCanRetrySameKey(true);
+        return;
+      }
+
+      const outcome = classifyIdempotencyError(result.error.detail);
+      if (outcome.kind === "in_progress") {
+        // SY-70-21/C-13: neutral notice, key kept, "Check again" same-key.
+        setInProgressNotice(true);
+        return;
+      }
+      if (outcome.kind === "reused") {
+        idempotency.reset();
+        setSubmitError(IDEMPOTENCY_REUSED_MESSAGE);
+        return;
+      }
+      if (outcome.kind === "client_error") {
+        // 428/400 idempotency codes are programming errors, never surfaced
+        // as a retriable condition — SY-70-21.
+        console.error("idempotency client error", getStructuredErrorCode(result.error.detail));
+        idempotency.reset();
+        setSubmitError(IDEMPOTENCY_CLIENT_ERROR_MESSAGE);
+        return;
+      }
+
+      // Every other code (403, kill_switch_active 409, WP1.3a 422, 400/502/5xx)
+      // keeps the key (SY-70-19) and falls through to the existing panel.
+      setSubmitError(result.error.message);
+      setSubmitErrorDetail(result.error.detail);
+    } finally {
+      setIsSubmitting(false);
+      submitLock.release();
+    }
+  }
+
+  // SY-70-22: retries the last attempted body with the SAME key. A live
+  // body re-opens <LiveConfirmDialog> so the operator retypes the token
+  // (G-13 — the token is never retained); a paper/backtest body resubmits
+  // directly.
+  function retryLastSubmission() {
+    const body = lastBodyRef.current;
+    if (!body) return;
+    if (body.mode === "live") {
+      setPendingLiveBody(body);
+    } else {
+      void submitCreateRun(body);
+    }
+  }
+
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setSubmitError(null);
+    setSubmitErrorDetail(undefined);
 
     if (symbols.length === 0) {
       setSubmitError("Select at least one symbol.");
@@ -245,7 +426,12 @@ function NewRunInner() {
       return;
     }
 
-    setIsSubmitting(true);
+    // WP1.3a (SY-13a-08/09, CF-13a-1 item 4): LIVE always sends an explicit
+    // `false` -- never editable in the form, and never omitted (so a live
+    // dca_rsi_hybrid/grid_trading request never resolves to the strategy's
+    // own `true` default and 422s with `live_pyramiding_forbidden`). Paper
+    // and backtest send the checkbox's current value explicitly.
+    const resolvedAllowPyramiding = mode === "live" ? false : allowPyramiding;
 
     const body = {
       strategyName: selectedStrategy.name,
@@ -256,21 +442,22 @@ function NewRunInner() {
       initialCapital,
       backtestStart: mode === "backtest" ? new Date(backtestStart).toISOString() : null,
       backtestEnd: mode === "backtest" ? new Date(backtestEnd).toISOString() : null,
-      confirmToken: mode === "live" ? confirmToken : undefined,
       enableAdaptiveLearning: mode !== "backtest" ? enableLearning : undefined,
       autoApplyLearning: mode === "paper" && enableLearning ? autoApplyLearning : undefined,
+      allowPyramiding: resolvedAllowPyramiding,
     };
 
-    const result = await createRun(body);
-
-    if (result.ok) {
-      toast("Run started successfully", "success");
-      router.push(`/runs/${result.data.id}`);
-    } else {
-      setSubmitError(result.error.message);
-      setIsSubmitting(false);
+    if (mode === "live") {
+      // Defer submission until the typed <LiveConfirmDialog> token is
+      // collected — the body itself never carries a confirmToken field.
+      setPendingLiveBody(body);
+      return;
     }
+
+    void submitCreateRun(body);
   }
+
+  const isPyramidingByDesign = isPyramidingByDesignStrategy(selectedStrategy?.name);
 
   return (
     <div className="space-y-6">
@@ -330,19 +517,13 @@ function NewRunInner() {
               : "Live trading executes real orders on your exchange account."}
           </p>
           {mode === "live" && (
-            <div>
-              <label className="block text-sm font-medium text-slate-700 dark:text-slate-300">
-                Confirm Token
-              </label>
-              <input
-                type="password"
-                value={confirmToken}
-                onChange={(e) => setConfirmToken(e.target.value)}
-                placeholder="LIVE_TRADING_CONFIRM_TOKEN from .env"
-                className="mt-1 w-full rounded-lg border border-red-300 dark:border-red-800 bg-white dark:bg-slate-800 px-3 py-2 text-sm text-slate-900 dark:text-slate-200 focus:border-red-500 focus:outline-none focus:ring-1 focus:ring-red-500"
-              />
-              <p className="mt-1 text-xs text-red-400">
-                This will place real orders. Ensure ENABLE_LIVE_TRADING=true and your API key are set in .env.
+            <div className="space-y-2">
+              <LiveBanner compact />
+              <p className="text-xs text-red-400">
+                This will place real orders. Ensure ENABLE_LIVE_TRADING=true
+                and your API key are set in .env. Clicking Start Run will ask
+                for the live-trading confirmation token separately — it is
+                never typed into this form.
               </p>
             </div>
           )}
@@ -402,6 +583,63 @@ function NewRunInner() {
                 )}
               </div>
             )}
+        </div>
+
+        {/* WP1.3a (CF-13a-1 item 4): allow-pyramiding control */}
+        <div className="card space-y-3">
+          <h2 className="text-sm font-semibold text-slate-800 dark:text-slate-200">Pyramiding</h2>
+          {mode === "live" ? (
+            <div className="space-y-2">
+              <div className="flex items-center justify-between opacity-60">
+                <label className="text-sm text-slate-700 dark:text-slate-300">
+                  Allow Pyramiding
+                </label>
+                <input
+                  type="checkbox"
+                  checked={false}
+                  disabled
+                  aria-label="Allow Pyramiding (disabled in live mode)"
+                  className="h-4 w-4 rounded border-slate-300 bg-white accent-indigo-500 dark:border-slate-700 dark:bg-slate-800"
+                />
+              </div>
+              <p className="text-xs text-amber-600 dark:text-amber-400">
+                Live pyramiding is disabled until WP1.3b/WP1.10.
+              </p>
+              {isPyramidingByDesign && selectedStrategy && (
+                <p className="text-xs text-amber-600 dark:text-amber-400">
+                  Accumulation disabled: single-entry variant, not validated.
+                  {" "}
+                  {selectedStrategy.displayName} normally accumulates
+                  (pyramids) into a held position — running it live single-entry
+                  is unvalidated but is allowed because it has strictly less
+                  exposure than its designed behaviour.
+                </p>
+              )}
+            </div>
+          ) : (
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <label
+                  htmlFor="allow-pyramiding-checkbox"
+                  className="text-sm text-slate-700 dark:text-slate-300"
+                >
+                  Allow Pyramiding
+                </label>
+                <input
+                  id="allow-pyramiding-checkbox"
+                  type="checkbox"
+                  checked={allowPyramiding}
+                  onChange={(e) => setAllowPyramiding(e.target.checked)}
+                  className="h-4 w-4 rounded border-slate-300 bg-white accent-indigo-500 dark:border-slate-700 dark:bg-slate-800"
+                />
+              </div>
+              <p className="text-xs text-slate-500">
+                When on, the strategy may submit a new BUY into an already-held
+                position (repeat entries). Defaults to{" "}
+                {isPyramidingByDesign ? "ON" : "OFF"} for this strategy.
+              </p>
+            </div>
+          )}
         </div>
 
         {/* Symbols */}
@@ -589,10 +827,48 @@ function NewRunInner() {
           </div>
         )}
 
-        {submitError && (
-          <div className="rounded-lg border border-red-300 bg-red-50 px-4 py-3 text-sm text-red-600 dark:border-red-800 dark:bg-red-900/20 dark:text-red-400">
-            {submitError}
+        {inProgressNotice && (
+          <div
+            role="status"
+            aria-live="polite"
+            className="space-y-2 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-700 dark:border-amber-800 dark:bg-amber-900/20 dark:text-amber-400"
+          >
+            <p>{IDEMPOTENCY_IN_PROGRESS_MESSAGE}</p>
+            <div className="flex gap-3">
+              <button
+                type="button"
+                onClick={retryLastSubmission}
+                className="rounded-lg border border-amber-400 bg-white px-3 py-1.5 text-xs font-medium text-amber-700 hover:bg-amber-100 dark:border-amber-700 dark:bg-transparent dark:text-amber-400 dark:hover:bg-amber-900/40"
+              >
+                Check again
+              </button>
+              <Link href="/runs" className="text-xs font-medium text-amber-700 underline dark:text-amber-400">
+                Runs list
+              </Link>
+            </div>
           </div>
+        )}
+
+        {canRetrySameKey && submitError && (
+          <div className="space-y-2 rounded-lg border border-red-300 bg-red-50 px-4 py-3 text-sm text-red-600 dark:border-red-800 dark:bg-red-900/20 dark:text-red-400">
+            <p>{submitError}</p>
+            <div className="flex gap-3">
+              <button
+                type="button"
+                onClick={retryLastSubmission}
+                className="rounded-lg border border-red-400 bg-white px-3 py-1.5 text-xs font-medium text-red-600 hover:bg-red-100 dark:border-red-700 dark:bg-transparent dark:text-red-400 dark:hover:bg-red-900/40"
+              >
+                Retry with the same key
+              </button>
+              <Link href="/runs" className="text-xs font-medium text-red-600 underline dark:text-red-400">
+                Check runs list
+              </Link>
+            </div>
+          </div>
+        )}
+
+        {submitError && !canRetrySameKey && !inProgressNotice && (
+          <ExitConfigErrorPanel detail={submitErrorDetail} fallbackMessage={submitError} />
         )}
 
         <button
@@ -600,9 +876,21 @@ function NewRunInner() {
           disabled={isSubmitting || isLoadingStrategies}
           className="w-full rounded-lg bg-indigo-600 py-3 text-sm font-semibold text-white transition-colors hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500"
         >
-          {isSubmitting ? "Starting run…" : "Start Run"}
+          {isSubmitting ? "Starting run…" : mode === "live" ? "Start Run…" : "Start Run"}
         </button>
       </form>
+
+      <LiveConfirmDialog
+        open={pendingLiveBody !== null}
+        title="Confirm live run"
+        description="This starts a LIVE run that places real orders. Type the live-trading confirmation token to proceed."
+        confirmLabel="Start Live Run"
+        loading={isSubmitting}
+        onCancel={() => setPendingLiveBody(null)}
+        onConfirm={(token) => {
+          if (pendingLiveBody) void submitCreateRun(pendingLiveBody, token);
+        }}
+      />
     </div>
   );
 }

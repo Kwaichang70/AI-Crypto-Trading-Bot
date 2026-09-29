@@ -129,6 +129,11 @@ class TestAutoRetryHappyPath:
         crashed = MagicMock()
         crashed.id = crashed_id
         crashed.status = "error"
+        # WP1.7a round 2 (S-16): a bare MagicMock() auto-vivifies unset
+        # attributes as truthy Mock objects, not None -- explicitly represent
+        # the real-world "not latched" state so the auto-retry guard does not
+        # spuriously skip this happy-path retry.
+        crashed.entries_latch_reason = None
         crashed.config = {
             "strategy_name": "grid_trading",
             "symbols": ["BTC/EUR"],
@@ -186,6 +191,7 @@ class TestAutoRetryHappyPath:
         crashed = MagicMock()
         crashed.id = uuid.uuid4()
         crashed.status = "error"
+        crashed.entries_latch_reason = None  # WP1.7a round 2 (S-16)
         crashed.config = {}
         factory, _db = _mock_session_factory(crashed)
 

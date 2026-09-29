@@ -1,0 +1,1486 @@
+"""
+tests/integration/test_live_protective_paths.py
+---------------------------------------------------
+WP1.0/WP1.1 (Verbeterplan v2, Documentation/Verbeterplan-v2-2026-09.md §4
+Fase 1, §3 "Herstart-protocol") -- live protective-path regression gate.
+
+Drives the *real* ``StrategyEngine(run_mode=LIVE)`` + the *real*
+``LiveExecutionEngine`` (``packages/trading/engines/live.py``) + the *real*
+``PortfolioAccounting`` + the *real* ``DefaultRiskManager``, with only the
+CCXT exchange client replaced by an in-memory
+``FakeCCXTExchange`` (``tests/integration/fakes/fake_ccxt_exchange.py``).
+
+This file is the regression gate the herstart-protocol (§3) and the Fase 1
+minimum-set (§4) require before any live run may restart. WP1.0 proved
+finding **C1** ("live-engine kan geen SELL uitvoeren") with 4 of these
+scenarios xfailing; WP1.1 (`reports/vp2-wp1.1/synthesis-spec.md`) fixes C1
+by wiring ``PortfolioAccounting`` in as the engine's
+``LivePositionSource`` (D1) and flips those 4 scenarios green. WP1.2
+(`reports/vp2-wp1.2/synthesis-spec.md`) then fixes **C6** -- the kill
+switch now blocks new entries only (D3), in every mode, so protective
+exits (and strategy SELLs) keep running while it is active:
+
+    buy_only                                  PASSES (proves harness validity)
+    sell_without_position_rejected            PASSES (SELL genuinely without
+                                               a position must always be
+                                               rejected)
+    buy_then_stop_loss                        PASSES (WP1.1)
+    buy_then_take_profit                      PASSES (WP1.1)
+    buy_then_trailing_stop                    PASSES (WP1.1)
+    buy_then_kill_switch                      PASSES (WP1.2, C6 / D3)
+    kill_switch_blocks_new_buy                PASSES (WP1.2)
+    kill_switch_strategy_sell_passes          PASSES (WP1.2)
+    buy_then_max_open_positions_stop_loss     PASSES (WP1.2, S2/G2)
+    buy_restart_reconcile_stop_loss           PASSES (WP1.8a, S6/S7 -- from_fills rebuild)
+    external_holdings_not_sold                PASSES (WP1.1, R-21)
+
+Two new WP1.1 scenarios cover R-22 (startup sync with an external balance
+never fabricates a position / false take-profit) and R-23 (the fake
+exchange's fee-in-base and locked-balance extensions, proving the SELL cap
+uses ``free`` -- not ``total`` -- per D9/I1).
+
+Runtime target: < 15s for the whole file (no real sleeps, no real network
+I/O -- see the ``_fast_sleep`` fixture and ``FakeCCXTExchange``).
+"""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Sequence
+from decimal import Decimal
+from typing import Any
+
+import pytest
+from structlog.testing import capture_logs
+
+from common.models import MultiTimeframeContext, OHLCVBar
+from common.types import SignalDirection, TimeFrame
+from tests.integration.fakes.fake_ccxt_exchange import FakeCCXTExchange
+from tests.integration.fakes.live_harness import (
+    LiveStack,
+    build_live_stack,
+    build_resumed_live_stack,
+    patch_exchange_factory,
+    start_and_warmup,
+    step_bar,
+)
+from tests.integration.fakes.scripted_strategy import ScriptedSignalStrategy
+from trading.models import Signal
+from trading.risk import RiskParameters
+from trading.strategies.momentum_breakout import MomentumBreakoutStrategy
+from trading.strategy import BaseStrategy, StrategyMetadata
+
+# ---------------------------------------------------------------------------
+# Fixed scenario constants -- deterministic, no randomness, no wall clock.
+# ---------------------------------------------------------------------------
+
+SYMBOL = "BTC/EUR"
+BASE = "BTC"
+QUOTE = "EUR"
+TIMEFRAME = TimeFrame.ONE_HOUR
+TIMEFRAME_STR = "1h"
+START_PRICE = Decimal("50000")
+INITIAL_CAPITAL = Decimal("1000")
+TARGET_NOTIONAL = Decimal("100")  # 10% of equity -- comfortably under every
+# default RiskParameters cap (15% concentration, 60% exposure, 40% cluster),
+# so the BUY fills at exactly target_notional / price with no risk-driven
+# quantity reduction (verified analytically in the producer report).
+
+_QTY_TOLERANCE = Decimal("0.00000001")
+
+
+def _buy_params(call_index: int = 0) -> dict[str, object]:
+    """Shorthand for a ScriptedSignalStrategy BUY-params dict."""
+    return {
+        "direction": "buy",
+        "call_index": call_index,
+        "target_notional": str(TARGET_NOTIONAL),
+    }
+
+
+def _approx_eq(a: Decimal, b: Decimal, tol: Decimal = _QTY_TOLERANCE) -> bool:
+    """Compare two Decimals allowing for CCXT's float-JSON round-trip.
+
+    Every fill quantity that flows through ``FakeCCXTExchange.fetch_my_trades``
+    is deliberately round-tripped through ``float`` (mirroring the real
+    CCXT wire format: real exchanges return JSON floats, not Decimals), so
+    comparisons against a value derived from that path use a tolerance
+    instead of ``==``. Values read directly from ``FakeCCXTExchange``'s own
+    internal ledger (``balance_of``, ``order_log``) never go through that
+    round-trip and are compared with exact equality instead.
+    """
+    return abs(a - b) <= tol
+
+
+class _ScriptedSequenceStrategy(BaseStrategy):
+    """WP1.2 harness-only strategy: emits one scripted signal per entry in
+    ``schedule``, HOLD otherwise.
+
+    ``ScriptedSignalStrategy`` (WP1.0) fires exactly one signal per
+    instance for its whole life, which is enough for every "one BUY, then
+    a protective manager exits it" scenario. The WP1.2 kill-switch
+    scenarios need more than that: a strategy-originated SELL (not a
+    bracket/trailing exit) arriving *after* the switch is already active,
+    or a second BUY attempt on a later bar to prove it gets dropped. This
+    class scripts an arbitrary sequence of (call_index, direction,
+    target_notional) triples instead of just one.
+
+    Params
+    ------
+    schedule:
+        Sequence of ``(call_index, direction, target_notional)`` triples.
+        ``call_index`` is 0-based over post-warmup ``on_bar`` calls (same
+        convention as ``ScriptedSignalStrategy``). ``direction`` is
+        ``"buy"`` or ``"sell"``; ``target_notional`` is ignored for
+        ``"sell"`` (fixed at ``"0"``, i.e. full-close), matching how the
+        real bracket/trailing managers emit their exit signals.
+    """
+
+    metadata = StrategyMetadata(
+        name="wp12_scripted_sequence_test_strategy",
+        description=(
+            "WP1.2 harness-only: emits a caller-scripted sequence of "
+            "BUY/SELL signals, HOLD otherwise."
+        ),
+        tags=["test-only"],
+    )
+    # WP1.3a (SY-13a-06): test-only double, no bracket/trailing configured.
+    requires_exit_manager = False
+
+    def __init__(self, strategy_id: str, params: dict[str, Any] | None = None) -> None:
+        super().__init__(strategy_id, params)
+        self._schedule: dict[int, tuple[SignalDirection, Decimal]] = {
+            int(call_index): (SignalDirection(direction), Decimal(str(target_notional)))
+            for call_index, direction, target_notional in self._params.get("schedule", [])
+        }
+        self._call_count = -1
+
+    @property
+    def min_bars_required(self) -> int:
+        return 1
+
+    def on_bar(
+        self,
+        bars: Sequence[OHLCVBar],
+        *,
+        mtf_context: MultiTimeframeContext | None = None,
+    ) -> list[Signal]:
+        self._call_count += 1
+        if not bars or self._call_count not in self._schedule:
+            return []
+        direction, target_notional = self._schedule[self._call_count]
+        symbol = bars[-1].symbol
+        target = Decimal("0") if direction == SignalDirection.SELL else target_notional
+        return [
+            Signal(
+                strategy_id=self.strategy_id,
+                symbol=symbol,
+                direction=direction,
+                target_position=target,
+                confidence=1.0,
+            )
+        ]
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _fast_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Neutralise every real sleep in the live path so the file runs in <15s.
+
+    Patches the shared ``asyncio`` module's ``sleep`` attribute, which is
+    what every affected call site actually looks up at call time (all of
+    them do ``import asyncio`` then ``asyncio.sleep(...)``, never
+    ``from asyncio import sleep``):
+
+    - ``LiveExecutionEngine.process_signal``'s post-submit
+      ``await asyncio.sleep(2)`` (packages/trading/engines/live.py).
+    - ``CCXTMarketDataService``'s internal throttle / backoff sleeps
+      (packages/data/services/ccxt_market_data.py) -- not expected to fire
+      against ``FakeCCXTExchange`` (it never raises the retryable CCXT
+      errors), but neutralised defensively.
+    """
+
+    async def _instant_sleep(delay: float = 0, result: object = None) -> object:
+        return result
+
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+
+
+@pytest.fixture
+def exchange(monkeypatch: pytest.MonkeyPatch) -> FakeCCXTExchange:
+    """A FakeCCXTExchange with the default market set and quote balance seeded.
+
+    Registers BTC/EUR, BTC/USD and ETH/EUR (requirement: "markets with
+    multiple quotes per base") even though only BTC/EUR is traded in this
+    file -- WP1.1's ``sync_positions`` base->market mapping fix needs a
+    fixture that already exercises the ambiguous-market case.
+    """
+    ex = FakeCCXTExchange()
+    ex.register_market(SYMBOL, base=BASE, quote=QUOTE)
+    ex.register_market("BTC/USD", base="BTC", quote="USD")
+    ex.register_market("ETH/EUR", base="ETH", quote="EUR")
+    ex.set_balance(QUOTE, INITIAL_CAPITAL)
+    ex.seed_flat_bars(SYMBOL, count=100, price=START_PRICE, timeframe=TIMEFRAME_STR)
+    patch_exchange_factory(monkeypatch, ex)
+    return ex
+
+
+async def _build_and_warm(
+    exchange: FakeCCXTExchange,
+    strategy: ScriptedSignalStrategy,
+    *,
+    engine_config: dict[str, object] | None = None,
+    run_id: str = "wp10-test-run",
+    risk_params: RiskParameters | None = None,
+) -> LiveStack:
+    stack = await build_live_stack(
+        exchange=exchange,
+        strategy=strategy,
+        symbol=SYMBOL,
+        timeframe=TIMEFRAME,
+        initial_capital=INITIAL_CAPITAL,
+        run_id=run_id,
+        engine_config=engine_config,
+        risk_params=risk_params,
+    )
+    await start_and_warmup(stack, run_id)
+    return stack
+
+
+# ---------------------------------------------------------------------------
+# buy_only -- MUST PASS today: proves the harness itself is valid before any
+# other scenario below is trusted to be failing/passing for the right reason.
+# ---------------------------------------------------------------------------
+
+
+async def test_buy_only_fills_and_shows_position(exchange: FakeCCXTExchange) -> None:
+    strategy = ScriptedSignalStrategy("buy-only", _buy_params())
+    stack = await _build_and_warm(exchange, strategy)
+
+    await step_bar(stack, SYMBOL, START_PRICE, timeframe=TIMEFRAME_STR)
+
+    buy_orders = [o for o in exchange.order_log if o["side"] == "buy"]
+    assert len(buy_orders) == 1, f"expected exactly one BUY order; got {exchange.order_log!r}"
+    bought_qty = buy_orders[0]["amount"]
+    assert bought_qty == TARGET_NOTIONAL / START_PRICE
+
+    # Fake-exchange balances reflect the fill (quote debited, base credited).
+    fee = bought_qty * START_PRICE * exchange.taker_fee_pct
+    assert exchange.balance_of(BASE) == bought_qty
+    assert exchange.balance_of(QUOTE) == INITIAL_CAPITAL - bought_qty * START_PRICE - fee
+
+    # PortfolioAccounting -- the real source of truth the bracket/trailing
+    # managers read from -- shows the same position.
+    position = stack.portfolio.get_position(SYMBOL)
+    assert position is not None and not position.is_flat
+    assert _approx_eq(position.quantity, bought_qty)
+    assert stack.portfolio.get_summary()["open_positions"] == 1
+
+    await stack.engine.stop()
+
+
+# ---------------------------------------------------------------------------
+# sell_without_position_rejected -- MUST PASS today AND after every fix in
+# this plan: a SELL with genuinely no position must always be rejected.
+# ---------------------------------------------------------------------------
+
+
+async def test_sell_without_position_rejected(exchange: FakeCCXTExchange) -> None:
+    strategy = ScriptedSignalStrategy("sell-no-position", {"direction": "sell", "call_index": 0})
+    stack = await _build_and_warm(exchange, strategy)
+
+    with capture_logs() as cap:
+        await step_bar(stack, SYMBOL, START_PRICE, timeframe=TIMEFRAME_STR)
+
+    reject_events = [e for e in cap if e.get("event") == "live.sell_no_position"]
+    assert reject_events, f"expected live.sell_no_position; got {cap!r}"
+
+    assert exchange.order_log == []
+    assert stack.execution.positions.get(SYMBOL) is None
+
+    position = stack.portfolio.get_position(SYMBOL)
+    assert position is None or position.is_flat
+
+    await stack.engine.stop()
+
+
+# ---------------------------------------------------------------------------
+# buy_then_stop_loss / buy_then_take_profit -- WP1.1 fixes C1: the bracket
+# manager's exit SELL now reaches the exchange instead of being rejected by
+# LiveExecutionEngine.process_signal's own (previously always-empty)
+# _positions guard.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("trigger", "breach_multiplier", "config_key"),
+    [
+        pytest.param(
+            "stop_loss", Decimal("0.80"), "bracket_stop_loss_pct", id="buy_then_stop_loss"
+        ),
+        pytest.param(
+            "take_profit", Decimal("1.20"), "bracket_take_profit_pct", id="buy_then_take_profit"
+        ),
+    ],
+)
+async def test_buy_then_bracket_exit(
+    exchange: FakeCCXTExchange,
+    trigger: str,
+    breach_multiplier: Decimal,
+    config_key: str,
+) -> None:
+    strategy = ScriptedSignalStrategy(f"buy-{trigger}", _buy_params())
+    stack = await _build_and_warm(exchange, strategy, engine_config={config_key: 0.05})
+
+    await step_bar(stack, SYMBOL, START_PRICE, timeframe=TIMEFRAME_STR)
+    position_after_buy = stack.portfolio.get_position(SYMBOL)
+    assert position_after_buy is not None and not position_after_buy.is_flat
+    bought_qty = exchange.order_log[-1]["amount"]
+
+    breach_price = START_PRICE * breach_multiplier
+    with capture_logs() as cap:
+        await step_bar(stack, SYMBOL, breach_price, timeframe=TIMEFRAME_STR)
+
+    reject_events = [e for e in cap if e.get("event") == "live.sell_no_position"]
+    assert not reject_events, (
+        f"WP1.1: the {trigger} exit must no longer be rejected as "
+        f"'live.sell_no_position' -- C1 is fixed; captured logs: {cap!r}"
+    )
+
+    sell_orders = [o for o in exchange.order_log if o["side"] == "sell"]
+    assert sell_orders, f"expected a {trigger} SELL order to reach the exchange"
+    assert sell_orders[-1]["amount"] == bought_qty
+
+    position_after_breach = stack.portfolio.get_position(SYMBOL)
+    assert position_after_breach is not None and position_after_breach.is_flat, (
+        f"the {trigger} exit should have fully closed the position"
+    )
+
+    await stack.engine.stop()
+
+
+# ---------------------------------------------------------------------------
+# buy_then_trailing_stop -- WP1.1 fixes C1 via TrailingStopManager instead
+# of BracketExitManager (same root cause, same fix).
+# ---------------------------------------------------------------------------
+
+
+async def test_buy_then_trailing_stop(exchange: FakeCCXTExchange) -> None:
+    strategy = ScriptedSignalStrategy("buy-trailing", _buy_params())
+    stack = await _build_and_warm(exchange, strategy, engine_config={"trailing_stop_pct": 0.05})
+
+    # bar0: BUY, peak seeds at 50000. bar1: new peak (55000), no trigger yet.
+    await step_bar(stack, SYMBOL, START_PRICE, timeframe=TIMEFRAME_STR)
+    bought_qty = exchange.order_log[-1]["amount"]
+    await step_bar(stack, SYMBOL, Decimal("55000"), timeframe=TIMEFRAME_STR)
+    position_after_peak = stack.portfolio.get_position(SYMBOL)
+    assert position_after_peak is not None and not position_after_peak.is_flat
+
+    # 55000 * (1 - 0.05) = 52250 -- 52000 breaches it.
+    with capture_logs() as cap:
+        await step_bar(stack, SYMBOL, Decimal("52000"), timeframe=TIMEFRAME_STR)
+
+    trigger_events = [e for e in cap if e.get("event") == "trailing_stop.triggered"]
+    assert trigger_events, f"expected trailing_stop.triggered; got {cap!r}"
+
+    reject_events = [e for e in cap if e.get("event") == "live.sell_no_position"]
+    assert not reject_events, (
+        f"WP1.1: the trailing-stop exit must no longer be rejected as "
+        f"'live.sell_no_position' -- C1 is fixed; captured logs: {cap!r}"
+    )
+
+    sell_orders = [o for o in exchange.order_log if o["side"] == "sell"]
+    assert sell_orders, "expected the trailing-stop exit to reach the exchange"
+    assert sell_orders[-1]["amount"] == bought_qty
+
+    position_after_exit = stack.portfolio.get_position(SYMBOL)
+    assert position_after_exit is not None and position_after_exit.is_flat
+
+    await stack.engine.stop()
+
+
+# ---------------------------------------------------------------------------
+# buy_then_kill_switch -- WP1.2 (C6, D3) fixes this: the kill switch blocks
+# new entries only, in every mode; protective exits (bracket, trailing,
+# strategy SELLs) keep running. A BUY attempted on the same bar the
+# stop-loss breaches is dropped (engine.kill_switch_entries_blocked) while
+# the stop-loss SELL still fills.
+# ---------------------------------------------------------------------------
+
+
+async def test_buy_then_kill_switch_protective_exit_still_fires(
+    exchange: FakeCCXTExchange,
+) -> None:
+    strategy = _ScriptedSequenceStrategy(
+        "buy-kill-switch",
+        {
+            "schedule": [
+                (0, "buy", str(TARGET_NOTIONAL)),
+                (1, "buy", str(TARGET_NOTIONAL)),
+            ]
+        },
+    )
+    stack = await _build_and_warm(exchange, strategy, engine_config={"bracket_stop_loss_pct": 0.05})
+
+    await step_bar(stack, SYMBOL, START_PRICE, timeframe=TIMEFRAME_STR)
+    position_after_buy = stack.portfolio.get_position(SYMBOL)
+    assert position_after_buy is not None and not position_after_buy.is_flat
+    bought_qty = exchange.order_log[-1]["amount"]
+
+    stack.risk_manager.trigger_kill_switch("wp12-harness-test")
+
+    breach_price = START_PRICE * Decimal("0.80")
+    with capture_logs() as cap:
+        await step_bar(stack, SYMBOL, breach_price, timeframe=TIMEFRAME_STR)
+
+    blocked_events = [e for e in cap if e.get("event") == "engine.kill_switch_entries_blocked"]
+    assert blocked_events, (
+        "expected the second BUY attempt to be dropped as "
+        f"engine.kill_switch_entries_blocked while the switch is active; got {cap!r}"
+    )
+
+    sell_orders = [o for o in exchange.order_log if o["side"] == "sell"]
+    assert sell_orders, (
+        "expected the protective stop-loss to still exit while the kill "
+        "switch blocks new entries (D3 / WP1.2)"
+    )
+    assert sell_orders[-1]["amount"] == bought_qty
+
+    position_after_breach = stack.portfolio.get_position(SYMBOL)
+    assert position_after_breach is not None and position_after_breach.is_flat
+
+    assert stack.risk_manager.kill_switch_active is True, "the latch must stay active"
+
+    buy_orders = [o for o in exchange.order_log if o["side"] == "buy"]
+    assert len(buy_orders) == 1, "the second BUY attempt must never reach the exchange"
+
+    await stack.engine.stop()
+
+
+# ---------------------------------------------------------------------------
+# kill_switch_blocks_new_buy -- a BUY attempted while the switch is already
+# active (before any position exists) never reaches the exchange.
+# ---------------------------------------------------------------------------
+
+
+async def test_kill_switch_blocks_new_buy(exchange: FakeCCXTExchange) -> None:
+    strategy = ScriptedSignalStrategy("kill-switch-blocks-buy", _buy_params())
+    stack = await _build_and_warm(exchange, strategy)
+    stack.risk_manager.trigger_kill_switch("wp12-harness-test")
+
+    with capture_logs() as cap:
+        await step_bar(stack, SYMBOL, START_PRICE, timeframe=TIMEFRAME_STR)
+
+    blocked_events = [e for e in cap if e.get("event") == "engine.kill_switch_entries_blocked"]
+    assert blocked_events, f"expected the BUY to be dropped; got {cap!r}"
+
+    assert exchange.order_log == [], "no order may reach the exchange while entries are blocked"
+    position = stack.portfolio.get_position(SYMBOL)
+    assert position is None or position.is_flat
+
+    await stack.engine.stop()
+
+
+# ---------------------------------------------------------------------------
+# kill_switch_strategy_sell_passes -- a strategy-originated SELL (not a
+# bracket/trailing exit) still reaches the exchange while the switch blocks
+# entries (D3): the side-aware gate is not limited to protective managers.
+# ---------------------------------------------------------------------------
+
+
+async def test_kill_switch_strategy_sell_passes(exchange: FakeCCXTExchange) -> None:
+    strategy = _ScriptedSequenceStrategy(
+        "kill-switch-strategy-sell",
+        {"schedule": [(0, "buy", str(TARGET_NOTIONAL)), (2, "sell", "0")]},
+    )
+    stack = await _build_and_warm(exchange, strategy)
+
+    await step_bar(stack, SYMBOL, START_PRICE, timeframe=TIMEFRAME_STR)
+    bought_qty = exchange.order_log[-1]["amount"]
+    position_after_buy = stack.portfolio.get_position(SYMBOL)
+    assert position_after_buy is not None and not position_after_buy.is_flat
+
+    stack.risk_manager.trigger_kill_switch("wp12-harness-test")
+
+    # bar1: HOLD (call_count == 1) -- lets the switch settle before the
+    # strategy SELL is due at call_count == 2.
+    await step_bar(stack, SYMBOL, START_PRICE, timeframe=TIMEFRAME_STR)
+
+    with capture_logs() as cap:
+        await step_bar(stack, SYMBOL, START_PRICE, timeframe=TIMEFRAME_STR)
+
+    sell_orders = [o for o in exchange.order_log if o["side"] == "sell"]
+    assert sell_orders, f"expected the strategy SELL to reach the exchange; got {cap!r}"
+    assert sell_orders[-1]["amount"] == bought_qty
+
+    position_after_sell = stack.portfolio.get_position(SYMBOL)
+    assert position_after_sell is not None and position_after_sell.is_flat
+
+    assert stack.risk_manager.kill_switch_active is True, "the latch must stay active"
+
+    await stack.engine.stop()
+
+
+# ---------------------------------------------------------------------------
+# buy_then_max_open_positions_stop_loss -- with max_open_positions=1 already
+# saturated by the bot's own position, the exposure-reducing stop-loss SELL
+# must not be blocked by that same gate (S2 / G2).
+# ---------------------------------------------------------------------------
+
+
+async def test_buy_then_max_open_positions_stop_loss(exchange: FakeCCXTExchange) -> None:
+    strategy = ScriptedSignalStrategy("buy-max-open-positions", _buy_params())
+    stack = await _build_and_warm(
+        exchange,
+        strategy,
+        engine_config={"bracket_stop_loss_pct": 0.05},
+        risk_params=RiskParameters(max_open_positions=1),
+    )
+
+    await step_bar(stack, SYMBOL, START_PRICE, timeframe=TIMEFRAME_STR)
+    position_after_buy = stack.portfolio.get_position(SYMBOL)
+    assert position_after_buy is not None and not position_after_buy.is_flat
+    bought_qty = exchange.order_log[-1]["amount"]
+
+    breach_price = START_PRICE * Decimal("0.80")
+    with capture_logs() as cap:
+        await step_bar(stack, SYMBOL, breach_price, timeframe=TIMEFRAME_STR)
+
+    sell_orders = [o for o in exchange.order_log if o["side"] == "sell"]
+    assert sell_orders, (
+        "expected the stop-loss SELL to fill despite max_open_positions=1 "
+        f"already being saturated by the bot's own position; captured logs: {cap!r}"
+    )
+    assert sell_orders[-1]["amount"] == bought_qty
+
+    position_after_breach = stack.portfolio.get_position(SYMBOL)
+    assert position_after_breach is not None and position_after_breach.is_flat
+
+    await stack.engine.stop()
+
+
+# ---------------------------------------------------------------------------
+# buy_restart_reconcile_stop_loss -- WP1.8a fixes I2/D15: the SAME run_id
+# resumes with its portfolio rebuilt from persisted fill history via
+# PortfolioAccounting.from_fills, so the pre-restart position (and its
+# stop-loss protection) survives a restart instead of looking external.
+# ---------------------------------------------------------------------------
+
+
+async def test_buy_restart_reconcile_stop_loss(exchange: FakeCCXTExchange) -> None:
+    run_id = "wp10-restart-same-id"
+    strategy_before = ScriptedSignalStrategy("buy-restart-entry", _buy_params())
+    stack_before = await _build_and_warm(
+        exchange,
+        strategy_before,
+        engine_config={"bracket_stop_loss_pct": 0.05},
+        run_id=run_id,
+    )
+
+    await step_bar(stack_before, SYMBOL, START_PRICE, timeframe=TIMEFRAME_STR)
+    position_before_restart = stack_before.portfolio.get_position(SYMBOL)
+    assert position_before_restart is not None and not position_before_restart.is_flat
+    bought_qty = exchange.order_log[-1]["amount"]
+    assert exchange.balance_of(BASE) == bought_qty  # the bot's BTC really sits on the exchange
+
+    # --- Simulate an API restart: a SECOND engine stack under the SAME
+    # run_id (WP1.8a S6), portfolio rebuilt from stack_before's own routed
+    # fills via the production from_fills classmethod -- exactly what
+    # prepare_live_resume/run_live_engine(resume=...) does in production.
+    # stack_before is deliberately never stopped: a real process restart
+    # does not get a graceful shutdown either.
+    persisted_fills = stack_before.execution.get_all_fills()
+    strategy_after = ScriptedSignalStrategy(
+        "buy-restart-noop", {"direction": "buy", "call_index": 999}
+    )
+    # WP1.3a (A-36/ST-44): allow_pyramiding=True -- this resumed portfolio
+    # already holds the pre-mismatch position, so the new default
+    # no-pyramiding held gate would otherwise drop the scripted BUY before
+    # it ever reaches the reconcile_required check this test is about.
+    stack_after = await build_resumed_live_stack(
+        exchange=exchange,
+        strategy=strategy_after,
+        symbol=SYMBOL,
+        timeframe=TIMEFRAME,
+        initial_capital=INITIAL_CAPITAL,
+        run_id=run_id,
+        fills=persisted_fills,
+        engine_config={"bracket_stop_loss_pct": 0.05, "allow_pyramiding": True},
+    )
+    await start_and_warmup(stack_after, run_id)
+
+    position_after_restart = stack_after.portfolio.get_position(SYMBOL)
+    assert position_after_restart is not None and not position_after_restart.is_flat, (
+        "WP1.8a: the entry recorded before the simulated restart must "
+        "survive it -- from_fills rebuilds the position from the run's own "
+        "persisted fills, so it is no longer indistinguishable from an "
+        "external holding."
+    )
+    assert position_after_restart.average_entry_price == position_before_restart.average_entry_price
+    assert position_after_restart.quantity == position_before_restart.quantity
+
+    breach_price = START_PRICE * Decimal("0.80")
+    with capture_logs() as cap:
+        await step_bar(stack_after, SYMBOL, breach_price, timeframe=TIMEFRAME_STR)
+
+    sell_orders = [o for o in exchange.order_log if o["side"] == "sell"]
+    assert sell_orders, (
+        "expected the stop-loss to fire against the rebuilt entry price; "
+        f"captured log events: {cap!r}"
+    )
+    assert sell_orders[-1]["amount"] == bought_qty
+
+    await stack_after.engine.stop()
+
+
+# ---------------------------------------------------------------------------
+# WP1.8a: mismatch after the rebuild -- own > total (an operator sold part
+# of the position directly on the exchange between the crash and the
+# resume).  The WP1.1 D2 flag fires: BUYs blocked, SELLs capped (U1).
+# ---------------------------------------------------------------------------
+
+
+async def test_resume_mismatch_flags_blocks_buy_caps_sell(exchange: FakeCCXTExchange) -> None:
+    run_id = "wp10-restart-mismatch"
+    strategy_before = ScriptedSignalStrategy("buy-restart-entry", _buy_params())
+    stack_before = await _build_and_warm(
+        exchange,
+        strategy_before,
+        engine_config={"bracket_stop_loss_pct": 0.05},
+        run_id=run_id,
+    )
+    await step_bar(stack_before, SYMBOL, START_PRICE, timeframe=TIMEFRAME_STR)
+    bought_qty = exchange.order_log[-1]["amount"]
+    persisted_fills = stack_before.execution.get_all_fills()
+
+    # An operator sells HALF the bot's own BTC directly on the exchange
+    # while it was orphaned -- own (from persisted fills) now exceeds total.
+    remaining = (bought_qty / Decimal("2")).quantize(Decimal("0.00000001"))
+    exchange.set_balance(BASE, remaining)
+
+    strategy_after = _ScriptedSequenceStrategy(
+        "resume-mismatch",
+        {"schedule": [(0, "buy", str(TARGET_NOTIONAL))]},
+    )
+    # WP1.3a (A-36/ST-44): allow_pyramiding=True -- this resumed portfolio
+    # already holds the pre-mismatch position, so the new default
+    # no-pyramiding held gate would otherwise drop the scripted BUY before
+    # it ever reaches the reconcile_required check this test is about.
+    stack_after = await build_resumed_live_stack(
+        exchange=exchange,
+        strategy=strategy_after,
+        symbol=SYMBOL,
+        timeframe=TIMEFRAME,
+        initial_capital=INITIAL_CAPITAL,
+        run_id=run_id,
+        fills=persisted_fills,
+        engine_config={"bracket_stop_loss_pct": 0.05, "allow_pyramiding": True},
+    )
+    await start_and_warmup(stack_after, run_id)
+
+    assert stack_after.execution.reconcile_required, (
+        "own (from persisted fills) > total (exchange) must flag the "
+        "symbol on the post-resume sync (WP1.1 D2/I8, applied per U1)"
+    )
+
+    orders_before_resume = len(exchange.order_log)
+    with capture_logs() as cap:
+        await step_bar(stack_after, SYMBOL, START_PRICE, timeframe=TIMEFRAME_STR)
+
+    new_orders = exchange.order_log[orders_before_resume:]
+    buy_orders = [o for o in new_orders if o["side"] == "buy"]
+    assert not buy_orders, f"BUY must be blocked while flagged; logs={cap!r}"
+
+    breach_price = START_PRICE * Decimal("0.80")
+    await step_bar(stack_after, SYMBOL, breach_price, timeframe=TIMEFRAME_STR)
+    new_orders = exchange.order_log[orders_before_resume:]
+    sell_orders = [o for o in new_orders if o["side"] == "sell"]
+    assert sell_orders, "the stop-loss SELL must still fire while flagged (D2 exits keep running)"
+    assert sell_orders[-1]["amount"] == remaining, (
+        f"the capped SELL must equal min(own, free) == {remaining}, got {sell_orders[-1]['amount']}"
+    )
+
+    await stack_after.engine.stop()
+
+
+# ---------------------------------------------------------------------------
+# WP1.8a: no persisted fills + an external balance -> empty portfolio (I2
+# holds even after a resume: an exchange balance alone never becomes a
+# position; only this run's own fills can).
+# ---------------------------------------------------------------------------
+
+
+async def test_resume_with_no_fills_and_external_balance_stays_empty(
+    exchange: FakeCCXTExchange,
+) -> None:
+    exchange.set_balance(BASE, Decimal("0.5"))  # pre-existing external holding
+
+    strategy = ScriptedSignalStrategy("resume-no-fills", {"direction": "buy", "call_index": 999})
+    stack = await build_resumed_live_stack(
+        exchange=exchange,
+        strategy=strategy,
+        symbol=SYMBOL,
+        timeframe=TIMEFRAME,
+        initial_capital=INITIAL_CAPITAL,
+        run_id="wp10-restart-no-fills",
+        fills=[],
+        engine_config={"bracket_take_profit_pct": 0.05},
+    )
+    await start_and_warmup(stack, "wp10-restart-no-fills")
+
+    assert stack.portfolio.get_position(SYMBOL) is None, (
+        "from_fills([]) must produce an empty portfolio -- an external "
+        "balance never becomes a position (I2), resume or not"
+    )
+    assert not stack.execution.reconcile_required
+
+    with capture_logs() as cap:
+        await step_bar(stack, SYMBOL, START_PRICE, timeframe=TIMEFRAME_STR)
+
+    assert exchange.order_log == []
+    tp_events = [e for e in cap if e.get("event") == "bracket_exit.take_profit"]
+    assert not tp_events, f"unexpected false take-profit: {cap!r}"
+
+    await stack.engine.stop()
+
+
+# ---------------------------------------------------------------------------
+# WP1.8a: mode=protective (S10/O9) -- the stop-loss still fires (exits keep
+# running) but a scripted BUY on the very next bar is dropped.
+# ---------------------------------------------------------------------------
+
+
+async def test_resume_protective_mode_drops_buy_but_stop_loss_fires(
+    exchange: FakeCCXTExchange,
+) -> None:
+    run_id = "wp10-restart-protective"
+    strategy_before = ScriptedSignalStrategy("buy-restart-entry", _buy_params())
+    stack_before = await _build_and_warm(
+        exchange,
+        strategy_before,
+        engine_config={"bracket_stop_loss_pct": 0.05},
+        run_id=run_id,
+    )
+    await step_bar(stack_before, SYMBOL, START_PRICE, timeframe=TIMEFRAME_STR)
+    bought_qty = exchange.order_log[-1]["amount"]
+    persisted_fills = stack_before.execution.get_all_fills()
+
+    # A BUY scripted for call_index 0 -- must be dropped in protective mode.
+    strategy_after = _ScriptedSequenceStrategy(
+        "resume-protective", {"schedule": [(0, "buy", str(TARGET_NOTIONAL))]}
+    )
+    stack_after = await build_resumed_live_stack(
+        exchange=exchange,
+        strategy=strategy_after,
+        symbol=SYMBOL,
+        timeframe=TIMEFRAME,
+        initial_capital=INITIAL_CAPITAL,
+        run_id=run_id,
+        fills=persisted_fills,
+        engine_config={"bracket_stop_loss_pct": 0.05},
+        protective_mode=True,
+    )
+    await start_and_warmup(stack_after, run_id)
+
+    orders_before_resume = len(exchange.order_log)
+    breach_price = START_PRICE * Decimal("0.80")
+    with capture_logs() as cap:
+        await step_bar(stack_after, SYMBOL, breach_price, timeframe=TIMEFRAME_STR)
+
+    new_orders = exchange.order_log[orders_before_resume:]
+    buy_orders = [o for o in new_orders if o["side"] == "buy"]
+    sell_orders = [o for o in new_orders if o["side"] == "sell"]
+    assert not buy_orders, f"protective mode must drop the scripted BUY; logs={cap!r}"
+    assert sell_orders, "the stop-loss exit must still fire in protective mode (O9)"
+    assert sell_orders[-1]["amount"] == bought_qty
+
+    await stack_after.engine.stop()
+
+
+# ---------------------------------------------------------------------------
+# WP1.8a: the resumed trailing-stop peak is seeded from the rebuilt bar
+# history and is never below the (rebuilt) entry price (A-09/R§3).
+# ---------------------------------------------------------------------------
+
+
+async def test_resume_trailing_peak_is_at_least_the_entry(exchange: FakeCCXTExchange) -> None:
+    run_id = "wp10-restart-trailing"
+    strategy_before = ScriptedSignalStrategy("buy-restart-entry", _buy_params())
+    stack_before = await _build_and_warm(
+        exchange,
+        strategy_before,
+        engine_config={"trailing_stop_pct": 0.05},
+        run_id=run_id,
+    )
+    await step_bar(stack_before, SYMBOL, START_PRICE, timeframe=TIMEFRAME_STR)
+    persisted_fills = stack_before.execution.get_all_fills()
+    entry_price = stack_before.portfolio.get_position(SYMBOL).average_entry_price
+
+    strategy_after = ScriptedSignalStrategy(
+        "resume-trailing-noop", {"direction": "buy", "call_index": 999}
+    )
+    stack_after = await build_resumed_live_stack(
+        exchange=exchange,
+        strategy=strategy_after,
+        symbol=SYMBOL,
+        timeframe=TIMEFRAME,
+        initial_capital=INITIAL_CAPITAL,
+        run_id=run_id,
+        fills=persisted_fills,
+        engine_config={"trailing_stop_pct": 0.05},
+    )
+    await start_and_warmup(stack_after, run_id)
+
+    assert stack_after.engine._trailing_stop is not None
+    seeded_peak = stack_after.engine._trailing_stop.peak_prices.get(SYMBOL)
+    assert seeded_peak is not None
+    assert seeded_peak >= entry_price
+
+    await stack_after.engine.stop()
+
+
+# ---------------------------------------------------------------------------
+# external_holdings_not_sold (R-21) -- WP1.1 fixes C1 together with the C22
+# over-sell bound (D15): the exit SELL closes exactly the bot's own
+# quantity, never touching the pre-existing 0.5 BTC external holding.
+# ---------------------------------------------------------------------------
+
+
+async def test_external_holdings_not_sold(exchange: FakeCCXTExchange) -> None:
+    exchange.set_balance(BASE, Decimal("0.5"))  # pre-existing holdings the bot never bought
+
+    strategy = ScriptedSignalStrategy("buy-external-holdings", _buy_params())
+    stack = await _build_and_warm(exchange, strategy, engine_config={"bracket_stop_loss_pct": 0.05})
+
+    await step_bar(stack, SYMBOL, START_PRICE, timeframe=TIMEFRAME_STR)
+    bot_bought_qty = exchange.order_log[-1]["amount"]
+    assert exchange.balance_of(BASE) == Decimal("0.5") + bot_bought_qty
+
+    breach_price = START_PRICE * Decimal("0.80")
+    with capture_logs() as cap:
+        await step_bar(stack, SYMBOL, breach_price, timeframe=TIMEFRAME_STR)
+
+    sell_orders = [o for o in exchange.order_log if o["side"] == "sell"]
+    assert sell_orders and sell_orders[-1]["amount"] == bot_bought_qty, (
+        f"expected the exit SELL to close exactly the bot's own quantity "
+        f"({bot_bought_qty}), never touching the pre-existing 0.5 BTC "
+        f"external holding (I5/D15/R-21); "
+        f"(sell_orders={sell_orders!r}, captured logs={cap!r})"
+    )
+
+    assert exchange.balance_of(BASE) == Decimal("0.5"), (
+        "external holdings must be untouched once the bot's own position is closed"
+    )
+
+    await stack.engine.stop()
+
+
+# ---------------------------------------------------------------------------
+# R-22 -- startup sync with a pre-existing external balance must never
+# fabricate a Position (and therefore never trigger a false take-profit
+# on the very first bar, before the bot has even bought anything).
+# ---------------------------------------------------------------------------
+
+
+async def test_startup_sync_with_external_balance_causes_no_false_take_profit(
+    exchange: FakeCCXTExchange,
+) -> None:
+    # A pre-existing external balance, seeded BEFORE the engine boots -- the
+    # pre-WP1.1 sync_positions() would have fabricated a Position for this
+    # with average_entry_price=0, so ANY positive price immediately breaches
+    # a take-profit level computed as entry * (1 + tp_pct) == 0.
+    exchange.set_balance(BASE, Decimal("0.5"))
+
+    # Never emits a signal: isolates sync_positions()'s own behaviour at
+    # boot from anything the strategy itself might do.
+    strategy = ScriptedSignalStrategy("never-fires", {"direction": "buy", "call_index": 999})
+    stack = await _build_and_warm(
+        exchange, strategy, engine_config={"bracket_take_profit_pct": 0.05}
+    )
+
+    # sync_positions() has already run once inside on_start() (WP11-A-07),
+    # against the pre-existing 0.5 BTC balance, before this first bar.
+    assert stack.portfolio.get_position(SYMBOL) is None, (
+        "sync_positions() must never fabricate a Position from the exchange "
+        "balance (I2) -- an external holding stays untracked, not a "
+        "zero-entry position waiting to falsely take-profit"
+    )
+    assert stack.execution.positions.get(SYMBOL) is None
+    assert not stack.execution.reconcile_required
+
+    with capture_logs() as cap:
+        await step_bar(stack, SYMBOL, START_PRICE, timeframe=TIMEFRAME_STR)
+
+    # No bracket exit can have fired -- there is no position to exit, bought
+    # or otherwise.
+    assert exchange.order_log == []
+    tp_events = [e for e in cap if e.get("event") == "bracket_exit.take_profit"]
+    assert not tp_events, f"unexpected false take-profit on first bar: {cap!r}"
+    assert exchange.balance_of(BASE) == Decimal("0.5"), "external holding must be untouched"
+
+    await stack.engine.stop()
+
+
+# ---------------------------------------------------------------------------
+# R-23 -- fake-exchange extensions (fee charged in base currency, a balance
+# partially locked in another open order) prove the SELL cap uses `free`,
+# never `total` (D9/I1): the bracket exit closes only what is actually
+# free, not the bot's full own quantity.
+# ---------------------------------------------------------------------------
+
+
+async def test_sell_capped_at_free_when_balance_partially_locked(
+    exchange: FakeCCXTExchange,
+) -> None:
+    exchange.set_fee_currency(SYMBOL, "base")
+
+    strategy = ScriptedSignalStrategy("buy-fee-in-base", _buy_params())
+    stack = await _build_and_warm(exchange, strategy, engine_config={"bracket_stop_loss_pct": 0.05})
+
+    await step_bar(stack, SYMBOL, START_PRICE, timeframe=TIMEFRAME_STR)
+
+    bought_qty = TARGET_NOTIONAL / START_PRICE  # 0.002 BTC
+    fee_base = (bought_qty * exchange.taker_fee_pct).quantize(Decimal("0.00000001"))
+    own_qty = bought_qty - fee_base  # 0.001988 BTC -- net of the base-currency fee
+
+    position_after_buy = stack.portfolio.get_position(SYMBOL)
+    assert position_after_buy is not None
+    assert _approx_eq(position_after_buy.quantity, own_qty), (
+        "WP11-A-05: a fee charged in the base currency must net out of the "
+        f"routed fill quantity; got {position_after_buy.quantity}, expected {own_qty}"
+    )
+    assert exchange.balance_of(BASE) == own_qty  # engine's own qty == exchange's actual balance
+
+    # Lock 90% of the bot's own BTC away in a (simulated) other open order:
+    # `total` is unaffected, only `free` shrinks. own == total here (no
+    # other external BTC balance), so the I8 mismatch flag must NOT fire --
+    # only the free-based cap engages (D9).
+    locked = (own_qty * Decimal("0.9")).quantize(Decimal("0.00000001"))
+    free = own_qty - locked
+    exchange.lock_balance(BASE, locked)
+
+    breach_price = START_PRICE * Decimal("0.80")
+    with capture_logs() as cap:
+        await step_bar(stack, SYMBOL, breach_price, timeframe=TIMEFRAME_STR)
+
+    assert not stack.execution.reconcile_required, (
+        f"own == total (only `free` is reduced) -- the I8 mismatch flag "
+        f"must not fire; got {dict(stack.execution.reconcile_required)!r}"
+    )
+
+    sell_orders = [o for o in exchange.order_log if o["side"] == "sell"]
+    assert sell_orders, f"expected a capped SELL to reach the exchange; captured logs: {cap!r}"
+    assert sell_orders[-1]["amount"] == free, (
+        f"the SELL must be capped at free ({free}), not own/total ({own_qty}) -- "
+        f"got {sell_orders[-1]['amount']}"
+    )
+
+    await stack.engine.stop()
+
+
+# ---------------------------------------------------------------------------
+# WP1.7a (reports/vp2-wp1.7/synthesis-spec.md) -- StrategyEngine.flatten().
+#
+# These scenarios drive ``stack.engine.flatten()`` directly, exactly as the
+# API layer will (``stop_run``/``emergency_stop_run``/the global kill switch
+# all latch the risk manager first, then await ``engine.flatten(reason=...)``
+# with no DB lock held -- WP17-R-09). On HEAD 4d594d0 ``StrategyEngine`` has
+# no ``flatten`` attribute at all, so every scenario below fails with
+# ``AttributeError`` -- this is the harness proof the producer report cites
+# for AC1.
+# ---------------------------------------------------------------------------
+
+
+async def test_emergency_stop_while_holding_flatten_true_flat(
+    exchange: FakeCCXTExchange,
+) -> None:
+    """AC1: emergency stop while holding, with flatten=true -> flat.
+
+    Mirrors ``emergency_stop_run(flatten=True)``: latch entries first
+    (``stop_in_progress``, SY-03), then flatten. The run ends fully flat
+    and the result is a complete, single-SELL ``FlattenResult``.
+    """
+    strategy = ScriptedSignalStrategy("flatten-emergency-stop", _buy_params())
+    stack = await _build_and_warm(exchange, strategy)
+
+    await step_bar(stack, SYMBOL, START_PRICE, timeframe=TIMEFRAME_STR)
+    bought_qty = exchange.order_log[-1]["amount"]
+    position_after_buy = stack.portfolio.get_position(SYMBOL)
+    assert position_after_buy is not None and not position_after_buy.is_flat
+
+    stack.risk_manager.trigger_kill_switch("stop_in_progress")
+    result = await stack.engine.flatten(reason="emergency_stop", timeout_s=30.0)
+
+    assert result.outcome == "flattened"
+    assert result.complete is True
+    assert len(result.symbols) == 1
+    symbol_result = result.symbols[0]
+    assert symbol_result.symbol == SYMBOL
+    assert symbol_result.status == "flat"
+    assert _approx_eq(symbol_result.sold_qty, bought_qty)
+    assert symbol_result.remaining_qty == Decimal("0")
+
+    position_after_flatten = stack.portfolio.get_position(SYMBOL)
+    assert position_after_flatten is not None and position_after_flatten.is_flat
+
+    sell_orders = [o for o in exchange.order_log if o["side"] == "sell"]
+    assert len(sell_orders) == 1, f"expected exactly one flatten SELL; got {exchange.order_log!r}"
+    assert sell_orders[-1]["amount"] == bought_qty
+
+    await stack.engine.stop()
+
+
+async def test_flatten_precondition_requires_kill_switch(
+    exchange: FakeCCXTExchange,
+) -> None:
+    """I7: flatten() raises FlattenPreconditionError when the kill switch
+    is not already active -- it never runs while entries are still open."""
+    from trading.strategy_engine import FlattenPreconditionError
+
+    strategy = ScriptedSignalStrategy("flatten-precondition", _buy_params())
+    stack = await _build_and_warm(exchange, strategy)
+    await step_bar(stack, SYMBOL, START_PRICE, timeframe=TIMEFRAME_STR)
+
+    assert stack.risk_manager.kill_switch_active is False
+    with pytest.raises(FlattenPreconditionError):
+        await stack.engine.flatten(reason="stop", timeout_s=5.0)
+
+    await stack.engine.stop()
+
+
+async def test_kill_switch_then_stop_loss_still_exits(exchange: FakeCCXTExchange) -> None:
+    """Kill switch, then the SL still exits (D3/I2 -- the kill switch never
+    cancels tasks or removes engines; exits keep running even with the
+    switch latched and no flatten requested)."""
+    strategy = ScriptedSignalStrategy("kill-switch-sl-still-fires", _buy_params())
+    stack = await _build_and_warm(exchange, strategy, engine_config={"bracket_stop_loss_pct": 0.05})
+
+    await step_bar(stack, SYMBOL, START_PRICE, timeframe=TIMEFRAME_STR)
+    bought_qty = exchange.order_log[-1]["amount"]
+
+    stack.risk_manager.trigger_kill_switch("global_kill_switch")
+
+    breach_price = START_PRICE * Decimal("0.80")
+    await step_bar(stack, SYMBOL, breach_price, timeframe=TIMEFRAME_STR)
+
+    sell_orders = [o for o in exchange.order_log if o["side"] == "sell"]
+    assert sell_orders and sell_orders[-1]["amount"] == bought_qty, (
+        "the stop-loss must still fire while the global latch is active and no flatten runs"
+    )
+    position = stack.portfolio.get_position(SYMBOL)
+    assert position is not None and position.is_flat
+    assert stack.risk_manager.kill_switch_active is True
+
+    await stack.engine.stop()
+
+
+async def test_stop_with_flatten_ends_flat(exchange: FakeCCXTExchange) -> None:
+    """Stop with flatten -> flat (engine layer): the same flatten() call
+    stop_run(flatten=true) awaits, driven with reason='stop'."""
+    strategy = ScriptedSignalStrategy("flatten-stop", _buy_params())
+    stack = await _build_and_warm(exchange, strategy)
+    await step_bar(stack, SYMBOL, START_PRICE, timeframe=TIMEFRAME_STR)
+    bought_qty = exchange.order_log[-1]["amount"]
+
+    stack.risk_manager.trigger_kill_switch("stop_in_progress")
+    result = await stack.engine.flatten(reason="stop", timeout_s=30.0)
+
+    assert result.complete is True
+    assert result.outcome == "flattened"
+    position = stack.portfolio.get_position(SYMBOL)
+    assert position is not None and position.is_flat
+
+    # Mirrors stop_run's own sequence once flatten is complete: cancel the
+    # task / stop the engine.
+    await stack.engine.stop()
+    assert exchange.order_log[-1]["amount"] == bought_qty
+
+
+async def test_flatten_ledger_doubt_caps_to_zero_partial_and_latched(
+    exchange: FakeCCXTExchange,
+) -> None:
+    """Ledger doubt (I8 mismatch, own_avail > exchange free) caps the SELL
+    to zero: the symbol result is 'partial' with cause='ledger_doubt', the
+    run-level outcome is 'partial' (never 'failed' -- risk-design
+    WP17-R-17), and the kill-switch latch this scenario set stays active
+    (the run, if driven through the router, would stay running and
+    latched -- WP17-R-08)."""
+    strategy = ScriptedSignalStrategy("flatten-ledger-doubt", _buy_params())
+    stack = await _build_and_warm(exchange, strategy)
+    await step_bar(stack, SYMBOL, START_PRICE, timeframe=TIMEFRAME_STR)
+    assert exchange.balance_of(BASE) > Decimal("0")
+
+    # An operator withdraws the bot's entire BTC balance directly on the
+    # exchange while the position ledger still shows it as held -- own
+    # (ledger) now exceeds total/free (exchange) (I8).
+    exchange.set_balance(BASE, Decimal("0"))
+
+    stack.risk_manager.trigger_kill_switch("stop_in_progress")
+    with capture_logs() as cap:
+        result = await stack.engine.flatten(reason="stop", timeout_s=2.0)
+
+    assert result.complete is False
+    assert result.outcome == "partial"
+    symbol_result = result.symbols[0]
+    assert symbol_result.status == "partial"
+    assert symbol_result.cause == "ledger_doubt"
+    assert symbol_result.sold_qty == Decimal("0")
+    assert stack.execution.reconcile_required, "the I8 mismatch must have been flagged"
+
+    critical_events = [e for e in cap if e.get("event") == "flatten.incomplete"]
+    assert critical_events, f"expected a critical flatten.incomplete log; got {cap!r}"
+
+    assert stack.risk_manager.kill_switch_active is True, "the latch must stay active"
+
+    await stack.engine.stop()
+
+
+async def test_flatten_external_holding_only_bot_qty_sold(exchange: FakeCCXTExchange) -> None:
+    """0.5 BTC external + 0.01 BTC bot -> flatten sells only the bot's own
+    quantity (D15/J1/I1 -- flatten goes through the same capped
+    process_signal path as every other exit)."""
+    exchange.set_balance(BASE, Decimal("0.5"))  # pre-existing external holding
+
+    strategy = ScriptedSignalStrategy("flatten-external-holdings", _buy_params())
+    stack = await _build_and_warm(exchange, strategy)
+    await step_bar(stack, SYMBOL, START_PRICE, timeframe=TIMEFRAME_STR)
+    bot_bought_qty = exchange.order_log[-1]["amount"]
+    assert exchange.balance_of(BASE) == Decimal("0.5") + bot_bought_qty
+
+    stack.risk_manager.trigger_kill_switch("stop_in_progress")
+    result = await stack.engine.flatten(reason="stop", timeout_s=30.0)
+
+    assert result.outcome == "flattened"
+    assert result.complete is True
+    assert _approx_eq(result.symbols[0].sold_qty, bot_bought_qty)
+
+    sell_orders = [o for o in exchange.order_log if o["side"] == "sell"]
+    assert sell_orders and sell_orders[-1]["amount"] == bot_bought_qty
+    assert exchange.balance_of(BASE) == Decimal("0.5"), (
+        "external holdings must be untouched by flatten"
+    )
+
+    await stack.engine.stop()
+
+
+async def test_flatten_racing_bracket_exit_exactly_one_sell(
+    exchange: FakeCCXTExchange,
+) -> None:
+    """Double flatten (or flatten racing a bracket exit): exactly one
+    SELL reaches the exchange -- the second attempt sees the position
+    already flat (I6/_cycle_lock: a bracket exit inside _process_bar and
+    a concurrent flatten() call can never interleave on the same
+    position)."""
+    strategy = ScriptedSignalStrategy("flatten-race-bracket", _buy_params())
+    stack = await _build_and_warm(exchange, strategy, engine_config={"bracket_stop_loss_pct": 0.05})
+    await step_bar(stack, SYMBOL, START_PRICE, timeframe=TIMEFRAME_STR)
+    bought_qty = exchange.order_log[-1]["amount"]
+
+    stack.risk_manager.trigger_kill_switch("stop_in_progress")
+
+    # Breach the stop-loss so the NEXT _process_bar call would exit too,
+    # then race it against a concurrent flatten() -- both content for
+    # _cycle_lock, so they run strictly one after the other, never
+    # interleaved.
+    exchange.push_bar(SYMBOL, START_PRICE * Decimal("0.80"), timeframe=TIMEFRAME_STR)
+    results = await asyncio.gather(
+        stack.engine._poll_and_process(),
+        stack.engine.flatten(reason="stop", timeout_s=30.0),
+    )
+    flatten_result = next(r for r in results if r is not None)
+
+    sell_orders = [o for o in exchange.order_log if o["side"] == "sell"]
+    assert len(sell_orders) == 1, f"expected exactly one SELL; got {exchange.order_log!r}"
+    assert sell_orders[-1]["amount"] == bought_qty
+
+    position = stack.portfolio.get_position(SYMBOL)
+    assert position is not None and position.is_flat
+    assert flatten_result.outcome in ("flattened", "noop")
+
+    await stack.engine.stop()
+
+
+# ---------------------------------------------------------------------------
+# WP1.7a round 2 (S-06): flatten()'s own deadline must cover ACQUIRING
+# _cycle_lock, not just the per-symbol work after it -- a hung
+# _process_bar (simulated here by holding the lock externally) must
+# never let flatten() block past its own advertised timeout_s.
+# ---------------------------------------------------------------------------
+
+
+async def test_flatten_lock_acquisition_timeout_reports_lock_timeout(
+    exchange: FakeCCXTExchange,
+) -> None:
+    strategy = ScriptedSignalStrategy("flatten-lock-timeout", _buy_params())
+    stack = await _build_and_warm(exchange, strategy)
+    await step_bar(stack, SYMBOL, START_PRICE, timeframe=TIMEFRAME_STR)
+    bought_qty = exchange.order_log[-1]["amount"]
+    assert bought_qty > 0
+
+    stack.risk_manager.trigger_kill_switch("stop_in_progress")
+
+    # Simulate a hung _process_bar (or a hung exchange call inside it) by
+    # holding _cycle_lock externally for the whole flatten() call below.
+    await stack.engine._cycle_lock.acquire()
+    try:
+        result = await stack.engine.flatten(reason="stop", timeout_s=0.2)
+    finally:
+        stack.engine._cycle_lock.release()
+
+    assert result.complete is False
+    # "in_flight" (not "failed") -- flatten() never even attempted a
+    # SELL, so this is not a hard failure, exactly like an unresolved
+    # submit or a reserved-by-another-SELL block would be.
+    assert result.outcome == "partial"
+    assert len(result.symbols) == 1
+    assert result.symbols[0].status == "in_flight"
+    assert result.symbols[0].cause == "lock_timeout"
+    # Nothing was sold -- flatten() never even attempted a SELL, since it
+    # never got past acquiring the lock.
+    sell_orders = [o for o in exchange.order_log if o["side"] == "sell"]
+    assert sell_orders == []
+
+    await stack.engine.stop()
+
+
+# ---------------------------------------------------------------------------
+# WP1.3a (SY-13a-10, AC1): "two breakouts, one position" -- the real
+# MomentumBreakoutStrategy against the real held gate.  The single most
+# important acceptance criterion of WP1.3a: with the default
+# allow_pyramiding=False, a second same-symbol BUY signal while already
+# holding is dropped BEFORE it ever reaches process_signal, and the run
+# still enters again cleanly after a bracket SL flattens it (ST-37/AC1).
+# ---------------------------------------------------------------------------
+
+
+async def test_wp13a_two_breakouts_one_position(exchange: FakeCCXTExchange) -> None:
+    strategy = MomentumBreakoutStrategy(
+        "wp13a-two-breakouts",
+        {"lookback": 3, "trend_sma_period": None, "position_size": 100},
+    )
+    stack = await _build_and_warm(
+        exchange,
+        strategy,
+        engine_config={
+            "bracket_mode": "fixed",
+            "bracket_stop_loss_pct": 0.05,
+            "bracket_take_profit_pct": 0.5,
+        },
+    )
+
+    orig_process_signal = stack.execution.process_signal
+    process_signal_calls: list[Signal] = []
+
+    async def _spy_process_signal(signal: Signal) -> Any:
+        process_signal_calls.append(signal)
+        return await orig_process_signal(signal)
+
+    stack.execution.process_signal = _spy_process_signal  # type: ignore[method-assign]
+
+    # Bar 1 (close 51000): a new breakout -- the first, and only, BUY.
+    await step_bar(stack, SYMBOL, Decimal("51000"), timeframe=TIMEFRAME_STR)
+    buy_orders = [o for o in exchange.order_log if o["side"] == "buy"]
+    assert len(buy_orders) == 1, f"expected exactly one BUY; got {exchange.order_log!r}"
+    first_fill_qty = stack.portfolio.get_position(SYMBOL).quantity  # type: ignore[union-attr]
+    assert first_fill_qty > 0
+    buy_signal_calls_after_first = sum(
+        1 for s in process_signal_calls if s.direction == SignalDirection.BUY
+    )
+    assert buy_signal_calls_after_first == 1
+
+    # Bar 2 (close 50500): a dip, not a new high -- no signal at all.
+    await step_bar(stack, SYMBOL, Decimal("50500"), timeframe=TIMEFRAME_STR)
+    assert len([o for o in exchange.order_log if o["side"] == "buy"]) == 1
+
+    # Bar 3 (close 52000): a second new breakout -- MUST be dropped as
+    # "already held", never reaching process_signal, and the ledger
+    # quantity is unchanged (still exactly the first fill).
+    with capture_logs() as cap3:
+        await step_bar(stack, SYMBOL, Decimal("52000"), timeframe=TIMEFRAME_STR)
+    buy_orders = [o for o in exchange.order_log if o["side"] == "buy"]
+    assert len(buy_orders) == 1, (
+        f"the second breakout must NOT submit a second BUY; got {exchange.order_log!r}"
+    )
+    assert stack.portfolio.get_position(SYMBOL).quantity == first_fill_qty  # type: ignore[union-attr]
+    buy_signal_calls_after_second = sum(
+        1 for s in process_signal_calls if s.direction == SignalDirection.BUY
+    )
+    assert buy_signal_calls_after_second == 1, (
+        "process_signal must not be called for the held-gate-dropped BUY"
+    )
+    assert any(e.get("event") == "engine.entry_skipped_position_held" for e in cap3), (
+        f"expected a held-skip log; got {cap3!r}"
+    )
+
+    # Bar 4 (close 48000): a >=5% breach of the fixed 5% SL -- exactly one
+    # SELL, flattening the position.  (Also not a new strategy breakout:
+    # 48000 is well below every recent high, so the SELL is bracket-only.)
+    await step_bar(stack, SYMBOL, Decimal("48000"), timeframe=TIMEFRAME_STR)
+    sell_orders = [o for o in exchange.order_log if o["side"] == "sell"]
+    assert len(sell_orders) == 1, f"expected exactly one SL SELL; got {exchange.order_log!r}"
+    flat_position = stack.portfolio.get_position(SYMBOL)
+    assert flat_position is None or flat_position.is_flat
+
+    # Bar 5 (close 53000): flat again, a fresh breakout above every prior
+    # high -- a brand-new BUY is allowed.
+    await step_bar(stack, SYMBOL, Decimal("53000"), timeframe=TIMEFRAME_STR)
+    buy_orders = [o for o in exchange.order_log if o["side"] == "buy"]
+    assert len(buy_orders) == 2, f"expected a new entry after flat; got {exchange.order_log!r}"
+
+    await stack.engine.stop()
+
+
+async def test_wp13a_two_breakouts_pyramiding_enabled_gives_two_buys(
+    exchange: FakeCCXTExchange,
+) -> None:
+    """ST-38: the SAME path, with library-level allow_pyramiding=True --
+    proves the held gate (not some other mechanism) is what caused the
+    single BUY above."""
+    strategy = MomentumBreakoutStrategy(
+        "wp13a-two-breakouts-pyramiding",
+        {"lookback": 3, "trend_sma_period": None, "position_size": 100},
+    )
+    stack = await _build_and_warm(
+        exchange,
+        strategy,
+        engine_config={
+            "bracket_mode": "fixed",
+            "bracket_stop_loss_pct": 0.05,
+            "bracket_take_profit_pct": 0.5,
+            "allow_pyramiding": True,
+        },
+    )
+
+    await step_bar(stack, SYMBOL, Decimal("51000"), timeframe=TIMEFRAME_STR)
+    await step_bar(stack, SYMBOL, Decimal("50500"), timeframe=TIMEFRAME_STR)
+    await step_bar(stack, SYMBOL, Decimal("52000"), timeframe=TIMEFRAME_STR)
+
+    buy_orders = [o for o in exchange.order_log if o["side"] == "buy"]
+    assert len(buy_orders) == 2, (
+        f"with allow_pyramiding=True both breakouts must fill; got {exchange.order_log!r}"
+    )
+
+    await stack.engine.stop()
+
+
+# ---------------------------------------------------------------------------
+# WP13a-S-01 (security round 2): a REAL StrategyEngine(LIVE,
+# protective_mode=True, exit_config_waived=True) must construct for a
+# BUY-only, requires_exit_manager strategy with NO exit config at all (or
+# TP-only) -- and, once constructed, flatten() must still bring a held
+# position to flat.  This is the harness proof the security report asked
+# for, independent of the API-layer test in test_wp18a_resume_endpoint.py.
+# ---------------------------------------------------------------------------
+
+
+async def test_wp13a_protective_resume_no_exit_config_constructs_and_flattens(
+    exchange: FakeCCXTExchange,
+) -> None:
+    run_id = "wp13a-s01-no-exit"
+    strategy_before = MomentumBreakoutStrategy(
+        "wp13a-s01-entry",
+        {"lookback": 3, "trend_sma_period": None, "position_size": 100},
+    )
+    stack_before = await _build_and_warm(
+        exchange,
+        strategy_before,
+        engine_config={
+            "bracket_mode": "fixed",
+            "bracket_stop_loss_pct": 0.05,
+            "bracket_take_profit_pct": 0.5,
+        },
+        run_id=run_id,
+    )
+    # Force a breakout BUY so there is a real held position to flatten.
+    await step_bar(stack_before, SYMBOL, Decimal("51000"), timeframe=TIMEFRAME_STR)
+    bought_qty = exchange.order_log[-1]["amount"]
+    assert bought_qty > 0
+    persisted_fills = stack_before.execution.get_all_fills()
+
+    # Resume PROTECTIVELY with NO exit config at all (the legacy-run
+    # scenario WP13a-S-01 is about) -- construction must NOT raise
+    # exit_manager_required, because exit_config_waived=True is accepted
+    # (only) together with protective_mode=True.
+    strategy_after = MomentumBreakoutStrategy(
+        "wp13a-s01-resumed", {"lookback": 3, "trend_sma_period": None, "position_size": 100}
+    )
+    stack_after = await build_resumed_live_stack(
+        exchange=exchange,
+        strategy=strategy_after,
+        symbol=SYMBOL,
+        timeframe=TIMEFRAME,
+        initial_capital=INITIAL_CAPITAL,
+        run_id=run_id,
+        fills=persisted_fills,
+        engine_config={"exit_config_waived": True},  # no bracket, no trailing
+        protective_mode=True,
+    )
+    await start_and_warmup(stack_after, run_id)
+
+    assert stack_after.engine._bracket_exit is None
+    assert stack_after.engine._trailing_stop is None
+
+    stack_after.risk_manager.trigger_kill_switch("stop_in_progress")
+    result = await stack_after.engine.flatten(reason="stop", timeout_s=30.0)
+    assert result.complete is True
+    assert stack_after.portfolio.get_position(SYMBOL).is_flat
+
+    await stack_after.engine.stop()
+
+
+async def test_wp13a_protective_resume_tp_only_constructs_and_flattens(
+    exchange: FakeCCXTExchange,
+) -> None:
+    """Same as above, TP-only (a downside-blind bracket) instead of no
+    bracket at all -- also must waive, not raise."""
+    run_id = "wp13a-s01-tp-only"
+    strategy_before = MomentumBreakoutStrategy(
+        "wp13a-s01-tp-entry",
+        {"lookback": 3, "trend_sma_period": None, "position_size": 100},
+    )
+    stack_before = await _build_and_warm(
+        exchange,
+        strategy_before,
+        engine_config={
+            "bracket_mode": "fixed",
+            "bracket_stop_loss_pct": 0.05,
+            "bracket_take_profit_pct": 0.5,
+        },
+        run_id=run_id,
+    )
+    await step_bar(stack_before, SYMBOL, Decimal("51000"), timeframe=TIMEFRAME_STR)
+    assert exchange.order_log[-1]["amount"] > 0
+    persisted_fills = stack_before.execution.get_all_fills()
+
+    strategy_after = MomentumBreakoutStrategy(
+        "wp13a-s01-tp-resumed", {"lookback": 3, "trend_sma_period": None, "position_size": 100}
+    )
+    stack_after = await build_resumed_live_stack(
+        exchange=exchange,
+        strategy=strategy_after,
+        symbol=SYMBOL,
+        timeframe=TIMEFRAME,
+        initial_capital=INITIAL_CAPITAL,
+        run_id=run_id,
+        fills=persisted_fills,
+        engine_config={
+            "exit_config_waived": True,
+            "bracket_mode": "fixed",
+            "bracket_take_profit_pct": 0.5,
+        },
+        protective_mode=True,
+    )
+    await start_and_warmup(stack_after, run_id)
+
+    assert stack_after.engine._bracket_exit is not None  # TP-only bracket DID build
+
+    stack_after.risk_manager.trigger_kill_switch("stop_in_progress")
+    result = await stack_after.engine.flatten(reason="stop", timeout_s=30.0)
+    assert result.complete is True
+    assert stack_after.portfolio.get_position(SYMBOL).is_flat
+
+    await stack_after.engine.stop()
