@@ -833,7 +833,16 @@ class TradeResponse(BaseModel):
     total_fees: str = Field(description="Total fees paid across all fills (quote)")
     entry_at: datetime = Field(description="UTC timestamp of first entry fill")
     exit_at: datetime = Field(description="UTC timestamp of final exit fill")
-    strategy_id: str = Field(description="Strategy that generated the opening signal")
+    strategy_id: str = Field(
+        description=(
+            "strategy_id of the signal that CLOSED the trade, not the opening "
+            "signal. Normally the run's strategy id; engine-originated exits "
+            "report their own id: 'operator_flatten' (stop, emergency-stop or "
+            "kill switch with flatten), 'trailing_stop', 'bracket_exit'. Exits "
+            "filled from resting orders report the run's first strategy id. "
+            "The exit reason is not exposed by this endpoint."
+        )
+    )
 
     @field_serializer(
         "entry_price", "exit_price", "quantity",
