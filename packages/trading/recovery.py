@@ -23,13 +23,14 @@ from __future__ import annotations
 
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 
 from common.types import OrderSide
 from trading.models import Fill, Order
 
 __all__ = [
+    "ResumeDailySeed",
     "ResumeRejected",
     "ResumeSnapshot",
     "check_fill_integrity",
@@ -83,6 +84,45 @@ class ResumeRejected(Exception):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.reason = reason
+
+
+@dataclass(frozen=True)
+class ResumeDailySeed:
+    """
+    Persisted day-start hints for a resume (WP1.5 §5.7 / §6).
+
+    Consumed by ``PortfolioAccounting.from_fills(daily_seed=...)`` to seed the
+    mark-to-market day state (``nav_day_start`` and the daily-loss latch).
+    The mark-to-market day start cannot be rebuilt from fills: the replay
+    values positions at old fill prices.  WP1.5b fills this from the
+    equity-snapshot table; WP1.5a only defines the type and the seeding
+    logic.
+
+    Attributes
+    ----------
+    as_of_day:
+        The UTC day the hints were read on (midnight-race detection: if it is
+        earlier than the resume's "today" the hints describe yesterday).
+    day_start_equity:
+        Equity of the latest snapshot strictly before ``as_of_day`` 00:00 UTC,
+        or ``None`` if the run has none.
+    day_min_equity:
+        Minimum snapshot equity at or after ``as_of_day`` 00:00 UTC, or
+        ``None`` if there is none.
+    run_started_at:
+        ``RunORM.started_at`` -- lets a run that started today use
+        ``initial_cash`` as its day start.
+    day_first_equity:
+        Equity of the earliest snapshot at or after ``as_of_day`` 00:00 UTC
+        (1.5b wires it).  With it, the snapshot day start is
+        ``max(day_start_equity, day_first_equity)``.
+    """
+
+    as_of_day: date
+    day_start_equity: Decimal | None
+    day_min_equity: Decimal | None
+    run_started_at: datetime | None
+    day_first_equity: Decimal | None = None
 
 
 @dataclass(frozen=True)

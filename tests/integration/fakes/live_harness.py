@@ -43,12 +43,26 @@ for the full rationale of each):
    -- in production these are two independently-constructed instances of
    the same real CCXT class hitting the same real exchange; sharing one
    fake instance is the in-memory equivalent.
+
+WP1.5a additions
+----------------
+- ``clock``: an injectable risk-day clock (``ManualClock``) passed to
+  ``PortfolioAccounting(clock=...)`` -- the paper/live risk day is the wall
+  clock UTC, so a test moves it by hand across 00:00 UTC.
+- ``risk_params`` defaults to ``live_risk_parameters()`` (R-02: live drawdown
+  limit 20%) in the live builders, exactly as ``run_live_engine`` does; the
+  paper builder defaults to ``RiskParameters()`` (30%).
+- ``build_paper_stack``: the paper-mode twin of ``build_live_stack``
+  (``PaperExecutionEngine`` + ``CCXTMarketDataService`` over the same fake).
+- ``daily_seed``: forwarded to ``PortfolioAccounting.from_fills`` by
+  ``build_resumed_live_stack`` (1.5b wiring uses it; 1.5a only passes it on).
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
@@ -59,9 +73,11 @@ from common.types import RunMode, TimeFrame
 from data.services.ccxt_market_data import CCXTMarketDataService
 from tests.integration.fakes.fake_ccxt_exchange import FakeCCXTExchange
 from trading.engines.live import LiveExecutionEngine
+from trading.engines.paper import PaperExecutionEngine
 from trading.models import Fill
 from trading.portfolio import PortfolioAccounting
-from trading.risk import RiskParameters
+from trading.recovery import ResumeDailySeed
+from trading.risk import RiskParameters, live_risk_parameters
 from trading.risk_manager import DefaultRiskManager
 from trading.strategy import BaseStrategy
 from trading.strategy_engine import StrategyEngine
@@ -69,7 +85,10 @@ from trading.strategy_engine import StrategyEngine
 __all__ = [
     "EXCHANGE_ATTR",
     "LiveStack",
+    "ManualClock",
+    "PaperStack",
     "build_live_stack",
+    "build_paper_stack",
     "build_resumed_live_stack",
     "patch_exchange_factory",
     "start_and_warmup",
@@ -93,6 +112,35 @@ class LiveStack:
     risk_manager: DefaultRiskManager
     market_data: CCXTMarketDataService
     exchange: FakeCCXTExchange
+
+
+@dataclass
+class PaperStack:
+    """The paper-mode twin of :class:`LiveStack` (WP1.5a)."""
+
+    engine: StrategyEngine
+    execution: PaperExecutionEngine
+    portfolio: PortfolioAccounting
+    risk_manager: DefaultRiskManager
+    market_data: CCXTMarketDataService
+    exchange: FakeCCXTExchange
+
+
+class ManualClock:
+    """A risk-day clock a test moves by hand (WP1.5a).
+
+    Pass it as ``clock=`` to the stack builders; call ``set`` to jump to an
+    absolute UTC time (e.g. across 00:00 UTC between two bars).
+    """
+
+    def __init__(self, at: datetime) -> None:
+        self.at = at
+
+    def __call__(self) -> datetime:
+        return self.at
+
+    def set(self, at: datetime) -> None:
+        self.at = at
 
 
 def patch_exchange_factory(monkeypatch: pytest.MonkeyPatch, exchange: FakeCCXTExchange) -> None:
@@ -120,6 +168,7 @@ async def build_live_stack(
     run_id: str,
     engine_config: dict[str, object] | None = None,
     risk_params: RiskParameters | None = None,
+    clock: Callable[[], datetime] | None = None,
 ) -> LiveStack:
     """Construct one real StrategyEngine(LIVE) stack against ``exchange``.
 
@@ -127,8 +176,14 @@ async def build_live_stack(
     ``patch_exchange_factory`` first so the two internal
     ``ccxt_async.coinbase(...)`` construction calls below resolve to the
     shared fake instance.
+
+    WP1.5a: ``risk_params=None`` means ``live_risk_parameters()`` (R-02 --
+    what production's live site passes), not ``RiskParameters()``; ``clock``
+    is the portfolio's risk-day clock (wall clock UTC when ``None``).
     """
-    risk_manager = DefaultRiskManager(run_id=run_id, params=risk_params)
+    risk_manager = DefaultRiskManager(
+        run_id=run_id, params=risk_params if risk_params is not None else live_risk_parameters()
+    )
 
     # Mirrors run_orchestrator.py:1111-1123.
     live_exchange_handle = getattr(ccxt_async, EXCHANGE_ATTR)({"enableRateLimit": True})
@@ -144,7 +199,7 @@ async def build_live_stack(
     # needs none) and with cache_ttl_seconds=0 (deviation #3 above).
     market_data = CCXTMarketDataService(exchange_id=EXCHANGE_ATTR, cache_ttl_seconds=0)
 
-    portfolio = PortfolioAccounting(run_id=run_id, initial_cash=initial_capital)
+    portfolio = PortfolioAccounting(run_id=run_id, initial_cash=initial_capital, clock=clock)
 
     engine = StrategyEngine(
         strategies=[strategy],
@@ -171,6 +226,55 @@ async def build_live_stack(
     )
 
 
+async def build_paper_stack(
+    *,
+    exchange: FakeCCXTExchange,
+    strategy: BaseStrategy,
+    symbol: str,
+    timeframe: TimeFrame,
+    initial_capital: Decimal,
+    run_id: str,
+    engine_config: dict[str, object] | None = None,
+    risk_params: RiskParameters | None = None,
+    clock: Callable[[], datetime] | None = None,
+) -> PaperStack:
+    """Construct one real StrategyEngine(PAPER) stack against ``exchange``.
+
+    Mirrors ``run_orchestrator.run_paper_engine``: ``DefaultRiskManager``
+    with the default (30% drawdown) parameters, ``PaperExecutionEngine``,
+    ``PortfolioAccounting``, and a ``CCXTMarketDataService`` that resolves to
+    the shared fake (``patch_exchange_factory``).  Same deviations as the
+    live builder (no DB, no flush task, ``cache_ttl_seconds=0``).
+    """
+    risk_manager = DefaultRiskManager(run_id=run_id, params=risk_params)
+    execution = PaperExecutionEngine(
+        run_id=run_id,
+        risk_manager=risk_manager,
+        initial_cash=initial_capital,
+    )
+    market_data = CCXTMarketDataService(exchange_id=EXCHANGE_ATTR, cache_ttl_seconds=0)
+    portfolio = PortfolioAccounting(run_id=run_id, initial_cash=initial_capital, clock=clock)
+    engine = StrategyEngine(
+        strategies=[strategy],
+        execution_engine=execution,
+        risk_manager=risk_manager,
+        market_data=market_data,
+        portfolio=portfolio,
+        symbols=[symbol],
+        timeframe=timeframe,
+        run_mode=RunMode.PAPER,
+        config=engine_config,
+    )
+    return PaperStack(
+        engine=engine,
+        execution=execution,
+        portfolio=portfolio,
+        risk_manager=risk_manager,
+        market_data=market_data,
+        exchange=exchange,
+    )
+
+
 async def build_resumed_live_stack(
     *,
     exchange: FakeCCXTExchange,
@@ -184,6 +288,8 @@ async def build_resumed_live_stack(
     risk_params: RiskParameters | None = None,
     protective_mode: bool = False,
     peak_equity_hint: Decimal | None = None,
+    clock: Callable[[], datetime] | None = None,
+    daily_seed: ResumeDailySeed | None = None,
 ) -> LiveStack:
     """Build a SECOND engine stack under the SAME ``run_id``, with its
     portfolio rebuilt from ``fills`` via the production
@@ -208,8 +314,13 @@ async def build_resumed_live_stack(
     (WP1.8) that the live engine itself no longer overwrites (WP1.4 S-03).
     ``None`` (default) preserves every pre-WP1.4 caller's behaviour
     unchanged.
+
+    WP1.5a: ``risk_params=None`` means ``live_risk_parameters()`` (R-02);
+    ``clock`` and ``daily_seed`` are forwarded to ``from_fills``.
     """
-    risk_manager = DefaultRiskManager(run_id=run_id, params=risk_params)
+    risk_manager = DefaultRiskManager(
+        run_id=run_id, params=risk_params if risk_params is not None else live_risk_parameters()
+    )
     if protective_mode:
         # WP1.8 S-10: risk-layer defence-in-depth mirror of the
         # strategy-layer protective_mode filter below -- production wires
@@ -234,6 +345,8 @@ async def build_resumed_live_stack(
         initial_cash=initial_capital,
         fills=fills,
         peak_equity_hint=peak_equity_hint,
+        clock=clock,
+        daily_seed=daily_seed,
     )
 
     engine = StrategyEngine(
@@ -259,7 +372,7 @@ async def build_resumed_live_stack(
     )
 
 
-async def start_and_warmup(stack: LiveStack, run_id: str) -> None:
+async def start_and_warmup(stack: LiveStack | PaperStack, run_id: str) -> None:
     """Start the engine and load its initial bar window.
 
     Calls the same two steps ``run_live_loop()`` performs before entering
@@ -273,7 +386,7 @@ async def start_and_warmup(stack: LiveStack, run_id: str) -> None:
 
 
 async def step_bar(
-    stack: LiveStack,
+    stack: LiveStack | PaperStack,
     symbol: str,
     close: Decimal,
     *,

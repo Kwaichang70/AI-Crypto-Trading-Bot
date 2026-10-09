@@ -23,15 +23,21 @@ Design principles
   (warning, not a block) and then treated as reducing; a SELL with
   ``held == 0`` is always rejected (``sell_without_position``). Portfolio /
   cluster exposure stays BUY-only, unchanged.
+- WP1.5 (daily-PnL & peak semantics): the daily-loss gate is fed the
+  mark-to-market NAV change since the UTC day start (a running-minimum latch)
+  over a fixed day-start ``daily_loss_basis``; ``daily_pnl <= -threshold``
+  blocks.  Both inputs come from ``PortfolioAccounting.risk_snapshot()``;
+  the risk manager stays a stateless reader.  LIVE runs use a 20% drawdown
+  limit (:func:`live_risk_parameters`, R-02).
 """
 
 from __future__ import annotations
 
 import abc
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
-from typing import Any
+from typing import Any, Final
 
 import structlog
 
@@ -116,8 +122,12 @@ class RiskParameters:
     max_order_size_quote: Decimal = Decimal("10000")  # hard cap per order
 
     # Run-level circuit breakers
-    max_daily_loss_pct: float = 0.08      # halt if daily loss >= 8% of start equity
-    max_drawdown_pct: float = 0.30        # halt if drawdown >= 30% of peak equity
+    # WP1.5: block BUYs when the mark-to-market NAV change since the UTC day
+    # start is <= -8% of min(day-start NAV, initial capital); latched for the day.
+    max_daily_loss_pct: float = 0.08
+    # Block BUYs at drawdown >= 30% of peak NAV.  This is the PAPER/BACKTEST
+    # default; LIVE runs use LIVE_MAX_DRAWDOWN_PCT via live_risk_parameters().
+    max_drawdown_pct: float = 0.30
 
     # Fee / slippage model (Coinbase Advanced Trade lowest tier)
     taker_fee_pct: float = 0.006          # 0.60% taker fee
@@ -200,6 +210,23 @@ class RiskParameters:
                 f"must be <= max_portfolio_exposure_pct "
                 f"({self.max_portfolio_exposure_pct})"
             )
+
+
+#: R-02 (WP1.5): the LIVE drawdown limit.  Applied as narrowly as possible --
+#: only :func:`live_risk_parameters` (used at the single live risk-manager
+#: construction site) carries it; the :class:`RiskParameters` class default
+#: stays 0.30 for paper and backtest.
+LIVE_MAX_DRAWDOWN_PCT: Final[float] = 0.20
+
+
+def live_risk_parameters() -> RiskParameters:
+    """Risk parameters for a LIVE run: the defaults with a 20% drawdown limit.
+
+    Interim per-mode default (R-02, WP1.5).  WP1.9 replaces it with
+    config-driven per-mode defaults and must keep live at 0.20.  No other
+    field differs from ``RiskParameters()``.
+    """
+    return replace(RiskParameters(), max_drawdown_pct=LIVE_MAX_DRAWDOWN_PCT)
 
 
 @dataclass(slots=True)
@@ -396,6 +423,8 @@ class BaseRiskManager(abc.ABC):
         daily_pnl: Decimal,
         peak_equity: Decimal,
         market_price: Decimal | None = None,
+        *,
+        daily_loss_basis: Decimal | None = None,
     ) -> RiskCheckResult:
         """
         Evaluate all risk rules against a proposed order.
@@ -413,13 +442,21 @@ class BaseRiskManager(abc.ABC):
         open_positions:
             List of all currently open positions for this run.
         daily_pnl:
-            Net PnL since the start of the current trading day in quote currency.
+            The daily-loss gate input in quote currency.  WP1.5: the engines
+            pass ``RiskSnapshot.gate_daily_pnl(nav)`` -- the mark-to-market
+            NAV change since the UTC day start, as a running minimum (the
+            latch).  Direct callers may still pass a realised figure.
         peak_equity:
             Highest equity reached since run start, used for drawdown calculation.
         market_price:
             Current market price for the order's symbol. Required for MARKET
             orders where order.price is None and no existing position provides
             a reference price. Defaults to None for backward compatibility.
+        daily_loss_basis:
+            WP1.5: the denominator of the daily-loss threshold, fixed from the
+            first NAV observation of the UTC day
+            (``RiskSnapshot.daily_loss_basis``).  ``None`` keeps the legacy
+            basis ``current_equity`` (direct callers, the D8 no-source path).
 
         Returns
         -------
@@ -636,14 +673,34 @@ class BaseRiskManager(abc.ABC):
         self,
         daily_pnl: Decimal,
         current_equity: Decimal,
+        daily_loss_basis: Decimal | None = None,
     ) -> RiskViolation | None:
-        threshold = current_equity * Decimal(str(self._params.max_daily_loss_pct))
-        if daily_pnl < -threshold:
+        """Block when ``daily_pnl <= -(basis * max_daily_loss_pct)`` (WP1.5).
+
+        The boundary is inclusive (``<=``), matching the drawdown gate's
+        ``>=``.  ``basis`` is ``daily_loss_basis`` when given (fixed from the
+        first NAV observation of the UTC day), else the legacy
+        ``current_equity``.  A basis ``<= 0`` is fail-closed: the threshold
+        cannot be computed, so the gate blocks.
+        """
+        basis = daily_loss_basis if daily_loss_basis is not None else current_equity
+        if basis <= Decimal(0):
             return RiskViolation(
                 rule="max_daily_loss",
                 message=(
-                    f"Daily loss {daily_pnl:.2f} exceeds threshold "
-                    f"-{threshold:.2f} ({self._params.max_daily_loss_pct:.1%})"
+                    f"Daily loss basis unavailable (basis {basis:.2f} <= 0); "
+                    f"entries blocked"
+                ),
+                blocking=True,
+            )
+        threshold = basis * Decimal(str(self._params.max_daily_loss_pct))
+        if daily_pnl <= -threshold:
+            return RiskViolation(
+                rule="max_daily_loss",
+                message=(
+                    f"Daily loss {daily_pnl:.2f} at or beyond threshold "
+                    f"-{threshold:.2f} ({self._params.max_daily_loss_pct:.1%} "
+                    f"of basis {basis:.2f})"
                 ),
                 blocking=True,
             )

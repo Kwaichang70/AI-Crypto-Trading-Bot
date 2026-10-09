@@ -25,14 +25,14 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal
 
 from common.models import MultiTimeframeContext, OHLCVBar
 from common.types import SignalDirection
 from trading.models import Signal
 from trading.strategy import BaseStrategy, StrategyMetadata
 
-__all__ = ["ScriptedSignalStrategy"]
+__all__ = ["ScriptedSequenceStrategy", "ScriptedSignalStrategy"]
 
 
 class ScriptedSignalStrategy(BaseStrategy):
@@ -91,6 +91,76 @@ class ScriptedSignalStrategy(BaseStrategy):
                 symbol=symbol,
                 direction=self._direction,
                 target_position=target,
+                confidence=1.0,
+            )
+        ]
+
+
+class ScriptedSequenceStrategy(BaseStrategy):
+    """Emit a scripted BUY/SELL on several ``on_bar`` call indices (WP1.5a).
+
+    ``ScriptedSignalStrategy`` can fire only once per instance; the daily-PnL
+    scenarios need a sequence (BUY, a rejected BUY later the same UTC day, a
+    BUY on the next day, an exit ...).
+
+    Params
+    ------
+    script:
+        ``dict[int, Literal["buy", "sell"]]`` -- 0-based index into the
+        sequence of post-warmup ``on_bar`` calls -> direction.  Every other
+        call HOLDs.  (JSON-ish string keys are accepted and coerced.)
+    target_notional:
+        ``Signal.target_position`` for BUY entries, as a string.  A SELL
+        always carries ``target_position = 0`` (full close).
+    targets:
+        Optional ``dict[int, str]`` overriding ``target_notional`` for the
+        BUY at a given call index (e.g. a small probe BUY after a big one).
+    """
+
+    metadata = StrategyMetadata(
+        name="scripted_sequence_test_strategy",
+        description="WP1.5a harness-only strategy: a scripted BUY/SELL sequence.",
+        tags=["test-only"],
+    )
+    # WP1.3a (SY-13a-06): test-only double; the tests configure brackets
+    # explicitly where they want an engine-level exit.
+    requires_exit_manager = False
+
+    def __init__(self, strategy_id: str, params: dict[str, Any] | None = None) -> None:
+        super().__init__(strategy_id, params)
+        raw = self._params.get("script") or {}
+        self._script: dict[int, Literal["buy", "sell"]] = {int(k): v for k, v in raw.items()}
+        self._target_notional = Decimal(str(self._params.get("target_notional", "100")))
+        self._targets: dict[int, Decimal] = {
+            int(k): Decimal(str(v)) for k, v in (self._params.get("targets") or {}).items()
+        }
+        self._call_count = -1
+
+    @property
+    def min_bars_required(self) -> int:
+        return 1
+
+    def on_bar(
+        self,
+        bars: Sequence[OHLCVBar],
+        *,
+        mtf_context: MultiTimeframeContext | None = None,
+    ) -> list[Signal]:
+        self._call_count += 1
+        action = self._script.get(self._call_count)
+        if action is None or not bars:
+            return []
+        is_sell = action == "sell"
+        return [
+            Signal(
+                strategy_id=self.strategy_id,
+                symbol=bars[-1].symbol,
+                direction=SignalDirection.SELL if is_sell else SignalDirection.BUY,
+                target_position=(
+                    Decimal("0")
+                    if is_sell
+                    else self._targets.get(self._call_count, self._target_notional)
+                ),
                 confidence=1.0,
             )
         ]

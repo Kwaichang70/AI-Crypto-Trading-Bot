@@ -40,7 +40,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum, auto
 from typing import Any
@@ -380,12 +380,23 @@ class StrategyEngine:
         # execution engine's live position source. Duck-typed -- only
         # LiveExecutionEngine implements attach_position_source; paper/
         # backtest engines have no such method, so this is a no-op there.
-        # This is the ONLY change this WP makes in this file.
         _attach_position_source = getattr(
             self._execution_engine, "attach_position_source", None
         )
         if callable(_attach_position_source):
             _attach_position_source(self._portfolio, symbols=self._symbols)
+
+        # WP1.5 (C-10): attach the portfolio as the engine's risk-state source
+        # in EVERY mode (duck-typed, so a test double without the method is
+        # fine).  Paper/backtest read NAV / peak / day-start basis / latch
+        # from it; live reads the same portfolio through its position source.
+        # Deliberately a separate hook from attach_position_source (that one
+        # means "the ledger the held quantity comes from", C1/C22).
+        _attach_risk_state_source = getattr(
+            self._execution_engine, "attach_risk_state_source", None
+        )
+        if callable(_attach_risk_state_source):
+            _attach_risk_state_source(self._portfolio)
 
         # Derived configuration
         config_warmup = self._config.get("warmup_bars")
@@ -899,6 +910,21 @@ class StrategyEngine:
                 history_by_symbol[symbol] = bars_by_symbol[symbol][
                     : bar_idx + 1
                 ]
+
+            # WP1.5 (§5.2): push the BAR CLOSE time (latest bar timestamp +
+            # one timeframe) to the portfolio's risk-day clock -- every bar,
+            # warmup included, BEFORE any mark or fill of this bar.  Close
+            # time matches paper/live, which only ever see a bar after its
+            # close; the wall clock is never read on the risk path, so a
+            # backtest is deterministic.  Forward-only: an earlier time (pre-
+            # WP2.3 multi-symbol misalignment) is a no-op.  Duck-typed so a
+            # portfolio test double without the method does not crash.
+            _advance_clock = getattr(self._portfolio, "advance_clock", None)
+            if callable(_advance_clock):
+                _advance_clock(
+                    max(b.timestamp for b in current_bars.values())
+                    + timedelta(seconds=_TIMEFRAME_SECONDS[self._timeframe])
+                )
 
             # Update last prices on the paper execution engine
             self._update_engine_prices(current_bars)

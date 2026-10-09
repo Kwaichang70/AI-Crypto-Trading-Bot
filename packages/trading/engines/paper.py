@@ -24,8 +24,9 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
-from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
+from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -44,6 +45,23 @@ logger = structlog.get_logger(__name__)
 # Precision for monetary rounding (8 decimal places, standard for crypto)
 _PRICE_PRECISION = Decimal("0.00000001")
 _QTY_PRECISION = Decimal("0.00000001")
+
+
+@dataclass(frozen=True, slots=True)
+class _RiskGateInputs:
+    """WP1.5: everything ``process_signal`` feeds sizing and the risk gate.
+
+    ``sizing_equity`` is the ``equity`` argument of ``_resolve_order_quantity``
+    (BUY: ``min(nav, initial_capital)``, D-WP15-B; SELL: ``nav``).
+    ``daily_loss_basis`` is ``None`` on the legacy no-source path, which keeps
+    the legacy ``current_equity`` basis inside the risk manager.
+    """
+
+    sizing_equity: Decimal
+    nav: Decimal
+    daily_pnl: Decimal
+    peak_equity: Decimal
+    daily_loss_basis: Decimal | None
 
 
 class PaperExecutionEngine(BaseExecutionEngine):
@@ -99,6 +117,9 @@ class PaperExecutionEngine(BaseExecutionEngine):
         self._impact_coefficient_bps = impact_coefficient_bps
         self._initial_cash = initial_cash
         self._cash = initial_cash
+
+        # WP1.5: log the "no risk-state source" fallback once, not per signal.
+        self._risk_source_missing_logged = False
 
         # Fill registry: order_id -> list of Fill objects
         self._fills: dict[UUID, list[Fill]] = {}
@@ -753,12 +774,14 @@ class PaperExecutionEngine(BaseExecutionEngine):
             if side == OrderSide.SELL
             else None
         )
-        equity = self._get_current_equity()
+        # WP1.5: ONE read of the risk state per signal (the portfolio's marked
+        # NAV / peak / day-start basis / latch), used for sizing AND the gate.
+        gate = self._risk_gate_inputs(side)
         quantity = self._resolve_order_quantity(
             signal=signal,
             side=side,
             last_price=last_price,
-            equity=equity,
+            equity=gate.sizing_equity,
             held_quantity=held_quantity,
         )
 
@@ -788,16 +811,22 @@ class PaperExecutionEngine(BaseExecutionEngine):
         open_positions = [
             p for p in self._positions.values() if not p.is_flat
         ]
-        daily_pnl = self._get_daily_pnl()
-        peak_equity = self._get_peak_equity()
-
+        # ``daily_loss_basis`` is only passed on the source path so the
+        # legacy no-source call shape (and its exact-args assertions) is
+        # unchanged.
+        gate_extra: dict[str, Decimal] = (
+            {"daily_loss_basis": gate.daily_loss_basis}
+            if gate.daily_loss_basis is not None
+            else {}
+        )
         risk_result = self._risk_manager.pre_trade_check(
             order=proposed_order,
-            current_equity=self._get_current_equity(),
+            current_equity=gate.nav,
             open_positions=open_positions,
-            daily_pnl=daily_pnl,
-            peak_equity=peak_equity,
+            daily_pnl=gate.daily_pnl,
+            peak_equity=gate.peak_equity,
             market_price=last_price,
+            **gate_extra,
         )
 
         if not risk_result.approved:
@@ -920,12 +949,68 @@ class PaperExecutionEngine(BaseExecutionEngine):
         return filled_orders
 
     # ------------------------------------------------------------------
-    # Equity helpers
+    # Risk-gate inputs (WP1.5)
+    # ------------------------------------------------------------------
+
+    def _risk_gate_inputs(self, side: OrderSide) -> _RiskGateInputs:
+        """Sizing equity and risk-gate inputs for one signal (WP1.5 §5.5).
+
+        With a risk-state source attached (every real run: ``StrategyEngine``
+        attaches the portfolio) a single ``risk_snapshot()`` supplies NAV,
+        peak, the mark-to-market daily value and the fixed basis.  The
+        engine-local ledger is NOT consulted for any of them: it values
+        positions at their last fill price and never re-marks, which made the
+        old peak/drawdown inputs wrong (C5).
+
+        Without a source (standalone unit tests only) the legacy helpers are
+        used unchanged and ``paper.risk_state_source_missing`` is logged once.
+        BUY sizing is capped at ``min(nav, initial_capital)`` in both
+        branches (D-WP15-B is mode-wide: no compounding).
+        """
+        source = self._risk_state_source
+        if source is not None:
+            snap = source.risk_snapshot()
+            nav = snap.nav
+            sizing = (
+                self._sizing_basis(nav, source.initial_cash)
+                if side == OrderSide.BUY
+                else nav
+            )
+            return _RiskGateInputs(
+                sizing_equity=sizing,
+                nav=nav,
+                daily_pnl=snap.gate_daily_pnl(nav),
+                peak_equity=snap.peak_equity,
+                daily_loss_basis=snap.daily_loss_basis,
+            )
+
+        if not self._risk_source_missing_logged:
+            self._risk_source_missing_logged = True
+            self._log.warning("paper.risk_state_source_missing")
+        legacy_nav = self._get_current_equity()
+        return _RiskGateInputs(
+            sizing_equity=(
+                self._sizing_basis(legacy_nav, self._initial_cash)
+                if side == OrderSide.BUY
+                else legacy_nav
+            ),
+            nav=legacy_nav,
+            daily_pnl=self._get_daily_pnl(),
+            peak_equity=self._get_peak_equity(),
+            daily_loss_basis=None,
+        )
+
+    # ------------------------------------------------------------------
+    # Equity helpers (legacy no-source path only; WP4.1 removes)
     # ------------------------------------------------------------------
 
     def _get_current_equity(self) -> Decimal:
         """
         Calculate current total equity (cash + unrealised position value).
+
+        WP1.5: legacy no-source path only (and ``on_stop`` reporting).  With a
+        risk-state source the portfolio's marked NAV is used instead; this
+        value uses last-fill-price marks.  WP4.1 removes it.
 
         Returns
         -------
@@ -940,10 +1025,11 @@ class PaperExecutionEngine(BaseExecutionEngine):
 
     def _get_peak_equity(self) -> Decimal:
         """
-        Return peak equity. In a full implementation this would be tracked
-        by PortfolioAccounting; for now we return initial_cash as a
-        conservative baseline. PortfolioAccounting.get_peak_equity() should
-        be used when that component is wired in.
+        Return peak equity (legacy no-source path only; WP4.1 removes).
+
+        WP1.5: with a risk-state source attached the portfolio's running peak
+        (``RiskSnapshot.peak_equity``) is used.  This legacy value is
+        ``max(initial_cash, current engine-local equity)``.
 
         Returns
         -------
@@ -955,9 +1041,11 @@ class PaperExecutionEngine(BaseExecutionEngine):
 
     def _get_daily_pnl(self) -> Decimal:
         """
-        Return daily PnL. In a full implementation this would be tracked
-        by PortfolioAccounting; for now we compute from realised PnL
-        across positions.
+        Return daily PnL (legacy no-source path only; WP4.1 removes).
+
+        WP1.5: with a risk-state source attached the gate value comes from
+        ``RiskSnapshot.gate_daily_pnl``.  This legacy value is the cumulative
+        realised PnL across positions (not a daily figure).
 
         Returns
         -------

@@ -17,7 +17,7 @@ import abc
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any
+from typing import TYPE_CHECKING, Any, Protocol
 from uuid import UUID
 
 import structlog
@@ -26,11 +26,15 @@ from common.types import OrderSide, OrderStatus
 from trading.models import Fill, Order, Signal
 from trading.risk import BaseRiskManager
 
+if TYPE_CHECKING:
+    from trading.portfolio import RiskSnapshot
+
 __all__ = [
     "BaseExecutionEngine",
     "EquitySnapshot",
     "InvalidOrderTransitionError",
     "ORDER_STATE_MACHINE",
+    "RiskStateSource",
 ]
 
 logger = structlog.get_logger(__name__)
@@ -162,6 +166,22 @@ class EquitySnapshot:
     sizing_basis: Decimal
 
 
+class RiskStateSource(Protocol):
+    """WP1.5: the typed read surface an engine takes its risk-gate inputs from.
+
+    ``PortfolioAccounting`` implements it.  Deliberately separate from the
+    live ``attach_position_source`` (C1/C22: that one means "the ledger the
+    held quantity comes from"); a risk-state source only answers "what is the
+    NAV, the peak and the day's mark-to-market loss".  ``risk_snapshot`` must
+    be pure.
+    """
+
+    @property
+    def initial_cash(self) -> Decimal: ...
+
+    def risk_snapshot(self) -> RiskSnapshot: ...
+
+
 class BaseExecutionEngine(abc.ABC):
     """
     Abstract execution engine.
@@ -200,6 +220,9 @@ class BaseExecutionEngine(abc.ABC):
         )
         # In-memory order registry; persistence layer flushes to DB separately.
         self._orders: dict[UUID, Order] = {}
+        # WP1.5: the portfolio as the risk-gate input source (NAV / peak /
+        # day-start basis / latch).  None until StrategyEngine attaches it.
+        self._risk_state_source: RiskStateSource | None = None
 
     # ------------------------------------------------------------------
     # Properties
@@ -208,6 +231,16 @@ class BaseExecutionEngine(abc.ABC):
     @property
     def run_id(self) -> str:
         return self._run_id
+
+    def attach_risk_state_source(self, source: RiskStateSource) -> None:
+        """WP1.5: attach the run's ``PortfolioAccounting`` as the risk-gate
+        input source.  Idempotent: re-attaching the same object is a no-op,
+        and the attach is logged once.
+        """
+        if self._risk_state_source is source:
+            return
+        self._risk_state_source = source
+        self._log.info("execution_engine.risk_state_source_attached")
 
     # ------------------------------------------------------------------
     # Abstract interface

@@ -1361,6 +1361,7 @@ async def run_live_engine(
     from data.services.ccxt_market_data import CCXTMarketDataService
     from trading.engines.live import LiveExecutionEngine
     from trading.portfolio import PortfolioAccounting
+    from trading.risk import live_risk_parameters
     from trading.risk_manager import DefaultRiskManager
     from trading.strategy_engine import StrategyEngine
 
@@ -1475,7 +1476,12 @@ async def run_live_engine(
             api_passphrase=api_passphrase,
             cache_ttl_seconds=60,
         )
-        risk_manager = DefaultRiskManager(run_id=run_id_str)
+        # R-02 (WP1.5): the single live risk-manager construction site -- fresh,
+        # promoted and resumed live runs all reach it.  Live drawdown limit 20%;
+        # paper (above) and backtest keep the 30% default.
+        risk_manager = DefaultRiskManager(
+            run_id=run_id_str, params=live_risk_parameters()
+        )
         if protective_mode:
             # WP1.8 S-10: risk-layer defence-in-depth alongside the
             # strategy-layer _drop_entry_signals filter (StrategyEngine's

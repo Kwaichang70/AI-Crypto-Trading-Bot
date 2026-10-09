@@ -52,3 +52,34 @@ Core trading engine containing the heart of the system.
   commented `allow_pyramiding=True`.
 - See `reports/vp2-wp1.3a/synthesis-spec.md` for the full bounds table
   (E1-E11, W1-W8) and the fix map.
+
+### WP1.5a (daily-PnL & peak semantics)
+- `PortfolioAccounting` is the ONLY owner of the daily-loss state
+  (`_nav_day_start`, `_worst_nav_pnl` latch, `_peak_equity`, source). Only
+  `update_market_prices` and `_apply_fill` (via `_record_nav`) write the peak
+  or the latch; `risk_snapshot()` / `get_daily_pnl()` / `get_summary()` are
+  pure (test-pinned, WP15-T-19). Engines and risk managers are stateless
+  readers of `RiskSnapshot`; never read `get_summary()` string keys.
+- Day roll (SYN-01 / Option B): the roll sets `_nav_day_start` provisionally to
+  the pre-roll NAV and arms `_day_start_pending`; the first NAV observation of
+  the day (`_record_nav`) raises the start if higher, once, before folding into
+  the latch. A loss on the bar spanning 00:00 counts toward the new day, its
+  gain does not create a cushion; a high outlier on the first mark can latch
+  the day (fail-closed). `nav_day_start` / `daily_loss_basis` may step up once
+  per day: read them from `risk_snapshot()` on every evaluation, never cache.
+- The risk-day clock is `PortfolioAccounting._now()`: wall clock UTC in
+  paper/live (injectable `clock=`), the pushed bar CLOSE time in backtests
+  (`advance_clock`, called once per bar before any mark). Never add a
+  `datetime.now()` to the risk-day path (AST-pinned, WP15-T-18).
+- Gate semantics: `daily_pnl <= -(daily_loss_basis * max_daily_loss_pct)`
+  blocks (inclusive); basis `<= 0` blocks; `daily_loss_basis=None` keeps the
+  legacy `current_equity` basis for direct callers. Both gates stay BUY-only
+  via `BaseRiskManager._ENTRY_ONLY_RULES`.
+- LIVE drawdown limit is 0.20 via `live_risk_parameters()` (R-02), applied only
+  at `run_orchestrator.run_live_engine`; `RiskParameters()` stays 0.30. WP1.9
+  must replace it with config-driven per-mode defaults and keep live at 0.20.
+- Paper takes sizing + gate inputs from the portfolio through
+  `BaseExecutionEngine.attach_risk_state_source` (separate from live's
+  `attach_position_source`); the engine-local ledger still supplies
+  `open_positions` / held quantity (WP1.10 revisits it).
+- See `reports/vp2-wp1.5/synthesis-spec.md`.

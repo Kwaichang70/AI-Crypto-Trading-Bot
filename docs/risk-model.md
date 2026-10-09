@@ -26,8 +26,9 @@ class RiskParameters:
     max_order_size_quote: Decimal = Decimal("10000")  # hard cap per order
 
     # Run-level circuit breakers
-    max_daily_loss_pct: float = 0.05         # halt if daily loss >= 5%
-    max_drawdown_pct: float = 0.15           # halt if drawdown >= 15%
+    max_daily_loss_pct: float = 0.08         # block BUYs at a day's NAV loss >= 8% (WP1.5)
+    max_drawdown_pct: float = 0.30           # block BUYs at drawdown >= 30% (paper/backtest);
+                                             # LIVE runs use 0.20 via live_risk_parameters() (R-02)
 
     # Fee / slippage model
     taker_fee_pct: float = 0.001             # 0.10% taker fee
@@ -76,8 +77,8 @@ Order proposed by ExecutionEngine
          |
          v
 +--------------------+
-| 4. Daily Loss      |  daily_pnl vs current_equity * max_daily_loss_pct
-|    BLOCKING        |  If daily loss exceeds threshold: reject
+| 4. Daily Loss      |  gate daily_pnl vs daily_loss_basis * max_daily_loss_pct
+|    BLOCKING        |  If daily_pnl <= -threshold: reject (BUY only)
 +--------+-----------+
          |
          v
@@ -112,13 +113,29 @@ the consecutive loss counter resets.
 count equals or exceeds `max_open_positions`, new entries are blocked. Closing
 trades (SELL on existing positions) are always allowed.
 
-**Stage 4 -- Daily Loss:** Compares `daily_pnl` (realised only) against
-`current_equity * max_daily_loss_pct`. Daily PnL resets automatically at UTC
-day boundaries. If daily loss exceeds the threshold, all new orders are blocked.
+**Stage 4 -- Daily Loss (WP1.5):** The engines feed the gate the
+mark-to-market NAV change since the UTC day start, taken as a running minimum
+(`RiskSnapshot.gate_daily_pnl(nav) = min(worst_nav_pnl, nav - nav_day_start)`):
+once the loss reaches the limit, BUYs stay blocked for the rest of the UTC
+day even if NAV recovers (the latch). The threshold is
+`daily_loss_basis * max_daily_loss_pct` with the basis
+`daily_loss_basis = max(0, min(nav_day_start, initial_cash))`, fixed from the
+first NAV observation of the UTC day: a gain at that first observation can
+raise it once (never above `initial_cash`); after that it does not move, so a
+profit later in the day never raises it (no compounding). The boundary is
+inclusive: `daily_pnl <= -threshold` blocks. A basis `<= 0` blocks
+(fail closed). The check is BUY-only: a reducing SELL (strategy exit,
+stop-loss, take-profit, trailing stop, flatten) is downgraded to a warning.
+Direct callers that pass no `daily_loss_basis` keep the legacy basis
+`current_equity`.
 
-**Stage 5 -- Max Drawdown:** Computes `(peak_equity - current_equity) / peak_equity`.
-If the drawdown fraction equals or exceeds `max_drawdown_pct`, all new orders
-are blocked. This triggers the circuit breaker.
+**Stage 5 -- Max Drawdown:** Computes `(peak_equity - current_equity) / peak_equity`
+from the portfolio's marked NAV and running peak (WP1.5: paper and backtest no
+longer use the paper engine's own fill-price ledger). If the drawdown fraction
+equals or exceeds `max_drawdown_pct`, new BUY orders are blocked. The limit is
+0.30 for paper and backtest and 0.20 for LIVE runs (R-02, set at the single
+live risk-manager construction site via `live_risk_parameters()`). Exposure-
+reducing SELLs are never blocked by this gate.
 
 **Stage 6 -- Order Size:** Validates the requested order quantity against
 two caps: the absolute notional cap (`max_order_size_quote`) and the
@@ -308,12 +325,49 @@ For backtest results, max drawdown is computed by iterating the full equity
 curve and finding the worst peak-to-trough decline. Max drawdown duration
 is the longest span (in bars) from a new peak to recovery to that peak.
 
-### Daily PnL Reset
+### Daily PnL, Day Roll and the Daily-Loss Gate (WP1.5)
 
-Daily PnL tracks only realised PnL from closed positions within the current
-UTC day. It resets automatically at day boundaries (detected in
-`update_position`) or explicitly via `reset_daily_pnl()`. Only realised PnL
-contributes -- unrealised PnL is excluded from the daily figure.
+`PortfolioAccounting` is the single owner of the daily state; engines and the
+risk manager only read `risk_snapshot()` (pure).
+
+- **Realised figure (display, API/UI):** `get_daily_pnl()` is realised-only
+  (FIX-07) and reads 0 on a new UTC day even before the first fill.
+- **Gate figure:** the mark-to-market NAV change since the UTC day start, as a
+  running minimum (latch), over the fixed day-start basis (see Stage 4).
+- **UTC day roll:** forward-only, at 00:00:00 UTC. A roll happens in
+  `update_market_prices`, on a fill, or via `advance_clock`; it sets
+  `nav_day_start` provisionally to the NAV at the previous marks, arms a
+  one-shot re-base, and clears the realised accumulator and the latch. The
+  first NAV observation of the new day (mark or fill) raises `nav_day_start`
+  to that NAV if it is higher, before it is folded into the latch, so
+  `nav_day_start = max(NAV at the last pre-roll observation, NAV at the first
+  observation of the day)`. A low outlier on the last pre-roll mark therefore
+  never depresses the next day's start. Asymmetry (RK-05): a loss on the bar
+  spanning 00:00 counts toward the new day, its gain does not create a
+  cushion. Residual: a high outlier on the first mark of a day becomes the
+  day start and can latch that day (fail-closed, BUY-only, until 00:00 UTC).
+  The peak never resets.
+- **Risk-day clock:** wall clock (UTC) in paper and live. In a backtest
+  `StrategyEngine.run_backtest` pushes the bar CLOSE time (bar timestamp +
+  timeframe) once per bar, warmup included, so the wall clock is never read
+  and a backtest is deterministic. An hourly bar opening 23:00 on day D
+  belongs to D+1; every 1d bar is its own day.
+- **Resume:** `PortfolioAccounting.from_fills(daily_seed=...)` seeds the day
+  state from persisted equity-snapshot hints (`ResumeDailySeed`). The day
+  start is unknown, and BUYs stay blocked until the next 00:00 UTC, only when
+  a seed exists but has neither a day-start hint nor a run that started today,
+  or when the seed is dated after the resume's UTC day
+  (`seed_from_the_future`).
+  Without a seed (legacy callers, `replay_estimate`) the gate *value* is never
+  weaker than HEAD's realised-today value, but the threshold uses the fixed
+  day-start basis, so losses in (pct/(1+pct)*S, pct*S] that HEAD's shrinking
+  `current_equity` basis blocked now pass, by design. The path can also be
+  stricter than HEAD: mark drift since the original fills counts toward the
+  resume day (until 00:00 UTC). A `day_first_equity` hint raises a snapshot
+  day start to `max(day_start_equity, day_first_equity)`. (The database
+  wiring of the seed is WP1.5b.)
+- **Sizing:** paper and backtest BUYs size on `min(NAV, initial_capital)`,
+  exactly like live (D-WP15-B): no compounding.
 
 ## Fee Model
 

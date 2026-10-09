@@ -86,7 +86,7 @@ from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
-from typing import Any, Protocol, overload
+from typing import TYPE_CHECKING, Any, Protocol, overload
 from uuid import UUID, uuid4
 
 import ccxt.async_support as ccxt_async
@@ -98,6 +98,9 @@ from trading.ccxt_errors import translate_ccxt_error
 from trading.ccxt_retry import ccxt_retry
 from trading.models import Fill, Order, Position, Signal
 from trading.risk import BaseRiskManager
+
+if TYPE_CHECKING:
+    from trading.portfolio import RiskSnapshot
 
 __all__ = ["LiveExecutionEngine", "LivePositionSource", "_parse_ccxt_trades"]
 
@@ -607,6 +610,11 @@ class LivePositionSource(Protocol):
     def current_equity(self) -> Decimal: ...
 
     def get_peak_equity(self) -> Decimal: ...
+
+    # WP1.5 (C-10): the risk-gate inputs (mark-to-market daily value, fixed
+    # day-start basis) come from one pure ``risk_snapshot()`` read of the same
+    # portfolio -- no second attach path is needed in live.
+    def risk_snapshot(self) -> RiskSnapshot: ...
 
 
 class LiveExecutionEngine(BaseExecutionEngine):
@@ -3027,13 +3035,24 @@ class LiveExecutionEngine(BaseExecutionEngine):
             # Pre-trade risk check. WP1.1 (WP11-A-03): read open positions from
             # the attached source when present (D1); fall back to the legacy
             # `_positions` cache otherwise (D8).
+            #
+            # WP1.5 (D-WP15-A, §5.6): with a source, ONE pure risk_snapshot()
+            # read feeds the daily-loss gate -- the mark-to-market NAV change
+            # since the UTC day start (latched) over the fixed day-start
+            # basis, evaluated at the same ``nav`` the gate already uses
+            # (ticker-adjusted for a BUY).  The realised
+            # ``_calculate_daily_pnl()`` stays the D8 no-source fallback.
+            daily_loss_basis: Decimal | None = None
             if self._position_source is not None:
                 open_positions = self._position_source.get_open_positions()
+                rsnap = self._position_source.risk_snapshot()
+                daily_pnl = rsnap.gate_daily_pnl(nav)
+                daily_loss_basis = rsnap.daily_loss_basis
             else:
                 open_positions = [
                     p for p in self._positions.values() if not p.is_flat
                 ]
-            daily_pnl = self._calculate_daily_pnl()
+                daily_pnl = self._calculate_daily_pnl()
             if peak_equity is None:
                 # D8 (no source): fetched here, exactly where this call has
                 # always lived -- never moved earlier, so a return above this
@@ -3041,6 +3060,13 @@ class LiveExecutionEngine(BaseExecutionEngine):
                 # never triggers a peak fetch, unchanged from before WP1.4.
                 peak_equity = await self._fetch_peak_equity()
 
+            # ``daily_loss_basis`` is only passed on the source path so the
+            # D8 no-source call shape is unchanged.
+            gate_extra: dict[str, Decimal] = (
+                {"daily_loss_basis": daily_loss_basis}
+                if daily_loss_basis is not None
+                else {}
+            )
             risk_result = self._risk_manager.pre_trade_check(
                 order=proposed_order,
                 current_equity=nav,
@@ -3048,6 +3074,7 @@ class LiveExecutionEngine(BaseExecutionEngine):
                 daily_pnl=daily_pnl,
                 peak_equity=peak_equity,
                 market_price=last_price,
+                **gate_extra,
             )
 
             if not risk_result.approved:
@@ -3759,6 +3786,11 @@ class LiveExecutionEngine(BaseExecutionEngine):
     def _calculate_daily_pnl(self) -> Decimal:
         """
         Calculate daily PnL.
+
+        WP1.5: this is the *realised* display figure only.  With a source
+        attached the daily-loss GATE no longer reads it -- ``process_signal``
+        feeds the gate ``RiskSnapshot.gate_daily_pnl(nav)`` (mark-to-market,
+        latched).  It remains the gate input for the D8 no-source fallback.
 
         WP1.1 (WP11-A-04): delegates to the attached position source's
         ``get_daily_pnl()`` when present -- otherwise the local
