@@ -59,6 +59,8 @@ class _CapturingEngine:
         self._stop_event = asyncio.Event()
         self.auto_stop_reason: str | None = None
         self.start = AsyncMock()
+        # WP1.3b-a: the resume sites call ``prime_resume_exit_state`` before ``start``.
+        self.prime_resume_exit_state = MagicMock()
         self.run_live_loop = AsyncMock(side_effect=asyncio.CancelledError())
         self.stop = AsyncMock()
         self.risk_manager = MagicMock()

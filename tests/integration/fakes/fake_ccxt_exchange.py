@@ -238,6 +238,18 @@ class FakeCCXTExchange:
         # for new order/trade timestamps -- see set_now_ms().
         self._now_ms_override: int | None = None
 
+        # WP1.3b-a: ``ohlcv_calls`` records every ``fetch_ohlcv`` call as
+        # (symbol, timeframe, since_ms, limit).  ``pad_forming_bar=False`` drops
+        # the "still forming" duplicate of the last closed bar that
+        # ``fetch_ohlcv(limit < len(bars))`` normally appends (needed to model a
+        # warmup window that is SHORTER than the exchange history).
+        self.ohlcv_calls: list[tuple[str, str, int | None, int | None]] = []
+        self.pad_forming_bar: bool = True
+        # WP1.3b-a (FX-01): models the exchange page cap (ccxt Coinbase
+        # ``limit = min(limit, 300)``): when set, every ``fetch_ohlcv`` returns at
+        # most this many rows, on the ``since`` and on the non-``since`` branch.
+        self.max_ohlcv_limit: int | None = None
+
         # Test-visible audit log of every create_order call, in call order.
         # Each entry: {"id", "symbol", "side", "amount" (Decimal), "price" (Decimal)}.
         self.order_log: list[dict[str, Any]] = []
@@ -607,11 +619,25 @@ class FakeCCXTExchange:
         limit: int | None = None,
         params: dict[str, Any] | None = None,
     ) -> list[list[Any]]:
+        self.ohlcv_calls.append((symbol, timeframe, since, limit))
+        if self.max_ohlcv_limit is not None:
+            limit = (
+                self.max_ohlcv_limit if limit is None else min(limit, self.max_ohlcv_limit)
+            )
         bars = self._closed_bars.get(symbol, [])
         if not bars:
             return []
 
+        if since is not None:
+            # WP1.3b-a: a ``since`` query returns real closed bars only (no
+            # forming-bar padding), oldest first, from ``since`` on.
+            ranged = [row for row in bars if row[0] >= since]
+            return [list(row) for row in (ranged[:limit] if limit is not None else ranged)]
+
         n = limit if limit is not None else len(bars)
+
+        if not self.pad_forming_bar and n < len(bars):
+            return [list(row) for row in (bars[-n:] if n > 0 else [])]
 
         if n >= len(bars):
             # WP10-C-05 fix: the caller wants (at least) the full seeded

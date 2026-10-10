@@ -45,11 +45,38 @@ from common.types import OrderSide
 from trading.models import Fill, Position, TradeResult
 from trading.recovery import ResumeDailySeed, replay_sort_key
 
-__all__ = ["DayStartSource", "PortfolioAccounting", "PortfolioSummary", "RiskSnapshot"]
+__all__ = [
+    "DayStartSource",
+    "PortfolioAccounting",
+    "PortfolioSummary",
+    "RiskSnapshot",
+    "blend_entry_price",
+]
 
 logger = structlog.get_logger(__name__)
 
 _PRECISION = Decimal("0.00000001")
+
+
+def blend_entry_price(prev_qty: Decimal, prev_avg: Decimal, fill: Fill) -> Decimal:
+    """All-in average entry price after applying a BUY ``fill`` (WP1.3b).
+
+    Extracted verbatim from :meth:`PortfolioAccounting._apply_fill` (same
+    ``_PRECISION`` / ``ROUND_HALF_UP``) so the bracket anchor's entry basis is
+    byte-identical to ``Position.average_entry_price`` for every lot without
+    adds.  ``prev_qty <= 0`` means a new position: the basis is the fill price
+    plus the entry fee spread over the fill quantity.  Otherwise the previous
+    cost (``prev_qty * prev_avg``) is blended with the fill cost
+    (``quantity * price + fee``).
+    """
+    if prev_qty <= Decimal("0"):
+        return ((fill.price * fill.quantity + fill.fee) / fill.quantity).quantize(
+            _PRECISION, rounding=ROUND_HALF_UP
+        )
+    old_cost = prev_qty * prev_avg
+    new_cost = fill.quantity * fill.price + fill.fee
+    total_qty = prev_qty + fill.quantity
+    return ((old_cost + new_cost) / total_qty).quantize(_PRECISION, rounding=ROUND_HALF_UP)
 
 #: Where the current UTC day's ``nav_day_start`` came from (WP1.5 §5.1).
 #:
@@ -487,9 +514,9 @@ class PortfolioAccounting:
         if fill.side == OrderSide.BUY:
             if position is None or position.is_flat:
                 # New position -- use all-in cost basis (includes entry fee)
-                all_in_entry_price = (
-                    (fill.price * fill.quantity + fill.fee) / fill.quantity
-                ).quantize(_PRECISION, rounding=ROUND_HALF_UP)
+                all_in_entry_price = blend_entry_price(
+                    Decimal("0"), Decimal("0"), fill
+                )
                 self._position_snapshots[fill.symbol] = Position(
                     symbol=fill.symbol,
                     run_id=self._run_id,
@@ -504,12 +531,10 @@ class PortfolioAccounting:
                 )
             else:
                 # Add to existing position
-                old_cost = position.quantity * position.average_entry_price
-                new_cost = fill.quantity * fill.price + fill.fee
                 total_qty = position.quantity + fill.quantity
-                new_avg = (
-                    (old_cost + new_cost) / total_qty
-                ).quantize(_PRECISION, rounding=ROUND_HALF_UP)
+                new_avg = blend_entry_price(
+                    position.quantity, position.average_entry_price, fill
+                )
 
                 unrealised = (current_price - new_avg) * total_qty
 

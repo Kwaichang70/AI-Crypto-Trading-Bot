@@ -132,3 +132,57 @@ Core trading engine containing the heart of the system.
   (WP16-SEC-06; `tests/unit/test_wp16_telegram_log_hygiene.py`). Alert text is sent
   with `parse_mode="HTML"`: never put a raw `<`, `>` or `&` in it.
 - See `reports/vp2-wp1.6/synthesis-spec.md`.
+
+### WP1.3b-a (exit anchoring in all modes, trailing semantics, R-04)
+- Bracket levels are FROZEN PRICES per lot (`BracketAnchor`), created by
+  `StrategyEngine._on_fill_routed` (called from `_route_exit_fills` and
+  `_check_resting_orders`; never raises) when a BUY takes a symbol from flat to
+  open. The ATR is read once (`atr_for_bars`, W = 6*period+1 bars) and never again;
+  `BracketExitManager.check(atr_value=...)` only matters for a lot WITHOUT an anchor
+  (lazy `late` anchor). Adds from other orders keep the first entry's levels (U-6);
+  further fills of the OPENING order re-blend E (`portfolio.blend_entry_price`), ATR0 stays.
+- Anchor bar = pure function of persisted data: `anchor_at = min(order.created_at,
+  first opening fill executed_at)`, rule bar = last bar with `ts + tf <= anchor_at`
+  (`select_anchor_bar` / `anchor_bar_timestamp`). PAPER/LIVE need exactly W contiguous bars
+  ending there; otherwise the anchor is `entry_provisional` (interim levels, finalised on a LATER
+  `_process_bar` from the window or up to 3 bounded `fetch_ohlcv` attempts, else `entry_unverified`)
+  or `entry_deferred` (no ATR estimate at all yet). BACKTEST uses the in-memory signal bar
+  (`_order_signal_bar_ts`) and reads no wall clock (AST-pinned, WP13B-T-31).
+- Resume: the orchestrator calls `engine.prime_resume_exit_state(resume.fills, resume.orders)`
+  BEFORE `start()` at the paper and live resume sites; `_restore_exit_anchors` (end of
+  `_warmup_bar_windows`) recomputes anchor + trailing mark with the SAME functions
+  (`lot_entry_from_opening_fills`). Failure never drops protection:
+  `resume_fallback_current_atr` (interim, non-final until the attempts are spent; error log
+  `bracket_exit.resume_fallback_final` + `bracket_anchor_source_total{source}`) or `entry_deferred`; a trailing gap that cannot be
+  fetched logs `trailing_stop.seed_partial`.
+- Trailing: HWM_0 = gross opening VWAP; ratchets only at bar closes with `bar_ts >
+  anchor_bar_ts`; KEPT on a trigger and on a quantity change (no re-seed from the current price).
+- R-04: an exit that was not submitted (`[]`, every order terminal+unfilled, or
+  `process_signal` raised) clears the manager's pending guard at once
+  (`StrategyEngine._submit_exit_signal`, `engine.exit_not_submitted`). Accepted/unknown submits
+  keep the guard + TTL; the live in-flight SELL reservation still prevents a double sell.
+- `entry.stop_inside_entry_cost` is a log only (U-4): the entry is never dropped.
+- Anchoring changes ATR-bracket, trailing and add-to-position backtest/paper results (D-13b-04):
+  fixed brackets without trailing/adds are byte-identical. Runs before this change are "legacy
+  exit semantics" (`engine.exit_semantics version="wp13b-1"` is logged at start).
+- The market-data service retries `fetch_ohlcv` internally; the 1.3b-a fetches only bound the
+  total time (`asyncio.wait_for`, 10 s).
+- ATR period capped at 49 (W = 6*period+1 <= 295 <= ccxt Coinbase `maxLimit` 300; one fetch always
+  suffices; `POLICY_ATR_PERIOD_MAX`, uniform in every mode, pinned by an invariant test). Runs persisted
+  with a larger period fail the WP1.3a validator on resume (422 / protective salvage / boot orphan);
+  pre-deploy check DS-1: `python scripts/wp13a_exit_config_precheck.py --json`.
+- Pending anchors (WP1.3b-a fix delta, PAPER/LIVE): an anchor that cannot be verified at once is armed
+  with the INTERIM ATR = `min(ATR over the window ending at the rule bar, ATR of the newest window)`
+  (`StrategyEngine._interim_atr`; set once via `BracketExitManager.arm_interim`, never re-armed, never
+  looser than the per-bar ATR HEAD used). `_finalize_pending_anchors` (step 4c) then retries the EXACT
+  window (always targeting the rule bar, like a resume) at most 3 times, at most one fetch per pass
+  engine-wide, and finalises to `entry` / `resume_recomputed`, or keeps the interim levels as
+  `entry_unverified` / `resume_fallback_current_atr` (error logs, `bracket_exit.anchor_finalized` with
+  `delta_bps`). A resume fallback is NOT final until those attempts are spent. A held lot with no
+  protective level logs `bracket_exit.lot_unprotected` (error, bars 1, 11, ...) and counts
+  `lot_unprotected_bars_total`. A flat symbol is skipped (no fetch).
+- Resume restore: the bracket half and the trailing half have their own `try` (`engine.exit_restore_failed`
+  with `part`); a trailing failure seeds HEAD's rule (`max(gross VWAP, closes >= opened_at)`) and logs
+  `trailing_stop.seed_partial` (`reason="restore_failed"`); an empty warmup window logs it with
+  `reason="no_warmup_bars"`.
+- See `reports/vp2-wp1.3b/synthesis-spec.md`.

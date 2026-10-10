@@ -84,7 +84,7 @@ from data.services.ccxt_market_data import CCXTMarketDataService
 from tests.integration.fakes.fake_ccxt_exchange import FakeCCXTExchange
 from trading.engines.live import LiveExecutionEngine
 from trading.engines.paper import PaperExecutionEngine
-from trading.models import Fill
+from trading.models import Fill, Order
 from trading.portfolio import PortfolioAccounting
 from trading.recovery import ResumeDailySeed
 from trading.risk import RiskParameters, live_risk_parameters
@@ -318,6 +318,7 @@ async def build_resumed_live_stack(
     clock: Callable[[], datetime] | None = None,
     daily_seed: ResumeDailySeed | None = None,
     circuit_breaker: bool = True,
+    orders: Sequence[Order] = (),
 ) -> LiveStack:
     """Build a SECOND engine stack under the SAME ``run_id``, with its
     portfolio rebuilt from ``fills`` via the production
@@ -348,6 +349,11 @@ async def build_resumed_live_stack(
 
     WP1.6 (K-15): ``circuit_breaker=True`` (default) builds a FRESH breaker, as a
     real resume does (nothing is persisted); ``False`` needs a written reason.
+
+    WP1.3b-a: ``orders`` are the persisted orders of the run (``ResumeSnapshot
+    .orders``); like production (``run_live_engine`` / ``run_paper_engine``) the
+    builder hands ``fills`` + ``orders`` to ``engine.prime_resume_exit_state``
+    BEFORE ``start`` so the warmup recomputes the bracket anchor / trailing mark.
     """
     risk_manager = DefaultRiskManager(
         run_id=run_id, params=risk_params if risk_params is not None else live_risk_parameters()
@@ -394,6 +400,7 @@ async def build_resumed_live_stack(
         protective_mode=protective_mode,
         circuit_breaker=cb,
     )
+    engine.prime_resume_exit_state(fills, orders)
 
     return LiveStack(
         engine=engine,

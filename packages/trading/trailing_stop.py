@@ -6,9 +6,23 @@ synthetic SELL signals when price drops below the trailing threshold.
 
 Designed to be composed into StrategyEngine._process_bar() without
 modifying execution engines (paper or live).
+
+Semantics (WP1.3b-a, SY-13b-05)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+1. ``HWM_0`` -- the initial high-water mark -- is the gross (fee-free) VWAP of
+   the lot's opening-order fills (the real fill in live), set by
+   :meth:`TrailingStopManager.open_lot`.
+2. The mark ratchets **only at bar-close checks**, and only with closes of
+   bars whose ``ts`` is later than the anchor bar (``bar_ts > anchor_bar_ts``);
+   the close of the signal bar itself is a pre-entry price.
+3. A trigger **keeps** the mark; a quantity change while pending does not
+   re-seed it.  It is dropped only when the position is flat.
+4. A resume seeds ``max(HWM_0, max close of bars after the anchor bar)``
+   (:meth:`TrailingStopManager.seed_peak`, never lowers).
 """
 from __future__ import annotations
 
+from datetime import datetime
 from decimal import Decimal
 
 import structlog
@@ -73,6 +87,8 @@ class TrailingStopManager:
         self._pending_stop_ttl = pending_stop_ttl
         # symbol -> highest close price since position opened
         self._peak_prices: dict[str, Decimal] = {}
+        # symbol -> (lot_key, anchor_bar_ts) of the lot opened via open_lot()
+        self._lots: dict[str, tuple[datetime, datetime | None]] = {}
         self._pending_stop_symbols: set[str] = set()
         # Position quantity captured when the stop was emitted — a later
         # change signals a partial fill (or re-entry) leaving a live size
@@ -108,11 +124,54 @@ class TrailingStopManager:
         """Checks before a stuck pending stop is force-cleared (CR-003 parity)."""
         return self._pending_stop_ttl
 
+    def open_lot(
+        self,
+        symbol: str,
+        *,
+        lot_key: datetime,
+        hwm0: Decimal,
+        anchor_bar_ts: datetime | None,
+    ) -> None:
+        """
+        Register a lot (flat -> open) and set its initial high-water mark.
+
+        ``hwm0`` is the gross (fee-free) VWAP of the opening order's fills.
+        Calling this again for the **same** ``lot_key`` (a further fill of the
+        opening order) only raises the mark: ``hwm = max(hwm, hwm0)``.  A new
+        ``lot_key`` starts a fresh lot (mark replaced, pending cleared).
+        ``anchor_bar_ts`` is the open time of the anchor bar; only later bars
+        ratchet the mark (see :meth:`check`).
+        """
+        existing = self._lots.get(symbol)
+        if existing is not None and existing[0] == lot_key:
+            current = self._peak_prices.get(symbol)
+            if current is None or hwm0 > current:
+                self._peak_prices[symbol] = hwm0
+            return
+        self._lots[symbol] = (lot_key, anchor_bar_ts)
+        self._peak_prices[symbol] = hwm0
+        self._clear_pending(symbol)
+
+    def protective_level(self, symbol: str, position: Position | None) -> Decimal | None:
+        """The current trailing stop price for an open lot, else ``None`` (pure)."""
+        if position is None or position.is_flat:
+            return None
+        peak = self._peak_prices.get(symbol)
+        if peak is None:
+            return None
+        return peak * (Decimal("1") - self._trailing_stop_pct)
+
+    def clear_pending(self, symbol: str) -> None:
+        """Drop the pending-stop guard for ``symbol`` (R-04: exit not submitted)."""
+        self._clear_pending(symbol)
+
     def check(
         self,
         symbol: str,
         current_price: Decimal,
         position: Position | None,
+        *,
+        bar_ts: datetime | None = None,
     ) -> Signal | None:
         """
         Check trailing stop for a single symbol.
@@ -125,6 +184,11 @@ class TrailingStopManager:
             Latest close price for this symbol.
         position : Position | None
             Current position for this symbol (None or flat = no tracking).
+        bar_ts : datetime | None
+            Open time of the bar ``current_price`` closes.  For a lot opened
+            via :meth:`open_lot` the mark ratchets only when ``bar_ts`` is
+            ``None`` (legacy direct callers) or later than the lot's anchor
+            bar.  The engine always passes ``bar.timestamp``.
 
         Returns
         -------
@@ -134,6 +198,7 @@ class TrailingStopManager:
         # No position or flat — clean up tracking (the stop filled fully)
         if position is None or position.is_flat:
             self._peak_prices.pop(symbol, None)
+            self._lots.pop(symbol, None)
             self._clear_pending(symbol)
             return None
 
@@ -146,8 +211,8 @@ class TrailingStopManager:
             if prev_qty is not None and position.quantity != prev_qty:
                 # Position size changed while pending: a partial fill left a
                 # residual, or a re-entry increased it.  Resume tracking now
-                # — the peak re-seeds from the current price below, giving
-                # the live size a fresh trailing stop.
+                # against the SAME high-water mark (WP1.3b-a: no re-seed from
+                # the current price -- that would loosen the stop).
                 self._log.info(
                     "trailing_stop.quantity_changed_resume",
                     symbol=symbol,
@@ -171,9 +236,21 @@ class TrailingStopManager:
                 self._clear_pending(symbol)
             # fall through: tracking resumes for the open/residual position
 
-        # Update high-water mark
+        # Update high-water mark.  A lot opened via open_lot() ratchets only
+        # with closes of bars after its anchor bar; a legacy lot (direct use,
+        # no open_lot) seeds from the current price as before.
         peak = self._peak_prices.get(symbol)
-        if peak is None or current_price > peak:
+        lot = self._lots.get(symbol)
+        may_ratchet = (
+            lot is None
+            or bar_ts is None
+            or lot[1] is None
+            or bar_ts > lot[1]
+        )
+        if peak is None:
+            self._peak_prices[symbol] = current_price
+            peak = current_price
+        elif may_ratchet and current_price > peak:
             self._peak_prices[symbol] = current_price
             peak = current_price
 
@@ -191,8 +268,9 @@ class TrailingStopManager:
                     round(float((peak - current_price) / peak) * 100, 2)
                 ),
             )
-            # Clear tracking — position will be closed
-            self._peak_prices.pop(symbol, None)
+            # The high-water mark is KEPT (WP1.3b-a): if the exit is not
+            # submitted or only partly fills, the residual is protected against
+            # the same mark.  It is dropped only when the position is flat.
             self._pending_stop_symbols.add(symbol)
             # Capture the position quantity so a later partial fill (which
             # changes it) is detectable, and reset the TTL age (CR-003 parity).
@@ -221,14 +299,14 @@ class TrailingStopManager:
         Seed the trailing high-water mark for ``symbol`` after a resume
         rebuild (WP1.8a A-09/R§3).
 
-        Called once, at the end of ``StrategyEngine._warmup_bar_windows``,
-        for every symbol with an open position restored via
-        ``PortfolioAccounting.from_fills``.  The in-memory peak is always
-        lost on restart; seeding it from the current price alone would
+        Called once, at the end of ``StrategyEngine._warmup_bar_windows``
+        (``_restore_exit_anchors``), for every symbol with an open position
+        restored via ``PortfolioAccounting.from_fills``.  The in-memory peak is
+        always lost on restart; seeding it from the current price alone would
         loosen the stop (a resumed position could sit further from its
-        true historical peak than before the restart).  The caller passes
-        ``max(entry_price, max close since opened_at)`` so the seeded peak
-        is never below the entry.
+        true historical peak than before the restart).  WP1.3b-a: the caller
+        passes ``max(HWM_0, max close of bars after the anchor bar)``, where
+        ``HWM_0`` is the gross VWAP of the opening-order fills.
 
         Never lowers an already-tracked peak -- idempotent/safe to call
         more than once for the same symbol.
@@ -239,7 +317,7 @@ class TrailingStopManager:
             The trading pair being seeded.
         peak:
             The peak price to seed, typically
-            ``max(entry_price, max close since opened_at)``.
+            ``max(HWM_0, max close of bars after the anchor bar)``.
         """
         current = self._peak_prices.get(symbol)
         if current is None or peak > current:
@@ -260,6 +338,7 @@ class TrailingStopManager:
     def reset(self) -> None:
         """Clear all tracking state."""
         self._peak_prices.clear()
+        self._lots.clear()
         self._pending_stop_symbols.clear()
         self._pending_qty.clear()
         self._pending_age.clear()

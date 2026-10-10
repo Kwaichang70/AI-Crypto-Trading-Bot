@@ -804,10 +804,13 @@ async def test_resume_protective_mode_drops_buy_but_stop_loss_fires(
 # ---------------------------------------------------------------------------
 # WP1.8a: the resumed trailing-stop peak is seeded from the rebuilt bar
 # history and is never below the (rebuilt) entry price (A-09/R§3).
+# WP1.3b-a (SY-13b-05): "entry price" for the mark is the GROSS (fee-free) fill
+# VWAP -- HWM_0 -- not the all-in cost basis (``average_entry_price`` includes the
+# entry fee); a resume seeds exactly what the live run held.
 # ---------------------------------------------------------------------------
 
 
-async def test_resume_trailing_peak_is_at_least_the_entry(exchange: FakeCCXTExchange) -> None:
+async def test_resume_trailing_peak_equals_live_hwm0(exchange: FakeCCXTExchange) -> None:
     run_id = "wp10-restart-trailing"
     strategy_before = ScriptedSignalStrategy("buy-restart-entry", _buy_params())
     stack_before = await _build_and_warm(
@@ -818,7 +821,10 @@ async def test_resume_trailing_peak_is_at_least_the_entry(exchange: FakeCCXTExch
     )
     await step_bar(stack_before, SYMBOL, START_PRICE, timeframe=TIMEFRAME_STR)
     persisted_fills = stack_before.execution.get_all_fills()
-    entry_price = stack_before.portfolio.get_position(SYMBOL).average_entry_price
+    assert stack_before.engine._trailing_stop is not None
+    gross_fill_price = persisted_fills[0].price  # HWM_0 (WP1.3b-a), no entry fee in it
+    live_peak = stack_before.engine._trailing_stop.peak_prices[SYMBOL]
+    assert live_peak == gross_fill_price
 
     strategy_after = ScriptedSignalStrategy(
         "resume-trailing-noop", {"direction": "buy", "call_index": 999}
@@ -838,7 +844,8 @@ async def test_resume_trailing_peak_is_at_least_the_entry(exchange: FakeCCXTExch
     assert stack_after.engine._trailing_stop is not None
     seeded_peak = stack_after.engine._trailing_stop.peak_prices.get(SYMBOL)
     assert seeded_peak is not None
-    assert seeded_peak >= entry_price
+    assert seeded_peak >= gross_fill_price
+    assert seeded_peak == live_peak  # fresh run and resume agree (AC-13B-06)
 
     await stack_after.engine.stop()
 

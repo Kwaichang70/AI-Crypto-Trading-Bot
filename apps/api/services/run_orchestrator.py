@@ -1196,6 +1196,11 @@ async def run_paper_engine(
         # global latch mirror and/or this run's own persisted latch before
         # anything else can observe this engine as registered.
         _kill_switch.apply_latch(engine, entries_latch_reason=entries_latch_reason)
+        if resume is not None:
+            # WP1.3b-a (SY-13b-01, AC-13B-04): hand the persisted fills/orders to
+            # the engine BEFORE start() so the warmup recomputes each open lot's
+            # bracket anchor and trailing mark exactly as the live run set them.
+            engine.prime_resume_exit_state(resume.fills, resume.orders)
         await engine.start(run_id_str)
         log.info("runs.paper_engine_running")
 
@@ -1718,6 +1723,9 @@ async def run_live_engine(
         _RUN_ENGINES[run_id_str] = engine
         # WP1.7a (I5): synchronous, no ``await`` in between.
         _kill_switch.apply_latch(engine, entries_latch_reason=entries_latch_reason)
+        if resume is not None:
+            # WP1.3b-a (SY-13b-01, AC-13B-04): see the paper resume site above.
+            engine.prime_resume_exit_state(resume.fills, resume.orders)
         await engine.start(run_id_str)
         log.info("runs.live_engine_running")
 

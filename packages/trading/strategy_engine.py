@@ -45,22 +45,34 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum, auto
-from typing import Any
+from typing import Any, Literal
+from uuid import UUID
 
 import pandas as pd
 import structlog
 
 from common.models import MultiTimeframeContext, OHLCVBar
-from common.types import OrderSide, RunMode, SignalDirection, TimeFrame
+from common.types import OrderSide, OrderStatus, RunMode, SignalDirection, TimeFrame
 from data.indicators import atr as _atr_series
 from data.market_data import BaseMarketDataService, MarketDataError
-from trading.bracket_exit import BracketExitManager
+from trading.bracket_exit import (
+    AnchorSource,
+    BracketAnchor,
+    BracketExitManager,
+    LotEntry,
+    anchor_bar_timestamp,
+    lot_entry_from_opening_fills,
+    open_lot_fills,
+    window_is_contiguous,
+)
 from trading.execution import BaseExecutionEngine
 from trading.exit_config import (
+    ExitCostModel,
     parse_exit_config,
     require_exit_manager,
     resolve_allow_pyramiding,
@@ -79,6 +91,7 @@ __all__ = [
     "FlattenResult",
     "FlattenSymbolResult",
     "StrategyEngine",
+    "atr_for_bars",
 ]
 
 logger = structlog.get_logger(__name__)
@@ -97,6 +110,58 @@ _CB_STATE_VALUES: dict[CircuitBreakerResponse, int] = {
 # have < e^-6 Wilder weight, so the bounded window is numerically equivalent
 # to full history while keeping per-bar ATR cost O(period) instead of O(n).
 _ATR_WINDOW_MULTIPLIER = 6
+
+#: WP1.3b-a: per-call timeout (seconds) for the bounded exit-state OHLCV
+#: fetches (anchor finalisation, resume recompute, trailing gap fill).  No retry.
+_EXIT_FETCH_TIMEOUT_S: float = 10.0
+#: WP1.3b-a (FX-01): ccxt's Coinbase ``fetch_ohlcv`` clamps ``limit`` to 300 bars.
+#: Documentation plus the invariant ``POLICY_ATR_PERIOD_MAX * 6 + 1 <= 300``
+#: (pinned by a test); there is no runtime clamp -- the single WP1.3a validator
+#: refuses an ATR period whose window ``W = 6*period+1`` would not fit one call.
+_EXCHANGE_OHLCV_MAX_LIMIT: int = 300
+#: WP1.3b-a (FX-03): a pending (provisional / deferred / fallback) anchor gets at
+#: most this many exact-window fetch attempts, at most one per bar pass.
+_ANCHOR_FETCH_MAX_ATTEMPTS: int = 3
+#: WP1.3b-a (FX-03, SEC-06): engine-wide budget of finalisation fetches per
+#: ``_finalize_pending_anchors`` call (i.e. per bar pass, under the bar lock).
+_ANCHOR_FETCHES_PER_PASS: int = 1
+#: WP1.3b-a (FX-06): ``bracket_exit.lot_unprotected`` is logged on the first bar
+#: of an unprotected streak and then every this-many bars.
+_UNPROTECTED_LOG_EVERY: int = 10
+#: WP1.3b-a: at most this many missing bars are fetched to rebuild the trailing
+#: high-water mark after a resume (beyond that: ``trailing_stop.seed_partial``).
+_TRAILING_GAP_FETCH_LIMIT: int = 1000
+#: WP1.3b-a (SY-13b-04): an order in one of these states with nothing filled
+#: means the exit was NOT submitted (R-04); any other state counts as accepted.
+_TERMINAL_UNFILLED_STATUSES: frozenset[OrderStatus] = frozenset(
+    {OrderStatus.REJECTED, OrderStatus.CANCELED, OrderStatus.EXPIRED}
+)
+
+
+def atr_for_bars(bars: Sequence[OHLCVBar], period: int) -> Decimal | None:
+    """
+    Latest ATR (price units) of ``bars``; the module-level extraction of
+    ``StrategyEngine._compute_atr_for_symbol``'s body (WP1.3b-a, unchanged
+    return value).
+
+    Returns None when there are too few bars for the configured ATR period
+    (Wilder warm-up) or the ATR is not positive.  CR-005: only the last
+    ``period * 6 + 1`` bars are used -- Wilder smoothing decays by
+    ``(1 - 1/period)`` per bar, so older bars contribute < e^-6 (~0.25%).
+    """
+    if not bars or len(bars) <= period:
+        return None
+    window = period * _ATR_WINDOW_MULTIPLIER + 1
+    if len(bars) > window:
+        bars = bars[-window:]
+    highs = pd.Series([float(b.high) for b in bars])
+    lows = pd.Series([float(b.low) for b in bars])
+    closes = pd.Series([float(b.close) for b in bars])
+    atr_series = _atr_series(highs, lows, closes, period=period)
+    last = atr_series.iloc[-1]
+    if pd.isna(last) or last <= 0:
+        return None
+    return Decimal(str(last))
 
 
 def _opt_float(value: Any) -> float | None:
@@ -307,6 +372,18 @@ def build_synthetic_flatten_result(
         complete=False,
         symbols=symbol_results,
     )
+
+
+@dataclass
+class _EngineLot:
+    """Engine-side facts of one open lot (WP1.3b-a): the opening order, its BUY
+    fills so far, and the :class:`LotEntry` derived from them.  Kept so a later
+    fill of the opening order can re-blend the entry basis without a re-read."""
+
+    opening_order_id: UUID | None
+    order: Order | None
+    fills: list[Fill]
+    entry: LotEntry
 
 
 class StrategyEngine:
@@ -522,9 +599,44 @@ class StrategyEngine:
                 bracket_mode=str(_exit_cfg.bracket.get("bracket_mode") or "fixed"),
                 atr_sl_multiplier=_opt_float(_exit_cfg.bracket.get("bracket_atr_sl_multiplier")),
                 atr_tp_multiplier=_opt_float(_exit_cfg.bracket.get("bracket_atr_tp_multiplier")),
-                atr_period=int(_raw_atr_period or 14),
+                # CF-13a-15: ``parse_exit_config`` always normalises the period
+                # (default 14) when a bracket is configured -- no ``or 14``.
+                atr_period=int(_raw_atr_period),
                 strategy_id="bracket_exit",
             )
+
+        # WP1.3b-a: lot / anchor bookkeeping (all in memory; rebuilt on resume).
+        self._tf_s: int = _TIMEFRAME_SECONDS.get(timeframe, 60)
+        # Same default cost model the exit-config validator uses (SY-13a-01).
+        self._exit_cost_model: ExitCostModel = ExitCostModel.from_risk_parameters()
+        # symbol -> facts of the open lot (opening order, its fills, LotEntry).
+        self._lots: dict[str, _EngineLot] = {}
+        # BACKTEST only: opening-order id -> open time of the bar that was being
+        # processed when the order was created (the signal bar).  In memory only;
+        # backtest timestamps are wall clock, so the persisted-data rule
+        # (``anchor_at``) cannot be used there.
+        self._order_signal_bar_ts: dict[UUID, datetime] = {}
+        # The history of the bar currently being processed (entry hook input).
+        self._current_history: dict[str, list[OHLCVBar]] | None = None
+        # prime_resume_exit_state() output, consumed by _restore_exit_anchors().
+        self._primed_lots: dict[str, _EngineLot] = {}
+        # symbol -> ``_bar_count`` when its anchor was created/restored; a
+        # provisional/deferred anchor is finalised on a LATER pass only.
+        self._anchor_created_bar: dict[str, int] = {}
+        # symbol -> exact-window fetch attempts spent on its pending anchor
+        # (WP1.3b-a FX-03: at most ``_ANCHOR_FETCH_MAX_ATTEMPTS``, <= 1 per pass;
+        # the restore fetch of a resumed lot counts as attempt 1).
+        self._anchor_fetch_attempts: dict[str, int] = {}
+        # symbol -> where the pending anchor came from: the entry hook ("entry")
+        # or a resume restore ("resume"); decides its final ``source`` tag.
+        self._anchor_origin: dict[str, Literal["entry", "resume"]] = {}
+        # Remaining finalisation fetches in the current ``_finalize_pending_anchors``
+        # call (engine-wide, ``_ANCHOR_FETCHES_PER_PASS``; SEC-06).
+        self._anchor_fetch_budget: int = _ANCHOR_FETCHES_PER_PASS
+        # symbol -> error type of the last failed exact-window fetch (log only).
+        self._last_exit_fetch_error: dict[str, str] = {}
+        # symbol -> consecutive bars a held lot had no protective level (FX-06).
+        self._unprotected_bars: dict[str, int] = {}
 
         # WP1.3a (SY-13a-08): resolve allow_pyramiding from the (already
         # type-checked) config, defaulting per-strategy when absent.  A
@@ -687,6 +799,10 @@ class StrategyEngine:
                 "engine.started",
                 strategies=[s.strategy_id for s in self._strategies],
             )
+            # WP1.3b-a (SY-13b-16, D-13b-04): runs started from this commit on
+            # use anchored exit semantics; older runs are "legacy" (their
+            # baselines are re-run in WP2.8).
+            self._log.info("engine.exit_semantics", version="wp13b-1")
 
         except Exception:
             self._state = EngineState.ERROR
@@ -730,9 +846,18 @@ class StrategyEngine:
         if self._trailing_stop is not None:
             self._trailing_stop.reset()
 
-        # Reset bracket exit tracking state
+        # Reset bracket exit tracking state (clears the anchors too)
         if self._bracket_exit is not None:
             self._bracket_exit.reset()
+        self._lots.clear()
+        self._order_signal_bar_ts.clear()
+        self._primed_lots.clear()
+        self._anchor_created_bar.clear()
+        self._anchor_fetch_attempts.clear()
+        self._anchor_origin.clear()
+        self._last_exit_fetch_error.clear()
+        self._unprotected_bars.clear()
+        self._current_history = None
 
         # Clear adaptive-learning trackers so a subsequent start() begins with
         # a clean MAE/MFE baseline and empty skip-trade log.
@@ -1064,29 +1189,16 @@ class StrategyEngine:
 
         Returns None when there are too few bars for the configured ATR
         period (Wilder warm-up) — the bracket manager treats None as
-        "hold, no ATR bracket this bar".  Used only in ATR bracket mode.
+        "hold, no ATR bracket this bar".  Used only in ATR bracket mode, and
+        since WP1.3b-a only for the entry-protectable gate and the lazy
+        ``late`` anchor: anchored lots never re-read the ATR (their levels
+        are frozen prices).
         """
         if self._bracket_exit is None:
             return None
-        bars = history_by_symbol.get(symbol)
-        period = self._bracket_exit.atr_period
-        if not bars or len(bars) <= period:
-            return None
-        # CR-005: bound the window so long backtests stay O(period) per bar
-        # instead of O(n) (full history made ATR-mode backtests O(n^2)).
-        # Wilder smoothing decays by (1-1/period) per bar, so bars older than
-        # 6*period contribute < e^-6 (~0.25%) — numerically equivalent.
-        window = period * _ATR_WINDOW_MULTIPLIER + 1
-        if len(bars) > window:
-            bars = bars[-window:]
-        highs = pd.Series([float(b.high) for b in bars])
-        lows = pd.Series([float(b.low) for b in bars])
-        closes = pd.Series([float(b.close) for b in bars])
-        atr_series = _atr_series(highs, lows, closes, period=period)
-        last = atr_series.iloc[-1]
-        if pd.isna(last) or last <= 0:
-            return None
-        return Decimal(str(last))
+        return atr_for_bars(
+            history_by_symbol.get(symbol) or [], self._bracket_exit.atr_period
+        )
 
     async def _process_bar(
         self,
@@ -1107,6 +1219,9 @@ class StrategyEngine:
             Full bar history per symbol up to and including the current bar.
         """
         bar_start = time.monotonic()
+        # WP1.3b-a: the entry hook (``_on_fill_routed``) anchors against the
+        # history of the bar being processed.
+        self._current_history = history_by_symbol
 
         # Get a representative timestamp for logging
         first_bar = next(iter(current_bars.values()))
@@ -1215,6 +1330,20 @@ class StrategyEngine:
 
         self._total_signals += len(bar_signals)
 
+        # 4c. WP1.3b-a: advance the non-final bracket anchors (PAPER/LIVE: interim
+        # levels, bounded exact-window retries, then final) created on an EARLIER
+        # pass.  Two things keep this pass's own anchors out: the PLACEMENT (before
+        # the signal loop and ``_check_resting_orders``, so this pass's entry hook
+        # has not run yet) and the ``_anchor_created_bar`` guard in
+        # ``_finalize_pending_anchors`` (defence in depth for an anchor created at
+        # the current ``_bar_count``; a restore at warmup carries count 0 and is
+        # advanced on the first pass).  Always before step 5a.
+        try:
+            await self._finalize_pending_anchors(history_by_symbol)
+        except Exception as exc:
+            # error_type only (CF-36 / AC-13B-18): this path does exchange I/O
+            self._log.error("engine.anchor_finalize_error", error_type=type(exc).__name__)
+
         # 5. Process each signal through the execution engine
         for signal in bar_signals:
             try:
@@ -1277,6 +1406,11 @@ class StrategyEngine:
 
                 orders = await self._execution_engine.process_signal(signal)
                 bar_orders += len(orders)
+                if (
+                    self._run_mode == RunMode.BACKTEST
+                    and signal.direction == SignalDirection.BUY
+                ):
+                    self._record_signal_bar(orders, signal.symbol, history_by_symbol)
 
                 # Route fills to portfolio and risk manager (WP1.7a:
                 # extracted into _route_exit_fills, shared with 5a/5b and
@@ -1317,9 +1451,18 @@ class StrategyEngine:
             for symbol, bar in current_bars.items():
                 try:
                     position = self._portfolio.get_position(symbol)
+                    # WP1.3b-a: an anchored lot never re-reads the ATR (its
+                    # levels are frozen prices).  The ATR is computed only for
+                    # a lot WITHOUT a valid anchor (lazy ``late`` path; a stale
+                    # anchor of another lot counts as none, the manager drops it).
+                    _anchor = self._bracket_exit.get_anchor(symbol)
                     atr_value = (
                         self._compute_atr_for_symbol(symbol, history_by_symbol)
                         if needs_atr
+                        and (
+                            _anchor is None
+                            or (position is not None and _anchor.lot_key != position.opened_at)
+                        )
                         else None
                     )
                     exit_signal = self._bracket_exit.check(
@@ -1329,12 +1472,14 @@ class StrategyEngine:
                         atr_value=atr_value,
                     )
                     if exit_signal is not None:
-                        orders = await self._execution_engine.process_signal(exit_signal)
-                        bar_orders += len(orders)
-                        fill_count, _ = await self._route_exit_fills(
-                            orders, current_bars, exit_signal
+                        self._unprotected_bars.pop(symbol, None)
+                        n_orders, n_fills = await self._submit_exit_signal(
+                            self._bracket_exit, exit_signal, current_bars
                         )
-                        bar_fills += fill_count
+                        bar_orders += n_orders
+                        bar_fills += n_fills
+                    else:
+                        self._track_lot_protection(symbol, position)
                 except Exception:
                     self._log.exception(
                         "engine.bracket_exit_error",
@@ -1350,14 +1495,14 @@ class StrategyEngine:
                         symbol=symbol,
                         current_price=bar.close,
                         position=position,
+                        bar_ts=bar.timestamp,
                     )
                     if stop_signal is not None:
-                        orders = await self._execution_engine.process_signal(stop_signal)
-                        bar_orders += len(orders)
-                        fill_count, _ = await self._route_exit_fills(
-                            orders, current_bars, stop_signal
+                        n_orders, n_fills = await self._submit_exit_signal(
+                            self._trailing_stop, stop_signal, current_bars
                         )
-                        bar_fills += fill_count
+                        bar_orders += n_orders
+                        bar_fills += n_fills
                 except Exception:
                     self._log.exception(
                         "engine.trailing_stop_error",
@@ -1831,6 +1976,8 @@ class StrategyEngine:
                 pre_fill_pos = self._portfolio.get_position(fill.symbol)
 
                 self._portfolio.update_position(fill, current_price)
+                # WP1.3b-a: lot / anchor lifecycle (never raises).
+                self._on_fill_routed(order, fill, pre_fill_pos)
 
                 # C4: Start excursion tracking when a new BUY fill opens a position (Sprint 32)
                 if fill.side.value == "buy" or str(fill.side) in ("buy", "BUY"):
@@ -2013,6 +2160,930 @@ class StrategyEngine:
             )
 
     # ------------------------------------------------------------------
+    # WP1.3b-a: exit anchors (entry anchoring, R-04, resume recompute)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _exit_not_submitted(orders: Sequence[Order]) -> bool:
+        """True when an exit signal produced NO accepted order (R-04, SY-13b-04).
+
+        That is an empty list, or every returned order terminal
+        (``REJECTED``/``CANCELED``/``EXPIRED``) with nothing filled.  An order
+        in any other state (``PENDING_SUBMIT``/``OPEN``/``PARTIAL``/``FILLED``/
+        unknown) counts as accepted and keeps the manager's pending guard.
+        """
+        if not orders:
+            return True
+        return all(
+            o.status in _TERMINAL_UNFILLED_STATUSES and o.filled_quantity == Decimal(0)
+            for o in orders
+        )
+
+    async def _submit_exit_signal(
+        self,
+        manager: BracketExitManager | TrailingStopManager,
+        exit_signal: Signal,
+        current_bars: dict[str, OHLCVBar],
+    ) -> tuple[int, int]:
+        """Submit a bracket/trailing exit and route its fills; R-04 safe.
+
+        Returns ``(orders, fills)``.  When nothing was submitted (empty order
+        list, every order terminal and unfilled, or ``process_signal`` raised
+        before returning) the manager's pending guard is cleared at once and
+        ``engine.exit_not_submitted`` is logged, so the next evaluation retries
+        instead of waiting out the 3-bar TTL.  An accepted order keeps the
+        guard.  A double sell stays impossible: the live engine's in-flight
+        reservation runs before any exchange call.
+        """
+        symbol = exit_signal.symbol
+        trigger = exit_signal.metadata.get("trigger")
+        try:
+            orders = await self._execution_engine.process_signal(exit_signal)
+        except Exception:
+            manager.clear_pending(symbol)
+            self._log.error(
+                "engine.exit_not_submitted",
+                symbol=symbol,
+                trigger=trigger,
+                reason="process_signal_raised",
+            )
+            raise
+        if self._exit_not_submitted(orders):
+            manager.clear_pending(symbol)
+            self._log.warning(
+                "engine.exit_not_submitted",
+                symbol=symbol,
+                trigger=trigger,
+                reason="no_orders" if not orders else "orders_terminal_unfilled",
+            )
+        fill_count, _ = await self._route_exit_fills(orders, current_bars, exit_signal)
+        return len(orders), fill_count
+
+    def _track_lot_protection(self, symbol: str, position: Position | None) -> None:
+        """FX-06 (SEC-01 C-1.3): make a held lot WITHOUT any protective level loud.
+
+        Called at step 5a after ``check`` returned no exit.  A held lot is
+        protected when the bracket anchor has a stop OR the trailing mark exists.
+        Otherwise the streak grows, ``lot_unprotected_bars_total`` is incremented
+        every bar and ``bracket_exit.lot_unprotected`` is logged at error level on
+        the first bar of the streak and every 10th bar after.  The streak resets
+        when the lot is protected or flat.  PAPER/LIVE only; a bracket without a
+        stop-loss leg is never reported (WP13BA-CR-201).
+        """
+        if (
+            position is None
+            or position.is_flat
+            or self._bracket_exit is None
+            or self._run_mode == RunMode.BACKTEST
+            or not self._bracket_exit.has_stop_loss
+        ):
+            self._unprotected_bars.pop(symbol, None)
+            return
+        protected = self._bracket_exit.protective_level(symbol, position) is not None or (
+            self._trailing_stop is not None
+            and self._trailing_stop.protective_level(symbol, position) is not None
+        )
+        if protected:
+            self._unprotected_bars.pop(symbol, None)
+            return
+        streak = self._unprotected_bars.get(symbol, 0) + 1
+        self._unprotected_bars[symbol] = streak
+        self._metric("lot_unprotected_bars_total")
+        if streak % _UNPROTECTED_LOG_EVERY == 1:
+            self._log.error(
+                "bracket_exit.lot_unprotected",
+                symbol=symbol,
+                bars_unprotected=streak,
+            )
+
+    def _record_signal_bar(
+        self,
+        orders: Sequence[Order],
+        symbol: str,
+        history_by_symbol: dict[str, list[OHLCVBar]],
+    ) -> None:
+        """BACKTEST: remember which bar was being processed when a BUY order
+        was created (in memory only; no clock is read)."""
+        history = history_by_symbol.get(symbol)
+        if not history:
+            return
+        for order in orders:
+            if order.side == OrderSide.BUY:
+                self._order_signal_bar_ts[order.order_id] = history[-1].timestamp
+
+    def _entry_history(self, symbol: str) -> list[OHLCVBar]:
+        """History the entry hook anchors against: the bar being processed,
+        else the rolling live window."""
+        current = self._current_history
+        if current is not None and symbol in current:
+            return current[symbol]
+        return self._bar_windows.get(symbol, [])
+
+    def _metric(self, name: str, **labels: str) -> None:
+        """Increment a run-labelled counter; metrics never raise."""
+        try:
+            from common.metrics import metrics as _mc
+
+            _mc.increment(
+                name, labels={"run_id": self._run_id or "unknown", **labels}
+            )
+        except Exception:
+            self._log.debug("engine.metrics_update_failed", exc_info=True)
+
+    def _atr_window_size(self) -> int:
+        """``W = 6 * period + 1`` bars: the bounded Wilder window (CR-005)."""
+        period = self._bracket_exit.atr_period if self._bracket_exit is not None else 14
+        return period * _ATR_WINDOW_MULTIPLIER + 1
+
+    def _window_ending_at(
+        self, bars: Sequence[OHLCVBar], end_ts: datetime | None
+    ) -> list[OHLCVBar] | None:
+        """Exactly ``W`` contiguous bars ending at ``end_ts`` (inclusive), or None."""
+        if end_ts is None:
+            return None
+        n = self._atr_window_size()
+        for i in range(len(bars) - 1, -1, -1):
+            if bars[i].timestamp == end_ts:
+                if i + 1 < n:
+                    return None
+                window = list(bars[i + 1 - n : i + 1])
+                return window if window_is_contiguous(window, self._tf_s) else None
+            if bars[i].timestamp < end_ts:
+                return None
+        return None
+
+    async def _fetch_exact_window(
+        self, symbol: str, end_ts: datetime
+    ) -> list[OHLCVBar] | None:
+        """One bounded ``fetch_ohlcv`` (10 s) for the ``W`` bars ending at ``end_ts``.
+
+        ``None`` on any failure or when the answer is not exactly ``W``
+        contiguous bars ending there.  The whole post-processing is inside the
+        guarded block (WP13BA-SEC-03): a non-list answer or a non-``OHLCVBar``
+        element is ``MalformedWindow``.  Logs ``error_type`` only.
+        """
+        n = self._atr_window_size()
+        since = end_ts - timedelta(seconds=self._tf_s * (n - 1))
+        try:
+            bars = await asyncio.wait_for(
+                self._market_data.fetch_ohlcv(
+                    symbol=symbol, timeframe=self._timeframe, since=since, limit=n
+                ),
+                timeout=_EXIT_FETCH_TIMEOUT_S,
+            )
+            if not isinstance(bars, list) or not all(isinstance(b, OHLCVBar) for b in bars):
+                self._exit_fetch_failed(symbol, "MalformedWindow")
+                return None
+            window = [b for b in bars if b.timestamp <= end_ts][-n:]
+            if (
+                len(window) != n
+                or window[-1].timestamp != end_ts
+                or not window_is_contiguous(window, self._tf_s)
+            ):
+                self._exit_fetch_failed(
+                    symbol, "IncompleteWindow", got=len(window), expected=n
+                )
+                return None
+        except Exception as exc:
+            self._exit_fetch_failed(symbol, type(exc).__name__)
+            return None
+        self._last_exit_fetch_error.pop(symbol, None)
+        return window
+
+    def _exit_fetch_failed(self, symbol: str, error_type: str, **extra: int) -> None:
+        """Log one failed exact-window fetch (``error_type`` only, never text)."""
+        self._last_exit_fetch_error[symbol] = error_type
+        self._log.error(
+            "engine.exit_window_fetch_failed",
+            symbol=symbol,
+            error_type=error_type,
+            **extra,
+        )
+
+    @staticmethod
+    def _interim_atr(
+        history: Sequence[OHLCVBar], rule_ts: datetime | None, period: int
+    ) -> Decimal | None:
+        """The INTERIM ATR of a pending anchor: ``min`` of the available estimates.
+
+        * ``ATR_best(R)``: Wilder ATR over the (up to) ``W = 6p+1`` bars ending at
+          the last bar with ``ts <= R`` (``rule_ts``);
+        * ``ATR_newest``: ``atr_for_bars(history[-W:])`` -- HEAD's per-bar ATR.
+
+        Each term is ``None`` when it has <= ``period`` bars.  The minimum makes
+        the interim stop never looser than HEAD would have set on that bar
+        (``I <= ATR_newest``, I-2); it is an ESTIMATE of the exact ``ATR(R)``, not a
+        bound (I-3).  ``None`` when neither term is computable.  Pure; no clock.
+        """
+        if not history:
+            return None
+        window_n = period * _ATR_WINDOW_MULTIPLIER + 1
+        estimates: list[Decimal] = []
+        newest = atr_for_bars(history[-window_n:], period)
+        if newest is not None:
+            estimates.append(newest)
+        if rule_ts is not None:
+            for i in range(len(history) - 1, -1, -1):
+                if history[i].timestamp <= rule_ts:
+                    best = atr_for_bars(history[max(0, i + 1 - window_n) : i + 1], period)
+                    if best is not None:
+                        estimates.append(best)
+                    break
+        return min(estimates) if estimates else None
+
+    def _clear_anchor_pending(self, symbol: str) -> None:
+        """Drop the engine-side pending-anchor state of ``symbol`` (finalised / flat)."""
+        self._anchor_fetch_attempts.pop(symbol, None)
+        self._anchor_origin.pop(symbol, None)
+        self._last_exit_fetch_error.pop(symbol, None)
+
+    def _log_stop_cost(self, anchor: BracketAnchor) -> None:
+        """U-4: log (never drop) a stop that sits inside the entry/round-trip cost."""
+        if anchor.stop_price is None or anchor.entry_basis <= Decimal(0):
+            return
+        d = (anchor.entry_basis - anchor.stop_price) / anchor.entry_basis
+        c_side = Decimal(str(self._exit_cost_model.c_side))
+        c_rt = Decimal(str(self._exit_cost_model.c_rt))
+        if d <= c_side:
+            self._log.warning(
+                "entry.stop_inside_entry_cost",
+                symbol=anchor.symbol,
+                d=str(d),
+                c_side=str(c_side),
+                c_rt=str(c_rt),
+            )
+        elif d <= c_rt:
+            self._log.info(
+                "entry.stop_inside_round_trip_cost",
+                symbol=anchor.symbol,
+                d=str(d),
+                c_side=str(c_side),
+                c_rt=str(c_rt),
+            )
+
+    def _on_fill_routed(
+        self, order: Order | None, fill: Fill, pre_fill_pos: Position | None
+    ) -> None:
+        """Lot / anchor lifecycle hook, called after a fill reached the portfolio.
+
+        NEVER raises: an anchoring fault must not break fill routing (the lazy
+        ``late`` anchor then protects the lot at the next bar close).  For a BUY
+        that takes the symbol from flat to open it opens the lot (bracket anchor
+        + trailing high-water mark); a further fill of the opening order
+        re-blends the entry basis; a fill of any other order is an add and keeps
+        the levels (U-6).  A SELL that leaves the symbol flat ends the lot.
+        """
+        try:
+            self._on_fill_routed_impl(order, fill, pre_fill_pos)
+        except Exception:
+            self._log.exception("engine.fill_hook_error", symbol=fill.symbol)
+
+    def _on_fill_routed_impl(
+        self, order: Order | None, fill: Fill, pre_fill_pos: Position | None
+    ) -> None:
+        if self._bracket_exit is None and self._trailing_stop is None:
+            return
+        symbol = fill.symbol
+        if fill.side == OrderSide.SELL:
+            # Closed in full -> the lot ends (derived from the pre-fill
+            # position so no extra portfolio read is needed on exits).
+            if pre_fill_pos is None or fill.quantity >= pre_fill_pos.quantity:
+                closed = self._lots.pop(symbol, None)
+                if closed is not None and closed.opening_order_id is not None:
+                    # CR-10: the signal-bar entry of a closed lot is never read again
+                    self._order_signal_bar_ts.pop(closed.opening_order_id, None)
+                self._clear_anchor_pending(symbol)
+            return
+        if fill.side != OrderSide.BUY:
+            return
+        position = self._portfolio.get_position(symbol)
+        if position is None or position.is_flat:
+            return
+
+        was_flat = pre_fill_pos is None or pre_fill_pos.is_flat
+        lot = self._lots.get(symbol)
+        if was_flat:
+            entry = lot_entry_from_opening_fills(symbol, order, [fill])
+            if entry is None:
+                return
+            self._lots[symbol] = _EngineLot(
+                opening_order_id=fill.order_id, order=order, fills=[fill], entry=entry
+            )
+            self._open_exit_lot(symbol, entry, position)
+            return
+        if lot is None:
+            # Open position the engine never saw open (direct use, adoption):
+            # the lazy ``late`` anchor handles it at the next bar close.
+            return
+        if fill.order_id == lot.opening_order_id:
+            lot.fills.append(fill)
+            entry = lot_entry_from_opening_fills(symbol, lot.order, lot.fills)
+            if entry is None:
+                return
+            lot.entry = entry
+            if self._bracket_exit is not None:
+                self._bracket_exit.add_opening_fill(
+                    symbol,
+                    order_id=fill.order_id,
+                    entry_basis=entry.entry_basis,
+                    basis_qty=entry.basis_qty,
+                )
+            if self._trailing_stop is not None:
+                self._trailing_stop.open_lot(
+                    symbol,
+                    lot_key=position.opened_at,
+                    hwm0=entry.entry_gross_vwap,
+                    anchor_bar_ts=None,
+                )
+            return
+        # An add from another order: the first entry's levels stay (U-6).
+        if self._bracket_exit is not None:
+            self._bracket_exit.add_opening_fill(
+                symbol,
+                order_id=fill.order_id,
+                entry_basis=lot.entry.entry_basis,
+                basis_qty=lot.entry.basis_qty,
+            )
+
+    def _open_exit_lot(self, symbol: str, entry: LotEntry, position: Position) -> None:
+        """Flat -> open: create the bracket anchor and the trailing mark."""
+        history = self._entry_history(symbol)
+        self._anchor_created_bar[symbol] = self._bar_count
+        self._clear_anchor_pending(symbol)
+        self._unprotected_bars.pop(symbol, None)
+        anchor_bar_ts: datetime | None
+        if self._bracket_exit is not None:
+            anchor = self._anchor_for_entry(symbol, entry, history)
+            anchor_bar_ts = anchor.anchor_bar_ts
+            if not anchor.final:
+                self._anchor_fetch_attempts[symbol] = 0
+                self._anchor_origin[symbol] = "entry"
+            self._log_stop_cost(anchor)
+            self._metric("bracket_anchor_source_total", source=anchor.source)
+        elif self._run_mode == RunMode.BACKTEST:
+            anchor_bar_ts = self._backtest_signal_bar_ts(entry, history)
+        else:
+            anchor_bar_ts = anchor_bar_timestamp(history, entry.anchor_at, self._tf_s)
+        if self._trailing_stop is not None:
+            self._trailing_stop.open_lot(
+                symbol,
+                lot_key=position.opened_at,
+                hwm0=entry.entry_gross_vwap,
+                anchor_bar_ts=anchor_bar_ts,
+            )
+
+    def _backtest_signal_bar_ts(
+        self, lot: LotEntry, history: Sequence[OHLCVBar]
+    ) -> datetime | None:
+        """BACKTEST anchor bar: the bar being processed when the opening order
+        was created (in memory; falls back to the processed bar).  No clock."""
+        ts = (
+            self._order_signal_bar_ts.get(lot.opening_order_id)
+            if lot.opening_order_id is not None
+            else None
+        )
+        if ts is None and history:
+            ts = history[-1].timestamp
+        return ts
+
+    def _anchor_for_entry(
+        self, symbol: str, lot: LotEntry, history: Sequence[OHLCVBar]
+    ) -> BracketAnchor:
+        """Create the bracket anchor of a new lot (SY-13b-01/02).
+
+        * BACKTEST: the in-memory signal bar and today's ATR window (it may be
+          shorter than ``W`` early in a run).  Reads no wall clock.
+        * PAPER/LIVE: the rule bar of ``lot.anchor_at`` and exactly ``W``
+          contiguous bars ending at it.  When that window is not (yet)
+          available the anchor is ``entry_provisional`` (levels from the best
+          available window, finalised once later) or ``entry_deferred`` (no ATR
+          at all).
+        """
+        bracket = self._bracket_exit
+        if bracket is None:
+            raise RuntimeError("_anchor_for_entry requires a bracket manager")
+        position = self._portfolio.get_position(symbol)
+        lot_key = position.opened_at if position is not None else lot.anchor_at
+        period = bracket.atr_period
+        window_n = self._atr_window_size()
+        atr: Decimal | None = None
+        source: AnchorSource = "entry"
+        final = True
+        anchor_bar_ts: datetime | None
+        if self._run_mode == RunMode.BACKTEST:
+            anchor_bar_ts = self._backtest_signal_bar_ts(lot, history)
+            if bracket.requires_atr:
+                end = len(history)
+                for i in range(len(history) - 1, -1, -1):
+                    if history[i].timestamp == anchor_bar_ts:
+                        end = i + 1
+                        break
+                atr = atr_for_bars(history[max(0, end - window_n) : end], period)
+                if atr is None:
+                    source, final = "entry_deferred", False
+        else:
+            anchor_bar_ts = anchor_bar_timestamp(history, lot.anchor_at, self._tf_s)
+            if bracket.requires_atr:
+                window = self._window_ending_at(history, anchor_bar_ts)
+                atr = atr_for_bars(window, period) if window is not None else None
+                if atr is None:
+                    # FX-02: the interim ATR is the MIN of the rule-bar window and
+                    # the newest window (never looser than HEAD's per-bar ATR).
+                    atr = self._interim_atr(history, anchor_bar_ts, period)
+                    source = "entry_provisional" if atr is not None else "entry_deferred"
+                    final = False
+        return bracket.open_lot(
+            symbol,
+            lot_key=lot_key,
+            opening_order_id=lot.opening_order_id,
+            anchor_at=lot.anchor_at,
+            anchor_bar_ts=anchor_bar_ts,
+            entry_basis=lot.entry_basis,
+            basis_qty=lot.basis_qty,
+            atr=atr,
+            source=source,
+            final=final,
+        )
+
+    async def _finalize_pending_anchors(
+        self, history_by_symbol: dict[str, list[OHLCVBar]]
+    ) -> None:
+        """Advance every non-final bracket anchor one step (PAPER/LIVE state machine).
+
+        Runs once per bar pass (step 4c, under the bar lock) for each held symbol
+        whose anchor is ``final=False`` and was created on an EARLIER pass.  The
+        per-anchor procedure is :meth:`_finalize_one_anchor`.  Engine-wide I/O
+        budget: at most ``_ANCHOR_FETCHES_PER_PASS`` exact-window fetch per call
+        (a symbol skipped for budget spends no attempt), so a pass is never held
+        for more than one ``_EXIT_FETCH_TIMEOUT_S`` by finalisation (SEC-06).
+        """
+        bracket = self._bracket_exit
+        if bracket is None or not bracket.requires_atr:
+            return
+        period = bracket.atr_period
+        self._anchor_fetch_budget = _ANCHOR_FETCHES_PER_PASS
+        for symbol in self._symbols:
+            anchor = bracket.get_anchor(symbol)
+            if anchor is None or anchor.final:
+                continue
+            # CR-02: a closed lot has nothing left to verify -- no fetch, no log.
+            position = self._portfolio.get_position(symbol)
+            if position is None or position.is_flat:
+                self._clear_anchor_pending(symbol)
+                continue
+            if self._anchor_created_bar.get(symbol, -1) >= self._bar_count:
+                continue
+            history = history_by_symbol.get(symbol) or []
+            if not history:
+                continue
+            try:
+                changed = await self._finalize_one_anchor(symbol, anchor, history, period)
+            except Exception as exc:
+                self._log.error(
+                    "engine.anchor_finalize_error",
+                    symbol=symbol,
+                    error_type=type(exc).__name__,
+                )
+                continue
+            if changed is not None:
+                self._log_stop_cost(changed)
+                self._metric("bracket_anchor_source_total", source=changed.source)
+
+    async def _finalize_one_anchor(
+        self,
+        symbol: str,
+        anchor: BracketAnchor,
+        history: list[OHLCVBar],
+        period: int,
+    ) -> BracketAnchor | None:
+        """One step for one pending anchor; returns the anchor it changed, if any.
+
+        BACKTEST: only a deferred anchor finalises, on the newest window (unchanged).
+
+        PAPER/LIVE (synthesis ``final-synthesis-1.3b-a.md`` section 4 steps 1-7;
+        ``R`` = the rule bar):
+
+        1. ``R`` = stored ``anchor_bar_ts`` else computed from ``anchor_at``
+           (lazily, after a resume with an empty warmup window); none -> skip.
+        2. ``exact`` = the ``W`` contiguous bars ending at ``R`` from the live
+           window (no I/O).
+        3. Absent, attempts < 3 and the pass budget unspent -> one bounded fetch
+           (an attempt).
+        4. ``atr(exact)`` computable -> FINALISE (source ``entry`` or
+           ``resume_recomputed`` by origin), anchor bar ``R``.
+        5. Else, an anchor without levels -> arm the INTERIM ATR once
+           (``entry_provisional`` / ``resume_fallback_current_atr``).
+        6. Verification over (3 attempts, or an exact window without an ATR) and
+           the anchor is armed -> FINALISE UNVERIFIED, levels unchanged (error log).
+        7. Otherwise stay pending; no I/O beyond step 3.
+        """
+        bracket = self._bracket_exit
+        if bracket is None:
+            return None
+        newest_ts = history[-1].timestamp
+        if self._run_mode == RunMode.BACKTEST:
+            if anchor.source != "entry_deferred":
+                return None
+            atr = atr_for_bars(history, period)
+            if atr is None:
+                return None
+            return bracket.finalize_anchor(
+                symbol, atr=atr, anchor_bar_ts=newest_ts, source="entry_deferred"
+            )
+
+        origin = self._anchor_origin.get(symbol, "entry")
+        rule_ts = anchor.anchor_bar_ts
+        if rule_ts is None and anchor.anchor_at is not None:
+            rule_ts = anchor_bar_timestamp(history, anchor.anchor_at, self._tf_s)
+        if rule_ts is None:
+            return None  # step 1: nothing to anchor against yet
+
+        exact = self._window_ending_at(history, rule_ts)  # step 2
+        attempts = self._anchor_fetch_attempts.get(symbol, 0)
+        if (
+            exact is None
+            and attempts < _ANCHOR_FETCH_MAX_ATTEMPTS
+            and self._anchor_fetch_budget > 0
+        ):
+            attempts += 1  # step 3
+            self._anchor_fetch_attempts[symbol] = attempts
+            self._anchor_fetch_budget -= 1
+            exact = await self._fetch_exact_window(symbol, rule_ts)
+        exact_atr = atr_for_bars(exact, period) if exact is not None else None
+
+        if exact_atr is not None:  # step 4
+            done = bracket.finalize_anchor(
+                symbol,
+                atr=exact_atr,
+                anchor_bar_ts=rule_ts,
+                source="entry" if origin == "entry" else "resume_recomputed",
+            )
+            self._clear_anchor_pending(symbol)
+            return done
+
+        changed: BracketAnchor | None = None
+        armed = anchor.atr is not None
+        if not armed:  # step 5
+            interim = self._interim_atr(history, rule_ts, period)
+            if interim is not None:
+                interim_source: AnchorSource = (
+                    "entry_provisional" if origin == "entry" else "resume_fallback_current_atr"
+                )
+                changed = bracket.arm_interim(
+                    symbol, atr=interim, anchor_bar_ts=rule_ts, source=interim_source
+                )
+                if changed is not None:
+                    armed = True
+                    self._log.warning(
+                        "bracket_exit.interim_armed",
+                        symbol=symbol,
+                        source=interim_source,
+                        attempts=attempts,
+                        error_type=self._last_exit_fetch_error.get(symbol),
+                    )
+
+        verification_over = attempts >= _ANCHOR_FETCH_MAX_ATTEMPTS or exact is not None
+        if verification_over and armed:  # step 6
+            if origin == "entry":
+                self._log.error(
+                    "bracket_exit.entry_unverified",
+                    symbol=symbol,
+                    source="entry_unverified",
+                    attempts=attempts,
+                    error_type=self._last_exit_fetch_error.get(symbol),
+                    note="could not verify the entry ATR; keeping the interim levels",
+                )
+                final_source: AnchorSource = "entry_unverified"
+            else:
+                self._log.error(
+                    "bracket_exit.resume_fallback_final",
+                    symbol=symbol,
+                    source="resume_fallback_current_atr",
+                    attempts=attempts,
+                    error_type=self._last_exit_fetch_error.get(symbol),
+                    note="entry ATR could not be recomputed; keeping the interim levels",
+                )
+                final_source = "resume_fallback_current_atr"
+            done = bracket.finalize_anchor(
+                symbol, atr=None, anchor_bar_ts=None, source=final_source
+            )
+            self._clear_anchor_pending(symbol)
+            return done if done is not None else changed
+        return changed  # step 7
+
+    # ------------------------------------------------------------------
+    # WP1.3b-a: resume (prime + restore)
+    # ------------------------------------------------------------------
+
+    def prime_resume_exit_state(
+        self, fills: Sequence[Fill], orders: Sequence[Order]
+    ) -> None:
+        """Remember each open lot's entry facts from the persisted history.
+
+        Pure and synchronous; called by the orchestrator BEFORE ``start()`` at
+        the paper boot-resume and the live ``POST /resume`` sites.  The result
+        is consumed by :meth:`_restore_exit_anchors` at the end of the warmup.
+        Never raises (a symbol that fails is simply not primed).
+        """
+        self._primed_lots.clear()
+        for symbol in self._symbols:
+            try:
+                opening_fills = open_lot_fills(fills, symbol)
+                if not opening_fills:
+                    continue
+                order = next(
+                    (o for o in orders if o.order_id == opening_fills[0].order_id), None
+                )
+                entry = lot_entry_from_opening_fills(symbol, order, opening_fills)
+                if entry is None:
+                    continue
+                self._primed_lots[symbol] = _EngineLot(
+                    opening_order_id=entry.opening_order_id,
+                    order=order,
+                    fills=list(opening_fills),
+                    entry=entry,
+                )
+            except Exception:
+                self._log.error("engine.resume_prime_failed", symbol=symbol, exc_info=True)
+
+    async def _restore_exit_anchors(self) -> None:
+        """Rebuild the bracket anchors and trailing marks of every open position.
+
+        Replaces the pre-WP1.3b trailing-only seed block.  Runs at the end of
+        ``_warmup_bar_windows``, before the first bar evaluation.  Protection is
+        never dropped: a failed recompute falls back to the current ATR or to a
+        deferred anchor (trailing stop only until finalised).
+        """
+        if self._bracket_exit is None and self._trailing_stop is None:
+            self._primed_lots.clear()
+            return
+        for symbol in self._symbols:
+            try:
+                position = self._portfolio.get_position(symbol)
+                if position is None or position.is_flat:
+                    continue
+                await self._restore_symbol_exit_state(symbol, position)
+            except Exception as exc:
+                self._log.error(
+                    "engine.exit_restore_failed",
+                    symbol=symbol,
+                    error_type=type(exc).__name__,
+                )
+        self._primed_lots.clear()
+
+    async def _restore_symbol_exit_state(self, symbol: str, position: Position) -> None:
+        lot = self._primed_lots.get(symbol)
+        if lot is None:
+            # Not primed (legacy caller): the position's own numbers.
+            entry = LotEntry(
+                symbol=symbol,
+                opening_order_id=None,
+                anchor_at=position.opened_at,
+                entry_basis=position.average_entry_price,
+                entry_gross_vwap=position.average_entry_price,
+                basis_qty=position.quantity,
+            )
+            lot = _EngineLot(opening_order_id=None, order=None, fills=[], entry=entry)
+        self._lots[symbol] = lot
+        entry = lot.entry
+        bars = self._bar_windows.get(symbol, [])
+        rule_ts = anchor_bar_timestamp(bars, entry.anchor_at, self._tf_s)
+        self._anchor_created_bar[symbol] = self._bar_count
+        self._clear_anchor_pending(symbol)
+        self._unprotected_bars.pop(symbol, None)
+
+        # SEC-03: the bracket half and the trailing half are independent
+        # protective mechanisms -- a fault in one never skips the other.
+        bracket = self._bracket_exit
+        if bracket is not None:
+            try:
+                await self._restore_bracket_anchor(symbol, position, lot, bars, rule_ts)
+            except Exception as exc:
+                # The lazy ``late`` anchor then protects the lot at the next bar.
+                self._log.error(
+                    "engine.exit_restore_failed",
+                    symbol=symbol,
+                    part="bracket",
+                    error_type=type(exc).__name__,
+                )
+
+        trailing = self._trailing_stop
+        if trailing is not None:
+            try:
+                seed = await self._resume_trailing_peak(symbol, bars, rule_ts, entry)
+                trailing.open_lot(
+                    symbol,
+                    lot_key=position.opened_at,
+                    hwm0=seed,
+                    anchor_bar_ts=rule_ts,
+                )
+                trailing.seed_peak(symbol, seed)
+            except Exception as exc:
+                self._log.error(
+                    "engine.exit_restore_failed",
+                    symbol=symbol,
+                    part="trailing",
+                    error_type=type(exc).__name__,
+                )
+                self._seed_trailing_after_failure(symbol, position, entry, bars, rule_ts)
+
+    async def _restore_bracket_anchor(
+        self,
+        symbol: str,
+        position: Position,
+        lot: _EngineLot,
+        bars: Sequence[OHLCVBar],
+        rule_ts: datetime | None,
+    ) -> None:
+        """Install the bracket anchor of a resumed lot (the bracket half of the restore)."""
+        bracket = self._bracket_exit
+        if bracket is None:
+            return
+        entry = lot.entry
+        atr: Decimal | None = None
+        source: AnchorSource = "resume_recomputed"
+        final = True
+        if bracket.requires_atr:
+            atr, source, final = await self._resume_atr(
+                symbol, bars, rule_ts, bracket.atr_period
+            )
+        stop, tp = bracket.projected_levels(entry.entry_basis, atr)
+        anchor = BracketAnchor(
+            symbol=symbol,
+            lot_key=position.opened_at,
+            opening_order_id=entry.opening_order_id,
+            anchor_at=entry.anchor_at,
+            anchor_bar_ts=rule_ts,
+            entry_basis=entry.entry_basis,
+            basis_qty=entry.basis_qty,
+            atr=atr,
+            stop_price=stop,
+            take_profit_price=tp,
+            source=source,
+            final=final,
+        )
+        bracket.restore_anchor(anchor)
+        self._log_stop_cost(anchor)
+        self._metric("bracket_anchor_source_total", source=source)
+        if final:
+            self._clear_anchor_pending(symbol)
+        else:
+            self._anchor_origin[symbol] = "resume"
+            if anchor.atr is not None:
+                self._log.warning(
+                    "bracket_exit.interim_armed",
+                    symbol=symbol,
+                    source=source,
+                    attempts=self._anchor_fetch_attempts.get(symbol, 0),
+                    error_type=self._last_exit_fetch_error.get(symbol),
+                )
+
+    def _seed_trailing_after_failure(
+        self,
+        symbol: str,
+        position: Position,
+        entry: LotEntry,
+        bars: Sequence[OHLCVBar],
+        rule_ts: datetime | None,
+    ) -> None:
+        """HEAD's WP1.8a seed rule when the trailing restore raised (SEC-03, R04).
+
+        ``max(entry gross VWAP, max close of the warmup bars with ts >= the
+        position's opened_at)``.  Never the whole window (a pre-entry close could
+        put the trail above the market).  If this raises too, the lazy seed stays.
+        """
+        trailing = self._trailing_stop
+        if trailing is None:
+            return
+        try:
+            seed = max(
+                [
+                    entry.entry_gross_vwap,
+                    *(b.close for b in bars if b.timestamp >= position.opened_at),
+                ]
+            )
+            trailing.open_lot(
+                symbol,
+                lot_key=position.opened_at,
+                hwm0=seed,
+                anchor_bar_ts=rule_ts,
+            )
+            trailing.seed_peak(symbol, seed)
+            self._log.error(
+                "trailing_stop.seed_partial",
+                symbol=symbol,
+                reason="restore_failed",
+                note="seeded from the closes available in the warmup window",
+            )
+            self._metric("trailing_seed_partial_total")
+        except Exception as exc:
+            self._log.error(
+                "engine.exit_restore_failed",
+                symbol=symbol,
+                part="trailing_fallback",
+                error_type=type(exc).__name__,
+            )
+
+    async def _resume_atr(
+        self,
+        symbol: str,
+        bars: Sequence[OHLCVBar],
+        rule_ts: datetime | None,
+        period: int,
+    ) -> tuple[Decimal | None, AnchorSource, bool]:
+        """ATR0 of a resumed lot: the ``W`` bars ending at the rule bar, from the
+        warmup window or one bounded fetch (attempt 1 of ``_ANCHOR_FETCH_MAX_ATTEMPTS``).
+
+        Not recomputable -> the INTERIM ATR (``min`` of the available estimates,
+        :meth:`_interim_atr`) as a NON-final ``resume_fallback_current_atr`` anchor:
+        :meth:`_finalize_one_anchor` retries the exact window on later passes and
+        either finalises it (``resume_recomputed``) or settles on the interim
+        levels.  No ATR at all -> ``entry_deferred`` (no levels yet).
+        """
+        window = self._window_ending_at(bars, rule_ts)
+        if window is None and rule_ts is not None:
+            self._anchor_fetch_attempts[symbol] = 1
+            window = await self._fetch_exact_window(symbol, rule_ts)
+        if window is not None:
+            atr = atr_for_bars(window, period)
+            if atr is not None:
+                return atr, "resume_recomputed", True
+        interim = self._interim_atr(bars, rule_ts, period)
+        if interim is not None:
+            return interim, "resume_fallback_current_atr", False
+        self._log.error(
+            "bracket_exit.resume_anchor_deferred",
+            symbol=symbol,
+            note="ATR not computable; trailing stop only until the anchor is finalised",
+        )
+        return None, "entry_deferred", False
+
+    async def _resume_trailing_peak(
+        self,
+        symbol: str,
+        bars: Sequence[OHLCVBar],
+        rule_ts: datetime | None,
+        entry: LotEntry,
+    ) -> Decimal:
+        """``max(HWM_0, max close of bars after the anchor bar)`` for a resume.
+
+        When the warmup window starts after ``anchor bar + 1`` the gap is
+        fetched once (``since = anchor_bar_ts + tf``, at most 1000 bars, 10 s);
+        on failure the available closes are used and ``trailing_stop.seed_partial``
+        is logged.
+        """
+        peak = entry.entry_gross_vwap
+        if rule_ts is None:
+            # FX-08: no warmup bars -> HWM_0 only; say so (looser than live).
+            self._log.warning(
+                "trailing_stop.seed_partial",
+                symbol=symbol,
+                reason="no_warmup_bars",
+                note="no warmup bars; seeded from the entry fill only",
+            )
+            self._metric("trailing_seed_partial_total")
+            return peak
+        tf = timedelta(seconds=self._tf_s)
+        first_wanted = rule_ts + tf
+        closes: list[Decimal] = [b.close for b in bars if b.timestamp > rule_ts]
+        if bars and bars[0].timestamp > first_wanted:
+            missing = (bars[0].timestamp - first_wanted) // tf
+            gap: list[OHLCVBar] | None = None
+            if missing <= _TRAILING_GAP_FETCH_LIMIT:
+                try:
+                    fetched = await asyncio.wait_for(
+                        self._market_data.fetch_ohlcv(
+                            symbol=symbol,
+                            timeframe=self._timeframe,
+                            since=first_wanted,
+                            limit=missing,
+                        ),
+                        timeout=_EXIT_FETCH_TIMEOUT_S,
+                    )
+                    gap = [
+                        b for b in fetched if first_wanted <= b.timestamp < bars[0].timestamp
+                    ]
+                except Exception as exc:
+                    self._log.error(
+                        "engine.exit_gap_fetch_failed",
+                        symbol=symbol,
+                        error_type=type(exc).__name__,
+                    )
+            if gap is not None and len(gap) == missing:
+                closes.extend(b.close for b in gap)
+            else:
+                if gap:
+                    closes.extend(b.close for b in gap)
+                self._log.warning(
+                    "trailing_stop.seed_partial",
+                    symbol=symbol,
+                    missing_bars=missing,
+                    note="seeded from the closes available",
+                )
+                self._metric("trailing_seed_partial_total")
+        return max([peak, *closes])
+
+    # ------------------------------------------------------------------
     # Resting order check (paper engine)
     # ------------------------------------------------------------------
 
@@ -2052,6 +3123,8 @@ class StrategyEngine:
                             self._portfolio.update_position(
                                 fill, bar.close
                             )
+                            # WP1.3b-a: lot / anchor lifecycle (never raises).
+                            self._on_fill_routed(order, fill, pre_fill_pos)
                             # TODO: track Order ->strategy_id mapping for
                             # correct multi-strategy attribution on resting fills.
                             self._record_trade_if_closed(
@@ -2472,27 +3545,16 @@ class StrategyEngine:
                     symbol=symbol,
                 )
 
-        # WP1.8a (A-09/R§3): after a resume, seed the trailing-stop peak for
-        # every symbol with an open position -- the in-memory peak is always
-        # lost on restart, and seeding from the current price alone would
-        # loosen the stop.  Uses the just-loaded warmup window to find the
-        # highest close since the (rebuilt) position's opened_at; falls back
-        # to the entry price when no bar in the window is new enough (or the
-        # window is empty).  No-op when no trailing stop is configured or no
-        # symbol has an open position (a fresh run never reaches the `if`).
-        if self._trailing_stop is not None:
-            for symbol in self._symbols:
-                position = self._portfolio.get_position(symbol)
-                if position is None or position.is_flat:
-                    continue
-                bars = self._bar_windows.get(symbol, [])
-                closes_since_open = [
-                    bar.close for bar in bars if bar.timestamp >= position.opened_at
-                ]
-                highest_close = max(closes_since_open, default=position.average_entry_price)
-                self._trailing_stop.seed_peak(
-                    symbol, max(position.average_entry_price, highest_close)
-                )
+        # WP1.3b-a (replaces the WP1.8a A-09 trailing-only seed block): after a
+        # resume, recompute the bracket anchor and the trailing high-water mark
+        # of every open position from the persisted history primed by
+        # ``prime_resume_exit_state`` -- before the first bar evaluation.  A
+        # fresh run has no open position, so this is a no-op there.  It never
+        # aborts the warmup.
+        try:
+            await self._restore_exit_anchors()
+        except Exception as exc:
+            self._log.error("engine.exit_restore_failed", error_type=type(exc).__name__)
 
     async def _poll_and_process(self) -> None:
         """

@@ -17,7 +17,7 @@ constructor ranges (``FIXED_PCT_RANGE``, ``ATR_MULTIPLIER_RANGE``,
 ``ATR_PERIOD_MIN``, ``TRAILING_PCT_RANGE``).  This module layers the
 *policy* bounds on top (SY-13a-04 §1a): the entry-cost floor (E6/E7), the
 tightened stop-loss ceiling (E4, 0.50 rather than the constructor's 0.95),
-and the ATR period ceiling (E4/E10, 99 rather than 500) -- see the module
+and the ATR period ceiling (E4/E10, 49 rather than 500) -- see the module
 constants below.  A config that fails these policy bounds is still
 *mechanically* constructible; that is precisely why a shared validator, run
 BEFORE construction, is required (a construction-time ``try/except`` can
@@ -74,7 +74,8 @@ logger = structlog.get_logger(__name__)
 # ---------------------------------------------------------------------------
 POLICY_FIXED_SL_MAX: float = 0.50
 POLICY_FIXED_TP_MAX: float = FIXED_PCT_RANGE[1]  # 0.95, unchanged
-POLICY_ATR_PERIOD_MAX: int = 99
+# W = 6*period+1 must fit one ccxt Coinbase fetch_ohlcv call (maxLimit 300): 6*49+1 = 295
+POLICY_ATR_PERIOD_MAX: int = 49
 
 _VALID_BRACKET_MODES: frozenset[str] = frozenset({"fixed", "atr"})
 _FIXED_ACTIVE_KEYS: tuple[str, str] = ("bracket_stop_loss_pct", "bracket_take_profit_pct")
