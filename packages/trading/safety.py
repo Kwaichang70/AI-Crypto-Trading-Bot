@@ -9,38 +9,52 @@ This module implements two independent safety mechanisms:
    satisfied before any live order is submitted.  Checked by the
    ``LiveExecutionEngine`` and by the API run-creation endpoint.
 
-2. **CircuitBreaker**  -- Emergency stop mechanism that halts all trading
-   when configurable risk thresholds are breached.  Once tripped, the
-   breaker stays open until manually reset by an operator.
+2. **CircuitBreaker**  -- Graduated entry guard evaluated once per processed
+   bar from a typed :class:`~trading.portfolio.RiskSnapshot` (WP1.6, C2/C3/C23).
 
-   Sprint 32 adds a graduated response system via ``check_graduated()``:
-   - REDUCE: drawdown below max but above reduce threshold  -> scale down position sizes
-   - DAILY_LIMIT: daily loss limit reached  -> no new entries until next day
-   - HALT: max thresholds breached  -> full trading halt (same as check())
+   WP1.6 semantics (``CircuitBreaker.evaluate``):
+   - REDUCE: drawdown >= 0.5 x the run limit  -> BUY quantity x 0.5
+   - DAILY_LIMIT: the WP1.5 daily-loss predicate  -> BUYs dropped until the
+     UTC day rolls (``snapshot.day``, never the wall clock)
+   - HALT: drawdown >= the run limit  -> BUYs dropped.  HALT does NOT stop the
+     run and does NOT latch: it auto-recovers (user decision U-1) after N
+     consecutive evaluations below 0.9 x the limit, stepping down to REDUCE.
+   - Every effect is BUY-only (C23): exits are never blocked.
+
+   The pre-WP1.6 API (``check``, ``check_graduated``,
+   ``check_daily_limit_reset``, ``get_position_size_multiplier``, ``trip``,
+   ``reset``) is LEGACY -- unreachable from production code, kept only for the
+   existing unit tests (removal: CF-29).
 
 Both classes are stateless with respect to persistence  -- they evaluate
 conditions from injected state at call time.  The CircuitBreaker holds
-in-memory trip state that survives across bar ticks within a single process
-but must be persisted externally for crash recovery.
+in-memory hysteresis counters; nothing is persisted (P-8): every level is
+re-derived from data after a restart (restart watch, see ``CircuitBreaker``).
 
 Design principles
 -----------------
-- Fail-closed: any ambiguity defaults to blocking orders.
-- Explicit reset: breakers never auto-reset.
-- No I/O in the hot path: all inputs are passed as arguments.
+- Fail-closed: any ambiguity defaults to blocking orders (entries only).
+- No operator state: HALT / REDUCE / DAILY_LIMIT are data-derived.
+- No I/O and no wall-clock read in the evaluation path.
 - Full audit trail via structlog at WARNING/CRITICAL severity.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
+from decimal import Decimal
 from enum import StrEnum
-from typing import Any
+from typing import Any, Final
 
 import hmac
 import structlog
 from pydantic import BaseModel, Field, model_validator
 from pydantic import SecretStr
+
+from trading.portfolio import RiskSnapshot
+from trading.risk import RiskParameters
 
 __all__ = [
     "LiveTradingGate",
@@ -51,6 +65,16 @@ __all__ = [
     "CircuitBreakerConfig",
     "CircuitBreakerResponse",
     "CircuitBreakerState",
+    "CircuitBreakerDecision",
+    "CircuitBreakerInputs",
+    "CircuitBreakerThresholds",
+    "CircuitBreakerTransition",
+    "DEESCALATION_EVALUATIONS",
+    "HALT_EXIT_RATIO",
+    "REDUCE_ENTRY_RATIO",
+    "REDUCE_EXIT_RATIO",
+    "REDUCE_MULTIPLIER",
+    "build_run_circuit_breaker",
 ]
 
 logger = structlog.get_logger(__name__)
@@ -492,12 +516,193 @@ class CircuitBreakerConfig(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# WP1.6: typed thresholds, inputs, transitions and decisions
+# ---------------------------------------------------------------------------
+
+#: WP1.6 §5.2 band constants.  They become per-run parameters in WP1.9 (CF-28).
+HALT_EXIT_RATIO: Final[Decimal] = Decimal("0.9")
+REDUCE_ENTRY_RATIO: Final[Decimal] = Decimal("0.5")
+REDUCE_EXIT_RATIO: Final[Decimal] = Decimal("0.4")
+REDUCE_MULTIPLIER: Final[Decimal] = Decimal("0.5")
+#: Consecutive evaluations (processed bars) below the exit band before the
+#: HALT -> REDUCE and REDUCE -> OK de-escalations (U-3, K-02).
+DEESCALATION_EVALUATIONS: Final[int] = 3
+
+_LIMIT_CEILING: Final[Decimal] = Decimal("0.50")
+_ZERO: Final[Decimal] = Decimal(0)
+_ONE: Final[Decimal] = Decimal(1)
+
+#: ``RiskSnapshot`` Decimal fields validated (finite) before ANY state change.
+_SNAPSHOT_DECIMAL_FIELDS: Final[tuple[str, ...]] = (
+    "nav",
+    "peak_equity",
+    "drawdown_pct",
+    "nav_day_start",
+    "daily_loss_basis",
+    "worst_nav_pnl",
+)
+
+
+def _require_finite_decimal(name: str, value: object) -> Decimal:
+    """Return ``value`` if it is a finite ``Decimal``; raise ``ValueError`` otherwise."""
+    if isinstance(value, bool) or not isinstance(value, Decimal) or not value.is_finite():
+        raise ValueError(f"{name} must be a finite Decimal, got {value!r}")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class CircuitBreakerThresholds:
+    """Validated, exact-``Decimal`` bands of one run's circuit breaker (§5.2).
+
+    ``halt_entry`` is the run's ``max_drawdown_pct`` (the WP1.5 gate limit);
+    every other band is derived from it in ``Decimal`` so no float drift can
+    appear (SYN-02: ``0.2 * 0.9 == 0.18000000000000002`` in float).
+    """
+
+    max_daily_loss_pct: Decimal
+    halt_entry: Decimal
+    halt_exit: Decimal
+    reduce_entry: Decimal
+    reduce_exit: Decimal
+    reduce_multiplier: Decimal
+    deescalation_evaluations: int
+
+    def __post_init__(self) -> None:
+        for name in (
+            "max_daily_loss_pct",
+            "halt_entry",
+            "halt_exit",
+            "reduce_entry",
+            "reduce_exit",
+            "reduce_multiplier",
+        ):
+            _require_finite_decimal(name, getattr(self, name))
+        if not (
+            _ZERO < self.reduce_exit < self.reduce_entry < self.halt_exit < self.halt_entry
+            and self.halt_entry <= _LIMIT_CEILING
+        ):
+            raise ValueError(
+                "thresholds must satisfy 0 < reduce_exit < reduce_entry < halt_exit "
+                f"< halt_entry <= 0.50, got reduce_exit={self.reduce_exit} "
+                f"reduce_entry={self.reduce_entry} halt_exit={self.halt_exit} "
+                f"halt_entry={self.halt_entry}"
+            )
+        if not (_ZERO < self.max_daily_loss_pct <= _LIMIT_CEILING):
+            raise ValueError(
+                f"max_daily_loss_pct must be in (0, 0.50], got {self.max_daily_loss_pct}"
+            )
+        if not (_ZERO < self.reduce_multiplier <= _ONE):
+            raise ValueError(
+                f"reduce_multiplier must be in (0, 1], got {self.reduce_multiplier}"
+            )
+        n = self.deescalation_evaluations
+        if isinstance(n, bool) or not isinstance(n, int) or not (1 <= n <= 50):
+            raise ValueError(f"deescalation_evaluations must be an int in [1, 50], got {n!r}")
+
+    @classmethod
+    def from_risk_parameters(cls, params: RiskParameters) -> CircuitBreakerThresholds:
+        """Derive the bands from the run's own ``RiskParameters`` (P-2).
+
+        ``Decimal(str(float))`` is exactly what the WP1.5 gate does
+        (``risk.py`` ``_check_drawdown`` / ``_check_daily_loss``), so the
+        CB limit and the gate limit are the same ``Decimal``.
+        """
+        limit = Decimal(str(params.max_drawdown_pct))
+        return cls(
+            max_daily_loss_pct=Decimal(str(params.max_daily_loss_pct)),
+            halt_entry=limit,
+            halt_exit=limit * HALT_EXIT_RATIO,
+            reduce_entry=limit * REDUCE_ENTRY_RATIO,
+            reduce_exit=limit * REDUCE_EXIT_RATIO,
+            reduce_multiplier=REDUCE_MULTIPLIER,
+            deescalation_evaluations=DEESCALATION_EVALUATIONS,
+        )
+
+    def as_str_dict(self) -> dict[str, str]:
+        """The seven threshold values as strings (API / log payload)."""
+        return {
+            "max_daily_loss_pct": str(self.max_daily_loss_pct),
+            "halt_entry": str(self.halt_entry),
+            "halt_exit": str(self.halt_exit),
+            "reduce_entry": str(self.reduce_entry),
+            "reduce_exit": str(self.reduce_exit),
+            "reduce_multiplier": str(self.reduce_multiplier),
+            "deescalation_evaluations": str(self.deescalation_evaluations),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class CircuitBreakerInputs:
+    """Run-level figures one evaluation used.  Never cached across evaluations (E-6)."""
+
+    as_of: datetime
+    day: date
+    nav: Decimal
+    peak_equity: Decimal
+    drawdown_pct: Decimal
+    gate_daily_pnl: Decimal
+    daily_loss_basis: Decimal
+    daily_threshold: Decimal
+    day_start_source: str
+    state_unknown: bool
+    open_position_count: int
+
+    def as_str_dict(self) -> dict[str, str]:
+        """Allow-listed string view (API / log payload)."""
+        return {
+            "as_of": self.as_of.isoformat(),
+            "day": self.day.isoformat(),
+            "nav": str(self.nav),
+            "peak_equity": str(self.peak_equity),
+            "drawdown_pct": str(self.drawdown_pct),
+            "gate_daily_pnl": str(self.gate_daily_pnl),
+            "daily_loss_basis": str(self.daily_loss_basis),
+            "daily_threshold": str(self.daily_threshold),
+            "day_start_source": self.day_start_source,
+            "state_unknown": str(self.state_unknown).lower(),
+            "open_position_count": str(self.open_position_count),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class CircuitBreakerTransition:
+    """One change of the effective level (emitted once per change)."""
+
+    run_id: str
+    from_level: CircuitBreakerResponse
+    to_level: CircuitBreakerResponse
+    at: datetime  # ``snapshot.as_of`` (the risk clock), never the wall clock
+    reason: str
+    drawdown_pct: Decimal
+    thresholds: CircuitBreakerThresholds
+
+
+@dataclass(frozen=True, slots=True)
+class CircuitBreakerDecision:
+    """Result of one :meth:`CircuitBreaker.evaluate` call."""
+
+    level: CircuitBreakerResponse
+    active_conditions: tuple[CircuitBreakerResponse, ...]
+    entries_blocked: bool
+    entry_size_multiplier: Decimal  # 1 (OK) / reduce_multiplier (REDUCE) / 0 (blocked)
+    reason: str | None
+    inputs: CircuitBreakerInputs
+    transition: CircuitBreakerTransition | None
+
+
+# ---------------------------------------------------------------------------
 # Circuit breaker state snapshot
 # ---------------------------------------------------------------------------
 
 
 class CircuitBreakerState(BaseModel):
-    """Snapshot of the circuit breaker's current state for API exposure."""
+    """Snapshot of the circuit breaker's current state for API exposure.
+
+    The first five fields are the legacy contract (``is_tripped`` is
+    ``manual trip or level == HALT``; ``graduated_response`` is the effective
+    level; ``trip_reason`` / ``tripped_at`` / ``trip_count`` keep their legacy
+    manual-trip meaning).  Every WP1.6 field has a default.
+    """
 
     model_config = {"frozen": True}
 
@@ -518,6 +723,35 @@ class CircuitBreakerState(BaseModel):
         default=CircuitBreakerResponse.OK,
         description="Current graduated response level (Sprint 32)",
     )
+    # ---- WP1.6 -------------------------------------------------------- #
+    level: str = Field(default="ok", description="Effective level: ok/reduce/daily_limit/halt")
+    active_conditions: list[str] = Field(
+        default_factory=list, description="Active conditions, most severe first"
+    )
+    entries_blocked: bool = Field(default=False, description="True while BUYs are dropped")
+    entry_size_multiplier: str = Field(default="1", description="BUY size multiplier (Decimal)")
+    halt_since: datetime | None = Field(default=None, description="Risk-clock start of the HALT")
+    last_halt_reason: str | None = Field(default=None, description="Reason of the last HALT")
+    halt_count: int = Field(default=0, description="HALT entries in this process")
+    halt_exit_progress: int = Field(
+        default=0, description="Consecutive evaluations below halt_exit (k of N)"
+    )
+    reduce_exit_progress: int = Field(
+        default=0, description="Consecutive evaluations below reduce_exit (k of N)"
+    )
+    restart_watch: str = Field(
+        default="none",
+        description="Restart watch (CF-35): halt / reduce (exit band is the entry band) / none",
+    )
+    daily_limit_day: date | None = Field(default=None, description="Risk day of the DAILY_LIMIT")
+    evaluations: int = Field(default=0, description="Evaluations performed")
+    last_evaluated_at: datetime | None = Field(
+        default=None, description="Risk-clock time of the last evaluation"
+    )
+    thresholds: dict[str, str] = Field(default_factory=dict, description="Bands, as strings")
+    inputs: dict[str, str] | None = Field(
+        default=None, description="Last evaluation inputs (allow-list), as strings"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -527,67 +761,52 @@ class CircuitBreakerState(BaseModel):
 
 class CircuitBreaker:
     """
-    Emergency stop mechanism that halts all trading when triggered.
+    Graduated, auto-recovering entry guard (WP1.6).
 
-    The circuit breaker evaluates risk conditions on every bar tick or
-    before every order submission.  When any threshold is breached, the
-    breaker trips and remains open until an operator explicitly resets it.
+    **Production path:** :meth:`evaluate` -- called once per processed bar by
+    ``StrategyEngine._process_bar`` with ``PortfolioAccounting.risk_snapshot()``.
+    Escalation is immediate; HALT and REDUCE de-escalate after N consecutive
+    evaluations below an exit band (HALT always steps down to REDUCE first);
+    DAILY_LIMIT clears when ``snapshot.day`` advances.  All effects are
+    BUY-only and nothing is persisted or operator-resettable.  Build instances
+    only through :func:`build_run_circuit_breaker`.
 
-    Sprint 32 adds a graduated response system via ``check_graduated()``:
-    - REDUCE: soft warning with position size scaling
-    - DAILY_LIMIT: no new entries until next trading day
-    - HALT: full trading halt
+    **Restart watch (WP1.6 CF-35, user decision "stricter"):** an instance
+    cannot know the level an uninterrupted breaker would hold, so during its
+    first N evaluations it enters HALT at ``halt_exit`` (0.9 L) instead of
+    ``halt_entry``, and during its first 2N evaluations it enters REDUCE at
+    ``reduce_exit`` (0.4 L) instead of ``reduce_entry``.  That is exactly how
+    long an uninterrupted breaker that was in HALT could still be in HALT
+    (N evaluations below 0.9 L) and then in REDUCE (N more below 0.4 L).
+    Streaks start at 0; a level entered during the watch is then held by the
+    ordinary hysteresis.  Result (WP16-T-46): from the 2N-th evaluation on, a
+    new instance is never laxer than an uninterrupted one; before that only
+    at dd < 0.9 L, for at most 2N-1 evaluations.  It applies to every new
+    instance (resume or not): the breaker does not know which it is.
 
-    IMPORTANT: ``check()`` is unchanged. ``check_graduated()`` is a
-    separate method that does NOT trip the hard breaker. Callers must
-    handle both methods independently.
-
-    Triggers (hard halt)
-    --------------------
-    - Max daily loss exceeded
-    - Max drawdown from peak exceeded
-    - Rapid consecutive losses (configurable threshold)
-    - Manual trip via API or kill switch
-
-    Once tripped, the circuit breaker stays open until ``reset()`` is called.
-    This is a deliberate design choice: automatic recovery from risk events
-    is dangerous and requires human review.
+    **Legacy path (not used by production since WP1.6; removal CF-29):**
+    ``check``, ``check_graduated``, ``check_daily_limit_reset``,
+    ``get_position_size_multiplier``, ``trip`` and ``reset``.  They read the
+    wall clock and/or stay sticky until reset; they are kept so the existing
+    unit tests stay green.
 
     Parameters
     ----------
     config : CircuitBreakerConfig
-        Threshold configuration.
+        Legacy threshold configuration (mirror of the run's risk parameters
+        when built by :func:`build_run_circuit_breaker`).
     run_id : str
         Run identifier for structured logging.
-
-    Usage
-    -----
-    ::
-
-        breaker = CircuitBreaker(config=CircuitBreakerConfig(), run_id="run-123")
-
-        # Hard check before every order
-        if breaker.check(equity=9500, daily_pnl=-600, drawdown=0.12, consecutive_losses=3):
-            # Trading halted  -- do not submit orders
-            ...
-
-        # Graduated check for soft warnings
-        response = breaker.check_graduated(equity=9500, daily_pnl=-300, drawdown=0.08)
-        if response == CircuitBreakerResponse.REDUCE:
-            multiplier = breaker.get_position_size_multiplier()
-            # scale down position sizes
-
-        # Manual trip
-        breaker.trip("Operator initiated emergency stop")
-
-        # Reset after review
-        breaker.reset()
+    thresholds : CircuitBreakerThresholds | None
+        WP1.6 bands.  ``None`` makes :meth:`evaluate` raise ``RuntimeError``.
     """
 
     def __init__(
         self,
         config: CircuitBreakerConfig | None = None,
         run_id: str = "",
+        *,
+        thresholds: CircuitBreakerThresholds | None = None,
     ) -> None:
         self._config = config or CircuitBreakerConfig()
         self._run_id = run_id
@@ -601,6 +820,20 @@ class CircuitBreaker:
             component="circuit_breaker",
             run_id=run_id,
         )
+        # ---- WP1.6 machine state (in-memory only; P-8) ---------------- #
+        self._thresholds: CircuitBreakerThresholds | None = thresholds
+        self._halt: bool = False
+        self._halt_exit_streak: int = 0
+        self._reduce: bool = False
+        self._reduce_exit_streak: int = 0
+        self._daily_limit_day: date | None = None
+        self._evaluations: int = 0
+        self._halt_since: datetime | None = None
+        self._halt_reason: str | None = None
+        self._halt_count: int = 0
+        self._last_inputs: CircuitBreakerInputs | None = None
+        self._last_evaluated_at: datetime | None = None
+        self._listeners: list[Callable[[CircuitBreakerTransition], None]] = []
 
     # ------------------------------------------------------------------ #
     # Properties
@@ -622,18 +855,338 @@ class CircuitBreaker:
         return self._current_response
 
     @property
+    def thresholds(self) -> CircuitBreakerThresholds | None:
+        """The WP1.6 bands, or ``None`` when the breaker was built without them."""
+        return self._thresholds
+
+    def _active_conditions(self) -> tuple[CircuitBreakerResponse, ...]:
+        """Active conditions, most severe first (halt, daily_limit, reduce)."""
+        conditions: list[CircuitBreakerResponse] = []
+        if self._halt or self._tripped:
+            conditions.append(CircuitBreakerResponse.HALT)
+        if self._daily_limit_day is not None:
+            conditions.append(CircuitBreakerResponse.DAILY_LIMIT)
+        if self._reduce:
+            conditions.append(CircuitBreakerResponse.REDUCE)
+        return tuple(conditions)
+
+    def _multiplier_for(self, level: CircuitBreakerResponse) -> Decimal:
+        """BUY size multiplier of ``level``: 1 / reduce_multiplier / 0 (blocked)."""
+        if level == CircuitBreakerResponse.OK:
+            return _ONE
+        if level == CircuitBreakerResponse.REDUCE:
+            if self._thresholds is not None:
+                return self._thresholds.reduce_multiplier
+            return Decimal(str(self._config.reduce_position_multiplier))
+        return _ZERO
+
+    @property
     def state(self) -> CircuitBreakerState:
-        """Return a snapshot of the current breaker state."""
+        """Return a snapshot of the current breaker state (read-only, atomic)."""
+        level = self._current_response
+        t = self._thresholds
         return CircuitBreakerState(
-            is_tripped=self._tripped,
+            is_tripped=self._tripped or level == CircuitBreakerResponse.HALT,
             trip_reason=self._trip_reason,
             tripped_at=self._tripped_at,
             trip_count=self._trip_count,
-            graduated_response=self._current_response,
+            graduated_response=level,
+            level=level.value,
+            active_conditions=[c.value for c in self._active_conditions()],
+            entries_blocked=level
+            in (CircuitBreakerResponse.HALT, CircuitBreakerResponse.DAILY_LIMIT),
+            entry_size_multiplier=str(self._multiplier_for(level)),
+            halt_since=self._halt_since,
+            last_halt_reason=self._halt_reason,
+            halt_count=self._halt_count,
+            halt_exit_progress=self._halt_exit_streak,
+            reduce_exit_progress=self._reduce_exit_streak,
+            restart_watch=self._restart_watch(),
+            daily_limit_day=self._daily_limit_day,
+            evaluations=self._evaluations,
+            last_evaluated_at=self._last_evaluated_at,
+            thresholds=t.as_str_dict() if t is not None else {},
+            inputs=self._last_inputs.as_str_dict() if self._last_inputs is not None else None,
         )
 
+    def _restart_watch(self) -> str:
+        """``halt`` / ``reduce`` while the exit bands act as entry bands, else ``none``."""
+        t = self._thresholds
+        if t is None:
+            return "none"
+        if self._evaluations < t.deescalation_evaluations:
+            return "halt"
+        if self._evaluations < 2 * t.deescalation_evaluations:
+            return "reduce"
+        return "none"
+
+    def add_transition_listener(
+        self, listener: Callable[[CircuitBreakerTransition], None]
+    ) -> None:
+        """Register a callback invoked once per level change (never raises into evaluate)."""
+        self._listeners.append(listener)
+
     # ------------------------------------------------------------------ #
-    # Core check (unchanged from pre-Sprint 32)
+    # WP1.6: the production evaluation (RiskSnapshot -> decision)
+    # ------------------------------------------------------------------ #
+
+    def evaluate(self, snapshot: RiskSnapshot) -> CircuitBreakerDecision:
+        """Evaluate one processed bar from a typed :class:`RiskSnapshot` (§5.2).
+
+        Pure with respect to the portfolio (P-5): the only input is
+        ``snapshot``; the basis / day start are read fresh every call (E-6).
+        There is no wall-clock read (P-6): the day comes from
+        ``snapshot.day`` and times from ``snapshot.as_of``.
+
+        Transactional (SYN-06): inputs are validated first and the machine
+        state is committed only after every computation succeeded, so a raise
+        leaves the breaker exactly as it was.
+
+        Raises
+        ------
+        TypeError
+            ``snapshot`` is not a :class:`RiskSnapshot`.
+        RuntimeError
+            The breaker was built without thresholds.
+        ValueError
+            A snapshot Decimal field is not finite.
+        """
+        if not isinstance(snapshot, RiskSnapshot):
+            raise TypeError(
+                f"evaluate() requires a RiskSnapshot, got {type(snapshot).__name__}"
+            )
+        t = self._thresholds
+        if t is None:
+            raise RuntimeError(
+                "circuit breaker thresholds not configured; use build_run_circuit_breaker"
+            )
+        for field_name in _SNAPSHOT_DECIMAL_FIELDS:
+            _require_finite_decimal(field_name, getattr(snapshot, field_name))
+
+        dd = snapshot.drawdown_pct
+        basis = snapshot.daily_loss_basis
+        daily_threshold = basis * t.max_daily_loss_pct  # E-6: recomputed every call
+        gate_pnl = snapshot.gate_daily_pnl(snapshot.nav)
+        # Identical to the WP1.5 gate (risk.py _check_daily_loss, inclusive).
+        raw_daily = snapshot.state_unknown or basis <= _ZERO or gate_pnl <= -daily_threshold
+        n = t.deescalation_evaluations
+        # Restart watch (CF-35): the exit band is the entry band for the first
+        # N (HALT) / 2N (REDUCE) evaluations of every instance.
+        halt_watch = self._evaluations < n
+        reduce_watch = self._evaluations < 2 * n
+
+        # Work on locals; commit at the end.
+        prev_halt, prev_reduce, prev_dl = self._halt, self._reduce, self._daily_limit_day
+        halt, h_streak = self._halt, self._halt_exit_streak
+        reduce, r_streak = self._reduce, self._reduce_exit_streak
+        dl_day = self._daily_limit_day
+
+        # REDUCE machine (entry 0.5L, exit 0.4L for N consecutive evaluations).
+        if dd >= t.reduce_entry or (reduce_watch and dd >= t.reduce_exit):
+            reduce, r_streak = True, 0
+        elif reduce:
+            if dd < t.reduce_exit:
+                r_streak += 1
+                if r_streak >= n:
+                    reduce, r_streak = False, 0
+            else:
+                r_streak = 0
+        # HALT machine (entry L, exit 0.9L for N consecutive evaluations).
+        if dd >= t.halt_entry or (halt_watch and dd >= t.halt_exit):
+            halt, h_streak = True, 0
+        elif halt:
+            if dd < t.halt_exit:
+                h_streak += 1
+                if h_streak >= n:
+                    # One-level step-down: HALT never clears straight to OK.
+                    halt, h_streak = False, 0
+                    reduce, r_streak = True, 0
+            else:
+                h_streak = 0
+        if halt:
+            reduce, r_streak = True, 0  # invariant: HALT implies REDUCE
+        # DAILY machine: latches for the risk day, clears on the day roll only.
+        if raw_daily:
+            dl_day = snapshot.day  # SYN-01: always the current day
+        elif dl_day is not None and snapshot.day > dl_day:
+            dl_day = None
+
+        if halt or self._tripped:
+            level = CircuitBreakerResponse.HALT
+        elif dl_day is not None:
+            level = CircuitBreakerResponse.DAILY_LIMIT
+        elif reduce:
+            level = CircuitBreakerResponse.REDUCE
+        else:
+            level = CircuitBreakerResponse.OK
+
+        inputs = CircuitBreakerInputs(
+            as_of=snapshot.as_of,
+            day=snapshot.day,
+            nav=snapshot.nav,
+            peak_equity=snapshot.peak_equity,
+            drawdown_pct=dd,
+            gate_daily_pnl=gate_pnl,
+            daily_loss_basis=basis,
+            daily_threshold=daily_threshold,
+            day_start_source=snapshot.day_start_source,
+            state_unknown=snapshot.state_unknown,
+            open_position_count=snapshot.open_position_count,
+        )
+        if level == CircuitBreakerResponse.HALT:
+            if halt:
+                if dd >= t.halt_entry:
+                    reason: str | None = f"drawdown {dd} >= limit {t.halt_entry}"
+                elif not prev_halt:  # entered below L: only the restart watch does that
+                    reason = f"drawdown {dd} >= halt exit band {t.halt_exit} (restart watch)"
+                else:
+                    reason = f"drawdown {dd} >= halt exit band {t.halt_exit} (recovery pending)"
+            else:
+                reason = f"manual trip: {self._trip_reason}"
+        elif level == CircuitBreakerResponse.DAILY_LIMIT:
+            reason = (
+                "daily loss state unknown or basis unavailable"
+                if snapshot.state_unknown or basis <= _ZERO
+                else f"daily pnl {gate_pnl} <= -{daily_threshold}"
+            )
+        elif level == CircuitBreakerResponse.REDUCE:
+            reason = (
+                f"reduce active: drawdown {dd} (entry >= {t.reduce_entry}, "
+                f"exit < {t.reduce_exit} for {n} evaluations)"
+            )
+        else:
+            reason = None
+
+        # ---- commit ------------------------------------------------- #
+        prev_level = self._current_response
+        self._halt, self._halt_exit_streak = halt, h_streak
+        self._reduce, self._reduce_exit_streak = reduce, r_streak
+        self._daily_limit_day = dl_day
+        self._current_response = level
+        self._evaluations += 1
+        self._last_inputs = inputs
+        self._last_evaluated_at = snapshot.as_of
+        if halt and not prev_halt:
+            self._halt_since = snapshot.as_of
+            self._halt_reason = reason
+            self._halt_count += 1
+        elif prev_halt and not halt:
+            self._halt_since = None  # _halt_reason kept as last_halt_reason
+
+        transition: CircuitBreakerTransition | None = None
+        if level != prev_level:
+            transition = CircuitBreakerTransition(
+                run_id=self._run_id,
+                from_level=prev_level,
+                to_level=level,
+                at=snapshot.as_of,
+                reason=reason if reason is not None else "recovered",
+                drawdown_pct=dd,
+                thresholds=t,
+            )
+        decision = CircuitBreakerDecision(
+            level=level,
+            active_conditions=self._active_conditions(),
+            entries_blocked=level
+            in (CircuitBreakerResponse.HALT, CircuitBreakerResponse.DAILY_LIMIT),
+            entry_size_multiplier=self._multiplier_for(level),
+            reason=reason,
+            inputs=inputs,
+            transition=transition,
+        )
+
+        # ---- emit (logs, then listeners; nothing here may raise) ----- #
+        self._emit_events(
+            decision,
+            prev_halt=prev_halt,
+            prev_reduce=prev_reduce,
+            prev_daily_limit_day=prev_dl,
+        )
+        return decision
+
+    def _emit_events(
+        self,
+        decision: CircuitBreakerDecision,
+        *,
+        prev_halt: bool,
+        prev_reduce: bool,
+        prev_daily_limit_day: date | None,
+    ) -> None:
+        """Structured log events and listener fan-out for one evaluation (§5.8)."""
+        t = self._thresholds
+        if t is None:  # unreachable: evaluate() checked
+            return
+        inp = decision.inputs
+        if self._halt and not prev_halt:
+            self._log.critical(
+                "circuit_breaker.halt_entered",
+                alert="ENTRIES_BLOCKED",
+                drawdown_pct=str(inp.drawdown_pct),
+                halt_entry=str(t.halt_entry),
+                halt_exit=str(t.halt_exit),
+                nav=str(inp.nav),
+                peak_equity=str(inp.peak_equity),
+                open_position_count=inp.open_position_count,
+            )
+        elif prev_halt and not self._halt:
+            self._log.warning(
+                "circuit_breaker.halt_cleared",
+                drawdown_pct=str(inp.drawdown_pct),
+                halt_exit=str(t.halt_exit),
+                deescalation_evaluations=t.deescalation_evaluations,
+                next_level="reduce",
+            )
+        if self._daily_limit_day is not None and prev_daily_limit_day is None:
+            self._log.warning(
+                "circuit_breaker.daily_limit_entered",
+                day=inp.day.isoformat(),
+                gate_daily_pnl=str(inp.gate_daily_pnl),
+                threshold=str(inp.daily_threshold),
+                day_start_source=inp.day_start_source,
+            )
+        elif self._daily_limit_day is None and prev_daily_limit_day is not None:
+            self._log.info(
+                "circuit_breaker.daily_limit_cleared",
+                day=inp.day.isoformat(),
+                gate_daily_pnl=str(inp.gate_daily_pnl),
+                threshold=str(inp.daily_threshold),
+                day_start_source=inp.day_start_source,
+            )
+        if self._reduce and not prev_reduce:
+            self._log.warning(
+                "circuit_breaker.reduce_entered",
+                drawdown_pct=str(inp.drawdown_pct),
+                band=str(t.reduce_entry),
+            )
+        elif prev_reduce and not self._reduce:
+            self._log.info(
+                "circuit_breaker.reduce_cleared",
+                drawdown_pct=str(inp.drawdown_pct),
+                band=str(t.reduce_exit),
+            )
+        transition = decision.transition
+        if transition is None:
+            return
+        self._log.warning(
+            "circuit_breaker.transition",
+            from_level=transition.from_level.value,
+            to_level=transition.to_level.value,
+            reason=transition.reason,
+            inputs=inp.as_str_dict(),
+            thresholds=t.as_str_dict(),
+        )
+        for listener in list(self._listeners):
+            try:
+                listener(transition)
+            except Exception:
+                self._log.error(
+                    "circuit_breaker.listener_failed",
+                    listener=repr(listener),
+                    exc_info=True,
+                )
+
+    # ------------------------------------------------------------------ #
+    # Legacy API (pre-WP1.6) -- NOT used by production; removal CF-29
     # ------------------------------------------------------------------ #
 
     def check(
@@ -646,6 +1199,9 @@ class CircuitBreaker:
         """
         Evaluate risk conditions and trip the breaker if any threshold
         is exceeded.
+
+        Legacy -- not used by production since WP1.6 (wall clock / sticky);
+        removal CF-29.
 
         This method is idempotent: if the breaker is already tripped, it
         returns True immediately without re-evaluating conditions.
@@ -712,6 +1268,9 @@ class CircuitBreaker:
     ) -> CircuitBreakerResponse:
         """
         Evaluate graduated risk conditions without tripping the hard breaker.
+
+        Legacy -- not used by production since WP1.6 (wall clock / sticky);
+        removal CF-29.
 
         This method evaluates soft thresholds and returns an action-level
         response without permanently tripping the breaker. The hard ``check()``
@@ -784,6 +1343,9 @@ class CircuitBreaker:
         """
         Return the position size multiplier for the current response level.
 
+        Legacy -- not used by production since WP1.6 (wall clock / sticky);
+        removal CF-29.
+
         Returns
         -------
         float
@@ -799,6 +1361,9 @@ class CircuitBreaker:
     def check_daily_limit_reset(self) -> bool:
         """
         Check if the DAILY_LIMIT state should be cleared (new UTC day).
+
+        Legacy -- not used by production since WP1.6 (wall clock / sticky);
+        removal CF-29.
 
         Returns
         -------
@@ -828,6 +1393,9 @@ class CircuitBreaker:
         """
         Manually trip the circuit breaker.
 
+        Legacy -- not used by production since WP1.6 (wall clock / sticky);
+        removal CF-29.
+
         Use this for operator-initiated emergency stops or when external
         systems detect anomalous conditions.
 
@@ -841,6 +1409,12 @@ class CircuitBreaker:
     def reset(self) -> None:
         """
         Reset the circuit breaker after manual review.
+
+        Legacy -- not used by production since WP1.6 (wall clock / sticky);
+        removal CF-29.
+
+        Does not touch the WP1.6 machine state (halt / reduce / daily-limit
+        counters); those are data-derived and re-evaluated every bar.
 
         Clears the tripped state, graduated response, and daily limit state.
         Allows trading to resume. The trip count is preserved for audit purposes.
@@ -906,3 +1480,26 @@ class CircuitBreaker:
             f"trip_count={self._trip_count}, "
             f"response={self._current_response})"
         )
+
+
+def build_run_circuit_breaker(run_id: str, params: RiskParameters) -> CircuitBreaker:
+    """THE one construction helper for a run's circuit breaker (WP1.6, P-2).
+
+    Used by the orchestrator (paper + live), the integration harness and the
+    ``BacktestRunner`` opt-in, so production and tests share one set of
+    thresholds derived from the run's own :class:`RiskParameters`
+    (live 0.20 / paper 0.30 drawdown, 0.08 daily loss).
+
+    Raises
+    ------
+    ValueError
+        The derived thresholds are invalid (run start fails loudly, RK16-14).
+    """
+    thresholds = CircuitBreakerThresholds.from_risk_parameters(params)
+    config = CircuitBreakerConfig(
+        max_daily_loss_pct=params.max_daily_loss_pct,
+        max_drawdown_pct=params.max_drawdown_pct,
+        reduce_drawdown_pct=float(thresholds.reduce_entry),
+        reduce_position_multiplier=float(thresholds.reduce_multiplier),
+    )
+    return CircuitBreaker(config=config, run_id=run_id, thresholds=thresholds)

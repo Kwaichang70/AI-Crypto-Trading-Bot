@@ -345,7 +345,15 @@ async def test_h4_resumed_peak_hint_trips_drawdown_gate(exchange: FakeCCXTExchan
 
     buy_orders = [o for o in exchange.order_log if o["side"] == "buy"]
     assert buy_orders == [], f"expected the drawdown gate to reject the BUY; got {buy_orders!r}"
-    assert any(e.get("event") == "live.signal_rejected" for e in cap)
+    # WP1.6: the circuit breaker (harness default, K-15) drops the BUY one layer
+    # earlier -- peak hint 1 500 vs NAV 1 000 is a 33% drawdown, past the live 20%
+    # limit -> HALT -> skip reason ``circuit_breaker_halt``; the gate is never asked.
+    # (read from the engine's own skip log, not a debug log event: this file does not
+    # force structlog to pass debug events, so a log-based check is order-dependent)
+    cb_skips = [s.skip_reason for s in stack.engine._skip_logger._skipped]
+    assert any(e.get("event") == "live.signal_rejected" for e in cap) or (
+        "circuit_breaker_halt" in cb_skips
+    ), cb_skips
 
     await stack.engine.stop()
 

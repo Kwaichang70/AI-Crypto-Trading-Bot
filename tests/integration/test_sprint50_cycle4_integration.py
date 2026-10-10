@@ -3,11 +3,18 @@ tests/integration/test_sprint50_cycle4_integration.py
 ------------------------------------------------------
 Integration test for Sprint 50 Cycle 4: HALT auto-stop pipeline.
 
+WP1.6 (WP16-T-44, decision D4): the HALT auto-stop was REMOVED.  A circuit-breaker
+HALT blocks entries only; the run keeps polling.  The first test below was
+rewritten from "simulate the removed branch inline and assert it stops" to "drive
+the real ``_process_bar`` and assert it does NOT stop".  The audit-type and
+audit-ordering tests are unchanged (the orchestrator ``finally`` branches are
+unreachable legacy until CF-29).
+
 What this test validates
 ------------------------
-1. A backtest run with a pre-tripped CircuitBreaker processes bars.
-2. On the first bar where check_graduated() returns HALT, _stop_event is set.
-3. The engine's auto_stop_reason == "circuit_breaker_halt".
+1. A (BACKTEST-mode) engine with a real CircuitBreaker in HALT keeps processing bars.
+2. On a HALT bar, _stop_event is NOT set (D4).
+3. The engine's auto_stop_reason stays None.
 4. The orchestrator's logic (tested via run_orchestrator helpers) produces
    the correct audit event type for the engine's auto_stop_reason.
 
@@ -22,12 +29,13 @@ The test is marked `integration` to keep it out of the fast unit suite.
 
 from __future__ import annotations
 
-import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from trading.safety import CircuitBreaker, CircuitBreakerConfig, CircuitBreakerResponse
+from common.types import RunMode
+from tests.unit._wp16_support import HALT_ONLY, OTHER, bar, build_engine, buy
+from trading.safety import CircuitBreakerResponse, build_run_circuit_breaker
 
 
 pytestmark = pytest.mark.integration
@@ -39,32 +47,28 @@ pytestmark = pytest.mark.integration
 
 
 class TestHaltAutoStopPipeline:
-    """End-to-end pipeline: HALT fires -> engine stops -> audit event type correct."""
+    """HALT (WP1.6/D4: no stop) and the legacy audit event type / ordering contracts."""
 
-    def test_halt_sets_auto_stop_reason_and_event(self) -> None:
-        """Simulate the _process_bar HALT branch and verify state transitions."""
-        # Arrange: a tripped circuit breaker
-        config = CircuitBreakerConfig(
-            max_drawdown_pct=0.15,
-            reduce_drawdown_pct=0.10,
-            max_daily_loss_pct=0.05,
+    @pytest.mark.asyncio
+    async def test_halt_does_not_set_auto_stop_reason_or_event(self) -> None:
+        """Real ``_process_bar`` on a HALT bar: entries blocked, run NOT stopped (D4)."""
+        breaker = build_run_circuit_breaker("integration-halt-run", HALT_ONLY)
+        engine, execution, _pf = build_engine(
+            cb=breaker,
+            signals=lambda i: [buy(OTHER)],
+            params=HALT_ONLY,
+            mode=RunMode.BACKTEST,
         )
-        breaker = CircuitBreaker(config=config, run_id="integration-halt-run")
-        breaker.trip("integration test breach")
 
-        stop_event = asyncio.Event()
-        auto_stop_reason: str | None = None
+        await bar(engine, "800")  # 20% drawdown on the live limit -> HALT
 
-        # Act: simulate the Sprint 50 Cycle 4 _process_bar branch
-        cb_response = breaker.check_graduated(equity=10_000, daily_pnl=0.0, drawdown=0.20)
-        if cb_response == CircuitBreakerResponse.HALT and not stop_event.is_set():
-            auto_stop_reason = "circuit_breaker_halt"
-            stop_event.set()
+        assert breaker.current_response == CircuitBreakerResponse.HALT
+        assert not engine._stop_event.is_set(), "HALT must NOT stop the run (D4)"
+        assert engine.auto_stop_reason is None
+        assert execution.signals == [], "the BUY is dropped, the run keeps going"
 
-        # Assert: engine-level state transitions
-        assert cb_response == CircuitBreakerResponse.HALT
-        assert stop_event.is_set(), "Stop event must be set on HALT"
-        assert auto_stop_reason == "circuit_breaker_halt"
+        await bar(engine, "800")  # the next bar is processed as well
+        assert engine._bar_count == 2
 
     def test_orchestrator_audit_event_type_for_halt_reason(self) -> None:
         """Orchestrator must use 'circuit_breaker_halt_auto_stop' event type for HALT stops."""

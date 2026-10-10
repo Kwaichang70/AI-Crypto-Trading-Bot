@@ -8,7 +8,7 @@
 
 **Source of truth:** This runbook consolidates `reports/vp2-smoke/synthesis-spec.md` §10–§12, as amended by the operator conditions O-1..O-9 and deploy conditions D-1..D-6 in `reports/vp2-smoke/final-synthesis-smoke.md` (Round 2 addendum, R2-7/R2-8), and by `reports/vp2-docs/final-synthesis-docs.md` R-01 (O-3a), R-02 (AM-S12a), R-04 (live window) and R-09 (P12 interpretation). It closes carry-forward CF-SMK-S15. If this runbook and those three documents ever disagree, stop and escalate. Do not pick one yourself.
 
-**Related:** WP1.7a/b (stop + flatten, stop dialog), WP1.8 (orphaned / resume), WP7.0 (Idempotency-Key), SEC-004 (`X-Live-Confirm-Token`), `docs/runbooks/deploy-fase1-minimumset.md` (deploy; must be complete first), `docs/runbooks/circuit-breaker-halt-auto-stop.md`.
+**Related:** WP1.7a/b (stop + flatten, stop dialog), WP1.8 (orphaned / resume), WP7.0 (Idempotency-Key), SEC-004 (`X-Live-Confirm-Token`), `docs/runbooks/deploy-fase1-minimumset.md` (deploy; must be complete first), `docs/runbooks/circuit-breaker-halt.md`.
 
 ---
 

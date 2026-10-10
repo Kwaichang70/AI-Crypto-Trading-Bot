@@ -80,6 +80,7 @@ from trading.metrics import (
 from trading.portfolio import PortfolioAccounting
 from trading.risk import RiskParameters
 from trading.risk_manager import DefaultRiskManager
+from trading.safety import build_run_circuit_breaker
 from trading.strategy import BaseStrategy
 from trading.strategy_engine import StrategyEngine
 
@@ -180,6 +181,11 @@ class BacktestRunner:
     seed : int | None
         Random seed for deterministic backtests.  If provided, sets
         ``random.seed(seed)`` before execution.  Default None.
+    enable_circuit_breaker : bool
+        WP1.6 / U-2: opt-in graduated circuit breaker (HALT / DAILY_LIMIT /
+        REDUCE from ``RiskSnapshot``, bar-close clock).  Default ``False`` --
+        a default backtest is byte-identical to pre-WP1.6.  WP2.1 turns it on
+        by default with a re-baseline (CF-26).
     """
 
     def __init__(
@@ -196,6 +202,7 @@ class BacktestRunner:
         trailing_stop_pct: float | None = None,
         bracket_config: dict[str, object] | None = None,
         allow_pyramiding: bool | None = None,
+        enable_circuit_breaker: bool = False,
     ) -> None:
         if not strategies:
             raise ValueError("At least one strategy is required")
@@ -220,6 +227,8 @@ class BacktestRunner:
             seed = random.randint(0, 2**31 - 1)
         self._seed: int = seed
         self._trailing_stop_pct = trailing_stop_pct
+        # WP1.6 (U-2): the circuit breaker is opt-in in backtests (default off).
+        self._enable_circuit_breaker: bool = enable_circuit_breaker
         # Engine-level fixed/ATR stop-loss + take-profit bracket config
         # (stop_loss_pct, take_profit_pct, bracket_mode, atr_*_multiplier,
         # atr_period).  Passed verbatim into the StrategyEngine config.
@@ -748,6 +757,11 @@ class BacktestRunner:
             timeframe=self._timeframe,
             run_mode=RunMode.BACKTEST,
             config=self._build_engine_config(),
+            circuit_breaker=(
+                build_run_circuit_breaker(run_id, risk_manager.params)
+                if self._enable_circuit_breaker
+                else None
+            ),
         )
 
         return engine, portfolio, risk_manager, execution_engine

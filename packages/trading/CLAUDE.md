@@ -91,3 +91,44 @@ Core trading engine containing the heart of the system.
   seeding exception to `unknown` / `reason="seed_invalid"` (BUYs blocked until
   00:00 UTC, exits unaffected); a resume is never aborted by seed data.
 - See `reports/vp2-wp1.5/synthesis-spec.md`.
+
+### WP1.6 (circuit breaker wiring, C2/C3/C23)
+- `CircuitBreaker.evaluate(RiskSnapshot) -> CircuitBreakerDecision` is the ONLY
+  production path (once per processed bar in `StrategyEngine._process_bar`, after
+  the marks, before the strategies). The legacy methods (`check`,
+  `check_graduated`, `check_daily_limit_reset`, `get_position_size_multiplier`,
+  `trip`, `reset`) are unreachable from production (AST-pinned, WP16-T-25);
+  removal is CF-29. Never read `get_summary()` keys for a decision.
+- Build a breaker ONLY via `build_run_circuit_breaker(run_id, risk_manager.params)`
+  (orchestrator paper + live, the integration harness, the `BacktestRunner`
+  opt-in). Never construct `CircuitBreaker` / `CircuitBreakerConfig` directly in
+  `apps/` or `backtest.py`.
+- Every effect is BUY-only (C23): one filter site, `_drop_entry_signals`, first
+  matching reason wins (`kill_switch`, `protective_mode`,
+  `circuit_breaker_eval_failed`, `circuit_breaker_halt|daily_limit`). The breaker
+  NEVER sets `_stop_event` or `_auto_stop_reason` (D4) and has no wall-clock
+  read (day = `snapshot.day`, time = `snapshot.as_of`).
+- REDUCE rides on `Signal.entry_size_multiplier` (engine-owned, `(0, 1]`, BUY
+  only, strategies must not set it) and is applied to the FINAL quantity in
+  `BaseExecutionEngine._resolve_order_quantity`; `target_position` is never
+  mutated. The SELL branch never reads it.
+- HALT auto-recovers (U-1): exit below 0.9 x limit for 3 bars, then REDUCE; REDUCE
+  exits below 0.4 x limit for 3 bars; DAILY_LIMIT clears on the `snapshot.day`
+  roll. `evaluate` is transactional (state commits only after every computation
+  succeeded). Bands are `Decimal` derived from the run's `RiskParameters`.
+- Backtests: opt-in (`BacktestRunner(enable_circuit_breaker=True)`), default off (U-2).
+- Restart watch (CF-35, user decision): every new breaker enters HALT at
+  `halt_exit` (0.9 x limit) while `_evaluations < N` and REDUCE at `reduce_exit`
+  (0.4 x limit) while `_evaluations < 2N`; streaks start at 0; nothing is
+  persisted. Result: never laxer than the WP1.5 gate; never laxer than an
+  uninterrupted breaker from the 2N-th evaluation on; before that at most 2N-1
+  laxer evaluations, only at dd < 0.9 x limit (`test_wp16_restart_watch.py` T-46,
+  T-48). Do not shorten either window, make the REDUCE window equal to the HALT
+  window, or add a resume-only flag: each re-opens WP16-SEC-206. Never state a
+  restart bound without an exhaustive probe over every restart point.
+- Telegram: `TelegramNotifier.send_message` and the CB alert path log the exception
+  TYPE only (`error_type`), never `str(exc)` / `repr(exc)` / `exc_info`: aiohttp
+  exception text embeds the request URL, which contains the bot token
+  (WP16-SEC-06; `tests/unit/test_wp16_telegram_log_hygiene.py`). Alert text is sent
+  with `parse_mode="HTML"`: never put a raw `<`, `>` or `&` in it.
+- See `reports/vp2-wp1.6/synthesis-spec.md`.

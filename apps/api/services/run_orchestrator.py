@@ -11,6 +11,9 @@ Public API
   to :class:`api.run_registry.RunRegistry` on the ``AppContainer``.
 - :class:`_IncrementalFlushState` -- watermark dataclass.
 - :func:`notify_trade_telegram` -- fire-and-forget Telegram notifier.
+- :func:`notify_circuit_breaker_telegram` /
+  :func:`make_circuit_breaker_alert_listener` -- WP1.6 HALT entered / cleared
+  Telegram alert (fire-and-forget, never raises).
 - :func:`flush_incremental` -- one incremental DB flush cycle.
 - :func:`incremental_flush_loop` -- periodic 30s flush task.
 - :func:`auto_stop_after` -- max-duration guard task.
@@ -29,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -48,6 +52,11 @@ from api.services.audit_log import record_audit_event
 from common.types import TimeFrame
 from trading.exit_config import ExitConfigError
 from trading.recovery import ResumeSnapshot
+from trading.safety import (
+    CircuitBreakerResponse,
+    CircuitBreakerTransition,
+    build_run_circuit_breaker,
+)
 from trading.smoke_guard import SMOKE_STRATEGY_NAMES, SmokeGuardError, validate_smoke_run
 
 __all__ = [
@@ -59,7 +68,9 @@ __all__ = [
     "build_live_ccxt_exchange",
     "flush_incremental",
     "incremental_flush_loop",
+    "make_circuit_breaker_alert_listener",
     "mark_shutdown_requested",
+    "notify_circuit_breaker_telegram",
     "notify_trade_telegram",
     "run_live_engine",
     "run_paper_engine",
@@ -272,6 +283,118 @@ async def notify_trade_telegram(trade_orm: TradeORM) -> None:
         )
     except Exception:
         pass  # Never fail the flush path on notification errors
+
+
+# ---------------------------------------------------------------------------
+# WP1.6: circuit-breaker HALT Telegram alert
+# ---------------------------------------------------------------------------
+
+#: Strong references to in-flight alert tasks: ``asyncio`` only keeps weak
+#: references, so an unreferenced task can be garbage-collected mid-flight
+#: (SYN-05).  Each task removes itself on completion.
+_ALERT_TASKS: set[asyncio.Task[None]] = set()
+
+
+def _pct(value: Decimal) -> str:
+    """``Decimal('0.18')`` -> ``'18.00%'`` (display only)."""
+    return f"{(value * 100).quantize(Decimal('0.01'))}%"
+
+
+def _circuit_breaker_alert_text(
+    transition: CircuitBreakerTransition,
+) -> tuple[str, str] | None:
+    """Return ``(level, message)`` for a HALT entered / cleared transition, else None.
+
+    Allow-list only (K-12): the level, the drawdown and the HALT bands as
+    percentages, and N.  No NAV amounts, balances, keys or account
+    identifiers; the run id is added by ``send_alert``.
+    """
+    t = transition.thresholds
+    n = t.deescalation_evaluations
+    if transition.to_level == CircuitBreakerResponse.HALT:
+        if transition.drawdown_pct >= t.halt_entry:
+            cause = f"reached the limit {_pct(t.halt_entry)}"
+        else:  # restart watch (CF-35): HALT entered in the recovery band
+            cause = (
+                f"is at or above {_pct(t.halt_exit)} during the restart watch "
+                f"(limit {_pct(t.halt_entry)})"
+            )
+        return (
+            "CRITICAL",
+            "HALT: entries blocked, exits active, run NOT stopped. "
+            f"Drawdown {_pct(transition.drawdown_pct)} {cause}. "
+            f"Auto-recovers after {n} bars below {_pct(t.halt_exit)}.",
+        )
+    if transition.from_level == CircuitBreakerResponse.HALT:
+        if transition.to_level == CircuitBreakerResponse.DAILY_LIMIT:
+            tail = "entries stay blocked by the daily loss limit until the next UTC day."
+        else:
+            tail = f"entries resume at {(t.reduce_multiplier * 100).normalize():f}% size."
+        return (
+            "WARNING",
+            f"HALT cleared: {tail} Drawdown {_pct(transition.drawdown_pct)} "
+            f"below {_pct(t.halt_exit)} for {n} bars.",
+        )
+    return None
+
+
+async def notify_circuit_breaker_telegram(transition: CircuitBreakerTransition) -> None:
+    """Fire-and-forget Telegram alert for a HALT entered / cleared transition.
+
+    Never raises.  A missing notifier is a silent no-op.  Failures are logged
+    by exception TYPE only: the exception text of an HTTP client can embed the
+    request URL, which contains the bot token.
+    """
+    try:
+        text = _circuit_breaker_alert_text(transition)
+        if text is None:
+            return
+        from api.main import get_telegram_notifier
+
+        notifier = get_telegram_notifier()
+        if notifier is None:
+            return
+        level, message = text
+        await notifier.send_alert(
+            "circuit_breaker",
+            level,
+            message,
+            run_id=transition.run_id,
+        )
+    except Exception as exc:
+        logger.warning(
+            "circuit_breaker.telegram_notify_failed",
+            run_id=transition.run_id,
+            error_type=type(exc).__name__,
+        )
+
+
+def make_circuit_breaker_alert_listener(
+    run_id: str,
+) -> Callable[[CircuitBreakerTransition], None]:
+    """Build the CB transition listener that schedules the HALT Telegram alert.
+
+    Only transitions into or out of HALT alert (REDUCE / DAILY_LIMIT are logs
+    and the gauge only, CF-27).  The task is held in :data:`_ALERT_TASKS`; with
+    no running event loop the alert is skipped and logged.  Never raises.
+    """
+
+    def _listener(transition: CircuitBreakerTransition) -> None:
+        if (
+            transition.to_level != CircuitBreakerResponse.HALT
+            and transition.from_level != CircuitBreakerResponse.HALT
+        ):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            logger.warning("circuit_breaker.alert_skipped_no_event_loop", run_id=run_id)
+            return
+        task = loop.create_task(notify_circuit_breaker_telegram(transition))
+        _ALERT_TASKS.add(task)
+        task.add_done_callback(_ALERT_TASKS.discard)
+
+    return _listener
 
 
 @dataclass
@@ -988,6 +1111,10 @@ async def run_paper_engine(
             cache_ttl_seconds=60,
         )
         risk_manager = DefaultRiskManager(run_id=run_id_str)
+        # WP1.6 (C2): the run's circuit breaker, built from THIS run's risk
+        # parameters (paper: 30% drawdown); a HALT alerts via Telegram.
+        circuit_breaker = build_run_circuit_breaker(run_id_str, risk_manager.params)
+        circuit_breaker.add_transition_listener(make_circuit_breaker_alert_listener(run_id_str))
         execution = PaperExecutionEngine(
             run_id=run_id_str,
             risk_manager=risk_manager,
@@ -1012,7 +1139,8 @@ async def run_paper_engine(
             # keeps the sequence at max_bar_index + 1.
             flush_state.flushed_equity_count = len(portfolio.get_equity_curve())
             flush_state.bar_index_offset = resume.max_bar_index
-            flush_state.peak_equity = resume.peak_equity_hint or Decimal("0")
+            # CF-24 (WP1.6): the gate-true peak (hint + replay), not the raw hint.
+            flush_state.peak_equity = portfolio.get_peak_equity()
         else:
             portfolio = PortfolioAccounting(
                 run_id=run_id_str,
@@ -1060,6 +1188,7 @@ async def run_paper_engine(
             timeframe=timeframe,
             run_mode=RunMode.PAPER,
             config=engine_config,
+            circuit_breaker=circuit_breaker,
         )
 
         _RUN_ENGINES[run_id_str] = engine
@@ -1496,6 +1625,11 @@ async def run_live_engine(
             # strategy-layer _drop_entry_signals filter (StrategyEngine's
             # own protective_mode=protective_mode below).
             risk_manager.set_protective_mode(True)
+        # WP1.6 (C2): the run's circuit breaker, built from THIS run's (live)
+        # risk parameters -- fresh, promoted, resumed and protective runs all
+        # reach this site; a HALT alerts via Telegram.
+        circuit_breaker = build_run_circuit_breaker(run_id_str, risk_manager.params)
+        circuit_breaker.add_transition_listener(make_circuit_breaker_alert_listener(run_id_str))
         execution = LiveExecutionEngine(
             run_id=run_id_str,
             risk_manager=risk_manager,
@@ -1525,7 +1659,8 @@ async def run_live_engine(
             # keeps the sequence at max_bar_index + 1.
             flush_state.flushed_equity_count = len(portfolio.get_equity_curve())
             flush_state.bar_index_offset = resume.max_bar_index
-            flush_state.peak_equity = resume.peak_equity_hint or Decimal("0")
+            # CF-24 (WP1.6): the gate-true peak (hint + replay), not the raw hint.
+            flush_state.peak_equity = portfolio.get_peak_equity()
         else:
             portfolio = PortfolioAccounting(
                 run_id=run_id_str,
@@ -1577,6 +1712,7 @@ async def run_live_engine(
             run_mode=RunMode.LIVE,
             config=live_engine_config,
             protective_mode=protective_mode,
+            circuit_breaker=circuit_breaker,
         )
 
         _RUN_ENGINES[run_id_str] = engine

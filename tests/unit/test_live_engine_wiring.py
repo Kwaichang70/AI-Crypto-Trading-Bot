@@ -64,6 +64,7 @@ import pytest
 
 from api.routers.runs import _RUN_TASKS, _run_live_engine
 from common.types import RunMode, TimeFrame
+from trading.risk import RiskParameters
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -92,6 +93,19 @@ _PT_FLUSH_LOOP = "api.routers.runs._incremental_flush_loop"
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _risk_mgr_cls() -> MagicMock:
+    """Mock ``DefaultRiskManager`` class whose instances expose real ``params``.
+
+    WP1.6: the orchestrator builds the run's circuit breaker from
+    ``risk_manager.params`` (``build_run_circuit_breaker``), so a bare
+    ``MagicMock()`` risk manager (whose ``.params`` is a MagicMock) no longer
+    reaches the engine-construction step.
+    """
+    cls = MagicMock()
+    cls.return_value = MagicMock(params=RiskParameters())
+    return cls
 
 
 def _make_settings_mock() -> MagicMock:
@@ -272,8 +286,7 @@ class TestRunLiveEngine:
         portfolio_cls = MagicMock()
         portfolio_cls.return_value = MagicMock()
 
-        risk_mgr_cls = MagicMock()
-        risk_mgr_cls.return_value = MagicMock()
+        risk_mgr_cls = _risk_mgr_cls()
 
         mds_cls = MagicMock()
         mds_cls.return_value = MagicMock()
@@ -333,7 +346,7 @@ class TestRunLiveEngine:
             patch(_PT_MDS, MagicMock()),
             patch(_PT_LIVE_ENGINE, MagicMock()),
             patch(_PT_PORTFOLIO, MagicMock()),
-            patch(_PT_RISK_MGR, MagicMock()),
+            patch(_PT_RISK_MGR, _risk_mgr_cls()),
             patch(_PT_STRAT_ENGINE, se_cls_mock),
             patch(_PT_FLUSH, new_callable=AsyncMock),
             patch(_PT_FLUSH_LOOP, new_callable=AsyncMock),
@@ -382,7 +395,7 @@ class TestRunLiveEngine:
             patch(_PT_MDS, MagicMock()),
             patch(_PT_LIVE_ENGINE, MagicMock()),
             patch(_PT_PORTFOLIO, MagicMock()),
-            patch(_PT_RISK_MGR, MagicMock()),
+            patch(_PT_RISK_MGR, _risk_mgr_cls()),
             patch(_PT_STRAT_ENGINE, se_cls_mock),
             patch(_PT_FLUSH, flush_mock),
             patch(_PT_FLUSH_LOOP, new_callable=AsyncMock),
@@ -441,7 +454,7 @@ class TestRunLiveEngine:
             patch(_PT_MDS, MagicMock()),
             patch(_PT_LIVE_ENGINE, MagicMock()),
             patch(_PT_PORTFOLIO, MagicMock()),
-            patch(_PT_RISK_MGR, MagicMock()),
+            patch(_PT_RISK_MGR, _risk_mgr_cls()),
             patch(_PT_STRAT_ENGINE, se_cls_mock),
             patch(_PT_FLUSH, new_callable=AsyncMock),
             patch(_PT_FLUSH_LOOP, new_callable=AsyncMock),
@@ -488,7 +501,7 @@ class TestRunLiveEngine:
             patch(_PT_MDS, MagicMock()),
             patch(_PT_LIVE_ENGINE, MagicMock()),
             patch(_PT_PORTFOLIO, MagicMock()),
-            patch(_PT_RISK_MGR, MagicMock()),
+            patch(_PT_RISK_MGR, _risk_mgr_cls()),
             patch(_PT_STRAT_ENGINE, se_cls_mock),
             patch(_PT_FLUSH, new_callable=AsyncMock),
             patch(_PT_FLUSH_LOOP, new_callable=AsyncMock),
@@ -538,7 +551,7 @@ class TestRunLiveEngine:
             patch(_PT_MDS, MagicMock()),
             patch(_PT_LIVE_ENGINE, MagicMock()),
             patch(_PT_PORTFOLIO, MagicMock()),
-            patch(_PT_RISK_MGR, MagicMock()),
+            patch(_PT_RISK_MGR, _risk_mgr_cls()),
             patch(_PT_STRAT_ENGINE, se_cls_mock),
             patch(_PT_FLUSH, new_callable=AsyncMock),
             patch(_PT_FLUSH_LOOP, new_callable=AsyncMock),
@@ -587,7 +600,7 @@ class TestRunLiveEngine:
             patch(_PT_MDS, MagicMock()),
             patch(_PT_LIVE_ENGINE, MagicMock()),
             patch(_PT_PORTFOLIO, MagicMock()),
-            patch(_PT_RISK_MGR, MagicMock()),
+            patch(_PT_RISK_MGR, _risk_mgr_cls()),
             patch(_PT_STRAT_ENGINE, se_cls_mock),
             patch(_PT_FLUSH, new_callable=AsyncMock),
             patch(_PT_FLUSH_LOOP, new_callable=AsyncMock),

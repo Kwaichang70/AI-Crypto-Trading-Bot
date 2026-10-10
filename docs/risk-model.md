@@ -205,59 +205,93 @@ all-or-nothing positions.
 
 ## Circuit Breaker
 
-The CircuitBreaker is an emergency stop mechanism independent of the
-RiskManager's pre-trade checks. It evaluates risk conditions on every bar
-tick or before every order submission.
+The CircuitBreaker (WP1.6) is a graduated, **auto-recovering entry guard**. It
+is evaluated once per processed bar from `PortfolioAccounting.risk_snapshot()`
+(mark-to-market NAV, running peak, UTC-day start) and uses the run's own
+`RiskParameters` (`build_run_circuit_breaker(run_id, params)`), so it applies
+the same limits as the WP1.5 gates. It never reads `get_summary()` keys, never
+reads the wall clock (the day is `snapshot.day`), never stops the run and
+never writes portfolio state. Nothing is persisted and nothing is
+operator-resettable: every level is re-derived from data.
 
-### Configuration
+**Every effect is BUY-only** (C23). Strategy SELLs, bracket stop-loss /
+take-profit, trailing stops, resting orders and `flatten` are never blocked or
+scaled. A breaker failure (snapshot or evaluation exception, non-finite
+input) drops that bar's BUYs only (fail-closed for entries; exits run).
 
-```python
-class CircuitBreakerConfig:
-    max_daily_loss_pct: float = 0.05      # 5% daily loss limit
-    max_drawdown_pct: float = 0.15        # 15% drawdown limit
-    max_consecutive_losses: int = 5       # 5 consecutive losses
-```
+### Levels and bands
 
-### Triggers
+`L` = the run's `max_drawdown_pct` (live 0.20, paper 0.30), `D` = its
+`max_daily_loss_pct` (0.08). All values are exact `Decimal`.
 
-The circuit breaker trips when any of these conditions is met:
+| Level | Enters (1 bar) | Leaves | Effect |
+|-------|----------------|--------|--------|
+| REDUCE | `dd >= 0.5 L` | `dd < 0.4 L` for 3 consecutive bars | BUY quantity x 0.5 (final quantity, after the risk ceiling) |
+| DAILY_LIMIT | `gate_daily_pnl <= -(daily_loss_basis * D)`, basis `<= 0`, or unknown day state | first bar of the next UTC day (`snapshot.day`), no debounce | BUYs dropped |
+| HALT | `dd >= L` | `dd < 0.9 L` for 3 consecutive bars, then steps down to REDUCE (never straight to OK) | BUYs dropped; run NOT stopped |
 
-| Trigger              | Condition                                          |
-|----------------------|----------------------------------------------------|
-| Daily loss           | `abs(daily_pnl) / equity >= max_daily_loss_pct`    |
-| Drawdown             | `drawdown >= max_drawdown_pct`                     |
-| Consecutive losses   | `consecutive_losses >= max_consecutive_losses`     |
-| Manual trip          | Operator calls `breaker.trip(reason)`              |
+| Run | HALT entry / exit | REDUCE entry / exit |
+|-----|-------------------|---------------------|
+| LIVE | 20% / 18% | 10% / 8% |
+| PAPER | 30% / 27% | 15% / 12% |
 
-### Behavior
+Escalation is immediate; de-escalation needs N = 3 consecutive evaluations
+(processed bars) and an in-band reading resets the count (hysteresis). The
+most severe active condition wins (`HALT > DAILY_LIMIT > REDUCE > OK`), and
+`active_conditions` lists all of them. The raw HALT and DAILY_LIMIT predicates
+are identical to the WP1.5 gates (`>=` / `<=` inclusive), so on any snapshot
+where a gate would block, the breaker has `entries_blocked=True`; its
+recovery is stricter than the gate (in `[0.9 L, L)` the breaker still blocks).
+`pre_trade_check` remains the per-order enforcement of record.
 
-- Once tripped, the breaker stays open -- trading is halted
-- Logs at CRITICAL severity with `alert="TRADING_HALTED"`
-- `is_tripped` returns True until manual reset
-- `reset()` clears the trip state but preserves `trip_count` for audit
-- Trip count is never reset within a session
-- Idempotent: if already tripped, subsequent checks return True without
-  re-evaluating conditions (first trip reason wins)
+A flat run whose NAV is at or beyond the limit has a constant NAV and never
+recovers (neither does the gate); start a new run.
 
-### Manual Controls
+### Restart / resume
 
-```python
-breaker = CircuitBreaker(config=CircuitBreakerConfig(), run_id="run-123")
+A fresh breaker is built on every start and resume; nothing is persisted, so
+it cannot know the level an uninterrupted breaker would hold. It therefore
+runs a **restart watch**: during its first N evaluations it enters HALT at
+`dd >= 0.9 L` (instead of `L`), and during its first 2N evaluations it enters
+REDUCE at `dd >= 0.4 L` (instead of `0.5 L`). Streaks start at 0; a level
+entered during the watch is then held by the ordinary hysteresis. N and 2N
+are exactly how long an uninterrupted breaker that was in HALT can still hold
+HALT and then REDUCE. Measured exhaustively (WP1.6 final synthesis, round 2)
+and pinned by WP16-T-46:
 
-# Automatic check (called on every bar)
-if breaker.check(equity=9500, daily_pnl=-600, drawdown=0.12, consecutive_losses=3):
-    # Trading halted -- do not submit orders
-    ...
+- never laxer than the WP1.5 gate;
+- from the 2N-th evaluation on, never laxer than an uninterrupted breaker;
+- before that, at most 2N-1 = 5 laxer evaluations, only at `dd < 0.9 L`
+  (at full size only at `dd < 0.4 L`);
+- stricter than an uninterrupted breaker for as long as the drawdown stays in
+  `[0.9 L, L)` (HALT instead of REDUCE) or `[0.4 L, 0.5 L)` (REDUCE instead
+  of OK) after a restart there (CF-35, user decision).
 
-# Manual trip
-breaker.trip("Operator initiated emergency stop")
+The watch applies to every new instance, including a brand-new run, whose
+drawdown starts at 0.
 
-# Reset after review (requires explicit operator action)
-breaker.reset()
+### Backtests
 
-# Inspect state
-state = breaker.state  # CircuitBreakerState(is_tripped, trip_reason, tripped_at, trip_count)
-```
+Off by default (`BacktestRunner(enable_circuit_breaker=False)`); WP2.1 turns
+it on by default with a re-baseline.
+
+### Observability
+
+Gauge `circuit_breaker_state` (OK=0, REDUCE=1, DAILY_LIMIT=2, HALT=3; zeroed
+on engine stop); structured events `circuit_breaker.transition`,
+`circuit_breaker.halt_entered` (critical, once per entry),
+`circuit_breaker.halt_cleared`, `engine.circuit_breaker_entries_blocked`,
+`engine.circuit_breaker_eval_failed`; Telegram on HALT entered / cleared;
+`GET /api/v1/runs/{id}/circuit-breaker` (typed state). The reset endpoint is
+retired (410 Gone). See `docs/runbooks/circuit-breaker-halt.md`.
+
+### Legacy API
+
+`check()`, `check_graduated()`, `check_daily_limit_reset()`,
+`get_position_size_multiplier()`, `trip()` and `reset()` (and the
+`max_consecutive_losses` config field) are legacy: unreachable from production
+code (AST-pinned), kept only for the existing unit tests until CF-29. The
+risk manager's loss-streak cooldown is the only consecutive-loss mechanism.
 
 ## Live Trading Gate
 

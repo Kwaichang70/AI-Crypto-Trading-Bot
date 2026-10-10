@@ -425,11 +425,18 @@ class BaseExecutionEngine(abc.ABC):
           * otherwise → ``base = (target / price) * confidence``;
             ``ceiling = calculate_position_size(..., confidence=1.0)``;
             return ``min(base, ceiling)``.
+          * WP1.6: both branches are then multiplied by
+            ``signal.entry_size_multiplier`` (circuit-breaker REDUCE, engine
+            owned, in ``(0, 1]``) -- so the factor acts on the FINAL resolved
+            quantity, after the ceiling, and ``target_position`` is never
+            mutated.  Out-of-range values raise ``ValueError`` (a
+            ``model_copy`` skips field validation).
 
         SELL:
           * ``target_position <= 0`` → full close (return ``held_quantity``).
           * otherwise → ``min((target / price) * confidence, held_quantity)``
             so we never oversell the held position.
+          * Never scaled: exits ignore ``entry_size_multiplier`` (C23).
 
         Parameters
         ----------
@@ -455,15 +462,25 @@ class BaseExecutionEngine(abc.ABC):
         conf = Decimal(str(max(0.0, min(1.0, signal.confidence))))
 
         if side == OrderSide.BUY:
+            # WP1.6: engine-owned circuit-breaker REDUCE factor.  Re-validated
+            # here because ``Signal.model_copy(update=...)`` skips validation.
+            entry_mult = signal.entry_size_multiplier
+            if not (Decimal(0) < entry_mult <= Decimal(1)):
+                raise ValueError(
+                    f"signal.entry_size_multiplier must be in (0, 1], got {entry_mult}"
+                )
             if signal.target_position <= Decimal(0):
                 # No explicit target → preserve legacy risk-only sizing.
                 # Confidence is passed through to the risk manager here
                 # (single application) rather than applied separately.
-                return self._risk_manager.calculate_position_size(
-                    equity=equity,
-                    entry_price=last_price,
-                    stop_loss_price=None,
-                    confidence=signal.confidence,
+                return (
+                    self._risk_manager.calculate_position_size(
+                        equity=equity,
+                        entry_price=last_price,
+                        stop_loss_price=None,
+                        confidence=signal.confidence,
+                    )
+                    * entry_mult
                 )
             base_qty = (signal.target_position / last_price) * conf
             ceiling_qty = self._risk_manager.calculate_position_size(
@@ -472,7 +489,7 @@ class BaseExecutionEngine(abc.ABC):
                 stop_loss_price=None,
                 confidence=1.0,
             )
-            return min(base_qty, ceiling_qty)
+            return min(base_qty, ceiling_qty) * entry_mult
 
         # SELL
         held = held_quantity if held_quantity is not None else Decimal(0)

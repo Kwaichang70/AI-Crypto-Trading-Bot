@@ -37,7 +37,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import ROUND_HALF_UP, Decimal
-from typing import Any, Callable, Literal
+from typing import Callable, Literal, TypedDict
 
 import structlog
 
@@ -45,7 +45,7 @@ from common.types import OrderSide
 from trading.models import Fill, Position, TradeResult
 from trading.recovery import ResumeDailySeed, replay_sort_key
 
-__all__ = ["DayStartSource", "PortfolioAccounting", "RiskSnapshot"]
+__all__ = ["DayStartSource", "PortfolioAccounting", "PortfolioSummary", "RiskSnapshot"]
 
 logger = structlog.get_logger(__name__)
 
@@ -113,6 +113,34 @@ def _invalid_seed_field(seed: object) -> tuple[str, str] | None:
     if started is not None and (not isinstance(started, datetime) or started.utcoffset() is None):
         return ("run_started_at", type(started).__name__)
     return None
+
+
+class PortfolioSummary(TypedDict):
+    """Typed return of :meth:`PortfolioAccounting.get_summary` (WP1.6, C3).
+
+    The keys equal the runtime dict keys exactly (pinned by a contract test),
+    so a typo such as ``summary["realised_pnl"]`` is a mypy error instead of a
+    silent default.  ``get_summary`` is display / API data only: risk
+    decisions read :class:`RiskSnapshot`, never these keys.
+    """
+
+    run_id: str
+    initial_cash: str
+    current_cash: str
+    current_equity: str
+    peak_equity: str
+    total_return_pct: float
+    total_realised_pnl: str
+    total_fees_paid: str
+    daily_pnl: str
+    drawdown_pct: float
+    max_drawdown_pct: float
+    total_trades: int
+    winning_trades: int
+    losing_trades: int
+    win_rate: float
+    open_positions: int
+    equity_curve_length: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -1249,7 +1277,7 @@ class PortfolioAccounting:
     # Summary / snapshot
     # ------------------------------------------------------------------
 
-    def get_summary(self) -> dict[str, Any]:
+    def get_summary(self) -> PortfolioSummary:
         """
         Return a comprehensive portfolio summary dict.
 
@@ -1257,8 +1285,8 @@ class PortfolioAccounting:
 
         Returns
         -------
-        dict[str, Any]:
-            Portfolio summary with all key metrics.
+        PortfolioSummary:
+            Portfolio summary with all key metrics (a ``TypedDict``; WP1.6).
         """
         current_equity = self.get_equity(
             list(self._position_snapshots.values())

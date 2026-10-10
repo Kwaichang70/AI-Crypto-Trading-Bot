@@ -29,6 +29,18 @@ import pytest
 
 import api.services.run_orchestrator as orchestrator
 from common.types import TimeFrame
+from trading.risk import RiskParameters
+
+
+def _risk_manager_cls() -> MagicMock:
+    """Mock ``DefaultRiskManager`` class; instances expose real ``params``.
+
+    WP1.6: the orchestrator builds the circuit breaker from
+    ``risk_manager.params`` (``build_run_circuit_breaker``).
+    """
+    cls = MagicMock()
+    cls.return_value = MagicMock(params=RiskParameters())
+    return cls
 
 
 def _make_run_row(status: str = "running") -> SimpleNamespace:
@@ -127,7 +139,7 @@ class TestPaperEngineShutdownOrphaning:
             patch.object(orchestrator, "record_audit_event", AsyncMock()) as audit,
             patch("trading.engines.paper.PaperExecutionEngine", MagicMock()),
             patch("trading.portfolio.PortfolioAccounting", MagicMock()),
-            patch("trading.risk_manager.DefaultRiskManager", MagicMock()),
+            patch("trading.risk_manager.DefaultRiskManager", _risk_manager_cls()),
             patch("trading.strategy_engine.StrategyEngine", _FakeEngine),
             patch("data.services.ccxt_market_data.CCXTMarketDataService", MagicMock()),
         ):
@@ -162,7 +174,7 @@ class TestPaperEngineShutdownOrphaning:
             patch.object(orchestrator, "record_audit_event", AsyncMock()) as audit,
             patch("trading.engines.paper.PaperExecutionEngine", MagicMock()),
             patch("trading.portfolio.PortfolioAccounting", MagicMock()),
-            patch("trading.risk_manager.DefaultRiskManager", MagicMock()),
+            patch("trading.risk_manager.DefaultRiskManager", _risk_manager_cls()),
             patch("trading.strategy_engine.StrategyEngine", _FakeEngine),
             patch("data.services.ccxt_market_data.CCXTMarketDataService", MagicMock()),
         ):
@@ -198,7 +210,7 @@ class TestLiveEngineShutdownOrphaning:
             patch("ccxt.async_support.coinbase", return_value=fake_exchange),
             patch("trading.engines.live.LiveExecutionEngine", MagicMock()),
             patch("trading.portfolio.PortfolioAccounting", MagicMock()),
-            patch("trading.risk_manager.DefaultRiskManager", MagicMock()),
+            patch("trading.risk_manager.DefaultRiskManager", _risk_manager_cls()),
             patch("trading.strategy_engine.StrategyEngine", _FakeEngine),
             patch("data.services.ccxt_market_data.CCXTMarketDataService", MagicMock()),
         ):

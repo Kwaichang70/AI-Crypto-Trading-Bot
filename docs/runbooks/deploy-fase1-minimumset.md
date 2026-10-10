@@ -6,7 +6,7 @@
 
 **This runbook does not enable live trading.** `ENABLE_LIVE_TRADING` stays `false` throughout; the only exception is the rollback alternative RB-2 step 3 (section 6.2), on the new image only. The live restart (herstart-protocol) and the EUR mechanics test are separate procedures; section 8 defines the hand-off to `docs/runbooks/smoke-roundtrip-mechanics-test.md`.
 
-**Related:** `infra/CADDY-RUNBOOK.md` (STEP 2a, DC-1..DC-7 and DC-70-4), `docs/runbooks/circuit-breaker-halt-auto-stop.md`, `Documentation/Verbeterplan-v2-2026-09.md` (D12, herstart-protocol), and the final-synthesis/acceptance reports under `reports/vp2-*` (condition IDs are traced in Appendix A).
+**Related:** `infra/CADDY-RUNBOOK.md` (STEP 2a, DC-1..DC-7 and DC-70-4), `docs/runbooks/circuit-breaker-halt.md`, `Documentation/Verbeterplan-v2-2026-09.md` (D12, herstart-protocol), and the final-synthesis/acceptance reports under `reports/vp2-*` (condition IDs are traced in Appendix A).
 
 > [!CAUTION]
 > Never paste secret values into a terminal transcript, ticket or chat. This runbook only names variables. Never run `docker compose config` without `--quiet`: the plain form prints every interpolated secret. Never run `printenv`/`env` without a variable name, and never `docker inspect` the api/ui containers or run `$DC exec api env`; all of these print secrets.
@@ -529,7 +529,7 @@ Live engine (relevant when live is eventually enabled, not for this deploy):
 
 Log events worth an alert (all present in the code): `live.sell_reserve_stale`, `live.sell_blocked_ledger_doubt`, `live.sell_i8_mismatch`, `live.buy_inflight_block_stale`, `live.initial_capital_exceeds_free_quote`, `live.submit_lookup_cid_mismatch`, `recovery.orphan_holding_unprotected`, `recovery.resume_stuck` (a run in `resuming` for more than 600 s), `recovery.live_exit_config_invalid`, `idempotency.ambiguous_commit_marked_error`.
 
-Residual risks the operator accepts by deploying (unchanged by this deploy): exits are evaluated once per bar (a daily run checks its stop-loss once a day); the circuit-breaker HALT auto-stop leaves positions unprotected (`docs/runbooks/circuit-breaker-halt-auto-stop.md`).
+Residual risks the operator accepts by deploying (unchanged by this deploy): exits are evaluated once per bar (a daily run checks its stop-loss once a day); a circuit-breaker HALT blocks new entries only and exits continue; it auto-recovers (WP1.6, `docs/runbooks/circuit-breaker-halt.md`).
 
 ---
 

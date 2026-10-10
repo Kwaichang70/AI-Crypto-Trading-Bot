@@ -100,6 +100,7 @@ async def _live(
     *,
     risk_params: RiskParameters | None = None,
     engine_config: dict[str, object] | None = None,
+    circuit_breaker: bool = True,
 ) -> LiveStack:
     stack = await build_live_stack(
         exchange=exchange,
@@ -111,6 +112,7 @@ async def _live(
         engine_config=engine_config,
         risk_params=risk_params,
         clock=clock,
+        circuit_breaker=circuit_breaker,
     )
     await start_and_warmup(stack, "wp15-live")
     return stack
@@ -123,6 +125,7 @@ async def _paper(
     *,
     risk_params: RiskParameters | None = None,
     engine_config: dict[str, object] | None = None,
+    circuit_breaker: bool = True,
 ) -> PaperStack:
     stack = await build_paper_stack(
         exchange=exchange,
@@ -134,9 +137,17 @@ async def _paper(
         engine_config=engine_config,
         risk_params=risk_params,
         clock=clock,
+        circuit_breaker=circuit_breaker,
     )
     await start_and_warmup(stack, "wp15-paper")
     return stack
+
+
+#: WP1.6: with the harness circuit breaker on (production parity, K-15) the SAME
+#: predicates that the WP1.5 gate enforces block the BUY one layer earlier, in the
+#: engine's single BUY filter.  The skip record's reason replaces the gate's
+#: ``signal_rejected`` text (a CB-dropped BUY never reaches the gate: one reason).
+_CB_SKIP_REASON = {"daily loss": "circuit_breaker_daily_limit", "drawdown": "circuit_breaker_halt"}
 
 
 def _rejections(logs: list[dict[str, Any]], prefix: str, needle: str) -> list[str]:
@@ -144,7 +155,52 @@ def _rejections(logs: list[dict[str, Any]], prefix: str, needle: str) -> list[st
     for entry in logs:
         if entry["event"] == f"{prefix}.signal_rejected":
             out.extend(r for r in entry["reasons"] if needle in r.lower())
+        elif (
+            entry["event"] == "trade_skip_logger.skip_recorded"
+            and entry.get("skip_reason") == _CB_SKIP_REASON.get(needle)
+        ):
+            out.append(entry["skip_reason"])
     return out
+
+
+def _gate_rejections(logs: list[dict[str, Any]], prefix: str, needle: str) -> list[str]:
+    """Only the WP1.5 gate's own ``signal_rejected`` reasons (pre-WP1.6 semantics)."""
+    return [
+        r
+        for entry in logs
+        if entry["event"] == f"{prefix}.signal_rejected"
+        for r in entry["reasons"]
+        if needle in r.lower()
+    ]
+
+
+def _cb_skips(logs: list[dict[str, Any]]) -> list[str]:
+    return [
+        e["skip_reason"]
+        for e in logs
+        if e["event"] == "trade_skip_logger.skip_recorded"
+        and str(e.get("skip_reason", "")).startswith("circuit_breaker")
+    ]
+
+
+def _assert_layer(logs: list[dict[str, Any]], prefix: str, needle: str, cb: bool) -> None:
+    """WP16-CR-03: pin WHICH layer blocked the BUY (K-10: exactly one reason).
+
+    ``cb=True``: the breaker drops it and the gate is never asked.
+    ``cb=False`` (gate-only twin): the WP1.5 gate rejects it, as the second layer.
+    """
+    if cb:
+        assert _cb_skips(logs) == [_CB_SKIP_REASON[needle]], logs
+        assert not _gate_rejections(logs, prefix, needle), logs
+    else:
+        assert _gate_rejections(logs, prefix, needle), logs
+        assert not _cb_skips(logs), logs
+
+
+#: WP16-CR-03 twin parametrization.  ``gate_only`` passes ``circuit_breaker=False``
+#: for a written reason: it isolates the WP1.5 gate as the second layer, which the
+#: production breaker otherwise pre-empts for these predicates.
+_LAYERS = pytest.mark.parametrize("cb", [True, False], ids=["cb_on", "gate_only"])
 
 
 # ---------------------------------------------------------------------------
@@ -152,13 +208,14 @@ def _rejections(logs: list[dict[str, Any]], prefix: str, needle: str) -> list[st
 # ---------------------------------------------------------------------------
 
 
+@_LAYERS
 async def test_wp15_t26_live_day1_latch_then_day2_buy_sized_at_min_nav_initial(
-    exchange: FakeCCXTExchange,
+    exchange: FakeCCXTExchange, cb: bool,
 ) -> None:
     clock = ManualClock(D_2105)
     stack = await _live(
         exchange, _script({0: "buy", 2: "buy", 3: "buy"}), clock,
-        risk_params=_DAY_LOSS, engine_config=_SL,
+        risk_params=_DAY_LOSS, engine_config=_SL, circuit_breaker=cb,
     )
 
     # D 21:05 -- BUY 150 at 100
@@ -173,6 +230,7 @@ async def test_wp15_t26_live_day1_latch_then_day2_buy_sized_at_min_nav_initial(
     with capture_logs() as logs:
         await step_bar(stack, SYMBOL, Decimal("80"), timeframe=TF)
     assert _rejections(logs, "live", "daily loss"), logs
+    _assert_layer(logs, "live", "daily loss", cb)
     assert [o["side"] for o in exchange.order_log] == ["buy", "sell"]
 
     # D+1 00:05 -- a new UTC day: the BUY fills (HEAD kept blocking: the live
@@ -268,14 +326,15 @@ async def test_wp15_t42_control_without_the_decline_the_late_buy_fills(
 # ---------------------------------------------------------------------------
 
 
+@_LAYERS
 async def test_wp15_t25_paper_day1_latch_then_day2_buy_fills_and_peak_follows_marks(
-    exchange: FakeCCXTExchange,
+    exchange: FakeCCXTExchange, cb: bool,
 ) -> None:
     clock = ManualClock(D_2105)
     stack = await _paper(
         exchange, _script({0: "buy", 3: "buy", 4: "buy"}), clock,
         risk_params=dataclasses.replace(RiskParameters(), max_daily_loss_pct=0.02),
-        engine_config=_SL,
+        engine_config=_SL, circuit_breaker=cb,
     )
     portfolio = stack.portfolio
 
@@ -297,6 +356,7 @@ async def test_wp15_t25_paper_day1_latch_then_day2_buy_fills_and_peak_follows_ma
     with capture_logs() as logs:
         await step_bar(stack, SYMBOL, Decimal("80"), timeframe=TF)  # BUY: latched
     assert _rejections(logs, "paper", "daily loss"), logs
+    _assert_layer(logs, "paper", "daily loss", cb)
     assert len(stack.execution.get_all_fills()) == 2
 
     clock.set(D1_0005)
@@ -371,8 +431,9 @@ _BIG = {
 }
 
 
+@_LAYERS
 async def test_wp15_t28_live_blocks_buys_past_20pct_drawdown_but_stop_loss_still_fires(
-    exchange: FakeCCXTExchange,
+    exchange: FakeCCXTExchange, cb: bool,
 ) -> None:
     clock = ManualClock(D_2105)
     params = dataclasses.replace(live_risk_parameters(), **_BIG)
@@ -381,6 +442,7 @@ async def test_wp15_t28_live_blocks_buys_past_20pct_drawdown_but_stop_loss_still
         exchange, _script({0: "buy", 1: "buy"}, "700"), clock,
         risk_params=params,
         engine_config={"bracket_stop_loss_pct": 0.45, "allow_pyramiding": True},
+        circuit_breaker=cb,
     )
     await step_bar(stack, SYMBOL, PRICE, timeframe=TF)  # BUY ~700
     assert [o["side"] for o in exchange.order_log] == ["buy"]
@@ -388,6 +450,7 @@ async def test_wp15_t28_live_blocks_buys_past_20pct_drawdown_but_stop_loss_still
     with capture_logs() as logs:
         await step_bar(stack, SYMBOL, Decimal("60"), timeframe=TF)  # NAV -28%: BUY probe
     assert _rejections(logs, "live", "drawdown"), logs
+    _assert_layer(logs, "live", "drawdown", cb)
     assert [o["side"] for o in exchange.order_log] == ["buy"]
     snap = stack.portfolio.risk_snapshot()
     assert Decimal("0.20") < snap.drawdown_pct < Decimal("0.30")
@@ -407,6 +470,7 @@ async def test_wp15_t28_paper_allows_a_drawdown_between_20_and_30pct(
         exchange, _script({0: "buy", 1: "buy"}, "700", {1: "5"}), clock,
         risk_params=params,
         engine_config={"allow_pyramiding": True},
+        circuit_breaker=False,
     )
     await step_bar(stack, SYMBOL, PRICE, timeframe=TF)
     assert len(stack.execution.get_all_fills()) == 1

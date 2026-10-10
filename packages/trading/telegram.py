@@ -104,7 +104,11 @@ class TelegramNotifier:
                 )
                 return False
         except Exception as exc:
-            logger.warning("telegram.send_error", error=str(exc)[:200])
+            # Exception TYPE only (WP16-SEC-06): the text / repr of aiohttp
+            # exceptions (InvalidURL, ClientResponseError, TooManyRedirects, ...)
+            # embeds the request URL, which contains the bot token.  Never log
+            # str(exc), repr(exc) or exc_info here.
+            logger.warning("telegram.send_error", error_type=type(exc).__name__)
             return False
 
     async def send_trade(

@@ -44,6 +44,16 @@ for the full rationale of each):
    the same real CCXT class hitting the same real exchange; sharing one
    fake instance is the in-memory equivalent.
 
+WP1.6 addition (K-15)
+---------------------
+- ``circuit_breaker: bool = True`` on the three builders: the stack gets the SAME
+  breaker production builds (``build_run_circuit_breaker(run_id, risk_manager.params)``
+  -- live 20% / paper 30% drawdown, 8% daily loss), without the Telegram listener.
+  The pre-WP1.6 comment "production never instantiates one (finding C2)" no longer
+  holds: ``run_paper_engine`` / ``run_live_engine`` now wire it.  Passing
+  ``circuit_breaker=False`` is an explicit opt-out and REQUIRES a one-line written
+  reason in the calling test's docstring.  ``stack.circuit_breaker`` exposes it.
+
 WP1.5a additions
 ----------------
 - ``clock``: an injectable risk-day clock (``ManualClock``) passed to
@@ -79,6 +89,7 @@ from trading.portfolio import PortfolioAccounting
 from trading.recovery import ResumeDailySeed
 from trading.risk import RiskParameters, live_risk_parameters
 from trading.risk_manager import DefaultRiskManager
+from trading.safety import CircuitBreaker, build_run_circuit_breaker
 from trading.strategy import BaseStrategy
 from trading.strategy_engine import StrategyEngine
 
@@ -112,6 +123,7 @@ class LiveStack:
     risk_manager: DefaultRiskManager
     market_data: CCXTMarketDataService
     exchange: FakeCCXTExchange
+    circuit_breaker: CircuitBreaker | None = None
 
 
 @dataclass
@@ -124,6 +136,7 @@ class PaperStack:
     risk_manager: DefaultRiskManager
     market_data: CCXTMarketDataService
     exchange: FakeCCXTExchange
+    circuit_breaker: CircuitBreaker | None = None
 
 
 class ManualClock:
@@ -169,6 +182,7 @@ async def build_live_stack(
     engine_config: dict[str, object] | None = None,
     risk_params: RiskParameters | None = None,
     clock: Callable[[], datetime] | None = None,
+    circuit_breaker: bool = True,
 ) -> LiveStack:
     """Construct one real StrategyEngine(LIVE) stack against ``exchange``.
 
@@ -180,10 +194,15 @@ async def build_live_stack(
     WP1.5a: ``risk_params=None`` means ``live_risk_parameters()`` (R-02 --
     what production's live site passes), not ``RiskParameters()``; ``clock``
     is the portfolio's risk-day clock (wall clock UTC when ``None``).
+
+    WP1.6 (K-15): ``circuit_breaker=True`` (default) builds the production
+    breaker from the run's own risk parameters; ``False`` is an opt-out that
+    needs a written reason in the calling test.
     """
     risk_manager = DefaultRiskManager(
         run_id=run_id, params=risk_params if risk_params is not None else live_risk_parameters()
     )
+    cb = build_run_circuit_breaker(run_id, risk_manager.params) if circuit_breaker else None
 
     # Mirrors run_orchestrator.py:1111-1123.
     live_exchange_handle = getattr(ccxt_async, EXCHANGE_ATTR)({"enableRateLimit": True})
@@ -211,9 +230,9 @@ async def build_live_stack(
         timeframe=timeframe,
         run_mode=RunMode.LIVE,
         config=engine_config,
-        # circuit_breaker intentionally omitted: production never
-        # instantiates one either (finding C2) -- passing None here is
-        # therefore high-fidelity, not a simplification.
+        # WP1.6 (C2 closed): production wires the breaker, so the harness does
+        # too (same helper, same thresholds; no Telegram listener).
+        circuit_breaker=cb,
     )
 
     return LiveStack(
@@ -223,6 +242,7 @@ async def build_live_stack(
         risk_manager=risk_manager,
         market_data=market_data,
         exchange=exchange,
+        circuit_breaker=cb,
     )
 
 
@@ -237,6 +257,7 @@ async def build_paper_stack(
     engine_config: dict[str, object] | None = None,
     risk_params: RiskParameters | None = None,
     clock: Callable[[], datetime] | None = None,
+    circuit_breaker: bool = True,
 ) -> PaperStack:
     """Construct one real StrategyEngine(PAPER) stack against ``exchange``.
 
@@ -245,8 +266,12 @@ async def build_paper_stack(
     ``PortfolioAccounting``, and a ``CCXTMarketDataService`` that resolves to
     the shared fake (``patch_exchange_factory``).  Same deviations as the
     live builder (no DB, no flush task, ``cache_ttl_seconds=0``).
+
+    WP1.6 (K-15): ``circuit_breaker=True`` (default) builds the production
+    paper breaker (30% drawdown); ``False`` needs a written reason.
     """
     risk_manager = DefaultRiskManager(run_id=run_id, params=risk_params)
+    cb = build_run_circuit_breaker(run_id, risk_manager.params) if circuit_breaker else None
     execution = PaperExecutionEngine(
         run_id=run_id,
         risk_manager=risk_manager,
@@ -264,6 +289,7 @@ async def build_paper_stack(
         timeframe=timeframe,
         run_mode=RunMode.PAPER,
         config=engine_config,
+        circuit_breaker=cb,
     )
     return PaperStack(
         engine=engine,
@@ -272,6 +298,7 @@ async def build_paper_stack(
         risk_manager=risk_manager,
         market_data=market_data,
         exchange=exchange,
+        circuit_breaker=cb,
     )
 
 
@@ -290,6 +317,7 @@ async def build_resumed_live_stack(
     peak_equity_hint: Decimal | None = None,
     clock: Callable[[], datetime] | None = None,
     daily_seed: ResumeDailySeed | None = None,
+    circuit_breaker: bool = True,
 ) -> LiveStack:
     """Build a SECOND engine stack under the SAME ``run_id``, with its
     portfolio rebuilt from ``fills`` via the production
@@ -317,10 +345,14 @@ async def build_resumed_live_stack(
 
     WP1.5a: ``risk_params=None`` means ``live_risk_parameters()`` (R-02);
     ``clock`` and ``daily_seed`` are forwarded to ``from_fills``.
+
+    WP1.6 (K-15): ``circuit_breaker=True`` (default) builds a FRESH breaker, as a
+    real resume does (nothing is persisted); ``False`` needs a written reason.
     """
     risk_manager = DefaultRiskManager(
         run_id=run_id, params=risk_params if risk_params is not None else live_risk_parameters()
     )
+    cb = build_run_circuit_breaker(run_id, risk_manager.params) if circuit_breaker else None
     if protective_mode:
         # WP1.8 S-10: risk-layer defence-in-depth mirror of the
         # strategy-layer protective_mode filter below -- production wires
@@ -360,6 +392,7 @@ async def build_resumed_live_stack(
         run_mode=RunMode.LIVE,
         config=engine_config,
         protective_mode=protective_mode,
+        circuit_breaker=cb,
     )
 
     return LiveStack(
@@ -369,6 +402,7 @@ async def build_resumed_live_stack(
         risk_manager=risk_manager,
         market_data=market_data,
         exchange=exchange,
+        circuit_breaker=cb,
     )
 
 

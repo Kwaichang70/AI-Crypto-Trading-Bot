@@ -148,13 +148,23 @@ async def _resume(
 
 
 def _daily_loss_rejections(logs: list[dict[str, Any]]) -> list[str]:
-    return [
+    # WP1.6: with the harness circuit breaker on (production parity, K-15) the same
+    # daily-loss predicate drops the BUY one layer earlier (skip reason
+    # ``circuit_breaker_daily_limit``); the gate is then never asked (single reason).
+    gate = [
         r
         for e in logs
         if e["event"] == "live.signal_rejected"
         for r in e["reasons"]
         if "daily loss" in r.lower()
     ]
+    cb = [
+        e["skip_reason"]
+        for e in logs
+        if e["event"] == "trade_skip_logger.skip_recorded"
+        and e.get("skip_reason") == "circuit_breaker_daily_limit"
+    ]
+    return gate + cb
 
 
 def _snapshot(as_of: datetime, **hints: Any) -> ResumeSnapshot:

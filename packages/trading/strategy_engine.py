@@ -31,6 +31,12 @@ Safety invariants
   active. The side-aware ``DefaultRiskManager`` gate is what actually
   enforces this; the engine-level filter only avoids a pointless
   downstream attempt for BUYs and keeps the skip audit populated.
+- The circuit breaker (WP1.6) is evaluated once per processed bar from a typed
+  ``RiskSnapshot``.  HALT / DAILY_LIMIT drop BUYs only (C23, same
+  ``_drop_entry_signals`` site as the kill switch); REDUCE halves the final
+  BUY quantity via ``Signal.entry_size_multiplier``.  Exits are never blocked
+  and the run is NEVER stopped by the breaker (D4); a breaker failure drops
+  that bar's BUYs (fail-closed, entries only).
 - Strategy exceptions are caught and logged without crashing the bar loop
 - The bar loop never crashes -- all errors are logged and processing continues
 """
@@ -62,7 +68,7 @@ from trading.exit_config import (
 from trading.models import Fill, Order, Position, Signal, TradeResult
 from trading.portfolio import PortfolioAccounting
 from trading.risk import BaseRiskManager
-from trading.safety import CircuitBreaker, CircuitBreakerResponse
+from trading.safety import CircuitBreaker, CircuitBreakerDecision, CircuitBreakerResponse
 from trading.strategy import BaseStrategy
 from trading.trade_journal import ExitReasonDetector, TradeExcursionTracker, TradeSkipLogger
 from trading.trailing_stop import TrailingStopManager
@@ -117,6 +123,9 @@ _MIN_WARMUP_BARS: int = 50
 # Sprint 50 Cycle 4: HALT auto-stop reason marker. Public, immutable. The
 # orchestrator reads engine.auto_stop_reason and compares to this value
 # before writing a 'circuit_breaker_halt_auto_stop' audit row.
+# WP1.6 (D4): NOTHING sets the reason any more -- HALT blocks entries only
+# and never stops the run.  Kept (with the orchestrator audit branches) as an
+# unreachable legacy path until CF-29.
 _HALT_AUTO_STOP_REASON: str = "circuit_breaker_halt"
 
 
@@ -440,10 +449,8 @@ class StrategyEngine:
         # run. Never taken in backtest mode (single-threaded, no flatten).
         self._cycle_lock: asyncio.Lock = asyncio.Lock()
 
-        # Sprint 50 Cycle 4: auto-stop reason set by the engine when it
-        # initiates its own shutdown (e.g. graduated circuit breaker HALT).
-        # The orchestrator reads this via auto_stop_reason property to decide
-        # whether to write a targeted audit event.  None = operator/timeout stop.
+        # Sprint 50 Cycle 4: auto-stop reason.  WP1.6 (D4): never assigned any
+        # more (pinned by a contract test) -- always None.  Removal: CF-29.
         self._auto_stop_reason: str | None = None
 
         # Adaptive learning - excursion and skip tracking (Sprint 32)
@@ -589,7 +596,7 @@ class StrategyEngine:
         return self._risk_manager
 
     @property
-    def circuit_breaker(self) -> Any:
+    def circuit_breaker(self) -> CircuitBreaker | None:
         """The circuit breaker instance, or None if not configured."""
         return self._circuit_breaker
 
@@ -597,15 +604,10 @@ class StrategyEngine:
     def auto_stop_reason(self) -> str | None:
         """Reason string when the engine initiated its own shutdown, else None.
 
-        Set by :meth:`_process_bar` when the graduated circuit breaker returns
-        ``HALT``.  The orchestrator reads this in the ``finally`` block to write
-        a targeted audit event so the operator has a clear stop-cause trail.
-        Callers MUST NOT write to this attribute — it is set only by the engine.
-
-        Set in live and paper modes only.  In backtest mode the engine continues
-        iterating bars and never reaches the orchestrator ``finally`` block that
-        consumes this attribute; backtest callers MAY observe a non-None value
-        but no audit row is written.
+        WP1.6 (D4): no producer remains -- a circuit-breaker HALT blocks
+        entries only and never stops the run, so this is always ``None``.  The
+        orchestrator ``finally`` branches that read it are unreachable legacy
+        (removal: CF-29).  Callers MUST NOT write to this attribute.
         """
         return self._auto_stop_reason
 
@@ -785,6 +787,20 @@ class StrategyEngine:
             portfolio_summary=summary,
         )
 
+        # WP1.6 (K-20): zero the breaker gauge so a stopped run's last value
+        # (e.g. HALT = 3) does not keep a ``max(...)`` Grafana alert firing.
+        if self._circuit_breaker is not None:
+            try:
+                from common.metrics import metrics as _mc
+
+                _mc.gauge(
+                    "circuit_breaker_state",
+                    0.0,
+                    labels={"run_id": self._run_id or "unknown"},
+                )
+            except Exception:
+                self._log.debug("engine.circuit_breaker_gauge_reset_failed", exc_info=True)
+
         self._state = EngineState.STOPPED
 
     # ------------------------------------------------------------------
@@ -961,7 +977,7 @@ class StrategyEngine:
             total_orders=self._total_orders,
         )
 
-        summary = self._portfolio.get_summary()
+        summary: dict[str, Any] = dict(self._portfolio.get_summary())
         # Include M2 exposure counters so BacktestRunner.run() can use them
         # directly instead of the post-hoc _estimate_bars_in_market heuristic.
         summary["exposure_bars_total"] = self._exposure_bars_total
@@ -1116,25 +1132,29 @@ class StrategyEngine:
         # True` guards against a MagicMock risk manager in tests -- a mock
         # attribute is truthy even when a test never sets it explicitly.
         _kill_switch_engaged = self._risk_manager.kill_switch_active is True
-        entries_blocked = _kill_switch_engaged or self._protective_mode
 
         # Count only bars that reach strategy processing
         self._bar_count += 1
 
-        # Check graduated circuit breaker.
-        # DAILY_LIMIT: no new entries but trailing stops must still fire - do NOT return.
-        # HALT: block all new signals (but fall through to trailing stop section 5b).
-        _cb_response = CircuitBreakerResponse.OK
+        # 3b. WP1.6 circuit breaker: ONE evaluation per processed bar, from the
+        # typed ``RiskSnapshot`` (never ``get_summary()`` keys, C3), after the
+        # marks above and before the strategies.  It is also evaluated under
+        # the kill switch / protective mode so its state and alerts stay
+        # truthful.  A failure is fail-closed for ENTRIES only (P-7): that
+        # bar's BUYs are dropped below, exits run, breaker state is untouched
+        # (``evaluate`` is transactional).  It NEVER stops the run (D4).
+        _cb_decision: CircuitBreakerDecision | None = None
+        _cb_failed = False
         if self._circuit_breaker is not None:
-            equity_summary = self._portfolio.get_summary()
-            _cb_equity = float(equity_summary.get("current_equity", 0.0))
-            _cb_daily_pnl = float(equity_summary.get("realised_pnl", 0.0))
-            _cb_drawdown = float(equity_summary.get("max_drawdown", 0.0))
-            _cb_response = self._circuit_breaker.check_graduated(
-                equity=_cb_equity,
-                daily_pnl=_cb_daily_pnl,
-                drawdown=_cb_drawdown,
-            )
+            try:
+                _cb_decision = self._circuit_breaker.evaluate(self._portfolio.risk_snapshot())
+            except Exception:
+                _cb_failed = True
+                self._log.error(
+                    "engine.circuit_breaker_eval_failed",
+                    bar_timestamp=str(bar_timestamp),
+                    exc_info=True,
+                )
 
         # 4. For each strategy: call on_bar and process resulting signals
         bar_signals: list[Signal] = []
@@ -1145,45 +1165,6 @@ class StrategyEngine:
         mtf_context = self._build_mtf_context(bar_timestamp)
         # C3: Store for use in trade recording / skip logging (Sprint 32)
         self._last_mtf_context = mtf_context
-
-        # C2 (cont.): If HALT or DAILY_LIMIT, suppress new entry signals
-        # but preserve flow so trailing stops (section 5b) can still fire.
-        _suppress_new_signals = (
-            _cb_response in (CircuitBreakerResponse.HALT, CircuitBreakerResponse.DAILY_LIMIT)
-        )
-
-        # Sprint 50 Cycle 4: HALT is now auto-stop.  Setting _stop_event
-        # causes run_live_loop() to exit after this bar completes, which
-        # triggers the orchestrator's finally block (status transition +
-        # audit row).  DAILY_LIMIT is excluded — it may resume the next UTC day.
-        # The not-is_set() guard prevents repeated log spam on a hard-tripped
-        # breaker that is never reset between bars.
-        if _cb_response == CircuitBreakerResponse.HALT and not self._stop_event.is_set():
-            open_position_count = 0
-            try:
-                if self._portfolio is not None:
-                    _halt_summary = self._portfolio.get_summary()
-                    open_position_count = int(_halt_summary.get("open_positions", 0))
-            except Exception:
-                pass  # defensive — log enrichment must never crash the stop path
-            logger.warning(
-                "circuit_breaker.halt_auto_stop_requested",
-                run_id=self._run_id,
-                symbol=list(current_bars.keys())[0] if current_bars else None,
-                reason="graduated_circuit_breaker_halt",
-                open_position_count=open_position_count,
-            )
-            # NOTE: HALT auto-stop deliberately does NOT close open positions.
-            # Forced liquidation at HALT-trigger prices (typically post-flash-crash,
-            # post-drawdown) historically executes at worst-decile prices. Operator
-            # decides liquidation strategy after reviewing the audit row and dashboard.
-            # No-position-close policy: HALT stops trading but does NOT liquidate
-            # open positions.  Operator decides via the runbook
-            # (docs/runbooks/circuit-breaker-halt-auto-stop.md) whether to liquidate,
-            # hold, or reset+resume.  Rationale: a forced sell at a stressed moment
-            # could realise the very loss the breaker is trying to contain.
-            self._auto_stop_reason = _HALT_AUTO_STOP_REASON
-            self._stop_event.set()
 
         for strategy in self._strategies:
             try:
@@ -1199,61 +1180,58 @@ class StrategyEngine:
                 )
                 continue
 
-        # WP1.2 (S6): drop BUY-only entries while the kill switch is active.
-        # Runs before the circuit-breaker filter below, which is a
-        # separate, still BUY+SELL-suppressing legacy behaviour for
-        # HALT/DAILY_LIMIT (C23, out of scope for WP1.2 -- see WP1.6).
-        if entries_blocked:
-            _entry_skip_reason = (
-                "kill_switch" if _kill_switch_engaged else "protective_mode"
-            )
+        # 4b. WP1.2 (S6) + WP1.6 (C23): the SINGLE BUY-only entry filter.  The
+        # first matching reason wins, so a dropped BUY gets exactly one skip
+        # record and one block reason (K-10); the risk gate is never asked
+        # about it.  SELLs pass through unchanged -- exits keep running under
+        # the kill switch, protective mode, HALT and DAILY_LIMIT.
+        _entry_skip_reason: str | None = None
+        _entry_log_event = "engine.kill_switch_entries_blocked"
+        if _kill_switch_engaged:
+            _entry_skip_reason = "kill_switch"
+        elif self._protective_mode:
+            _entry_skip_reason = "protective_mode"
+        elif _cb_failed:
+            _entry_skip_reason = "circuit_breaker_eval_failed"
+            _entry_log_event = "engine.circuit_breaker_entries_blocked"
+        elif _cb_decision is not None and _cb_decision.entries_blocked:
+            _entry_skip_reason = f"circuit_breaker_{_cb_decision.level.value}"
+            _entry_log_event = "engine.circuit_breaker_entries_blocked"
+        if _entry_skip_reason is not None:
             bar_signals = self._drop_entry_signals(
-                bar_signals, current_bars, skip_reason=_entry_skip_reason
+                bar_signals,
+                current_bars,
+                skip_reason=_entry_skip_reason,
+                log_event=_entry_log_event,
             )
 
-        # C2 (cont.): filter/reduce signals based on graduated CB response
-        if _suppress_new_signals:
-            if _cb_response == CircuitBreakerResponse.DAILY_LIMIT:
-                self._log.warning(
-                    "engine.daily_limit_signals_suppressed",
-                    bar_timestamp=str(bar_timestamp),
-                    skip_count=len(bar_signals),
-                )
-            # Log suppressed BUY signals as skipped trades
-            for _sig in bar_signals:
-                if _sig.direction == SignalDirection.BUY:
-                    self._skip_logger.log_skip(
-                        symbol=_sig.symbol,
-                        skip_reason=f"circuit_breaker_{_cb_response}",
-                        hypothetical_entry_price=current_bars.get(_sig.symbol, next(iter(current_bars.values()))).close,
-                        signal_context=dict(_sig.metadata),
-                    )
-            bar_signals = []
+        # REDUCE (WP1.6): the multiplier rides on each BUY ``Signal`` and is
+        # applied to the FINAL resolved quantity in the execution engine.
+        _entry_mult = (
+            _cb_decision.entry_size_multiplier
+            if _cb_decision is not None and not _cb_decision.entries_blocked
+            else Decimal(1)
+        )
 
         self._total_signals += len(bar_signals)
 
         # 5. Process each signal through the execution engine
         for signal in bar_signals:
             try:
-                # C3: Apply REDUCE position multiplier to BUY signals only (Sprint 32)
-                _size_multiplier = 1.0
-                if (
-                    self._circuit_breaker is not None
-                    and _cb_response == CircuitBreakerResponse.REDUCE
-                ):
-                    if signal.direction == SignalDirection.BUY:
-                        _size_multiplier = self._circuit_breaker.get_position_size_multiplier()
-                        if _size_multiplier < 1.0:
-                            signal = signal.model_copy(
-                                update={
-                                    "target_position": signal.target_position * type(signal.target_position)(str(_size_multiplier))
-                                }
+                # WP1.6: REDUCE -- BUY only; ``target_position`` is never mutated.
+                if signal.direction == SignalDirection.BUY and _entry_mult < 1:
+                    signal = signal.model_copy(
+                        update={
+                            "entry_size_multiplier": min(
+                                signal.entry_size_multiplier, _entry_mult
                             )
+                        }
+                    )
 
                 # WP1.3a (SY-13a-10): per-signal, fail-closed "no pyramiding"
                 # gate.  BUY-only; SELLs are never touched (R-I7/I5).  Runs
-                # after the kill-switch/protective filter and the CB
-                # wipe/REDUCE sizing above, before ``process_signal`` so a
+                # after the kill-switch/protective/CB filter and the
+                # REDUCE multiplier above, before ``process_signal`` so a
                 # second same-bar BUY sees the first one's fill (paper/
                 # backtest: synchronous MARKET fills) or in-flight state
                 # (live: the existing WP1.4 run-wide block, SY-13a-11).
@@ -1444,9 +1422,15 @@ class StrategyEngine:
             )
             # Safety-state gauges so Grafana can alert on HALT / kill-switch
             # without log scraping: OK=0, REDUCE=1, DAILY_LIMIT=2, HALT=3.
+            # WP1.6: the breaker's own level; unchanged when this bar's
+            # evaluation failed (``evaluate`` is transactional).
             _mc.gauge(
                 "circuit_breaker_state",
-                float(_CB_STATE_VALUES.get(_cb_response, 0)),
+                float(
+                    _CB_STATE_VALUES.get(self._circuit_breaker.current_response, 0)
+                    if self._circuit_breaker is not None
+                    else 0
+                ),
                 labels=_run_label,
             )
             _mc.gauge(
@@ -1552,16 +1536,19 @@ class StrategyEngine:
         current_bars: dict[str, OHLCVBar],
         *,
         skip_reason: str,
+        log_event: str = "engine.kill_switch_entries_blocked",
     ) -> list[Signal]:
         """
         Drop BUY signals only, logging a skip for each one.
 
-        Called while the kill switch is blocking new entries (D3). SELL
-        signals pass through unchanged -- exits must keep running even
-        while entries are blocked. The side-aware ``DefaultRiskManager``
-        gate is what actually enforces the block; this filter only avoids
-        a pointless downstream order attempt for BUYs and keeps the skip
-        audit populated.
+        Called while entries are blocked: the kill switch (D3), protective
+        mode, and (WP1.6, C23) the circuit breaker's HALT / DAILY_LIMIT /
+        evaluation failure. SELL signals pass through unchanged -- exits
+        must keep running even while entries are blocked. The side-aware
+        ``DefaultRiskManager`` gate is what actually enforces the block;
+        this filter only avoids a pointless downstream order attempt for
+        BUYs and keeps the skip audit populated.  ``log_event`` names the
+        once-per-bar warning (the kill-switch name stays the default).
         """
         kept: list[Signal] = []
         dropped_buy_count = 0
@@ -1581,9 +1568,10 @@ class StrategyEngine:
         if dropped_buy_count:
             _first_bar = next(iter(current_bars.values()), None)
             self._log.warning(
-                "engine.kill_switch_entries_blocked",
+                log_event,
                 bar_timestamp=str(_first_bar.timestamp) if _first_bar is not None else None,
                 dropped_buy_count=dropped_buy_count,
+                skip_reason=skip_reason,
             )
         return kept
 

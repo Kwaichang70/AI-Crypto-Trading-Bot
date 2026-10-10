@@ -1,28 +1,43 @@
 """
 apps/api/routers/circuit_breaker.py
 ------------------------------------
-Circuit breaker management endpoints.
+Circuit breaker endpoints.
 
-GET  /api/v1/runs/{run_id}/circuit-breaker       — current state
-POST /api/v1/runs/{run_id}/circuit-breaker/reset  — reset tripped breaker
+GET  /api/v1/runs/{run_id}/circuit-breaker       -- current (typed) state
+POST /api/v1/runs/{run_id}/circuit-breaker/reset -- RETIRED (410 Gone)
+
+WP1.6 (U-1 / K-09): the breaker is data-derived and auto-recovering.  HALT,
+REDUCE and DAILY_LIMIT clear by themselves as the drawdown recovers (HALT
+after N bars below 0.9 x the limit, stepping down to REDUCE) or the UTC day
+rolls, so there is nothing an operator may reset.  The reset route is kept
+only so existing callers get an explicit 410 instead of a 404 / 405; it
+performs no state change, needs no DB session and writes no audit row.  To
+block entries manually use the kill switch; to exit use flatten.  The route
+itself is removed in CF-29.
+
+Authentication is applied at the router level in ``main.py``
+(``require_api_key``) and is unchanged.
 """
 
 from __future__ import annotations
 
-from typing import Annotated, Any
-
-from fastapi import APIRouter, Depends, HTTPException, Request
-from sqlalchemy.ext.asyncio import AsyncSession
+from fastapi import APIRouter, HTTPException
 
 import structlog
 
-from api.db.session import get_db
+from trading.safety import CircuitBreaker, CircuitBreakerState
 
 router = APIRouter()
 log = structlog.get_logger(__name__)
 
+#: Fixed detail of the retired reset route (asserted verbatim by tests).
+RESET_RETIRED_DETAIL: str = (
+    "circuit_breaker_reset_retired: HALT auto-recovers (WP1.6/U-1); "
+    "use the kill switch to block entries or flatten to exit"
+)
 
-def _get_circuit_breaker(run_id: str) -> Any:
+
+def _get_circuit_breaker(run_id: str) -> CircuitBreaker:
     """Retrieve the circuit breaker for a running engine.
 
     Reads from :mod:`api.services.run_orchestrator` — the registry was moved
@@ -35,58 +50,30 @@ def _get_circuit_breaker(run_id: str) -> Any:
     if engine is None:
         raise HTTPException(status_code=404, detail=f"No running engine for run {run_id}")
 
-    breaker = getattr(engine, "circuit_breaker", None)
+    breaker: CircuitBreaker | None = getattr(engine, "circuit_breaker", None)
     if breaker is None:
         raise HTTPException(status_code=404, detail=f"Run {run_id} has no circuit breaker configured")
 
     return breaker
 
 
-@router.get("/runs/{run_id}/circuit-breaker")
-async def get_circuit_breaker_state(run_id: str) -> dict[str, Any]:
-    """Return the current circuit breaker state for a running engine."""
-    breaker = _get_circuit_breaker(run_id)
-    result: dict[str, Any] = breaker.state.model_dump(mode="json")
-    return result
+@router.get("/runs/{run_id}/circuit-breaker", response_model=CircuitBreakerState)
+async def get_circuit_breaker_state(run_id: str) -> CircuitBreakerState:
+    """Return the current circuit breaker state for a running engine.
 
-
-@router.post("/runs/{run_id}/circuit-breaker/reset")
-async def reset_circuit_breaker(
-    run_id: str,
-    request: Request,
-    db: Annotated[AsyncSession, Depends(get_db)],
-) -> dict[str, Any]:
-    """Reset a tripped circuit breaker.
-
-    Returns 409 if the breaker is not currently tripped.
+    The read is atomic (single worker, no awaits in ``CircuitBreaker.state``).
+    The payload is an allow-list: level, active conditions, hysteresis
+    progress, thresholds and the last evaluation's run-level figures.
     """
-    breaker = _get_circuit_breaker(run_id)
+    return _get_circuit_breaker(run_id).state
 
-    if not breaker.is_tripped:
-        raise HTTPException(
-            status_code=409,
-            detail="Circuit breaker is not tripped; nothing to reset.",
-        )
 
-    breaker.reset()
-    log.warning(
-        "circuit_breaker.reset_via_api",
-        run_id=run_id,
-    )
-
-    # SEC-002: persist audit record — manually resetting a tripped breaker
-    # re-enables order submission on a run that has already breached its
-    # risk envelope, so the action must leave a durable forensic trail.
-    from api.services.audit_log import record_audit_event
-
-    await record_audit_event(
-        db,
-        event_type="circuit_breaker_reset",
-        resource_type="circuit_breaker",
-        resource_id=run_id,
-        request=request,
-        payload={"run_id": run_id},
-    )
-
-    result: dict[str, Any] = breaker.state.model_dump(mode="json")
-    return result
+@router.post(
+    "/runs/{run_id}/circuit-breaker/reset",
+    status_code=410,
+    response_model=None,
+)
+async def reset_circuit_breaker(run_id: str) -> None:
+    """Retired (WP1.6): always 410 Gone; no state change, no audit row."""
+    log.info("circuit_breaker.reset_retired_called", run_id=run_id)
+    raise HTTPException(status_code=410, detail=RESET_RETIRED_DETAIL)
