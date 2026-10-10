@@ -948,6 +948,8 @@ class _DispatchSession:
                 return result
             result.scalars.return_value.all.return_value = []
             result.scalar.return_value = None
+            # WP1.5b: the same-day (min, first) equity-hint statement -> an empty run
+            result.one.return_value = (None, None)
             return result
 
         return result

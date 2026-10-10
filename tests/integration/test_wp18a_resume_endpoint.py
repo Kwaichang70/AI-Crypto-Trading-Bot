@@ -189,6 +189,8 @@ class _DispatchSession:
             # orders / fills / equity_snapshots (load_resume_snapshot)
             result.scalars.return_value.all.return_value = []
             result.scalar.return_value = None
+            # WP1.5b: the same-day (min, first) hint statement -> an empty run.
+            result.one.return_value = (None, None)
             return result
 
         return result
@@ -463,6 +465,66 @@ class TestResumeStubAndHappyPath:
         body = resp.json()
         assert body["status"] == "running"
         assert str(RUN_ID) in runs_module._RUN_TASKS
+
+    def test_wp15_t35_normal_resume_builds_the_daily_seed(self, resume_app: Any) -> None:
+        """WP1.5b T-35: the snapshot handed to the engine carries the seed
+        (the run has no equity snapshots -> no hints, but the day and the
+        run start are set), never ``None`` (which would be the weaker
+        ``replay_estimate`` path)."""
+        run_row = _make_run_row(status="orphaned")
+        day_before = datetime.now(UTC).date()
+        engine_mock = self._resume(resume_app, run_row, "")
+        day_after = datetime.now(UTC).date()
+        engine_mock.assert_called_once()
+        seed = engine_mock.call_args.kwargs["resume"].daily_seed
+        assert seed is not None
+        assert seed.day_start_equity is None
+        assert seed.day_min_equity is None
+        assert seed.day_first_equity is None
+        assert seed.run_started_at == run_row.started_at
+        assert day_before <= seed.as_of_day <= day_after
+        assert engine_mock.call_args.kwargs["protective_mode"] is False
+
+    def test_wp15_t35_protective_resume_builds_the_daily_seed(self, resume_app: Any) -> None:
+        """WP1.5b T-35: a protective resume (kill switch active) succeeds and
+        ALSO carries the seed."""
+        run_row = _make_run_row(status="orphaned")
+        engine_mock = self._resume(resume_app, run_row, "?mode=protective", kill_switch_count=1)
+        engine_mock.assert_called_once()
+        assert engine_mock.call_args.kwargs["protective_mode"] is True
+        seed = engine_mock.call_args.kwargs["resume"].daily_seed
+        assert seed is not None
+        assert seed.run_started_at == run_row.started_at
+
+    @staticmethod
+    def _resume(
+        app: Any, run_row: Any, query: str, *, kill_switch_count: int = 0
+    ) -> AsyncMock:
+        session = _DispatchSession(
+            run_row=run_row, runs_update_rowcounts=[1, 1], kill_switch_count=kill_switch_count
+        )
+        client = _client(app, session)
+
+        async def _fake_scan_and_import(
+            db: Any, run: Any, exchange: Any, *, fence: Any = None
+        ) -> ImportReport:
+            return ImportReport()
+
+        import api.services.run_recovery as run_recovery_module
+
+        original_scan = run_recovery_module.scan_and_import
+        run_recovery_module.scan_and_import = _fake_scan_and_import
+        engine_mock = AsyncMock()
+        try:
+            with patch("api.routers.runs._run_live_engine", engine_mock):
+                resp = client.post(
+                    f"/api/v1/runs/{RUN_ID}/resume{query}",
+                    headers={"X-Live-Confirm-Token": CONFIRM_TOKEN, "X-Admin-Key": ADMIN_KEY},
+                )
+        finally:
+            run_recovery_module.scan_and_import = original_scan
+        assert resp.status_code == 200, resp.text
+        return engine_mock
 
 
 

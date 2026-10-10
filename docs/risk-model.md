@@ -356,16 +356,39 @@ risk manager only read `risk_snapshot()` (pure).
   state from persisted equity-snapshot hints (`ResumeDailySeed`). The day
   start is unknown, and BUYs stay blocked until the next 00:00 UTC, only when
   a seed exists but has neither a day-start hint nor a run that started today,
-  or when the seed is dated after the resume's UTC day
-  (`seed_from_the_future`).
+  when the seed is dated after the resume's UTC day (`seed_from_the_future`),
+  or when any seed field fails the strict type check or seeding raises
+  (`seed_invalid`, see below).
   Without a seed (legacy callers, `replay_estimate`) the gate *value* is never
   weaker than HEAD's realised-today value, but the threshold uses the fixed
   day-start basis, so losses in (pct/(1+pct)*S, pct*S] that HEAD's shrinking
   `current_equity` basis blocked now pass, by design. The path can also be
   stricter than HEAD: mark drift since the original fills counts toward the
   resume day (until 00:00 UTC). A `day_first_equity` hint raises a snapshot
-  day start to `max(day_start_equity, day_first_equity)`. (The database
-  wiring of the seed is WP1.5b.)
+  day start to `max(day_start_equity, day_first_equity)`.
+- **Resume seed source (WP1.5b):** `run_persistence.load_resume_snapshot`
+  reads three hints with two parameterised statements served by
+  `ix_equity_snapshots_run_id_timestamp` over `equity_snapshots`, with `T` =
+  00:00 UTC of the resume's UTC day:
+  `day_start_equity_hint` (latest row with `timestamp < T`, ties by the higher
+  `bar_index`), and `day_min_equity_hint` / `day_first_equity_hint` (minimum
+  and earliest row with `timestamp >= T`, ties by the lower `bar_index`; one
+  statement, so one is set if and only if the other is), plus
+  `daily_hints_day` and `run_started_at`. `ResumeSnapshot.daily_seed` is
+  `None` only if the hints were never read. Both orchestrator resume paths
+  (paper boot recovery and live/protective resume) pass it to `from_fills`.
+  The rebuild's own equity point (positions valued at their fill prices) is
+  never persisted, so the hints only ever see real marks (WP15B-CR-01).
+- **Seed validation, no coercion (WP1.5b):** every seed field is checked
+  strictly before any comparison: `Decimal` that is finite and `>= 0` for the
+  three equities, a `date` that is not a `datetime` for `as_of_day`, `None` or
+  an aware `datetime` for `run_started_at`. A `float`, `int`, `str`, `bool`,
+  NaN, negative value or naive datetime is **rejected, never repaired** (the
+  column is `Numeric(20, 8)` and yields `Decimal`, so a wrong type is an
+  upstream defect). The result is `day_start_source = "unknown"` (BUYs blocked
+  until 00:00 UTC, exits unaffected) with `resume.daily_state_unknown`
+  (`reason="seed_invalid"`, field and type name only, never the value). Seed
+  construction and seeding never abort a resume, a protective resume included.
 - **Sizing:** paper and backtest BUYs size on `min(NAV, initial_capital)`,
   exactly like live (D-WP15-B): no compounding.
 

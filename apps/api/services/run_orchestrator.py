@@ -284,10 +284,12 @@ class _IncrementalFlushState:
     flushed_fill_ids: set[uuid.UUID] = field(default_factory=set)
     peak_equity: Decimal = field(default_factory=lambda: Decimal("0"))
     # WP1.8a (O2): a resumed run keeps its equity `bar_index` sequence
-    # continuous across the restart -- seeded with
-    # ``ResumeSnapshot.max_bar_index + 1`` so the first post-resume flush
-    # does not collide with `uq_equity_snapshots_run_bar`.  Zero for a
-    # fresh (non-resumed) run.
+    # continuous across the restart.  The resume sites set
+    # ``flushed_equity_count = len(curve)`` (the ``from_fills`` seed point is
+    # never persisted, WP15B-CR-01) and ``bar_index_offset =
+    # ResumeSnapshot.max_bar_index``, so the first post-resume row gets
+    # ``max_bar_index + 1`` and does not collide with
+    # `uq_equity_snapshots_run_bar`.  Zero for a fresh (non-resumed) run.
     bar_index_offset: int = 0
 
 
@@ -1000,9 +1002,16 @@ async def run_paper_engine(
                 initial_cash=capital,
                 fills=resume.fills,
                 peak_equity_hint=resume.peak_equity_hint,
+                # WP1.5b: persisted day-start hints; None (legacy snapshot) -> replay_estimate
+                daily_seed=resume.daily_seed,
             )
             execution.restore_from_fills(resume.fills)
-            flush_state.bar_index_offset = resume.max_bar_index + 1
+            # WP15B-CR-01: from_fills' single curve point is valued at old fill prices;
+            # never persist it (a later same-day resume would read it as day_first/day_min).
+            # bar_index = offset + flushed_equity_count + i, so offset = max_bar_index
+            # keeps the sequence at max_bar_index + 1.
+            flush_state.flushed_equity_count = len(portfolio.get_equity_curve())
+            flush_state.bar_index_offset = resume.max_bar_index
             flush_state.peak_equity = resume.peak_equity_hint or Decimal("0")
         else:
             portfolio = PortfolioAccounting(
@@ -1507,8 +1516,15 @@ async def run_live_engine(
                 initial_cash=capital,
                 fills=resume.fills,
                 peak_equity_hint=resume.peak_equity_hint,
+                # WP1.5b: persisted day-start hints; None (legacy snapshot) -> replay_estimate
+                daily_seed=resume.daily_seed,
             )
-            flush_state.bar_index_offset = resume.max_bar_index + 1
+            # WP15B-CR-01: from_fills' single curve point is valued at old fill prices;
+            # never persist it (a later same-day resume would read it as day_first/day_min).
+            # bar_index = offset + flushed_equity_count + i, so offset = max_bar_index
+            # keeps the sequence at max_bar_index + 1.
+            flush_state.flushed_equity_count = len(portfolio.get_equity_curve())
+            flush_state.bar_index_offset = resume.max_bar_index
             flush_state.peak_equity = resume.peak_equity_hint or Decimal("0")
         else:
             portfolio = PortfolioAccounting(

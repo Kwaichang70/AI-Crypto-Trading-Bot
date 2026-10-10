@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import math
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, time
 from decimal import Decimal
 from typing import Any
 
@@ -38,6 +38,7 @@ import structlog
 from pydantic import ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from api.db.models import (
     EquitySnapshotORM,
@@ -671,7 +672,9 @@ def _fill_orm_to_model(fill: FillORM) -> Fill:
     )
 
 
-async def load_resume_snapshot(db: AsyncSession, run: RunORM) -> ResumeSnapshot:
+async def load_resume_snapshot(
+    db: AsyncSession, run: RunORM, *, now: datetime | None = None
+) -> ResumeSnapshot:
     """Load every persisted fill/order for ``run`` into a pure ``ResumeSnapshot``.
 
     Used by both the paper boot-resume path (``recover_orphaned_runs``) and
@@ -687,15 +690,39 @@ async def load_resume_snapshot(db: AsyncSession, run: RunORM) -> ResumeSnapshot:
     run:
         The run being resumed.  ``run.config["initial_capital"]`` supplies
         the starting cash the replay is anchored to.
+    now:
+        WP1.5b: the instant that defines "today" (UTC) for the daily-risk-state
+        hints below; defaults to the wall clock.  A naive value is treated as
+        UTC.  Injectable so the DB tests are deterministic.
 
     Returns
     -------
     ResumeSnapshot
         ``peak_equity_hint`` is the highest persisted equity snapshot (or
         ``None`` if the run never flushed one).  ``max_bar_index`` is the
-        highest persisted ``bar_index`` (or ``-1`` if none), so callers can
-        seed ``bar_index_offset = max_bar_index + 1`` (O2: equity
-        ``bar_index`` continues, never restarts, across a resume).
+        highest persisted ``bar_index`` (or ``-1`` if none), so the first
+        post-resume equity row gets ``max_bar_index + 1`` (O2: equity
+        ``bar_index`` continues, never restarts, across a resume; see the
+        resume sites in ``run_orchestrator``).
+
+        WP1.5b -- the daily-risk-state seed hints (``ResumeSnapshot.daily_seed``
+        turns them into a ``ResumeDailySeed``).  ``T`` = 00:00 UTC of the UTC
+        day of ``now``; the two statements below (three hints) are
+        parameterised, scoped to ``run.id`` and served by
+        ``ix_equity_snapshots_run_id_timestamp``:
+
+        * ``day_start_equity_hint`` -- equity of the latest snapshot with
+          ``timestamp < T`` (ties broken by ``bar_index`` descending).
+        * ``day_min_equity_hint`` / ``day_first_equity_hint`` -- the minimum
+          equity and the equity of the earliest snapshot (``timestamp ASC,
+          bar_index ASC``) with ``timestamp >= T``.  Both come from ONE
+          statement over the same row set, so one is set if and only if the
+          other is.
+        * ``daily_hints_day`` -- the UTC day of ``now`` (always set, even for
+          a run with no snapshots), ``run_started_at`` -- ``run.started_at``.
+
+        The values are passed through unmodified; type validation is the
+        job of ``PortfolioAccounting._seed_daily_state`` (no coercion here).
     """
     order_result = await db.execute(select(OrderORM).where(OrderORM.run_id == run.id))
     order_rows = list(order_result.scalars().all())
@@ -731,6 +758,33 @@ async def load_resume_snapshot(db: AsyncSession, run: RunORM) -> ResumeSnapshot:
 
     initial_cash = Decimal(str((run.config or {}).get("initial_capital", "10000")))
 
+    hints_day = _utc_date_of(now if now is not None else datetime.now(UTC))
+    day_open = datetime.combine(hints_day, time.min, tzinfo=UTC)
+
+    day_start_result = await db.execute(
+        select(EquitySnapshotORM.equity)
+        .where(EquitySnapshotORM.run_id == run.id, EquitySnapshotORM.timestamp < day_open)
+        .order_by(EquitySnapshotORM.timestamp.desc(), EquitySnapshotORM.bar_index.desc())
+        .limit(1)
+    )
+    day_start_equity_hint = day_start_result.scalar()
+
+    first_row = aliased(EquitySnapshotORM)
+    first_today = (
+        select(first_row.equity)
+        .where(first_row.run_id == run.id, first_row.timestamp >= day_open)
+        .order_by(first_row.timestamp.asc(), first_row.bar_index.asc())
+        .limit(1)
+        .correlate(None)
+        .scalar_subquery()
+    )
+    today_result = await db.execute(
+        select(func.min(EquitySnapshotORM.equity), first_today).where(
+            EquitySnapshotORM.run_id == run.id, EquitySnapshotORM.timestamp >= day_open
+        )
+    )
+    day_min_equity_hint, day_first_equity_hint = today_result.one()
+
     return ResumeSnapshot(
         run_id=str(run.id),
         initial_cash=initial_cash,
@@ -738,4 +792,16 @@ async def load_resume_snapshot(db: AsyncSession, run: RunORM) -> ResumeSnapshot:
         orders=orders,
         peak_equity_hint=peak_equity_hint,
         max_bar_index=int(max_bar_index_raw) if max_bar_index_raw is not None else -1,
+        day_start_equity_hint=day_start_equity_hint,
+        day_min_equity_hint=day_min_equity_hint,
+        day_first_equity_hint=day_first_equity_hint,
+        daily_hints_day=hints_day,
+        run_started_at=run.started_at,
     )
+
+
+def _utc_date_of(at: datetime) -> date:
+    """UTC calendar day of ``at`` (a naive datetime is treated as UTC)."""
+    if at.tzinfo is None:
+        return at.replace(tzinfo=UTC).date()
+    return at.astimezone(UTC).date()

@@ -37,16 +37,13 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import ROUND_HALF_UP, Decimal
-from typing import TYPE_CHECKING, Any, Callable, Literal
+from typing import Any, Callable, Literal
 
 import structlog
 
 from common.types import OrderSide
 from trading.models import Fill, Position, TradeResult
-from trading.recovery import replay_sort_key
-
-if TYPE_CHECKING:
-    from trading.recovery import ResumeDailySeed
+from trading.recovery import ResumeDailySeed, replay_sort_key
 
 __all__ = ["DayStartSource", "PortfolioAccounting", "RiskSnapshot"]
 
@@ -83,6 +80,39 @@ def _utc_day(at: datetime) -> date:
     if at.tzinfo is None:
         return at.replace(tzinfo=UTC).date()
     return at.astimezone(UTC).date()
+
+
+def _invalid_seed_field(seed: object) -> tuple[str, str] | None:
+    """Strict type check of a resume seed (WP1.5b R-1 / SEC-05 / SEC-208).
+
+    Returns ``(field_name, type_name)`` of the first invalid field, or ``None``
+    if the seed is valid (or absent).  **No coercion**: a ``float``, ``int``,
+    ``str`` or ``bool`` hint, a NaN / infinite / negative ``Decimal``, a
+    ``datetime`` ``as_of_day`` and a naive ``run_started_at`` are all
+    rejected.  The persisted column is ``Numeric(20, 8)`` and yields
+    ``Decimal``, so a non-``Decimal`` hint is an upstream defect that must not
+    be silently repaired.  Only field and type *names* are returned, never
+    values.
+    """
+    if seed is None:
+        return None
+    if not isinstance(seed, ResumeDailySeed):
+        return ("daily_seed", type(seed).__name__)
+    as_of = seed.as_of_day
+    if not isinstance(as_of, date) or isinstance(as_of, datetime):
+        return ("as_of_day", type(as_of).__name__)
+    for name in ("day_start_equity", "day_min_equity", "day_first_equity"):
+        value = getattr(seed, name)
+        if value is None:
+            continue
+        # ``is_finite()`` first: ordering a NaN raises.  ``>= 0`` mirrors the
+        # DB check ``ck_equity_snapshots_equity_non_negative``.
+        if not isinstance(value, Decimal) or not value.is_finite() or value < 0:
+            return (name, type(value).__name__)
+    started = seed.run_started_at
+    if started is not None and (not isinstance(started, datetime) or started.utcoffset() is None):
+        return ("run_started_at", type(started).__name__)
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -587,8 +617,11 @@ class PortfolioAccounting:
         clock:
             Risk-day clock for the rebuilt portfolio (see ``__init__``).
         daily_seed:
-            Persisted day-start hints (WP1.5 1.5b wires these from the
-            equity-snapshot table).  ``None`` (legacy / test callers) uses
+            Persisted day-start hints (WP1.5b: ``ResumeSnapshot.daily_seed``,
+            read from the equity-snapshot table).  Every field is
+            type-validated strictly (no coercion); an invalid seed degrades to
+            ``unknown`` and never aborts the resume.  ``None`` (legacy / test
+            callers, or a snapshot that never read hints) uses
             ``replay_estimate``: the gate *value* is never weaker than HEAD's
             realised-today value (``worst = min(0, realised_today)``), but the
             threshold uses the fixed day-start basis (C-02) and mark drift
@@ -1079,6 +1112,15 @@ class PortfolioAccounting:
         The rebuilt NAV never feeds ``worst`` (C-07a); ``worst`` comes only
         from persisted equity-snapshot hints.  Evaluated in table order.
 
+        WP1.5b (R-1 / C-3): every seed field is type-validated first, before
+        any comparison, arithmetic or assignment
+        (:func:`_invalid_seed_field`), and the whole computation is guarded.
+        An invalid seed or any exception degrades to
+        ``day_start_source="unknown"`` (``resume.daily_state_unknown`` with
+        ``reason="seed_invalid"``; BUYs blocked until 00:00 UTC, exits
+        unaffected) -- seeding never aborts a resume, a protective resume
+        included.
+
         ``_day_start_pending`` (the one-shot re-base, SYN-01) is assigned
         unconditionally here -- the replay's own value is overwritten.  It is
         armed only where a higher first observation could not lift a seeded
@@ -1094,64 +1136,77 @@ class PortfolioAccounting:
         worst: Decimal
         source: DayStartSource
         unknown_reason = "no_day_start_hint"
-        if daily_seed is None:
-            # Legacy / test callers: the gate value is never weaker than HEAD's
-            # realised-today value (worst = min(0, realised_today)); the
-            # threshold uses the fixed day-start basis and mark drift since the
-            # fills counts (see ``from_fills``).
-            nav_day_start = rebuilt_nav - realised_today
-            worst = min(Decimal("0"), realised_today)
-            source = "replay_estimate"
-        elif daily_seed.as_of_day < today:
-            # Midnight race: the hints describe yesterday -> roll semantics.
-            nav_day_start = rebuilt_nav
-            worst = Decimal("0")
-            source = "roll"
-        elif daily_seed.as_of_day > today:
+        pending: bool
+        failure: tuple[str, str] | None = None
+        try:
+            failure = _invalid_seed_field(daily_seed)
+            if failure is None:
+                if daily_seed is None:
+                    # Legacy / test callers: the gate value is never weaker than HEAD's
+                    # realised-today value (worst = min(0, realised_today)); the
+                    # threshold uses the fixed day-start basis and mark drift since the
+                    # fills counts (see ``from_fills``).
+                    nav_day_start = rebuilt_nav - realised_today
+                    worst = min(Decimal("0"), realised_today)
+                    source = "replay_estimate"
+                elif daily_seed.as_of_day < today:
+                    # Midnight race: the hints describe yesterday -> roll semantics.
+                    nav_day_start = rebuilt_nav
+                    worst = Decimal("0")
+                    source = "roll"
+                elif daily_seed.as_of_day > today:
+                    nav_day_start = rebuilt_nav
+                    worst = Decimal("0")
+                    source = "unknown"
+                    unknown_reason = "seed_from_the_future"
+                else:
+                    day_min = daily_seed.day_min_equity
+                    if daily_seed.day_start_equity is not None:
+                        nav_day_start = daily_seed.day_start_equity
+                        source = "snapshot"
+                    elif (
+                        daily_seed.run_started_at is not None
+                        and _utc_day(daily_seed.run_started_at) == today
+                    ):
+                        nav_day_start = self._initial_cash
+                        source = "run_start"
+                    else:
+                        nav_day_start = rebuilt_nav
+                        day_min = None
+                        source = "unknown"
+                    if (
+                        source == "snapshot"
+                        and daily_seed.day_first_equity is not None
+                        and daily_seed.day_first_equity > nav_day_start
+                    ):
+                        # Robust day start: a depressed pre-midnight snapshot never
+                        # becomes the day's cushion (SYN-01 / Option B).
+                        nav_day_start = daily_seed.day_first_equity
+                    if day_min is not None:
+                        worst = min(Decimal("0"), day_min - nav_day_start)
+                    else:
+                        worst = Decimal("0")
+
+                # One-shot re-base flag per the 1.5a synthesis seed table.  Never armed
+                # when the seed carries a loss (a latch can never be relaxed).
+                pending = False
+                if worst == Decimal("0"):
+                    if source in ("roll", "replay_estimate"):
+                        pending = True
+                    elif source == "snapshot" and (
+                        daily_seed is not None
+                        and daily_seed.day_first_equity is None
+                        and daily_seed.day_min_equity is None
+                    ):
+                        pending = True
+        except Exception as exc:  # seeding must never abort a resume
+            failure = ("seeding", type(exc).__name__)
+        if failure is not None:
             nav_day_start = rebuilt_nav
             worst = Decimal("0")
             source = "unknown"
-            unknown_reason = "seed_from_the_future"
-        else:
-            day_min = daily_seed.day_min_equity
-            if daily_seed.day_start_equity is not None:
-                nav_day_start = daily_seed.day_start_equity
-                source = "snapshot"
-            elif (
-                daily_seed.run_started_at is not None
-                and _utc_day(daily_seed.run_started_at) == today
-            ):
-                nav_day_start = self._initial_cash
-                source = "run_start"
-            else:
-                nav_day_start = rebuilt_nav
-                day_min = None
-                source = "unknown"
-            if (
-                source == "snapshot"
-                and daily_seed.day_first_equity is not None
-                and daily_seed.day_first_equity > nav_day_start
-            ):
-                # Robust day start: a depressed pre-midnight snapshot never
-                # becomes the day's cushion (SYN-01 / Option B).
-                nav_day_start = daily_seed.day_first_equity
-            if day_min is not None:
-                worst = min(Decimal("0"), day_min - nav_day_start)
-            else:
-                worst = Decimal("0")
-
-        # One-shot re-base flag per the 1.5a synthesis seed table.  Never armed
-        # when the seed carries a loss (a latch can never be relaxed).
-        pending = False
-        if worst == Decimal("0"):
-            if source in ("roll", "replay_estimate"):
-                pending = True
-            elif source == "snapshot" and (
-                daily_seed is not None
-                and daily_seed.day_first_equity is None
-                and daily_seed.day_min_equity is None
-            ):
-                pending = True
+            unknown_reason = "seed_invalid"
+            pending = False
 
         self._nav_day_start = nav_day_start
         self._worst_nav_pnl = worst
@@ -1161,6 +1216,8 @@ class PortfolioAccounting:
             self._log.error(
                 "resume.daily_state_unknown",
                 reason=unknown_reason,
+                # field / type names only, never the offending value
+                **({"field": failure[0], "value_type": failure[1]} if failure else {}),
                 nav_day_start=str(nav_day_start),
                 peak_equity=str(self._peak_equity),
             )

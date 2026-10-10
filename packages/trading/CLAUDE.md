@@ -82,4 +82,12 @@ Core trading engine containing the heart of the system.
   `BaseExecutionEngine.attach_risk_state_source` (separate from live's
   `attach_position_source`); the engine-local ledger still supplies
   `open_positions` / held quantity (WP1.10 revisits it).
+- WP1.5b (resume seed wiring): `run_persistence.load_resume_snapshot(db, run,
+  *, now=None)` fills `ResumeSnapshot.{day_start,day_min,day_first}_equity_hint`,
+  `daily_hints_day`, `run_started_at`; both orchestrator `from_fills` sites pass
+  `daily_seed=resume.daily_seed` (`None` only for a snapshot that never read
+  hints). No coercion anywhere: `_seed_daily_state` type-validates every seed
+  field first (`_invalid_seed_field`) and degrades an invalid seed or a
+  seeding exception to `unknown` / `reason="seed_invalid"` (BUYs blocked until
+  00:00 UTC, exits unaffected); a resume is never aborted by seed data.
 - See `reports/vp2-wp1.5/synthesis-spec.md`.
