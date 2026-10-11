@@ -19,6 +19,15 @@ Semantics (WP1.3b-a, SY-13b-05)
    re-seed it.  It is dropped only when the position is flat.
 4. A resume seeds ``max(HWM_0, max close of bars after the anchor bar)``
    (:meth:`TrailingStopManager.seed_peak`, never lowers).
+
+Intra-bar mode (WP1.3b-b, live only)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+``check(..., intrabar=True)`` reads the mark and **never writes it**: a bid
+above the mark does not raise it (only bar-close checks ratchet, U-8), there is
+no lazy seed (no mark: ``None``), a flat position is not cleaned up and a pending
+exit is not aged.  A quantity change while an exit is pending still re-protects
+the residual.  The emitted signal carries ``exit_path="intrabar"``,
+``trigger_source="bid"`` and ``trigger_price``.
 """
 from __future__ import annotations
 
@@ -172,6 +181,7 @@ class TrailingStopManager:
         position: Position | None,
         *,
         bar_ts: datetime | None = None,
+        intrabar: bool = False,
     ) -> Signal | None:
         """
         Check trailing stop for a single symbol.
@@ -189,12 +199,19 @@ class TrailingStopManager:
             via :meth:`open_lot` the mark ratchets only when ``bar_ts`` is
             ``None`` (legacy direct callers) or later than the lot's anchor
             bar.  The engine always passes ``bar.timestamp``.
+        intrabar : bool
+            WP1.3b-b: evaluate as the live intra-bar check -- ``current_price``
+            is a confirmed BID; the mark is read-only (see the module
+            docstring).  ``bar_ts`` is ignored.
 
         Returns
         -------
         Signal | None
             A SELL signal if the trailing stop is triggered, else None.
         """
+        if intrabar:
+            return self._check_intrabar(symbol, current_price, position)
+
         # No position or flat — clean up tracking (the stop filled fully)
         if position is None or position.is_flat:
             self._peak_prices.pop(symbol, None)
@@ -258,41 +275,97 @@ class TrailingStopManager:
         stop_price = peak * (Decimal("1") - self._trailing_stop_pct)
 
         if current_price <= stop_price:
-            self._log.info(
-                "trailing_stop.triggered",
-                symbol=symbol,
-                peak=str(peak),
-                stop_price=str(stop_price),
-                current_price=str(current_price),
-                drop_pct=str(
-                    round(float((peak - current_price) / peak) * 100, 2)
-                ),
-            )
-            # The high-water mark is KEPT (WP1.3b-a): if the exit is not
-            # submitted or only partly fills, the residual is protected against
-            # the same mark.  It is dropped only when the position is flat.
-            self._pending_stop_symbols.add(symbol)
-            # Capture the position quantity so a later partial fill (which
-            # changes it) is detectable, and reset the TTL age (CR-003 parity).
-            self._pending_qty[symbol] = position.quantity
-            self._pending_age[symbol] = 0
-
-            return Signal(
-                strategy_id=self._strategy_id,
-                symbol=symbol,
-                direction=SignalDirection.SELL,
-                target_position=Decimal("0"),
-                confidence=1.0,
-                metadata={
-                    "trigger": "trailing_stop",
-                    "peak_price": str(peak),
-                    "stop_price": str(stop_price),
-                    "current_price": str(current_price),
-                    "trailing_stop_pct": str(self._trailing_stop_pct),
-                },
-            )
+            return self._emit(symbol, peak, stop_price, current_price, position)
 
         return None
+
+    def _check_intrabar(
+        self,
+        symbol: str,
+        current_price: Decimal,
+        position: Position | None,
+    ) -> Signal | None:
+        """Read-only trailing check against a confirmed BID (WP1.3b-b)."""
+        if position is None or position.is_flat:
+            return None
+        if symbol in self._pending_stop_symbols:
+            prev_qty = self._pending_qty.get(symbol)
+            if prev_qty is not None and position.quantity != prev_qty:
+                self._log.info(
+                    "trailing_stop.quantity_changed_resume",
+                    symbol=symbol,
+                    prev_quantity=str(prev_qty),
+                    new_quantity=str(position.quantity),
+                )
+                self._clear_pending(symbol)
+            else:
+                # In flight: never aged from a tick (bar-close checks only).
+                return None
+        peak = self._peak_prices.get(symbol)
+        if peak is None:
+            return None
+        stop_price = peak * (Decimal("1") - self._trailing_stop_pct)
+        if current_price > stop_price:
+            return None
+        return self._emit(symbol, peak, stop_price, current_price, position, intrabar=True)
+
+    def has_unchanged_pending(self, symbol: str, position: Position | None) -> bool:
+        """True iff a stop for ``symbol`` is in flight with the position quantity
+        unchanged since it was emitted (pure; used to skip pointless intra-bar reads)."""
+        if symbol not in self._pending_stop_symbols:
+            return False
+        prev_qty = self._pending_qty.get(symbol)
+        return prev_qty is None or position is None or position.quantity == prev_qty
+
+    def _emit(
+        self,
+        symbol: str,
+        peak: Decimal,
+        stop_price: Decimal,
+        current_price: Decimal,
+        position: Position,
+        *,
+        intrabar: bool = False,
+    ) -> Signal:
+        """Mark the symbol pending and build the full-close SELL signal."""
+        self._log.info(
+            "trailing_stop.triggered",
+            symbol=symbol,
+            peak=str(peak),
+            stop_price=str(stop_price),
+            current_price=str(current_price),
+            drop_pct=str(round(float((peak - current_price) / peak) * 100, 2)),
+            exit_path="intrabar" if intrabar else "bar_close",
+        )
+        # The high-water mark is KEPT (WP1.3b-a): if the exit is not
+        # submitted or only partly fills, the residual is protected against
+        # the same mark.  It is dropped only when the position is flat.
+        self._pending_stop_symbols.add(symbol)
+        # Capture the position quantity so a later partial fill (which
+        # changes it) is detectable, and reset the TTL age (CR-003 parity).
+        self._pending_qty[symbol] = position.quantity
+        self._pending_age[symbol] = 0
+
+        metadata: dict[str, object] = {
+            "trigger": "trailing_stop",
+            "peak_price": str(peak),
+            "stop_price": str(stop_price),
+            "current_price": str(current_price),
+            "trailing_stop_pct": str(self._trailing_stop_pct),
+        }
+        if intrabar:
+            # A missing ``exit_path`` means bar close (WP1.3b-b).
+            metadata["exit_path"] = "intrabar"
+            metadata["trigger_source"] = "bid"
+            metadata["trigger_price"] = str(current_price)
+        return Signal(
+            strategy_id=self._strategy_id,
+            symbol=symbol,
+            direction=SignalDirection.SELL,
+            target_position=Decimal("0"),
+            confidence=1.0,
+            metadata=metadata,
+        )
 
     def seed_peak(self, symbol: str, peak: Decimal) -> None:
         """

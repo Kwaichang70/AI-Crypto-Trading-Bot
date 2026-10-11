@@ -969,6 +969,7 @@ def _orch_settings() -> MagicMock:
     settings.exchange_api_secret = None
     settings.exchange_api_passphrase = None
     settings.max_run_duration_hours = 24.0
+    settings.live_exit_check_interval_s = 300  # WP1.3b-b: a real Settings value, not a MagicMock
     settings.exchange_id = "coinbase"
     return settings
 

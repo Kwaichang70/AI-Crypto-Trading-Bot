@@ -286,6 +286,20 @@ class Settings(BaseSettings):
     )
 
     # ------------------------------------------------------------------
+    # Live intra-bar exit check (WP1.3b-b)
+    # ------------------------------------------------------------------
+    live_exit_check_interval_s: int = Field(
+        default=300,
+        description=(
+            "Seconds between intra-bar stop-loss / trailing-stop checks of a LIVE run "
+            "(bid-based, confirmed by a second reading ~10 s later; take-profit stays "
+            "bar-close only). 0 = off (bar-close exits only). Otherwise an integer in "
+            "60..3600; the check is effective only when the interval is below the run's "
+            "timeframe. Always off for paper, backtest and smoke runs."
+        ),
+    )
+
+    # ------------------------------------------------------------------
     # Admin operations (Sprint 50 Cycle 3)
     # ------------------------------------------------------------------
     admin_api_key: SecretStr = Field(
@@ -636,6 +650,35 @@ class Settings(BaseSettings):
             raise ValueError(
                 "database_url must use the 'postgresql+asyncpg://' scheme for async support"
             )
+        return v
+
+    @field_validator("live_exit_check_interval_s", mode="before")
+    @classmethod
+    def validate_live_exit_check_interval(cls, v: object) -> object:
+        """WP1.3b-b: 0 (off) or an integer in 60..3600; ``bool`` and non-integral
+        values are rejected at startup (pydantic's lax int mode would coerce them)."""
+        from trading.exit_config import ExitConfigError, resolve_exit_check_interval
+
+        if isinstance(v, str):
+            text = v.strip()
+            try:
+                v = int(text)
+            except ValueError as exc:
+                raise ValueError(
+                    "live_exit_check_interval_s must be 0 or an integer 60..3600"
+                ) from exc
+        try:
+            resolve_exit_check_interval(
+                v,
+                mode="paper",
+                timeframe_s=1,
+                is_smoke=False,
+                has_protective_exit=False,
+            )
+        except ExitConfigError as exc:
+            raise ValueError(
+                "live_exit_check_interval_s must be 0 (off) or an integer 60..3600"
+            ) from exc
         return v
 
     @field_validator("api_key_hash", "api_key_hash_secondary")

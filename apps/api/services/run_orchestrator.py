@@ -50,7 +50,7 @@ from api.db.models import (
 )
 from api.services.audit_log import record_audit_event
 from common.types import TimeFrame
-from trading.exit_config import ExitConfigError
+from trading.exit_config import ExitConfigError, resolve_run_exit_check
 from trading.recovery import ResumeSnapshot
 from trading.safety import (
     CircuitBreakerResponse,
@@ -1705,6 +1705,27 @@ async def run_live_engine(
         for _bk, _bv in (bracket_config or {}).items():
             if _bv is not None:
                 live_engine_config[_bk] = _bv
+
+        # WP1.3b-b (SY-13b-10): the live intra-bar exit check.  ON by default
+        # (``live_exit_check_interval_s`` = 300); the resolver turns it off for
+        # smoke runs, intervals not below the timeframe, interval 0 and runs with
+        # no stop-loss / trailing stop (a protective resume with a waived exit
+        # config has no manager at all).  Covers fresh, promoted, resumed and
+        # protective-resumed live runs: they all pass through this site.
+        _exit_check = resolve_run_exit_check(
+            settings.live_exit_check_interval_s,
+            mode=RunMode.LIVE,
+            timeframe=timeframe,
+            strategy_name=strategy_name,
+            bracket=bracket_config,
+            trailing_stop_pct=trailing_stop_pct,
+            exit_config_waived=exit_config_waived,
+        )
+        if _exit_check.interval_s is not None:
+            live_engine_config["exit_check_interval_s"] = _exit_check.interval_s
+            log.info("runs.intrabar_exit_checks", interval_s=_exit_check.interval_s)
+        else:
+            log.info("runs.intrabar_exit_checks", interval_s=None, reason=_exit_check.reason)
 
         engine = StrategyEngine(
             strategies=[strategy_instance],

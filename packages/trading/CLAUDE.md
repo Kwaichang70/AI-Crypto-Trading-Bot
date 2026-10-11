@@ -153,8 +153,10 @@ Core trading engine containing the heart of the system.
   `_warmup_bar_windows`) recomputes anchor + trailing mark with the SAME functions
   (`lot_entry_from_opening_fills`). Failure never drops protection:
   `resume_fallback_current_atr` (interim, non-final until the attempts are spent; error log
-  `bracket_exit.resume_fallback_final` + `bracket_anchor_source_total{source}`) or `entry_deferred`; a trailing gap that cannot be
-  fetched logs `trailing_stop.seed_partial`.
+  `bracket_exit.resume_fallback_final` + `bracket_anchor_source_total{source,final}`) or
+  `entry_deferred`. The trailing gap (bars missing between the anchor bar and the warmup window,
+  up to 1000) is fetched through the paginated `fetch_ohlcv_range` (at most 4 pages of 300);
+  a gap that cannot be fetched, or is longer, logs `trailing_stop.seed_partial`.
 - Trailing: HWM_0 = gross opening VWAP; ratchets only at bar closes with `bar_ts >
   anchor_bar_ts`; KEPT on a trigger and on a quantity change (no re-seed from the current price).
 - R-04: an exit that was not submitted (`[]`, every order terminal+unfilled, or
@@ -186,3 +188,43 @@ Core trading engine containing the heart of the system.
   `trailing_stop.seed_partial` (`reason="restore_failed"`); an empty warmup window logs it with
   `reason="no_warmup_bars"`.
 - See `reports/vp2-wp1.3b/synthesis-spec.md`.
+
+### WP1.3b-b (live intra-bar exit check)
+- LIVE only. A sibling task (`StrategyEngine._intrabar_exit_loop`, started by `run_live_loop` after
+  the warmup + anchor restore and stopped in its `finally`) ticks every `exit_check_interval_s`
+  (first tick after `min(60, I)` s). The bar loop body is unchanged, so bar-poll timing is the same
+  with the feature on or off (`test_t37_*`).
+- Config: `Settings.live_exit_check_interval_s` (env `LIVE_EXIT_CHECK_INTERVAL_S`, default 300, `0`
+  = off, else 60..3600) -> `exit_config.resolve_run_exit_check` -> engine config
+  `exit_check_interval_s` (logged as `runs.intrabar_exit_checks`). OFF for paper/backtest, smoke
+  runs (forced), an interval not below the timeframe, and runs without a bracket stop-loss /
+  trailing stop. The engine re-validates and raises `ValueError` (non-LIVE, out of range, >= poll
+  interval, no `supports_ticker_quotes`). Warning W8 (`bar_close_exit_checks_only`, now also for 1h)
+  is shown only when the check is NOT effective.
+- A tick: held symbols with a protective level and no unchanged pending exit (none held = ZERO
+  exchange calls) -> reading 1 (`BaseMarketDataService.fetch_ticker_quote`: BID, uncached, NOT
+  retried, 10 s bound) -> symbols with `bid1 <= level` -> 10 s confirm wait (stop-interruptible,
+  lock NOT held) -> reading 2 -> `p = max(bid1, bid2)` must still be `<= level` -> `_cycle_lock`
+  (`wait_for(acquire, 5 s)`; busy: abandon, ONE fast retry after 30 s) ->
+  `bracket.check(intrabar=True)` (stop-loss only, TP is bar-close only), else
+  `trailing.check(intrabar=True)` -> `_submit_exit_signal` (so the WP1.11a cap and the WP1.4b
+  idempotent submit apply). Never fires on a missing, invalid (non-positive, non-finite, crossed
+  book) or unconfirmed reading, and never uses `last`.
+- READ-ONLY (CF-04 / CF-30, AST-pinned by `test_t44_*`): a tick never calls `update_market_prices`,
+  never evaluates the circuit breaker, ticks the cooldown, calls a strategy, counts a bar, ages a
+  pending TTL, raises the trailing peak, opens a lot or emits a BUY. A real fill is applied at the
+  EXCHANGE's own price/fee; only the mark argument is the last CLOSED bar close.
+- Kill switch, protective mode, HALT / DAILY_LIMIT and `reconcile_required` never stop an intra-bar
+  exit (entries only). `flatten()` holds the lock for its run: the tick abandons and retries.
+- Failures: a failed reading never changes pending / levels / HWM; 3 consecutive failed ticks for a
+  held symbol log `exit_check.degraded` (error, repeated every 15 min; `exit_check.recovered`
+  after); a 429 / DDoS answer abandons the tick and doubles the effective interval up to `max(I, 900
+  s)` (below the timeframe), restored after one clean tick. The bar-close SL always keeps working.
+- CF-13b-22: `_submit_exit_signal` keeps a per-symbol not-submitted streak (warning 1..2, error at 3
+  and every 10th after, `exit_not_submitted_total{trigger,reason}`); a SELL already in flight
+  (`LiveExecutionEngine.pending_sell_quantity > 0`) is `inflight_exit_pending`, info, outside the
+  streak.
+- Log hygiene (CF-36) for all 1.3b-b code: `error_type` and numbers only, never `str(exc)`, a URL or
+  a raw ticker dict (`test_t68_*`). The pre-existing `str(exc)` sites remain on CF-36.
+- See `reports/vp2-wp1.3b/synthesis-spec.md` section 5.3 and
+  `docs/runbooks/circuit-breaker-halt.md`.

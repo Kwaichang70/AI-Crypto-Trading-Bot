@@ -76,9 +76,7 @@ ATR_BRACKET: dict[str, Any] = {
 
 
 def _path(closes: list[int], *, symbol: str = SYM) -> list[OHLCVBar]:
-    return scripted_path(
-        closes, first_open=T0, symbol=symbol, warmup=0, warmup_price=closes[0]
-    )
+    return scripted_path(closes, first_open=T0, symbol=symbol, warmup=0, warmup_price=closes[0])
 
 
 def _calm(n: int) -> list[int]:
@@ -144,9 +142,7 @@ def test_fx01_window_always_fits_one_exchange_call() -> None:
     re-fetch the exact window."""
     assert POLICY_ATR_PERIOD_MAX == 49
     assert se._EXCHANGE_OHLCV_MAX_LIMIT == 300
-    assert (
-        POLICY_ATR_PERIOD_MAX * se._ATR_WINDOW_MULTIPLIER + 1 <= se._EXCHANGE_OHLCV_MAX_LIMIT
-    )
+    assert POLICY_ATR_PERIOD_MAX * se._ATR_WINDOW_MULTIPLIER + 1 <= se._EXCHANGE_OHLCV_MAX_LIMIT
     assert (POLICY_ATR_PERIOD_MAX + 1) * se._ATR_WINDOW_MULTIPLIER + 1 > (
         se._EXCHANGE_OHLCV_MAX_LIMIT
     ), "the cap must be tight: 50 would not fit"
@@ -317,9 +313,7 @@ async def test_fx02_cr03_rule_bar_at_window_index_3_is_provisional_not_deferred(
 
 
 def _arm(mgr: BracketExitManager, atr: str, rule: Any = None) -> Any:
-    return mgr.arm_interim(
-        SYM, atr=Decimal(atr), anchor_bar_ts=rule, source="entry_provisional"
-    )
+    return mgr.arm_interim(SYM, atr=Decimal(atr), anchor_bar_ts=rule, source="entry_provisional")
 
 
 def test_fx03g_arm_interim_arms_once_and_refuses_final_and_armed_anchors() -> None:

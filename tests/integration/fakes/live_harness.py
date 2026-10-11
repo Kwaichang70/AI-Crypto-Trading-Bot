@@ -54,6 +54,19 @@ WP1.6 addition (K-15)
   ``circuit_breaker=False`` is an explicit opt-out and REQUIRES a one-line written
   reason in the calling test's docstring.  ``stack.circuit_breaker`` exposes it.
 
+WP1.3b-b additions (live intra-bar exit check)
+----------------------------------------------
+- ``IntrabarClock`` / ``install_intrabar_clock(stack)``: a VIRTUAL clock for the
+  engine's intra-bar task.  It replaces ``engine._intrabar_wait`` (the only place
+  the task sleeps, stop-interruptible in production) and ``engine._intrabar_clock``,
+  so a 300 s interval and a 10 s confirm delay cost no wall time.  Exchange
+  mutations (``set_ticker``, ``push_bar``) can be scheduled at virtual times with
+  ``clock.at(t, fn)``; ``clock.create_order_times`` records the virtual time of
+  every ``create_order``.
+- ``run_intrabar_tick(stack)``: one ``engine._intrabar_exit_tick()`` call.
+- ``run_intrabar_loop(stack)``: run the REAL ``_intrabar_exit_loop``
+  task body until the virtual clock reaches its ``horizon``.
+
 WP1.5a additions
 ----------------
 - ``clock``: an injectable risk-day clock (``ManualClock``) passed to
@@ -70,7 +83,8 @@ WP1.5a additions
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+import asyncio
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -95,13 +109,17 @@ from trading.strategy_engine import StrategyEngine
 
 __all__ = [
     "EXCHANGE_ATTR",
+    "IntrabarClock",
     "LiveStack",
     "ManualClock",
     "PaperStack",
     "build_live_stack",
     "build_paper_stack",
     "build_resumed_live_stack",
+    "install_intrabar_clock",
     "patch_exchange_factory",
+    "run_intrabar_loop",
+    "run_intrabar_tick",
     "start_and_warmup",
     "step_bar",
 ]
@@ -183,8 +201,12 @@ async def build_live_stack(
     risk_params: RiskParameters | None = None,
     clock: Callable[[], datetime] | None = None,
     circuit_breaker: bool = True,
+    symbols: Sequence[str] | None = None,
 ) -> LiveStack:
     """Construct one real StrategyEngine(LIVE) stack against ``exchange``.
+
+    WP1.3b-b: ``symbols`` (default ``[symbol]``) lets a test run several symbols in
+    one engine (the intra-bar tick must keep checking the others).
 
     Mirrors ``run_orchestrator.run_live_engine`` lines ~1111-1185. Call
     ``patch_exchange_factory`` first so the two internal
@@ -226,7 +248,7 @@ async def build_live_stack(
         risk_manager=risk_manager,
         market_data=market_data,
         portfolio=portfolio,
-        symbols=[symbol],
+        symbols=list(symbols) if symbols is not None else [symbol],
         timeframe=timeframe,
         run_mode=RunMode.LIVE,
         config=engine_config,
@@ -443,3 +465,93 @@ async def step_bar(
     """
     stack.exchange.push_bar(symbol, close, timeframe=timeframe)
     await stack.engine._poll_and_process()
+
+
+class IntrabarClock:
+    """Virtual time for the intra-bar task (WP1.3b-b).
+
+    ``wait(seconds)`` advances ``now`` by ``seconds`` (running every action
+    scheduled with :meth:`at` that falls inside the interval, in time order, with
+    ``now`` set to the action's time while it runs) and returns ``True`` -- "stop"
+    -- once ``now`` reaches ``horizon`` or the engine's stop event is set.
+    ``waits`` records every requested wait, ``wake_times`` the virtual time after
+    each one.
+    """
+
+    def __init__(self, engine: StrategyEngine, *, horizon: float = float("inf")) -> None:
+        self.engine = engine
+        self.now: float = 0.0
+        self.horizon = horizon
+        self.waits: list[float] = []
+        self.wake_times: list[float] = []
+        self.create_order_times: list[float] = []
+        self._actions: list[tuple[float, int, Callable[[], Awaitable[None] | None]]] = []
+        self._seq = 0
+
+    def time(self) -> float:
+        return self.now
+
+    def at(self, t: float, action: Callable[[], Awaitable[None] | None]) -> None:
+        """Run ``action`` when virtual time reaches ``t`` (during a ``wait``).  An
+        ``async`` action is awaited -- e.g. a whole bar poll that falls INSIDE the
+        confirm wait."""
+        self._seq += 1
+        self._actions.append((t, self._seq, action))
+        self._actions.sort(key=lambda item: (item[0], item[1]))
+
+    async def wait(self, seconds: float) -> bool:
+        if self.engine._stop_event.is_set():
+            return True
+        self.waits.append(seconds)
+        target = self.now + max(0.0, seconds)
+        while self._actions and self._actions[0][0] <= target:
+            t, _seq, action = self._actions.pop(0)
+            self.now = max(self.now, t)
+            outcome = action()
+            if outcome is not None:
+                await outcome
+        if target >= self.horizon:
+            self.now = self.horizon
+            self.wake_times.append(self.now)
+            return True
+        self.now = target
+        self.wake_times.append(self.now)
+        # A REAL yield to the event loop (test modules patch ``asyncio.sleep`` to
+        # return instantly, which would not yield).
+        loop = asyncio.get_running_loop()
+        gate: asyncio.Future[None] = loop.create_future()
+        loop.call_soon(gate.set_result, None)
+        await gate
+        return self.engine._stop_event.is_set()
+
+    def record_create_orders(self, exchange: FakeCCXTExchange) -> None:
+        """Wrap ``exchange.create_order`` so its virtual call time is recorded."""
+        original = exchange.create_order
+
+        async def _recording(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            self.create_order_times.append(self.now)
+            return await original(*args, **kwargs)
+
+        exchange.create_order = _recording  # type: ignore[method-assign]
+
+
+def install_intrabar_clock(
+    stack: LiveStack, *, horizon: float = float("inf"), record_orders: bool = True
+) -> IntrabarClock:
+    """Swap the engine's intra-bar sleeper and clock for a virtual :class:`IntrabarClock`."""
+    clock = IntrabarClock(stack.engine, horizon=horizon)
+    stack.engine._intrabar_wait = clock.wait  # type: ignore[method-assign]
+    stack.engine._intrabar_clock = clock.time
+    if record_orders:
+        clock.record_create_orders(stack.exchange)
+    return clock
+
+
+async def run_intrabar_tick(stack: LiveStack) -> None:
+    """One intra-bar pass (``StrategyEngine._intrabar_exit_tick``)."""
+    await stack.engine._intrabar_exit_tick()
+
+
+async def run_intrabar_loop(stack: LiveStack) -> None:
+    """Run the REAL intra-bar task body until the installed clock's horizon (virtual time)."""
+    await stack.engine._intrabar_exit_loop()

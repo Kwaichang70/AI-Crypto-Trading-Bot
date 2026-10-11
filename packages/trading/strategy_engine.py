@@ -44,8 +44,9 @@ Safety invariants
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -59,7 +60,7 @@ import structlog
 from common.models import MultiTimeframeContext, OHLCVBar
 from common.types import OrderSide, OrderStatus, RunMode, SignalDirection, TimeFrame
 from data.indicators import atr as _atr_series
-from data.market_data import BaseMarketDataService, MarketDataError
+from data.market_data import BaseMarketDataService, MarketDataError, RateLimitError
 from trading.bracket_exit import (
     AnchorSource,
     BracketAnchor,
@@ -72,6 +73,8 @@ from trading.bracket_exit import (
 )
 from trading.execution import BaseExecutionEngine
 from trading.exit_config import (
+    EXIT_CHECK_INTERVAL_MAX_S,
+    EXIT_CHECK_INTERVAL_MIN_S,
     ExitCostModel,
     parse_exit_config,
     require_exit_manager,
@@ -131,6 +134,36 @@ _UNPROTECTED_LOG_EVERY: int = 10
 #: WP1.3b-a: at most this many missing bars are fetched to rebuild the trailing
 #: high-water mark after a resume (beyond that: ``trailing_stop.seed_partial``).
 _TRAILING_GAP_FETCH_LIMIT: int = 1000
+#: WP1.3b-a (CF-13b-20, SEC-04(a)): the trailing gap is fetched through
+#: ``fetch_ohlcv_range`` -- at most this many 300-bar pages (1000 bars = 4 pages),
+#: each bounded by ``_EXIT_FETCH_TIMEOUT_S``, the whole call by their product.
+_TRAILING_GAP_MAX_PAGES: int = 4
+#: WP1.3b-b (SY-13b-06): the confirming ticker reading is taken this long after the
+#: first one (the second reading *is* the retry).  Instance attribute
+#: ``_intrabar_confirm_delay_s`` so a test can shorten it.
+_INTRABAR_CONFIRM_DELAY_S: float = 10.0
+#: WP1.3b-b: the first intra-bar tick runs ``min(this, interval)`` seconds after
+#: the task starts (restore completed before the task is created).
+_INTRABAR_FIRST_TICK_S: float = 60.0
+#: WP1.3b-b: bound of one ticker reading (no retry).
+_INTRABAR_QUOTE_TIMEOUT_S: float = 10.0
+#: WP1.3b-b (SY-13b-08): the tick waits this long for ``_cycle_lock`` (the pattern
+#: ``flatten()`` uses), then abandons and schedules one fast retry.
+_INTRABAR_LOCK_TIMEOUT_S: float = 5.0
+_INTRABAR_LOCK_RETRY_S: float = 30.0
+#: WP1.3b-b (SY-13b-15): after a rate-limit answer the effective interval doubles up
+#: to ``max(configured, this)`` (and stays below the timeframe).
+_INTRABAR_BACKOFF_CAP_S: float = 900.0
+#: WP1.3b-b: ``exit_check.degraded`` after this many consecutive ticks with a failed
+#: first reading for a held symbol; repeated at most every ``..._REPEAT_S``.
+_INTRABAR_DEGRADED_AFTER_TICKS: int = 3
+_INTRABAR_DEGRADED_REPEAT_S: float = 900.0
+#: WP1.3b-b: ``run_live_loop`` waits this long for the intra-bar task to wind down.
+_INTRABAR_JOIN_TIMEOUT_S: float = 15.0
+#: WP1.3b-b (CF-13b-22): ``engine.exit_not_submitted`` escalates to error level at
+#: this consecutive-failure count, then at every ``..._REPEAT_EVERY``-th one.
+_EXIT_NOT_SUBMITTED_ERROR_AT: int = 3
+_EXIT_NOT_SUBMITTED_REPEAT_EVERY: int = 10
 #: WP1.3b-a (SY-13b-04): an order in one of these states with nothing filled
 #: means the exit was NOT submitted (R-04); any other state counts as accepted.
 _TERMINAL_UNFILLED_STATUSES: frozenset[OrderStatus] = frozenset(
@@ -384,6 +417,9 @@ class _EngineLot:
     order: Order | None
     fills: list[Fill]
     entry: LotEntry
+    #: order ids of BUY fills that ADDED to the lot (pyramiding; CF-13b-24), so the
+    #: BACKTEST ``_order_signal_bar_ts`` entries of the whole lot can be dropped.
+    add_order_ids: set[UUID] = field(default_factory=set)
 
 
 class StrategyEngine:
@@ -637,6 +673,22 @@ class StrategyEngine:
         self._last_exit_fetch_error: dict[str, str] = {}
         # symbol -> consecutive bars a held lot had no protective level (FX-06).
         self._unprotected_bars: dict[str, int] = {}
+        # symbol -> consecutive exits that were NOT submitted (CF-13b-22); reset on an
+        # accepted order or when the lot is flat.
+        self._exit_not_submitted_streak: dict[str, int] = {}
+
+        # WP1.3b-b: the live intra-bar exit check (SY-13b-10).  ``None`` = off.
+        self._exit_check_interval_s: int | None = self._validated_exit_check_interval()
+        self._intrabar_task: asyncio.Task[None] | None = None
+        # Effective interval (doubles after a rate-limit answer, restored after one
+        # clean tick) and the "fast retry after a busy lock" request.
+        self._intrabar_interval_now_s: float = float(self._exit_check_interval_s or 0)
+        self._intrabar_retry_soon: bool = False
+        self._intrabar_confirm_delay_s: float = _INTRABAR_CONFIRM_DELAY_S
+        # Injectable clock for the degradation repeat timer (tests use a fake).
+        self._intrabar_clock: Callable[[], float] = time.monotonic
+        self._intrabar_failure_streak: dict[str, int] = {}
+        self._intrabar_degraded_at: dict[str, float] = {}
 
         # WP1.3a (SY-13a-08): resolve allow_pyramiding from the (already
         # type-checked) config, defaulting per-strategy when absent.  A
@@ -662,9 +714,46 @@ class StrategyEngine:
             strategy_count=len(self._strategies),
         )
 
+    def _validated_exit_check_interval(self) -> int | None:
+        """The ``exit_check_interval_s`` config key, re-validated (WP1.3b-b, SY-13b-10).
+
+        The orchestrator's resolver already decided; this is defence in depth for
+        any caller that builds an engine directly.  ``None``/absent means off.
+        Anything else must be LIVE, an ``int`` (not ``bool``) within
+        ``[EXIT_CHECK_INTERVAL_MIN_S, EXIT_CHECK_INTERVAL_MAX_S]``, strictly below
+        the poll interval, and the market data service must support ticker quotes.
+        """
+        raw = self._config.get("exit_check_interval_s")
+        if raw is None:
+            return None
+        if self._run_mode != RunMode.LIVE:
+            raise ValueError("exit_check_interval_s is only valid for LIVE runs")
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            raise ValueError("exit_check_interval_s must be an integer number of seconds")
+        if not (EXIT_CHECK_INTERVAL_MIN_S <= raw <= EXIT_CHECK_INTERVAL_MAX_S):
+            raise ValueError(
+                f"exit_check_interval_s must be within [{EXIT_CHECK_INTERVAL_MIN_S}, "
+                f"{EXIT_CHECK_INTERVAL_MAX_S}], got {raw}"
+            )
+        if raw >= self._poll_interval:
+            raise ValueError(
+                f"exit_check_interval_s ({raw}) must be below the poll interval "
+                f"({self._poll_interval:g})"
+            )
+        if getattr(self._market_data, "supports_ticker_quotes", False) is not True:
+            raise ValueError(
+                "exit_check_interval_s requires a market data service with ticker quotes"
+            )
+        return int(raw)
+
     # ------------------------------------------------------------------
     # Properties
     # ------------------------------------------------------------------
+
+    @property
+    def exit_check_interval_s(self) -> int | None:
+        """WP1.3b-b: the live intra-bar exit-check interval in seconds, or ``None`` (off)."""
+        return self._exit_check_interval_s
 
     @property
     def state(self) -> EngineState:
@@ -857,6 +946,9 @@ class StrategyEngine:
         self._anchor_origin.clear()
         self._last_exit_fetch_error.clear()
         self._unprotected_bars.clear()
+        self._exit_not_submitted_streak.clear()
+        self._intrabar_failure_streak.clear()
+        self._intrabar_degraded_at.clear()
         self._current_history = None
 
         # Clear adaptive-learning trackers so a subsequent start() begins with
@@ -1150,30 +1242,38 @@ class StrategyEngine:
         # Initial warmup: fetch recent bars for each symbol
         await self._warmup_bar_windows()
 
-        # Main polling loop
-        while not self._stop_event.is_set():
-            loop_start = time.monotonic()
+        # WP1.3b-b (SY-13b-07): the intra-bar exit check is a SIBLING task, started
+        # only after the warmup (and so after the anchor / trailing-mark restore) and
+        # stopped in the ``finally`` below.  The bar-polling loop body is unchanged:
+        # with the feature off nothing here differs from before.
+        self._start_intrabar_task()
+        try:
+            # Main polling loop
+            while not self._stop_event.is_set():
+                loop_start = time.monotonic()
 
-            try:
-                await self._poll_and_process()
-            except Exception:
-                self._log.exception("engine.live_loop_iteration_error")
-
-            # Sleep until the next candle interval
-            elapsed = time.monotonic() - loop_start
-            sleep_time = max(0.0, self._poll_interval - elapsed)
-
-            if sleep_time > 0:
                 try:
-                    await asyncio.wait_for(
-                        self._stop_event.wait(),
-                        timeout=sleep_time,
-                    )
-                except TimeoutError:
-                    # Normal: timeout means the stop event was not set
-                    pass
+                    await self._poll_and_process()
+                except Exception:
+                    self._log.exception("engine.live_loop_iteration_error")
 
-        self._log.info("engine.live_loop_exited")
+                # Sleep until the next candle interval
+                elapsed = time.monotonic() - loop_start
+                sleep_time = max(0.0, self._poll_interval - elapsed)
+
+                if sleep_time > 0:
+                    try:
+                        await asyncio.wait_for(
+                            self._stop_event.wait(),
+                            timeout=sleep_time,
+                        )
+                    except TimeoutError:
+                        # Normal: timeout means the stop event was not set
+                        pass
+
+            self._log.info("engine.live_loop_exited")
+        finally:
+            await self._stop_intrabar_task()
 
     # ------------------------------------------------------------------
     # Core bar processing
@@ -2150,6 +2250,8 @@ class StrategyEngine:
                 pnl=str(trade.realised_pnl),
                 quantity=str(trade.quantity),
                 exit_reason=exit_reason,
+                # WP1.3b-b: a missing ``exit_path`` in the signal metadata means bar close.
+                exit_path=(signal_metadata or {}).get("exit_path", "bar_close"),
                 mae_pct=mae_pct,
                 mfe_pct=mfe_pct,
             )
@@ -2194,6 +2296,11 @@ class StrategyEngine:
         instead of waiting out the 3-bar TTL.  An accepted order keeps the
         guard.  A double sell stays impossible: the live engine's in-flight
         reservation runs before any exchange call.
+
+        Shared by the bar-close path (5a/5b) and the live intra-bar tick.  A
+        per-symbol streak of consecutive non-submissions escalates the log level
+        and a counter tracks every one (:meth:`_note_exit_not_submitted`, CF-13b-22);
+        an accepted order resets the streak.
         """
         symbol = exit_signal.symbol
         trigger = exit_signal.metadata.get("trigger")
@@ -2201,23 +2308,71 @@ class StrategyEngine:
             orders = await self._execution_engine.process_signal(exit_signal)
         except Exception:
             manager.clear_pending(symbol)
-            self._log.error(
-                "engine.exit_not_submitted",
-                symbol=symbol,
-                trigger=trigger,
-                reason="process_signal_raised",
-            )
+            self._note_exit_not_submitted(symbol, trigger, "process_signal_raised")
             raise
         if self._exit_not_submitted(orders):
             manager.clear_pending(symbol)
-            self._log.warning(
-                "engine.exit_not_submitted",
-                symbol=symbol,
-                trigger=trigger,
-                reason="no_orders" if not orders else "orders_terminal_unfilled",
+            self._note_exit_not_submitted(
+                symbol, trigger, "no_orders" if not orders else "orders_terminal_unfilled"
             )
+        else:
+            self._exit_not_submitted_streak.pop(symbol, None)
         fill_count, _ = await self._route_exit_fills(orders, current_bars, exit_signal)
         return len(orders), fill_count
+
+    def _pending_sell_quantity(self, symbol: str) -> Decimal:
+        """SELL quantity the execution engine reports as still in flight (duck-typed:
+        only ``LiveExecutionEngine`` has the accessor, looked up on the *type* so a
+        bare ``MagicMock`` engine counts as "none").  Never raises."""
+        accessor = getattr(type(self._execution_engine), "pending_sell_quantity", None)
+        if not callable(accessor):
+            return Decimal(0)
+        try:
+            qty = accessor(self._execution_engine, symbol)
+            return qty if isinstance(qty, Decimal) else Decimal(str(qty))
+        except Exception:
+            return Decimal(0)
+
+    def _note_exit_not_submitted(self, symbol: str, trigger: object, reason: str) -> None:
+        """Log / count one exit that reached no accepted order (R-04, CF-13b-22).
+
+        * A SELL already in flight for the symbol (the live engine reports a pending
+          SELL quantity > 0) is NOT a failure: ``reason="inflight_exit_pending"``, info
+          level, outside the streak -- unless ``process_signal`` raised, which is never
+          reclassified (WP13BB-CR-05).
+        * Otherwise the per-symbol streak grows: warning for streak 1..2, error at
+          ``_EXIT_NOT_SUBMITTED_ERROR_AT`` and at every
+          ``_EXIT_NOT_SUBMITTED_REPEAT_EVERY``-th after it (10, 20, ...); a
+          ``process_signal`` that raised is always error level.
+        * ``exit_not_submitted_total{trigger,reason}`` counts every case.
+        Log fields are fixed values and counts only (CF-36: no exception text).
+        """
+        label = str(trigger) if trigger is not None else "unknown"
+        if reason != "process_signal_raised" and self._pending_sell_quantity(symbol) > 0:
+            reason = "inflight_exit_pending"
+            self._metric("exit_not_submitted_total", trigger=label, reason=reason)
+            self._log.info(
+                "engine.exit_not_submitted", symbol=symbol, trigger=trigger, reason=reason
+            )
+            return
+        streak = self._exit_not_submitted_streak.get(symbol, 0) + 1
+        self._exit_not_submitted_streak[symbol] = streak
+        self._metric("exit_not_submitted_total", trigger=label, reason=reason)
+        escalate = streak == _EXIT_NOT_SUBMITTED_ERROR_AT or (
+            streak > _EXIT_NOT_SUBMITTED_ERROR_AT and streak % _EXIT_NOT_SUBMITTED_REPEAT_EVERY == 0
+        )
+        emit = (
+            self._log.error
+            if escalate or reason == "process_signal_raised"
+            else self._log.warning
+        )
+        emit(
+            "engine.exit_not_submitted",
+            symbol=symbol,
+            trigger=trigger,
+            reason=reason,
+            streak=streak,
+        )
 
     def _track_lot_protection(self, symbol: str, position: Position | None) -> None:
         """FX-06 (SEC-01 C-1.3): make a held lot WITHOUT any protective level loud.
@@ -2391,6 +2546,13 @@ class StrategyEngine:
                     break
         return min(estimates) if estimates else None
 
+    def _forget_exit_check_state(self, symbol: str) -> None:
+        """The lot is flat: drop the per-symbol exit bookkeeping that only makes
+        sense while it is held (not-submitted streak, intra-bar degradation)."""
+        self._exit_not_submitted_streak.pop(symbol, None)
+        self._intrabar_failure_streak.pop(symbol, None)
+        self._intrabar_degraded_at.pop(symbol, None)
+
     def _clear_anchor_pending(self, symbol: str) -> None:
         """Drop the engine-side pending-anchor state of ``symbol`` (finalised / flat)."""
         self._anchor_fetch_attempts.pop(symbol, None)
@@ -2449,10 +2611,15 @@ class StrategyEngine:
             # position so no extra portfolio read is needed on exits).
             if pre_fill_pos is None or fill.quantity >= pre_fill_pos.quantity:
                 closed = self._lots.pop(symbol, None)
-                if closed is not None and closed.opening_order_id is not None:
-                    # CR-10: the signal-bar entry of a closed lot is never read again
-                    self._order_signal_bar_ts.pop(closed.opening_order_id, None)
+                if closed is not None:
+                    # CR-10 / CF-13b-24: the signal-bar entries of a closed lot (the
+                    # opening order and every pyramiding add) are never read again
+                    if closed.opening_order_id is not None:
+                        self._order_signal_bar_ts.pop(closed.opening_order_id, None)
+                    for add_id in closed.add_order_ids:
+                        self._order_signal_bar_ts.pop(add_id, None)
                 self._clear_anchor_pending(symbol)
+                self._forget_exit_check_state(symbol)
             return
         if fill.side != OrderSide.BUY:
             return
@@ -2497,6 +2664,7 @@ class StrategyEngine:
                 )
             return
         # An add from another order: the first entry's levels stay (U-6).
+        lot.add_order_ids.add(fill.order_id)
         if self._bracket_exit is not None:
             self._bracket_exit.add_opening_fill(
                 symbol,
@@ -2519,7 +2687,11 @@ class StrategyEngine:
                 self._anchor_fetch_attempts[symbol] = 0
                 self._anchor_origin[symbol] = "entry"
             self._log_stop_cost(anchor)
-            self._metric("bracket_anchor_source_total", source=anchor.source)
+            self._metric(
+                "bracket_anchor_source_total",
+                source=anchor.source,
+                final=str(anchor.final).lower(),
+            )
         elif self._run_mode == RunMode.BACKTEST:
             anchor_bar_ts = self._backtest_signal_bar_ts(entry, history)
         else:
@@ -2647,7 +2819,11 @@ class StrategyEngine:
                 continue
             if changed is not None:
                 self._log_stop_cost(changed)
-                self._metric("bracket_anchor_source_total", source=changed.source)
+                self._metric(
+                    "bracket_anchor_source_total",
+                    source=changed.source,
+                    final=str(changed.final).lower(),
+                )
 
     async def _finalize_one_anchor(
         self,
@@ -2922,21 +3098,25 @@ class StrategyEngine:
             source=source,
             final=final,
         )
+        if not final:
+            # CF-13b-27 (SEC-206): tag the origin BEFORE installing the anchor, so the
+            # source tag survives an exception raised after ``restore_anchor``.
+            self._anchor_origin[symbol] = "resume"
         bracket.restore_anchor(anchor)
         self._log_stop_cost(anchor)
-        self._metric("bracket_anchor_source_total", source=source)
+        self._metric(
+            "bracket_anchor_source_total", source=source, final=str(final).lower()
+        )
         if final:
             self._clear_anchor_pending(symbol)
-        else:
-            self._anchor_origin[symbol] = "resume"
-            if anchor.atr is not None:
-                self._log.warning(
-                    "bracket_exit.interim_armed",
-                    symbol=symbol,
-                    source=source,
-                    attempts=self._anchor_fetch_attempts.get(symbol, 0),
-                    error_type=self._last_exit_fetch_error.get(symbol),
-                )
+        elif anchor.atr is not None:
+            self._log.warning(
+                "bracket_exit.interim_armed",
+                symbol=symbol,
+                source=source,
+                attempts=self._anchor_fetch_attempts.get(symbol, 0),
+                error_type=self._last_exit_fetch_error.get(symbol),
+            )
 
     def _seed_trailing_after_failure(
         self,
@@ -3028,9 +3208,9 @@ class StrategyEngine:
         """``max(HWM_0, max close of bars after the anchor bar)`` for a resume.
 
         When the warmup window starts after ``anchor bar + 1`` the gap is
-        fetched once (``since = anchor_bar_ts + tf``, at most 1000 bars, 10 s);
-        on failure the available closes are used and ``trailing_stop.seed_partial``
-        is logged.
+        fetched through the paginated ``fetch_ohlcv_range`` (from
+        ``anchor_bar_ts + tf``, at most 1000 bars = 4 pages, CF-13b-20); on failure
+        the available closes are used and ``trailing_stop.seed_partial`` is logged.
         """
         peak = entry.entry_gross_vwap
         if rule_ts is None:
@@ -3051,14 +3231,18 @@ class StrategyEngine:
             gap: list[OHLCVBar] | None = None
             if missing <= _TRAILING_GAP_FETCH_LIMIT:
                 try:
+                    # CF-13b-20: paginated -- at most ``_TRAILING_GAP_MAX_PAGES`` pages of
+                    # the service's page limit (1000 bars = 4 x 300), 10 s per page, the
+                    # whole call under one overall timeout; each page may retry inside
+                    # the service (WP13BB-CR-08).
                     fetched = await asyncio.wait_for(
-                        self._market_data.fetch_ohlcv(
+                        self._market_data.fetch_ohlcv_range(
                             symbol=symbol,
                             timeframe=self._timeframe,
-                            since=first_wanted,
-                            limit=missing,
+                            start=first_wanted,
+                            end=bars[0].timestamp,
                         ),
-                        timeout=_EXIT_FETCH_TIMEOUT_S,
+                        timeout=_EXIT_FETCH_TIMEOUT_S * _TRAILING_GAP_MAX_PAGES,
                     )
                     gap = [
                         b for b in fetched if first_wanted <= b.timestamp < bars[0].timestamp
@@ -3082,6 +3266,429 @@ class StrategyEngine:
                 )
                 self._metric("trailing_seed_partial_total")
         return max([peak, *closes])
+
+    # ------------------------------------------------------------------
+    # WP1.3b-b: live intra-bar exit check (SY-13b-04..15, D-13b-01..03)
+    # ------------------------------------------------------------------
+    #
+    # A sibling task of the bar loop.  Every ``exit_check_interval_s`` it reads the
+    # BID of every held symbol that has a protective level, and for those at or
+    # below the level takes a second reading ``_intrabar_confirm_delay_s`` later.
+    # Only if ``max(bid1, bid2)`` is still at or below the level does it ask the
+    # managers (``check(..., intrabar=True)``: stop-loss and trailing only, no TP)
+    # and route the exit through ``process_signal`` -- so the WP1.11a cap and the
+    # WP1.4b idempotent submit apply unchanged.
+    #
+    # Hard rules (AST-pinned by tests):
+    #   * never fires on missing / invalid / unconfirmed data;
+    #   * read-only on portfolio state (CF-04): no ``update_market_prices``, no mark
+    #     from a ticker -- a real fill is applied at the exchange's own price and
+    #     marked at the last closed bar close;
+    #   * never evaluates the circuit breaker, ticks cooldown, calls a strategy,
+    #     counts a bar, ages a pending TTL, raises a trailing peak, opens a lot or
+    #     emits a BUY (CF-30);
+    #   * ``_cycle_lock`` is held only for the re-read + submit + route, never across
+    #     a ticker fetch or the confirm wait (a bar pass is never delayed by I/O);
+    #   * log sites carry ``error_type`` and numbers only -- no exception text, no
+    #     URL, no raw ticker payload (CF-36).
+
+    def _start_intrabar_task(self) -> None:
+        """Create the sibling task (no-op when the feature is off or already running)."""
+        if self._exit_check_interval_s is None or self._intrabar_task is not None:
+            return
+        self._intrabar_interval_now_s = float(self._exit_check_interval_s)
+        self._intrabar_retry_soon = False
+        self._intrabar_task = asyncio.create_task(
+            self._intrabar_exit_loop(), name=f"intrabar-{self._run_id or 'unknown'}"
+        )
+        self._log.info("engine.intrabar_started", interval_s=self._exit_check_interval_s)
+
+    async def _stop_intrabar_task(self) -> None:
+        """Stop the sibling task: set the stop event, give it ``_INTRABAR_JOIN_TIMEOUT_S``,
+        then cancel it.  Never raises (``CancelledError`` of the task is swallowed)."""
+        task = self._intrabar_task
+        if task is None:
+            return
+        self._intrabar_task = None
+        self._stop_event.set()
+        try:
+            await asyncio.wait({task}, timeout=_INTRABAR_JOIN_TIMEOUT_S)
+        except asyncio.CancelledError:
+            task.cancel()
+            raise
+        if not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        elif not task.cancelled():
+            task.exception()  # retrieve, so the loop never reports it as unretrieved
+
+    async def _intrabar_wait(self, seconds: float) -> bool:
+        """Wait up to ``seconds``; ``True`` iff the stop event was set (interruptible).
+
+        Every wait of the intra-bar task goes through here, so a stop interrupts the
+        confirm wait too.  Tests replace it with a fake-clock version.
+        """
+        if self._stop_event.is_set():
+            return True
+        try:
+            await asyncio.wait_for(self._stop_event.wait(), timeout=max(0.0, seconds))
+        except TimeoutError:
+            return self._stop_event.is_set()
+        return True
+
+    async def _intrabar_exit_loop(self) -> None:
+        """The sibling task: ``wait -> tick`` until the stop event is set."""
+        interval = self._exit_check_interval_s
+        if interval is None:
+            return
+        try:
+            wait_s = float(min(_INTRABAR_FIRST_TICK_S, interval))
+            in_fast_retry = False
+            while not self._stop_event.is_set():
+                if await self._intrabar_wait(wait_s):
+                    break
+                try:
+                    await self._intrabar_exit_tick()
+                except Exception as exc:
+                    self._log.error(
+                        "engine.intrabar_tick_error", error_type=type(exc).__name__
+                    )
+                    self._metric("intrabar_tick_errors_total")
+                # A busy lock earns exactly ONE fast retry (SY-13b-08): a retry that is
+                # itself blocked falls back to the normal cadence.
+                if self._intrabar_retry_soon and not in_fast_retry:
+                    wait_s = _INTRABAR_LOCK_RETRY_S
+                    in_fast_retry = True
+                else:
+                    wait_s = self._intrabar_interval_now_s
+                    in_fast_retry = False
+                self._intrabar_retry_soon = False
+        except Exception as exc:
+            # The task itself died (not a tick): the bar loop is unaffected and keeps
+            # protecting at bar close.
+            self._log.error("engine.intrabar_loop_died", error_type=type(exc).__name__)
+            self._metric("intrabar_loop_died_total")
+
+    async def _acquire_cycle_lock(self, timeout_s: float) -> bool:
+        """Acquire ``_cycle_lock`` within ``timeout_s`` (the ``flatten()`` pattern).
+
+        On timeout nothing is held: ``wait_for`` cancels the pending acquire, and on
+        Python 3.11 an acquire that completes in the same step is returned as a
+        success (so a held lock is never leaked, and an abandoned one never kept).
+        """
+        try:
+            await asyncio.wait_for(self._cycle_lock.acquire(), timeout=timeout_s)
+        except TimeoutError:
+            return False
+        return True
+
+    def _intrabar_levels(
+        self, symbol: str, position: Position
+    ) -> tuple[Decimal | None, Decimal | None]:
+        """``(bracket stop, trailing stop)`` of an open lot -- pure, read-only."""
+        bracket = (
+            self._bracket_exit.protective_level(symbol, position)
+            if self._bracket_exit is not None
+            else None
+        )
+        trailing = (
+            self._trailing_stop.protective_level(symbol, position)
+            if self._trailing_stop is not None
+            else None
+        )
+        return bracket, trailing
+
+    def _intrabar_held_symbols(self) -> list[str]:
+        """Run symbols worth a ticker call: an open position with a positive entry,
+        a protective level, and no exit already in flight with an unchanged quantity.
+        Read-only; no lock needed."""
+        held: list[str] = []
+        for symbol in self._symbols:
+            position = self._portfolio.get_position(symbol)
+            if position is None or position.is_flat or position.average_entry_price <= 0:
+                continue
+            if self._intrabar_levels(symbol, position) == (None, None):
+                continue
+            if (
+                self._bracket_exit is not None
+                and self._bracket_exit.has_unchanged_pending(symbol, position)
+            ) or (
+                self._trailing_stop is not None
+                and self._trailing_stop.has_unchanged_pending(symbol, position)
+            ):
+                continue
+            held.append(symbol)
+        return held
+
+    @staticmethod
+    def _usable_bid(quote: object) -> Decimal | None:
+        """The bid of a reading iff it is usable: finite and > 0, and the ask (when
+        present) finite and not below it (a crossed book is invalid).  Else ``None``."""
+        bid = getattr(quote, "bid", None)
+        if not isinstance(bid, Decimal) or not bid.is_finite() or bid <= 0:
+            return None
+        ask = getattr(quote, "ask", None)
+        if ask is not None and (
+            not isinstance(ask, Decimal) or not ask.is_finite() or ask < bid
+        ):
+            return None
+        return bid
+
+    @staticmethod
+    def _quote_context(quote: object) -> dict[str, str | None]:
+        """Forensic fields of a usable reading, logged only and never part of the fire
+        decision (SY-13b-06 / RD-19, WP13BB-SEC-03): the ``ask`` and ``quote_age_s`` =
+        local receive time minus the exchange timestamp.  On Coinbase v3 that timestamp
+        is the LAST-TRADE time, so the age is a trade age, not a book age.  Numeric
+        strings or ``None``; never raises."""
+        ask = getattr(quote, "ask", None)
+        ts = getattr(quote, "exchange_ts", None)
+        age: str | None = None
+        if isinstance(ts, datetime):
+            stamp = ts if ts.tzinfo is not None else ts.replace(tzinfo=UTC)
+            age = f"{(datetime.now(UTC) - stamp).total_seconds():.3f}"
+        return {
+            "ask": str(ask) if isinstance(ask, Decimal) and ask.is_finite() else None,
+            "quote_age_s": age,
+        }
+
+    async def _intrabar_read_bid(
+        self, symbol: str
+    ) -> tuple[Decimal | None, str | None, dict[str, str | None]]:
+        """One ticker reading, bounded and NOT retried: ``(bid, None, context)`` or
+        ``(None, reason, {})`` where ``reason`` is an exception class name or
+        ``"invalid_quote"`` and ``context`` is :meth:`_quote_context` (logged only).
+        A rate-limit answer propagates as ``RateLimitError``."""
+        try:
+            quote = await asyncio.wait_for(
+                self._market_data.fetch_ticker_quote(symbol),
+                timeout=_INTRABAR_QUOTE_TIMEOUT_S,
+            )
+        except RateLimitError:
+            raise
+        except Exception as exc:
+            return None, type(exc).__name__, {}
+        bid = self._usable_bid(quote)
+        if bid is None:
+            return None, "invalid_quote", {}
+        return bid, None, self._quote_context(quote)
+
+    def _intrabar_note_reading(self, symbol: str, bid: Decimal | None, reason: str | None) -> None:
+        """First-reading bookkeeping: failure streak, ``exit_check.degraded`` after
+        ``_INTRABAR_DEGRADED_AFTER_TICKS`` consecutive failed ticks (repeated every
+        ``_INTRABAR_DEGRADED_REPEAT_S``), ``exit_check.recovered`` on the first valid
+        reading afterwards."""
+        if bid is not None:
+            self._intrabar_failure_streak.pop(symbol, None)
+            if self._intrabar_degraded_at.pop(symbol, None) is not None:
+                self._log.info("exit_check.recovered", symbol=symbol)
+            return
+        reason = reason or "unknown"
+        streak = self._intrabar_failure_streak.get(symbol, 0) + 1
+        self._intrabar_failure_streak[symbol] = streak
+        self._metric("intrabar_ticker_errors_total", reason=reason)
+        self._log.warning(
+            "engine.intrabar_quote_failed", symbol=symbol, reason=reason, ticks=streak
+        )
+        if streak >= _INTRABAR_DEGRADED_AFTER_TICKS:
+            now = self._intrabar_clock()
+            last = self._intrabar_degraded_at.get(symbol)
+            if last is None or now - last >= _INTRABAR_DEGRADED_REPEAT_S:
+                self._intrabar_degraded_at[symbol] = now
+                self._log.error("exit_check.degraded", symbol=symbol, reason=reason, ticks=streak)
+
+    def _intrabar_on_rate_limit(self) -> None:
+        """A rate-limit answer: abandon the tick and double the effective interval,
+        capped at ``max(configured, 900 s)`` and kept below the timeframe."""
+        configured = self._exit_check_interval_s or 0
+        cap = min(max(float(configured), _INTRABAR_BACKOFF_CAP_S), float(self._tf_s - 1))
+        self._intrabar_interval_now_s = max(
+            float(configured), min(self._intrabar_interval_now_s * 2.0, cap)
+        )
+        self._metric("intrabar_ticker_errors_total", reason="RateLimitError")
+        self._log.warning(
+            "engine.intrabar_rate_limited", interval_s=self._intrabar_interval_now_s
+        )
+
+    async def _intrabar_exit_tick(self) -> None:
+        """One intra-bar pass (see the section comment).  Never raises for expected
+        failures; the loop logs anything else (``error_type`` only)."""
+        if self._stop_event.is_set() or self._state != EngineState.RUNNING:
+            return
+        held = self._intrabar_held_symbols()
+        if not held:
+            return  # a flat run makes no exchange call at all
+        self._metric("intrabar_exit_checks_total")
+
+        # Reading 1 -- no lock held.
+        bids1: dict[str, Decimal] = {}
+        context1: dict[str, dict[str, str | None]] = {}
+        for symbol in held:
+            if self._stop_event.is_set():
+                return
+            try:
+                bid, reason, context = await self._intrabar_read_bid(symbol)
+            except RateLimitError:
+                self._intrabar_on_rate_limit()
+                return
+            self._intrabar_note_reading(symbol, bid, reason)
+            if bid is not None:
+                bids1[symbol] = bid
+                context1[symbol] = context
+        if self._intrabar_interval_now_s != float(self._exit_check_interval_s or 0):
+            # one clean tick: restore the configured interval
+            self._intrabar_interval_now_s = float(self._exit_check_interval_s or 0)
+
+        candidates: list[str] = []
+        for symbol in held:
+            bid1 = bids1.get(symbol)
+            position = self._portfolio.get_position(symbol)
+            if bid1 is None or position is None or position.is_flat:
+                continue
+            if any(
+                level is not None and bid1 <= level
+                for level in self._intrabar_levels(symbol, position)
+            ):
+                candidates.append(symbol)
+        if not candidates:
+            return
+
+        # Confirm wait -- no lock held, stop-interruptible.
+        if await self._intrabar_wait(self._intrabar_confirm_delay_s):
+            return
+
+        # Reading 2 -- no lock held.  An invalid / missing / failed reading never
+        # confirms and never fires.
+        confirmed: dict[str, tuple[Decimal, Decimal]] = {}
+        quote_fields: dict[str, dict[str, str | None]] = {}
+        for symbol in candidates:
+            if self._stop_event.is_set():
+                return
+            try:
+                bid2, reason, context2 = await self._intrabar_read_bid(symbol)
+            except RateLimitError:
+                self._intrabar_on_rate_limit()
+                return
+            if bid2 is None:
+                self._metric("intrabar_confirm_failed_total", reason=reason or "unknown")
+                self._log.warning(
+                    "engine.intrabar_confirm_failed", symbol=symbol, reason=reason
+                )
+                continue
+            bid1 = bids1[symbol]
+            price = max(bid1, bid2)
+            fields = {
+                "ask1": context1[symbol].get("ask"),
+                "ask2": context2.get("ask"),
+                "quote_age_s1": context1[symbol].get("quote_age_s"),
+                "quote_age_s2": context2.get("quote_age_s"),
+            }
+            position = self._portfolio.get_position(symbol)
+            if position is None or position.is_flat:
+                continue
+            if not any(
+                level is not None and price <= level
+                for level in self._intrabar_levels(symbol, position)
+            ):
+                self._metric("intrabar_breach_unconfirmed_total")
+                self._log.info(
+                    "engine.intrabar_breach_unconfirmed",
+                    symbol=symbol,
+                    bid1=str(bid1),
+                    bid2=str(bid2),
+                    **fields,
+                )
+                continue
+            confirmed[symbol] = (bid1, bid2)
+            quote_fields[symbol] = fields
+        if not confirmed:
+            return
+
+        if not await self._acquire_cycle_lock(_INTRABAR_LOCK_TIMEOUT_S):
+            # A bar pass or flatten() holds it: abandon (no state change) and retry once soon.
+            self._intrabar_retry_soon = True
+            self._metric("intrabar_lock_busy_total")
+            self._log.warning("engine.intrabar_lock_busy", symbols=sorted(confirmed))
+            return
+        try:
+            await self._intrabar_fire(confirmed, quote_fields)
+        finally:
+            self._cycle_lock.release()
+
+    async def _intrabar_fire(
+        self,
+        confirmed: dict[str, tuple[Decimal, Decimal]],
+        quote_fields: dict[str, dict[str, str | None]] | None = None,
+    ) -> None:
+        """Under ``_cycle_lock``: re-read, ask the managers, submit, route (SY-13b-13).
+
+        The fill is applied at the exchange's own ``fill.price`` / ``fill.fee``; only
+        the mark argument of ``update_position`` is the last CLOSED bar close
+        (``_route_exit_fills`` falls back to the fill price for an empty window).  A
+        ticker price never enters ``PortfolioAccounting``."""
+        last_closed_bars: dict[str, OHLCVBar] = {
+            s: w[-1] for s, w in self._bar_windows.items() if w
+        }
+        for symbol in self._symbols:
+            pair = confirmed.get(symbol)
+            if pair is None:
+                continue
+            if self._stop_event.is_set():
+                return
+            bid1, bid2 = pair
+            price = max(bid1, bid2)
+            try:
+                position = self._portfolio.get_position(symbol)
+                if position is None or position.is_flat:
+                    continue
+                manager: BracketExitManager | TrailingStopManager | None = None
+                exit_signal: Signal | None = None
+                if self._bracket_exit is not None:
+                    exit_signal = self._bracket_exit.check(
+                        symbol, price, position, intrabar=True
+                    )
+                    manager = self._bracket_exit
+                if exit_signal is None and self._trailing_stop is not None:
+                    position = self._portfolio.get_position(symbol)
+                    if position is None or position.is_flat:
+                        continue
+                    exit_signal = self._trailing_stop.check(
+                        symbol, price, position, intrabar=True
+                    )
+                    manager = self._trailing_stop
+                if exit_signal is None or manager is None:
+                    continue
+                exit_signal = exit_signal.model_copy(
+                    update={
+                        "metadata": {
+                            **exit_signal.metadata,
+                            "confirm_bids": [str(bid1), str(bid2)],
+                        }
+                    }
+                )
+                trigger = str(exit_signal.metadata.get("trigger"))
+                self._metric("intrabar_exit_signals_total", trigger=trigger)
+                self._log.warning(
+                    "engine.intrabar_exit_signal",
+                    symbol=symbol,
+                    trigger=trigger,
+                    trigger_price=str(price),
+                    bid1=str(bid1),
+                    bid2=str(bid2),
+                    **(quote_fields or {}).get(symbol, {}),
+                )
+                n_orders, n_fills = await self._submit_exit_signal(
+                    manager, exit_signal, last_closed_bars
+                )
+                self._total_orders += n_orders
+                self._total_fills += n_fills
+            except Exception as exc:
+                self._log.error(
+                    "engine.intrabar_exit_error",
+                    symbol=symbol,
+                    error_type=type(exc).__name__,
+                )
 
     # ------------------------------------------------------------------
     # Resting order check (paper engine)

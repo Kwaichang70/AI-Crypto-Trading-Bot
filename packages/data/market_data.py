@@ -20,6 +20,7 @@ Concrete implementation: packages/data/services/ccxt_market_data.py (TBI).
 from __future__ import annotations
 
 import abc
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 
@@ -33,6 +34,7 @@ __all__ = [
     "MarketDataError",
     "RateLimitError",
     "DataNotAvailableError",
+    "TickerQuote",
 ]
 
 logger = structlog.get_logger(__name__)
@@ -60,6 +62,23 @@ class DataNotAvailableError(MarketDataError):
     Raised when requested OHLCV data does not exist for the given
     symbol / timeframe / date range combination.
     """
+
+
+@dataclass(frozen=True, slots=True)
+class TickerQuote:
+    """One top-of-book reading of a symbol (WP1.3b-b, live intra-bar exit check).
+
+    Every price is ``None`` when the exchange omitted it or sent an empty,
+    non-numeric, non-finite or non-positive value.  Whether a reading is
+    *usable* is decided by the caller (the engine needs a positive ``bid``, and
+    ``ask >= bid`` when ``ask`` is present); the service only normalises.
+    """
+
+    symbol: str
+    bid: Decimal | None
+    ask: Decimal | None
+    last: Decimal | None
+    exchange_ts: datetime | None
 
 
 class BaseMarketDataService(abc.ABC):
@@ -219,6 +238,36 @@ class BaseMarketDataService(abc.ABC):
             Supported timeframe enum members.
         """
         ...
+
+    # ------------------------------------------------------------------
+    # Ticker quotes (WP1.3b-b) -- optional capability, NOT abstract so every
+    # existing implementation and test double stays valid.
+    # ------------------------------------------------------------------
+
+    @property
+    def supports_ticker_quotes(self) -> bool:
+        """True iff :meth:`fetch_ticker_quote` is implemented."""
+        return False
+
+    async def fetch_ticker_quote(self, symbol: str) -> TickerQuote:
+        """One uncached, non-retrying top-of-book reading for ``symbol``.
+
+        Used by the live intra-bar exit check.  Implementations MUST NOT cache
+        and MUST NOT retry (the confirming reading is the retry), and MUST NOT
+        log the raw exchange payload or exception text.
+
+        Raises
+        ------
+        NotImplementedError:
+            When the service does not support ticker quotes.
+        RateLimitError:
+            On HTTP 429 / DDoS protection.
+        DataNotAvailableError:
+            When the symbol is unknown to the exchange.
+        MarketDataError:
+            On any other exchange communication or payload error.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support ticker quotes")
 
     # ------------------------------------------------------------------
     # Lifecycle

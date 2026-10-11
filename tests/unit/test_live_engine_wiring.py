@@ -131,6 +131,7 @@ def _make_settings_mock() -> MagicMock:
     settings.exchange_api_key = secret_key
     settings.exchange_api_secret = secret_secret
     settings.exchange_api_passphrase = secret_passphrase
+    settings.live_exit_check_interval_s = 300  # WP1.3b-b: a real Settings value, not a MagicMock
     return settings
 
 

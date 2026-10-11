@@ -103,7 +103,85 @@ ORDER BY timestamp DESC LIMIT 20;
 
 ---
 
-## 7. Change log
+## 7. Intra-bar exit check (WP1.3b-b)
+
+**What it is.** A LIVE run with a stop-loss and/or a trailing stop checks the **bid** between bar closes
+(default every 300 s) instead of waiting for the next close. It is a sibling task of the bar loop: a
+bar pass is never delayed by it. Take-profit is **bar-close only**; the check never opens a position.
+
+**Settings.** `LIVE_EXIT_CHECK_INTERVAL_S` (default `300`; `0` = off; otherwise an integer 60 to 3600).
+It is effective only for a LIVE run whose timeframe is longer than the interval and that has a
+bracket stop-loss or a trailing stop. It is always off for paper, backtest and `smoke_roundtrip`
+runs. The run's start logs `runs.intrabar_exit_checks interval_s=300` or `interval_s=null reason=...`
+(`disabled`, `interval_ge_timeframe`, `smoke_run`, `no_protective_exit`, `not_live`).
+
+**Semantics.**
+- Tick: read the bid of every held symbol that has a protective level. A symbol at or below its level
+  gets a second bid reading about 10 s later; only if the higher of the two readings is still at or
+  below the level is the exit sent (a normal market SELL through `process_signal`: the WP1.11a cap and
+  the WP1.4b idempotent submit apply). `last` is never used.
+- It never fires on a missing, empty, non-positive, non-finite or crossed-book reading, nor on one
+  reading alone. Nothing is retried inside a reading; the confirming reading is the retry.
+- Breach to SELL is at most: one interval + 10 s + fetch time + order latency. Gaps are gaps.
+- The check is read-only on the portfolio (no marks, peak, day-start or breaker are touched) and never
+  evaluates the circuit breaker. The kill switch, protective mode, HALT, DAILY_LIMIT and
+  `reconcile_required` do **not** stop an intra-bar exit (they block entries only).
+- Live stops are therefore touch-based (bid, confirmed), while the validated backtest is close-based.
+
+**Logs and metrics.**
+
+| Signal | Meaning | Action |
+|---|---|---|
+| `engine.intrabar_started` | the task runs (interval in the log) | none |
+| `engine.intrabar_exit_signal` (warning) | an intra-bar exit was sent (`trigger`, both bids, both asks, `quote_age_s1/2` = age of the exchange's last-trade timestamp, logged only) | check the SELL fill; a wide spread or an old trade age is a thin-book or stale-ticker hint (L-14) |
+| `engine.intrabar_breach_unconfirmed` (info) | the second reading was back above the level | none |
+| `engine.intrabar_quote_failed` (warning) | one failed reading (`reason` = error type) | watch for `degraded` |
+| `exit_check.degraded` (error) | 3 consecutive ticks without a usable bid for a held symbol; repeated every 15 min | **incident**: the bar close still protects; check the exchange / ticker; see G-LIVE L-14 |
+| `exit_check.recovered` (info) | a valid reading again | none |
+| `engine.intrabar_rate_limited` (warning) | 429: the interval doubled (cap 900 s) and is restored after one clean tick | none unless it persists |
+| `engine.intrabar_lock_busy` (warning) | a bar pass / flatten held the lock for 5 s; one retry follows in 30 s | more than 6 per hour: incident |
+| `engine.intrabar_tick_error` / `engine.intrabar_loop_died` (error) | a tick failed / the task ended; the bar loop is unaffected | `loop_died` (also `intrabar_loop_died_total`): plan a restart (bar close protects) |
+| `engine.exit_not_submitted` | an exit reached no accepted order (`reason`, `streak`); `inflight_exit_pending` (info) is a SELL already in flight and not a failure | error level (streak 3, then every 10th) is an incident |
+
+Counters: `intrabar_exit_checks_total`, `intrabar_exit_signals_total{trigger}`,
+`intrabar_ticker_errors_total{reason}`, `intrabar_confirm_failed_total{reason}`,
+`intrabar_breach_unconfirmed_total`, `intrabar_lock_busy_total`, `intrabar_tick_errors_total`,
+`intrabar_loop_died_total`,
+`exit_not_submitted_total{trigger,reason}`, `bracket_anchor_source_total{source,final}`.
+No log line of this feature carries exception text, a URL or a raw ticker.
+
+**G-LIVE checks (WP1.3b).**
+- **L-14 (before the restart).** Read-only ticker sanity on the deploy host for every run symbol:
+  `bid` finite and positive, `ask >= bid`, latency under 2 s, three calls 10 s apart. Also record
+  whether `fetch_ohlcv(limit=N)` returns the still-forming candle on the real exchange (if it does,
+  open the CR-09 fix). If the bid is not usable the check would never fire: fix it, or set
+  `LIVE_EXIT_CHECK_INTERVAL_S=0` and record the operator's acceptance of bar-close-only exits.
+- **L-15 (after the restart).** `runs.intrabar_exit_checks interval_s=300` for the live run; while it
+  holds a position `intrabar_exit_checks_total` increases within 2 x the interval and
+  `intrabar_ticker_errors_total` and `exit_check.degraded` stay at 0.
+- **L-16 (after a resume).** For every held symbol `bracket_exit.anchored` with
+  `source=resume_recomputed` (ATR) or exact (fixed), and `trailing_stop.peak_seeded`. Judge sources
+  after 3 bar passes. `resume_fallback_current_atr` (final), `entry_unverified`, `entry_deferred` or
+  `trailing_stop.seed_partial` are incidents: the position is protected, record the level difference.
+
+**Limits.** No backtest or optimizer on the live API process while live holds positions (an
+event-loop stall stops every exit). A dust position below the exchange minimum cannot be sold: the
+exit retries every tick and logs `engine.exit_not_submitted` (error from the 3rd attempt).
+
+**Shutdown and flatten (WP13BB-SEC-05, SEC-07).** On a stop or a graceful shutdown the run waits up
+to 15 s for the check: at once when it is idle or in the confirm wait, at most one ticker reading
+(10 s) when it is reading, and one `process_signal` per confirmed symbol when it is sending exits
+(an exit in flight is never cancelled on purpose). A `flatten()` that starts while an intra-bar exit
+holds the lock waits for it inside its own 30 s budget. With several confirmed symbols that wait can
+use up the budget: the result is then `in_flight` with cause `lock_timeout` and the run latches
+`flatten_incomplete` (entries blocked), while the check is selling those same positions. Re-read the
+positions and retry the flatten; do not sell by hand while a bot SELL is still open.
+
+---
+
+## 8. Change log
 
 - **2026-05-28** — Initial runbook (Sprint 50 cycle 4, HALT auto-stop).
 - **WP1.6** — Rewritten: HALT blocks entries only, auto-recovers (U-1), reset endpoint retired (410), Telegram alert on HALT, gauge zeroed on stop. Renamed from `circuit-breaker-halt-auto-stop.md`.
+- **WP1.3b-b** — Added section 7: the live intra-bar exit check (settings, semantics, logs, G-LIVE L-14..L-16).
+- **WP1.3b-b fix** — Section 7: asks and trade age on `engine.intrabar_exit_signal`, `intrabar_loop_died_total`, shutdown and flatten notes.

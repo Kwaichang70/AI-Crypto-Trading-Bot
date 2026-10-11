@@ -1048,6 +1048,16 @@ class LiveExecutionEngine(BaseExecutionEngine):
     # WP1.1: held-quantity / SELL cap (WP11-A-03, D9, I1; round 2 S-03/S-07)
     # ------------------------------------------------------------------
 
+    def pending_sell_quantity(self, symbol: str) -> Decimal:
+        """Public, read-only view of :meth:`_pending_sell_quantity` (WP1.3b-b).
+
+        The strategy engine uses it to tell a "SELL already in flight for this
+        symbol" non-submission (benign, info level) from a genuine failure to
+        submit an exit (streak, error level).  No state is read or written
+        beyond what the private method does (it is itself read-only).
+        """
+        return self._pending_sell_quantity(symbol)
+
     def _pending_sell_quantity(self, symbol: str) -> Decimal:
         """WP11-S-03: total SELL quantity for ``symbol`` still in flight --
         submitted to the exchange but not yet fully routed into the

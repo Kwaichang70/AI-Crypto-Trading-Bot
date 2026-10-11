@@ -49,8 +49,11 @@ from trading.risk import RiskParameters
 from trading.trailing_stop import TRAILING_PCT_RANGE
 
 __all__ = [
+    "EXIT_CHECK_INTERVAL_MAX_S",
+    "EXIT_CHECK_INTERVAL_MIN_S",
     "POLICY_ATR_PERIOD_MAX",
     "POLICY_FIXED_SL_MAX",
+    "ExitCheckResolution",
     "ExitConfig",
     "ExitConfigError",
     "ExitConfigIssue",
@@ -61,6 +64,8 @@ __all__ = [
     "parse_exit_config",
     "require_exit_manager",
     "resolve_allow_pyramiding",
+    "resolve_exit_check_interval",
+    "resolve_run_exit_check",
     "salvage_exit_config",
     "strategy_requires_exit_manager",
     "validate_param_grid_exit_config",
@@ -81,7 +86,14 @@ _VALID_BRACKET_MODES: frozenset[str] = frozenset({"fixed", "atr"})
 _FIXED_ACTIVE_KEYS: tuple[str, str] = ("bracket_stop_loss_pct", "bracket_take_profit_pct")
 _ATR_ACTIVE_KEYS: tuple[str, str] = ("bracket_atr_sl_multiplier", "bracket_atr_tp_multiplier")
 
-_LONG_TIMEFRAMES: frozenset[str] = frozenset({"4h", "1d", "1w"})
+# WP1.3b-b (SY-13b-10): live intra-bar exit-check interval, seconds.  ``0`` = off,
+# otherwise an integer in [MIN, MAX] that is also strictly below the timeframe.
+EXIT_CHECK_INTERVAL_MIN_S: int = 60
+EXIT_CHECK_INTERVAL_MAX_S: int = 3600
+
+# W8 ("bar close only") now also covers 1h (WP1.3b-b): a 1h run with the intra-bar
+# check off is exposed for up to an hour.
+_LONG_TIMEFRAMES: frozenset[str] = frozenset({"1h", "4h", "1d", "1w"})
 
 _REQUIRES_ONE_OF: tuple[str, str, str] = (
     "bracket_stop_loss_pct (bracket_mode=fixed)",
@@ -258,6 +270,157 @@ class ExitConfigVerdict:
     config: ExitConfig
     allow_pyramiding: bool
     warnings: tuple[ExitConfigWarning, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ExitCheckResolution:
+    """Outcome of :func:`resolve_exit_check_interval`.
+
+    ``interval_s`` is the effective intra-bar check interval in seconds, or
+    ``None`` when the check is off for this run; ``reason`` says why
+    (``"enabled"`` when on).
+    """
+
+    interval_s: int | None
+    reason: str
+
+
+def resolve_exit_check_interval(
+    configured_s: object,
+    *,
+    mode: RunMode | str,
+    timeframe_s: int,
+    is_smoke: bool,
+    has_protective_exit: bool,
+) -> ExitCheckResolution:
+    """Effective live intra-bar exit-check interval for one run (WP1.3b-b).
+
+    Pure.  The configured value is validated FIRST and in every mode (a bad
+    setting is a configuration error, not a per-run decision): ``0`` or an
+    integer in ``[EXIT_CHECK_INTERVAL_MIN_S, EXIT_CHECK_INTERVAL_MAX_S]``;
+    ``bool``, non-integral floats, NaN/inf and other types raise
+    :class:`ExitConfigError`.  The check is then OFF (``interval_s=None``) for:
+    a non-LIVE mode, a smoke run (forced off), ``0``, an interval that is not
+    strictly below the timeframe, and a run with neither a bracket stop-loss
+    nor a trailing stop.  The checks are evaluated in that order.
+    """
+    interval = _validate_exit_check_interval(configured_s)
+    mode_value = mode.value if isinstance(mode, RunMode) else str(mode)
+    if mode_value != RunMode.LIVE.value:
+        return ExitCheckResolution(None, "not_live")
+    if is_smoke:
+        return ExitCheckResolution(None, "smoke_run")
+    if interval == 0:
+        return ExitCheckResolution(None, "disabled")
+    if interval >= timeframe_s:
+        return ExitCheckResolution(None, "interval_ge_timeframe")
+    if not has_protective_exit:
+        return ExitCheckResolution(None, "no_protective_exit")
+    return ExitCheckResolution(interval, "enabled")
+
+
+_TIMEFRAME_SECONDS_BY_VALUE: dict[str, int] = {
+    "1m": 60,
+    "3m": 180,
+    "5m": 300,
+    "15m": 900,
+    "30m": 1800,
+    "1h": 3600,
+    "4h": 14400,
+    "1d": 86400,
+    "1w": 604800,
+}
+_SMOKE_STRATEGY_NAME = "smoke_roundtrip"
+
+
+def resolve_run_exit_check(
+    configured_s: object,
+    *,
+    mode: RunMode | str,
+    timeframe: object,
+    strategy_name: str,
+    bracket: Mapping[str, object] | None,
+    trailing_stop_pct: object,
+    exit_config_waived: bool = False,
+) -> ExitCheckResolution:
+    """Run-level wrapper of :func:`resolve_exit_check_interval` (WP1.3b-b).
+
+    Derives the three run facts the pure resolver needs: the timeframe in
+    seconds (unknown timeframe: 0, so the check is off), smoke
+    (``strategy_name`` is ``smoke_roundtrip``) and whether the run has a
+    bracket stop-loss or a trailing stop (an unparsable or waived exit config has
+    none).  Used by the orchestrator (to configure the engine) and by the
+    routers (to decide whether warning W8 applies).
+    """
+    has_protective_exit = False
+    if not exit_config_waived:
+        try:
+            has_protective_exit = parse_exit_config(
+                bracket=bracket, trailing_stop_pct=trailing_stop_pct
+            ).has_downside_exit
+        except ExitConfigError:
+            has_protective_exit = False
+    return resolve_exit_check_interval(
+        configured_s,
+        mode=mode,
+        timeframe_s=_TIMEFRAME_SECONDS_BY_VALUE.get(str(getattr(timeframe, "value", timeframe)), 0),
+        is_smoke=str(strategy_name).lower().replace("-", "_") == _SMOKE_STRATEGY_NAME,
+        has_protective_exit=has_protective_exit,
+    )
+
+
+def _validate_exit_check_interval(configured_s: object) -> int:
+    field_name = "live_exit_check_interval_s"
+    if isinstance(configured_s, bool) or not isinstance(configured_s, (int, float)):
+        raise ExitConfigError(
+            "invalid_exit_config",
+            (
+                ExitConfigIssue(
+                    field=field_name,
+                    reason="invalid_type",
+                    value=_trunc(configured_s),
+                    message=f"{field_name} must be an integer number of seconds",
+                ),
+            ),
+        )
+    if isinstance(configured_s, float):
+        if not math.isfinite(configured_s):
+            reason = "not_finite"
+        elif configured_s != int(configured_s):
+            reason = "not_integral"
+        else:
+            reason = ""
+        if reason:
+            raise ExitConfigError(
+                "invalid_exit_config",
+                (
+                    ExitConfigIssue(
+                        field=field_name,
+                        reason=reason,
+                        value=_trunc(configured_s),
+                        message=f"{field_name} must be an integer number of seconds",
+                    ),
+                ),
+            )
+    value = int(configured_s)
+    if value != 0 and not (EXIT_CHECK_INTERVAL_MIN_S <= value <= EXIT_CHECK_INTERVAL_MAX_S):
+        raise ExitConfigError(
+            "invalid_exit_config",
+            (
+                ExitConfigIssue(
+                    field=field_name,
+                    reason="out_of_range",
+                    value=_trunc(configured_s),
+                    min=float(EXIT_CHECK_INTERVAL_MIN_S),
+                    max=float(EXIT_CHECK_INTERVAL_MAX_S),
+                    message=(
+                        f"{field_name} must be 0 (off) or between "
+                        f"{EXIT_CHECK_INTERVAL_MIN_S} and {EXIT_CHECK_INTERVAL_MAX_S}"
+                    ),
+                ),
+            ),
+        )
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -709,12 +872,17 @@ def validate_run_exit_config(
     allow_pyramiding: bool | None,
     timeframe: str | None = None,
     cost: ExitCostModel | None = None,
+    intrabar_exit_checks: bool = False,
 ) -> ExitConfigVerdict:
     """The one-stop call used by every enforcement point (SY-13a-15/§1c).
 
     Order: parse (raises ``invalid_exit_config``) -> require_exit_manager
     (raises ``exit_manager_required``) -> resolve ``allow_pyramiding`` ->
     live-pyramiding ban (raises ``live_pyramiding_forbidden``) -> warnings.
+
+    ``intrabar_exit_checks`` (WP1.3b-b): True iff the live intra-bar exit check
+    is EFFECTIVE for this run (see :func:`resolve_exit_check_interval`).  Warning
+    W8 (``bar_close_exit_checks_only``) is emitted only when it is False.
     """
     # WP13a-S-03 (security round 2): normalise/validate mode FIRST, before
     # any other check.  ``RunMode`` is a plain ``StrEnum`` with no custom
@@ -788,14 +956,21 @@ def validate_run_exit_config(
                     ),
                 )
             )
-        if timeframe is not None and str(timeframe) in _LONG_TIMEFRAMES:
+        if (
+            timeframe is not None
+            and str(timeframe) in _LONG_TIMEFRAMES
+            and not intrabar_exit_checks
+        ):
             warnings.append(
                 ExitConfigWarning(
                     code="bar_close_exit_checks_only",
                     field=None,
                     message=(
-                        f"timeframe {timeframe} is checked at bar close only; "
-                        "intra-bar exit crossings are not detected until 1.3b"
+                        f"timeframe {timeframe} is checked at bar close only; the "
+                        "live intra-bar exit check is not active for this run "
+                        "(disabled, smoke, or its interval is not below the "
+                        "timeframe), so a stop crossing is detected at the next "
+                        "bar close"
                     ),
                 )
             )

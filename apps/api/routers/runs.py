@@ -103,6 +103,7 @@ from api.services.run_persistence import (
 from common.types import OrderSide, RunMode, TimeFrame
 from trading.exit_config import (
     ExitConfigError,
+    resolve_run_exit_check,
     strategy_requires_exit_manager,
     validate_run_exit_config,
 )
@@ -121,6 +122,38 @@ def _flatten_result_to_response(result: FlattenResult) -> FlattenResultResponse:
 router = APIRouter(prefix="/runs", tags=["runs"])
 
 logger = structlog.get_logger(__name__)
+
+
+def _intrabar_exit_checks_effective(
+    *,
+    mode: RunMode | str,
+    timeframe: object,
+    strategy_name: str,
+    bracket: dict[str, object] | None,
+    trailing_stop_pct: object,
+) -> bool:
+    """WP1.3b-b: will the live intra-bar exit check be effective for this run?
+
+    Feeds the W8 gate of ``validate_run_exit_config``.  Any failure (settings not
+    loadable, a bad value) answers ``False``: the "bar close only" warning is then
+    shown, which is the safe direction.
+    """
+    try:
+        from api.config import get_settings
+
+        return (
+            resolve_run_exit_check(
+                get_settings().live_exit_check_interval_s,
+                mode=mode,
+                timeframe=timeframe,
+                strategy_name=strategy_name,
+                bracket=bracket,
+                trailing_stop_pct=trailing_stop_pct,
+            ).interval_s
+            is not None
+        )
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -731,6 +764,13 @@ async def create_run(
             mode=body.mode,
             allow_pyramiding=body.allow_pyramiding,
             timeframe=str(body.timeframe),
+            intrabar_exit_checks=_intrabar_exit_checks_effective(
+                mode=body.mode,
+                timeframe=body.timeframe,
+                strategy_name=strategy_name,
+                bracket=_bracket_config,
+                trailing_stop_pct=_raw_trailing_stop_pct,
+            ),
         )
     except ExitConfigError as exc:
         log.warning(
@@ -2762,6 +2802,13 @@ async def promote_to_live(
             mode=RunMode.LIVE,
             allow_pyramiding=source_run.config.get("allow_pyramiding"),
             timeframe=str(source_run.config.get("timeframe", "1h")),
+            intrabar_exit_checks=_intrabar_exit_checks_effective(
+                mode=RunMode.LIVE,
+                timeframe=source_run.config.get("timeframe", "1h"),
+                strategy_name=promotion_strategy_name,
+                bracket=source_run.config.get("bracket_config") or {},
+                trailing_stop_pct=_source_strategy_params.get("trailing_stop_pct"),
+            ),
         )
     except ExitConfigError as exc:
         log.warning(
@@ -3313,6 +3360,13 @@ async def resume_run(
                 mode=RunMode.LIVE,
                 allow_pyramiding=orphan_config.get("allow_pyramiding"),
                 timeframe=str(timeframe),
+                intrabar_exit_checks=_intrabar_exit_checks_effective(
+                    mode=RunMode.LIVE,
+                    timeframe=timeframe,
+                    strategy_name=strategy_name,
+                    bracket=_bracket_config_raw,
+                    trailing_stop_pct=_raw_trailing_for_validation,
+                ),
             )
         except ExitConfigError as exc:
             log.warning(

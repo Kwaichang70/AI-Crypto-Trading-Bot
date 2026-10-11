@@ -34,6 +34,7 @@ import random
 import re
 import time
 from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import ccxt.async_support as ccxt_async
@@ -46,6 +47,7 @@ from data.market_data import (
     DataNotAvailableError,
     MarketDataError,
     RateLimitError,
+    TickerQuote,
 )
 
 __all__ = ["CCXTMarketDataService"]
@@ -430,6 +432,99 @@ class CCXTMarketDataService(BaseMarketDataService):
             bars_fetched=len(all_bars),
         )
         return all_bars
+
+    @property
+    def supports_ticker_quotes(self) -> bool:
+        return True
+
+    async def fetch_ticker_quote(self, symbol: str) -> TickerQuote:
+        """
+        One top-of-book reading for ``symbol`` (WP1.3b-b live intra-bar exit check).
+
+        Deliberately **no cache and no retry** (WP1.3b DEV-2 ruling): a stale
+        or silently re-tried quote would defeat the engine's two-reading
+        confirmation, whose second reading *is* the retry.  The call runs under
+        the service's own semaphore and 100 ms throttle (``enableRateLimit`` is
+        off on this handle), so it never queues ahead of an order on the
+        trading handle.
+
+        Errors are mapped like :meth:`_fetch_raw_with_retry` maps them, but the
+        raised message is fixed text and the cause is not chained: neither the
+        exchange's message nor its request URL can reach a log (CF-36).  The raw
+        ticker payload is never logged.
+
+        Raises
+        ------
+        RateLimitError:
+            ``RateLimitExceeded`` / ``DDoSProtection``.
+        DataNotAvailableError:
+            Unknown symbol.
+        MarketDataError:
+            Any other error -- every other ccxt error (``OperationFailed``,
+            ``BaseError``) and any non-ccxt exception -- or a payload that is not a
+            ticker dict (WP13BB-SEC-01).
+        """
+        self._validate_symbol(symbol)
+        try:
+            async with self._semaphore:
+                await self._throttle()
+                try:
+                    raw = await self._exchange.fetch_ticker(symbol)
+                finally:
+                    self._last_request_time = time.monotonic()
+        except (ccxt_async.RateLimitExceeded, ccxt_async.DDoSProtection):
+            raise RateLimitError(
+                f"Ticker rate limit hit for {symbol!r}"
+            ) from None
+        except ccxt_async.BadSymbol:
+            raise DataNotAvailableError(
+                f"Symbol {symbol!r} is not available on exchange '{self._exchange_id}'"
+            ) from None
+        except ccxt_async.NetworkError as exc:
+            raise MarketDataError(
+                f"Ticker fetch failed for {symbol!r} ({type(exc).__name__})"
+            ) from None
+        except ccxt_async.ExchangeError as exc:
+            raise MarketDataError(
+                f"Ticker fetch failed for {symbol!r} ({type(exc).__name__})"
+            ) from None
+        except Exception as exc:  # ccxt BaseError / OperationFailed, parsing, aiohttp (CF-36)
+            raise MarketDataError(
+                f"Ticker fetch failed for {symbol!r} ({type(exc).__name__})"
+            ) from None
+
+        if not isinstance(raw, dict):
+            raise MarketDataError(f"Malformed ticker payload for {symbol!r}")
+
+        ts_raw = raw.get("timestamp")
+        exchange_ts: datetime | None = None
+        if isinstance(ts_raw, (int, float)) and not isinstance(ts_raw, bool):
+            try:
+                exchange_ts = self._normalise_timestamp(int(ts_raw))
+            except (OverflowError, OSError, ValueError):
+                exchange_ts = None
+
+        return TickerQuote(
+            symbol=symbol,
+            bid=self._positive_decimal(raw.get("bid")),
+            ask=self._positive_decimal(raw.get("ask")),
+            last=self._positive_decimal(raw.get("last")),
+            exchange_ts=exchange_ts,
+        )
+
+    @staticmethod
+    def _positive_decimal(value: object) -> Decimal | None:
+        """``Decimal`` of a ticker field, or ``None`` when missing, empty,
+        non-numeric, non-finite or <= 0 (never raises)."""
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            number = Decimal(str(value).strip())
+        except (InvalidOperation, ValueError):
+            return None
+        if not number.is_finite() or number <= 0:
+            return None
+        return number
 
     async def get_latest_bar(self, symbol: str, timeframe: TimeFrame) -> OHLCVBar:
         """

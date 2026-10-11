@@ -46,6 +46,17 @@ Anchoring (WP1.3b-a, SY-13b-01..03, D-13b-04: all modes)
    lazily at the first :meth:`BracketExitManager.check` from the position's
    ``average_entry_price`` and the caller's ``atr_value`` (source ``late``).
 
+Intra-bar mode (WP1.3b-b, live only)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+``check(..., intrabar=True)`` is the read-only variant the live engine's
+intra-bar exit task calls between bar closes with a confirmed BID.  It uses the
+existing anchor only (no anchor, or an anchor of another lot: ``None``; nothing
+is created, dropped or finalised), evaluates the **stop-loss only** (take-profit
+is bar-close only, D-13b-02), never ages the pending-exit TTL (only bar-close
+checks do) and does not clean up a flat position.  A quantity change while an
+exit is pending still re-protects the residual.  The signal it emits carries
+``exit_path="intrabar"``, ``trigger_source="bid"`` and ``trigger_price``.
+
 Precedence
 ~~~~~~~~~~
 Stop-loss is checked **before** take-profit.  On a bar that gaps through
@@ -487,6 +498,7 @@ class BracketExitManager:
         position: Position | None,
         *,
         atr_value: Decimal | None = None,
+        intrabar: bool = False,
     ) -> Signal | None:
         """
         Check the lot's frozen stop-loss / take-profit levels for one symbol.
@@ -507,12 +519,20 @@ class BracketExitManager:
             prices and never follow a later ATR (WP1.3b-a, AC-13B-01).  In ATR
             mode, no anchor and no usable ATR means no exit and a warning
             (logged once).
+        intrabar : bool
+            WP1.3b-b: evaluate as the live intra-bar check -- ``current_price``
+            is a confirmed BID, only the stop-loss is evaluated, the pending TTL
+            is not aged and no state other than the pending guard is touched
+            (see the module docstring).  ``atr_value`` is ignored.
 
         Returns
         -------
         Signal | None
             A full-close SELL signal if a bracket is breached, else None.
         """
+        if intrabar:
+            return self._check_intrabar(symbol, current_price, position)
+
         # No position or flat — clean up tracking (the exit filled fully).
         if position is None or position.is_flat:
             self._clear_pending(symbol)
@@ -598,6 +618,60 @@ class BracketExitManager:
             )
 
         return None
+
+    def _check_intrabar(
+        self,
+        symbol: str,
+        current_price: Decimal,
+        position: Position | None,
+    ) -> Signal | None:
+        """Read-only stop-loss check against a confirmed BID (WP1.3b-b)."""
+        if position is None or position.is_flat:
+            return None
+        if symbol in self._pending_exit_symbols:
+            prev_qty = self._pending_qty.get(symbol)
+            if prev_qty is not None and position.quantity != prev_qty:
+                self._log.info(
+                    "bracket_exit.quantity_changed_reprotect",
+                    symbol=symbol,
+                    prev_quantity=str(prev_qty),
+                    new_quantity=str(position.quantity),
+                    direction=(
+                        "partial_fill" if position.quantity < prev_qty else "increase"
+                    ),
+                )
+                self._clear_pending(symbol)
+            else:
+                # An exit is in flight: never age it from a tick (only bar-close
+                # checks count towards the TTL).
+                return None
+        entry = position.average_entry_price
+        if entry <= Decimal(0):
+            return None
+        anchor = self._anchors.get(symbol)
+        if anchor is None or anchor.lot_key != position.opened_at:
+            return None
+        stop_price = anchor.stop_price
+        if stop_price is None or current_price > stop_price:
+            return None
+        return self._emit(
+            symbol=symbol,
+            entry=entry,
+            current_price=current_price,
+            level=stop_price,
+            quantity=position.quantity,
+            is_stop_loss=True,
+            anchor=anchor,
+            intrabar=True,
+        )
+
+    def has_unchanged_pending(self, symbol: str, position: Position | None) -> bool:
+        """True iff an exit for ``symbol`` is in flight with the position quantity
+        unchanged since it was emitted (pure; used to skip pointless intra-bar reads)."""
+        if symbol not in self._pending_exit_symbols:
+            return False
+        prev_qty = self._pending_qty.get(symbol)
+        return prev_qty is None or position is None or position.quantity == prev_qty
 
     # ------------------------------------------------------------------ #
     # Anchor book (WP1.3b-a)
@@ -948,6 +1022,7 @@ class BracketExitManager:
         quantity: Decimal,
         is_stop_loss: bool,
         anchor: BracketAnchor,
+        intrabar: bool = False,
     ) -> Signal:
         """Build the full-close SELL signal and mark the symbol pending."""
         self._pending_exit_symbols.add(symbol)
@@ -964,6 +1039,7 @@ class BracketExitManager:
             level_price=str(level),
             current_price=str(current_price),
             anchor_source=anchor.source,
+            exit_path="intrabar" if intrabar else "bar_close",
         )
 
         metadata: dict[str, object] = {
@@ -974,6 +1050,11 @@ class BracketExitManager:
             "anchor_source": anchor.source,
             "atr_anchor": str(anchor.atr) if anchor.atr is not None else None,
         }
+        if intrabar:
+            # A missing ``exit_path`` means bar close (WP1.3b-b).
+            metadata["exit_path"] = "intrabar"
+            metadata["trigger_source"] = "bid"
+            metadata["trigger_price"] = str(current_price)
         # Exactly one of these is set so ExitReasonDetector classifies
         # the trade correctly (it checks stop_loss before take_profit).
         if is_stop_loss:
