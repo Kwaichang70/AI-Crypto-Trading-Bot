@@ -30,6 +30,7 @@ from common.types import (
     SignalDirection,
     TimeFrame,
 )
+from tests._cf36_logging import production_logging  # noqa: F401 -- CF-36 fixture, shared
 from trading.models import Fill, Order, Signal
 
 
@@ -40,6 +41,23 @@ from trading.models import Fill, Order, Signal
 _FIXED_TIMESTAMP = datetime(2024, 1, 15, 12, 0, 0, tzinfo=UTC)
 _SYMBOL = "BTC/USDT"
 _RUN_ID = "test-run-001"
+
+
+# ---------------------------------------------------------------------------
+# CF-36 (RK-13): the log-redaction secret registry is process-global state.
+# Several tests register fake secrets (and every API lifespan registers the
+# Settings secrets); clear it around each test so nothing leaks across the
+# suite and every test starts from "no registered secrets".
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _cf36_redaction_registry_isolated() -> None:
+    from common import redaction
+
+    redaction._reset_registry_for_tests()
+    yield
+    redaction._reset_registry_for_tests()
 
 
 # ---------------------------------------------------------------------------

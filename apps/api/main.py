@@ -59,7 +59,7 @@ from fastapi.responses import JSONResponse
 
 from api.auth import require_api_key
 from api.body_size_limit import BodySizeLimitMiddleware
-from api.config import get_settings
+from api.config import get_settings, register_settings_secrets
 from api.prometheus import setup_prometheus
 from api.rate_limit import setup_rate_limiting
 from common.logging import configure_logging
@@ -177,6 +177,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         service_name=settings.app_name,
         environment="development" if settings.debug else "production",
     )
+    # CF-36: register every configured secret for exact-match redaction BEFORE
+    # the first application log line.
+    register_settings_secrets(settings)
 
     log = structlog.get_logger(__name__)
     log.info(
@@ -439,12 +442,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # ------------------------------------------------------------------
     # 7. Telegram notifier (optional)
     # ------------------------------------------------------------------
-    if settings.telegram_bot_token and settings.telegram_chat_id:
+    telegram_token = (
+        settings.telegram_bot_token.get_secret_value() if settings.telegram_bot_token else ""
+    )
+    if telegram_token and settings.telegram_chat_id:
         try:
             from trading.telegram import TelegramNotifier
 
             _telegram_notifier = TelegramNotifier(
-                bot_token=settings.telegram_bot_token,
+                bot_token=telegram_token,
                 chat_id=settings.telegram_chat_id,
             )
             container.services.telegram_notifier = _telegram_notifier  # LS-002

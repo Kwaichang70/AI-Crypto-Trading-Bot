@@ -38,17 +38,23 @@ the stdlib ``logging`` bridge.
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import os
+import sys
 import uuid
+from collections.abc import MutableMapping
 from contextvars import ContextVar
 from typing import Any
 
 import structlog
 
-from common.config import configure_structlog
+from common import redaction as _redaction
+from common.config import build_renderer, configure_structlog
 
 __all__ = [
     "configure_logging",
+    "exc_log_fields",
     "get_logger",
     "set_request_id",
     "clear_request_id",
@@ -109,6 +115,8 @@ def configure_logging(
     json_output: bool = True,
     service_name: str = "trading-bot",
     environment: str = "production",
+    *,
+    register_env_secrets: bool = True,
 ) -> None:
     """
     Configure structured logging for the entire process.
@@ -140,6 +148,11 @@ def configure_logging(
         Deployment environment tag, e.g. ``"production"``, ``"staging"``,
         ``"development"``.  Added to every log record as ``env``.
         Defaults to ``"production"``.
+    register_env_secrets:
+        When ``True`` (default) credential-named process environment variables
+        are registered for exact-match redaction (CF-36 fallback source for
+        processes that never build ``Settings``).  ``Settings``-held secrets
+        are registered separately by ``api.config.register_settings_secrets``.
 
     Notes
     -----
@@ -165,7 +178,7 @@ def configure_logging(
     #    This captures uvicorn access logs, SQLAlchemy warnings, httpx
     #    debug output, and any other library that uses stdlib logging.
     numeric_level = getattr(logging, log_level.upper(), logging.INFO)
-    _configure_stdlib_bridge(numeric_level)
+    _configure_stdlib_bridge(numeric_level, json_output)
 
     # 4. Suppress noisy third-party loggers at WARNING unless in DEBUG mode.
     #    These libraries emit per-request noise at INFO that drowns signal.
@@ -173,36 +186,130 @@ def configure_logging(
         for noisy_logger in ("asyncio", "urllib3", "httpcore", "hpack"):
             logging.getLogger(noisy_logger).setLevel(logging.WARNING)
 
+    # 5. CF36-SEC-07: ccxt's library logger emits request headers
+    #    (X-MBX-APIKEY, Authorization, CB-ACCESS-*) at DEBUG by construction and
+    #    has no production use.  Forced to WARNING regardless of LOG_LEVEL.
+    logging.getLogger("ccxt").setLevel(logging.WARNING)
+
+    # 6. CF36-SEC-09: uvicorn installs its own handlers (propagate=False) that
+    #    bypass the bridge.  Absorb them so its records (including "Exception in
+    #    ASGI application" tracebacks) are redacted like every other record.
+    for uvicorn_logger in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+        lg = logging.getLogger(uvicorn_logger)
+        if uvicorn_logger == "uvicorn.access":
+            if not lg.handlers and not lg.propagate:
+                # uvicorn --no-access-log (Config.configure_logging) leaves handlers=[] and
+                # propagate=False so the protocols' per-connection hasHandlers() is False.
+                # Re-enabling propagation would switch access logging back on (CF36A-SEC-01).
+                continue
+            if not any(isinstance(f, _AccessQueryFilter) for f in lg.filters):
+                lg.addFilter(_AccessQueryFilter())
+        lg.handlers.clear()
+        lg.propagate = True
+
+    # 7. Exact-match registry, env fallback source.
+    if register_env_secrets:
+        _redaction.register_secrets_from_env()
+
     _LOGGING_CONFIGURED = True
 
 
-def _configure_stdlib_bridge(numeric_level: int) -> None:
+class _AccessQueryFilter(logging.Filter):
+    """CF36A-SEC-01: drop the query string from uvicorn access records.
+
+    uvicorn logs the RAW query string (``?api%5Fkey=...``) while Starlette decodes
+    parameter names, so name-based rules cannot be relied on.  Never raises.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            args = record.args
+            if isinstance(args, tuple) and len(args) >= 3 and isinstance(args[2], str):
+                path = args[2]
+                if "?" in path:
+                    record.args = (
+                        *args[:2],
+                        path.split("?", 1)[0] + "?[QUERY_REDACTED]",
+                        *args[3:],
+                    )
+        except Exception:
+            record.msg, record.args = "[REDACTION_FAILED]", None
+        return True
+
+
+_BRIDGE_FAILED_LINE = '{"event": "[REDACTION_FAILED]", "level": "error", "redaction_error": true}'
+
+
+def _drop_color_message(
+    _: object, __: str, event_dict: MutableMapping[str, Any]
+) -> MutableMapping[str, Any]:
+    """Drop uvicorn's ``color_message`` extra (ANSI duplicate of the message)."""
+    event_dict.pop("color_message", None)
+    return event_dict
+
+
+class _SafeProcessorFormatter(structlog.stdlib.ProcessorFormatter):
+    """ProcessorFormatter that can never raise or echo a record's message.
+
+    ``ProcessorFormatter.format`` calls ``record.getMessage()`` BEFORE any
+    processor, so a malformed third-party call (``"%d" % "x"``) raises inside
+    ``format``; ``logging.Handler.handleError`` would then dump ``record.msg``
+    and ``record.args`` raw to stderr (ARB-CF36-10).
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        try:
+            return super().format(record)
+        except Exception:
+            _redaction._count_failure()
+            return _BRIDGE_FAILED_LINE
+
+
+class _SafeStreamHandler(logging.StreamHandler):  # type: ignore[type-arg]
+    """StreamHandler whose ``handleError`` writes a constant line only."""
+
+    def handleError(self, record: logging.LogRecord) -> None:
+        with contextlib.suppress(Exception):
+            stream = sys.__stderr__
+            if stream is not None:
+                stream.write(_BRIDGE_FAILED_LINE + "\n")
+
+
+def _configure_stdlib_bridge(numeric_level: int, json_output: bool = True) -> None:
     """
     Install a stdlib logging handler that forwards records through structlog.
 
     Uses ``structlog.stdlib.ProcessorFormatter`` so that records emitted
     by third-party libraries pass through the same JSON / console renderer
-    as native structlog calls, producing a single unified log stream.
+    and the same redaction tail as native structlog calls, producing a single
+    unified, redacted log stream (CF36-SEC-06 repair: the old ``processors``
+    ended in ``wrap_for_formatter``, which returns a tuple, not a string).
 
     Parameters
     ----------
     numeric_level:
         The ``logging.*`` integer level constant (e.g. ``logging.INFO``).
+    json_output:
+        ``True`` for JSON lines, ``False`` for the coloured console renderer.
     """
-    formatter = structlog.stdlib.ProcessorFormatter(
-        processors=[
-            structlog.stdlib.ExtraAdder(),
-            structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
-        ],
+    formatter = _SafeProcessorFormatter(
         foreign_pre_chain=[
             structlog.contextvars.merge_contextvars,
             structlog.stdlib.add_logger_name,
             structlog.stdlib.add_log_level,
+            structlog.stdlib.ExtraAdder(),
+            _drop_color_message,
             structlog.processors.TimeStamper(fmt="iso", utc=True),
+        ],
+        processors=[
+            structlog.stdlib.ProcessorFormatter.remove_processors_meta,
+            structlog.processors.format_exc_info,
+            _redaction.redact_event_dict,
+            _redaction.RedactingRenderer(build_renderer(json_output)),
         ],
     )
 
-    handler = logging.StreamHandler()
+    handler = _SafeStreamHandler()
     handler.setFormatter(formatter)
 
     root_logger = logging.getLogger()
@@ -211,6 +318,44 @@ def _configure_stdlib_bridge(numeric_level: int) -> None:
     root_logger.handlers.clear()
     root_logger.addHandler(handler)
     root_logger.setLevel(numeric_level)
+
+
+# ---------------------------------------------------------------------------
+# Exception fields for log calls (CF-36 layer 2 helper)
+# ---------------------------------------------------------------------------
+
+
+def exc_log_fields(exc: BaseException) -> dict[str, object]:
+    """
+    Safe structured fields describing ``exc``: type, HTTP status, code location.
+
+    Use as ``log.warning("event", **exc_log_fields(exc))`` at every site that
+    handles an outbound-I/O exception.  Never ``str(exc)`` / ``repr(exc)``:
+    ccxt and aiohttp exception text embeds the request URL, query string
+    (``signature=``, ``api_key=``) and response body.
+
+    Returns
+    -------
+    dict
+        ``error_type`` (class name), ``http_status`` (only when ``exc.status``
+        is an int in 100..599, e.g. aiohttp ``ClientResponseError``) and
+        ``error_at`` (``"<file>:<line>:<function>"`` of the innermost
+        traceback frame; code identifiers only, never values).  Never raises.
+    """
+    fields: dict[str, object] = {"error_type": type(exc).__name__}
+    with contextlib.suppress(Exception):
+        status = getattr(exc, "status", None)
+        if isinstance(status, int) and not isinstance(status, bool) and 100 <= status <= 599:
+            fields["http_status"] = status
+        tb = exc.__traceback__
+        if tb is not None:
+            while tb.tb_next is not None:
+                tb = tb.tb_next
+            code = tb.tb_frame.f_code
+            fields["error_at"] = (
+                f"{os.path.basename(code.co_filename)}:{tb.tb_lineno}:{code.co_name}"
+            )
+    return fields
 
 
 # ---------------------------------------------------------------------------

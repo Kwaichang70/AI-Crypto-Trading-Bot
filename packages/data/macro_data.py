@@ -50,6 +50,8 @@ from typing import Any
 import structlog
 from pydantic import BaseModel, Field
 
+from common.logging import exc_log_fields
+
 __all__ = [
     "MacroSnapshot",
     "FREDClient",
@@ -259,9 +261,11 @@ class FREDClient:
             return snapshot
 
         except Exception as exc:
+            # CF-36 F-10: aiohttp's ClientResponseError text embeds the request
+            # URL including ``api_key=``; log type / status / location only.
             self._log.warning(
                 "fred_client.fetch_failed",
-                error=str(exc),
+                **exc_log_fields(exc),
             )
             if self._latest_cache is not None:
                 self._log.debug("fred_client.stale_cache_used")
@@ -317,6 +321,6 @@ class FREDClient:
             self._log.warning(
                 "fred_client.series_fetch_failed",
                 series_id=series_id,
-                error=str(exc),
+                **exc_log_fields(exc),
             )
             return None

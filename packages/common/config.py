@@ -19,9 +19,10 @@ import structlog
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from common import redaction as _redaction
 from common.types import RunMode
 
-__all__ = ["BaseAppConfig", "generate_run_id", "configure_structlog"]
+__all__ = ["BaseAppConfig", "generate_run_id", "configure_structlog", "build_renderer"]
 
 
 def generate_run_id() -> str:
@@ -37,6 +38,22 @@ def generate_run_id() -> str:
     ts = datetime.now(tz=UTC).strftime("%Y%m%dT%H%M%SZ")
     uid = uuid.uuid4().hex[:8]
     return f"run_{ts}_{uid}"
+
+
+def build_renderer(json_logs: bool) -> structlog.types.Processor:
+    """
+    Return the final (innermost) renderer for the given output mode.
+
+    Shared by the native structlog chain and the stdlib bridge so both paths
+    print identically.  The console renderer is pinned to ``plain_traceback``:
+    it never uses ``rich`` / ``show_locals`` (CF36-SEC-15), so locals (settings,
+    tokens) can never be rendered into a traceback.
+    """
+    if json_logs:
+        return structlog.processors.JSONRenderer()
+    return structlog.dev.ConsoleRenderer(
+        colors=True, exception_formatter=structlog.dev.plain_traceback
+    )
 
 
 def configure_structlog(log_level: str = "INFO", *, json_logs: bool = True) -> None:
@@ -70,16 +87,16 @@ def configure_structlog(log_level: str = "INFO", *, json_logs: bool = True) -> N
         structlog.processors.StackInfoRenderer(),
     ]
 
-    if json_logs:
-        renderer: Any = structlog.processors.JSONRenderer()
-    else:
-        renderer = structlog.dev.ConsoleRenderer(colors=True)
-
+    # CF-36 layer 1: redaction runs AFTER every processor that turns objects
+    # into text (format_exc_info, StackInfoRenderer) and immediately BEFORE the
+    # renderer, which is wrapped for an exact-match final pass + fail-safe.
+    # The module attributes are read at configure time (not import time).
     structlog.configure(
         processors=[
             *shared_processors,
             structlog.processors.format_exc_info,
-            renderer,
+            _redaction.redact_event_dict,
+            _redaction.RedactingRenderer(build_renderer(json_logs)),
         ],
         wrapper_class=structlog.make_filtering_bound_logger(
             getattr(logging, log_level.upper(), logging.INFO)
@@ -104,6 +121,7 @@ class BaseAppConfig(BaseSettings):
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
+        hide_input_in_errors=True,
     )
 
     log_level: str = Field(
