@@ -179,6 +179,25 @@ def production_logging(capsys: pytest.CaptureFixture[str]) -> Iterator[Configure
         yield configure
 
 
+def disable_layer1() -> None:
+    """Remove the layer-1 processor and unwrap the renderer on the LIVE structlog config.
+
+    cf36b "red-before-green" aid: after :func:`production_logging` has configured the
+    production chain, this leaves ``format_exc_info`` and the plain renderer only, so
+    whatever a log SITE emits reaches the sink verbatim.  A site test that passes in this
+    mode proves the site fix itself, independent of the cf36a processor.
+    """
+    cfg = structlog.get_config()
+    processors: list[Any] = []
+    for p in cfg["processors"]:
+        if p is redaction.redact_event_dict:
+            continue
+        processors.append(p.inner if isinstance(p, redaction.RedactingRenderer) else p)
+    assert not any(p is redaction.redact_event_dict for p in processors)
+    assert not any(isinstance(p, redaction.RedactingRenderer) for p in processors)
+    structlog.configure(processors=processors)
+
+
 def json_lines(text: str) -> list[dict[str, Any]]:
     import json
 

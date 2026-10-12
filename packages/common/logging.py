@@ -45,6 +45,7 @@ import sys
 import uuid
 from collections.abc import MutableMapping
 from contextvars import ContextVar
+from decimal import Decimal
 from typing import Any
 
 import structlog
@@ -53,6 +54,7 @@ from common import redaction as _redaction
 from common.config import build_renderer, configure_structlog
 
 __all__ = [
+    "bounded_scalar",
     "configure_logging",
     "exc_log_fields",
     "get_logger",
@@ -194,8 +196,14 @@ def configure_logging(
     # 6. CF36-SEC-09: uvicorn installs its own handlers (propagate=False) that
     #    bypass the bridge.  Absorb them so its records (including "Exception in
     #    ASGI application" tracebacks) are redacted like every other record.
+    #    CF-A (CF36A-SEC-204): the WebSocket handshake lines on ``uvicorn.error``
+    #    carry the raw query string; ``_WsQueryFilter`` strips it.
     for uvicorn_logger in ("uvicorn", "uvicorn.error", "uvicorn.access"):
         lg = logging.getLogger(uvicorn_logger)
+        if uvicorn_logger == "uvicorn.error" and not any(
+            isinstance(f, _WsQueryFilter) for f in lg.filters
+        ):
+            lg.addFilter(_WsQueryFilter())
         if uvicorn_logger == "uvicorn.access":
             if not lg.handlers and not lg.propagate:
                 # uvicorn --no-access-log (Config.configure_logging) leaves handlers=[] and
@@ -232,6 +240,39 @@ class _AccessQueryFilter(logging.Filter):
                         path.split("?", 1)[0] + "?[QUERY_REDACTED]",
                         *args[3:],
                     )
+        except Exception:
+            record.msg, record.args = "[REDACTION_FAILED]", None
+        return True
+
+
+class _WsQueryFilter(logging.Filter):
+    """CF-A (CF36A-SEC-204): drop the query string from uvicorn WebSocket handshake records.
+
+    uvicorn logs ``'%s - "WebSocket %s" <status>'`` on ``uvicorn.error`` (INFO) with the
+    RAW query string for EVERY Upgrade request -- also for paths without a WebSocket
+    route (403) and also under ``--no-access-log``.  Starlette decodes parameter names,
+    so ``?api%5Fkey=<K>`` is a working credential that name-based rules cannot see.
+    Never raises.
+    """
+
+    _PREFIX = '%s - "WebSocket %s"'
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg, args = record.msg, record.args
+            if (
+                isinstance(msg, str)
+                and msg.startswith(self._PREFIX)
+                and isinstance(args, tuple)
+                and len(args) >= 2
+                and isinstance(args[1], str)
+                and "?" in args[1]
+            ):
+                record.args = (
+                    args[0],
+                    args[1].split("?", 1)[0] + "?[QUERY_REDACTED]",
+                    *args[2:],
+                )
         except Exception:
             record.msg, record.args = "[REDACTION_FAILED]", None
         return True
@@ -356,6 +397,32 @@ def exc_log_fields(exc: BaseException) -> dict[str, object]:
                 f"{os.path.basename(code.co_filename)}:{tb.tb_lineno}:{code.co_name}"
             )
     return fields
+
+
+def bounded_scalar(v: object, max_len: int = 32) -> object:
+    """
+    Reduce an untrusted value to a short, log-safe scalar (CF-36 layer 2 helper).
+
+    Use it to log selected fields of an exchange payload (for example a ticker's
+    ``last`` / ``bid`` / ``ask``) instead of the whole dict, whose ``info``
+    sub-dict is the raw exchange response.
+
+    * ``int`` / ``float`` (not ``bool``): returned as-is.
+    * ``str`` / ``Decimal``: ``str(v)`` cut to ``max_len`` characters.
+    * ``None``: ``None``.
+    * anything else (``bool``, containers, ``bytes``, objects): the class name,
+      never the content.
+
+    Never raises: a value whose ``__str__`` fails yields its class name.
+    """
+    if v is None:
+        return None
+    with contextlib.suppress(Exception):  # a hostile __str__ must not break logging
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            return v
+        if isinstance(v, (str, Decimal)):
+            return str(v)[:max_len]
+    return type(v).__name__
 
 
 # ---------------------------------------------------------------------------

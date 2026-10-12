@@ -57,6 +57,7 @@ from uuid import UUID
 import pandas as pd
 import structlog
 
+from common.logging import exc_log_fields
 from common.models import MultiTimeframeContext, OHLCVBar
 from common.types import OrderSide, OrderStatus, RunMode, SignalDirection, TimeFrame
 from data.indicators import atr as _atr_series
@@ -1580,10 +1581,18 @@ class StrategyEngine:
                         bar_fills += n_fills
                     else:
                         self._track_lot_protection(symbol, position)
-                except Exception:
-                    self._log.exception(
+                except Exception as exc:
+                    # CF-36 F-06: type + code location only at INFO; the traceback
+                    # (needed to diagnose an exit-path bug) is DEBUG-only.
+                    self._log.error(
                         "engine.bracket_exit_error",
                         symbol=symbol,
+                        **exc_log_fields(exc),
+                    )
+                    self._log.debug(
+                        "engine.bracket_exit_error.trace",
+                        symbol=symbol,
+                        exc_info=exc,
                     )
 
         # 5b. Check trailing stops for open positions
@@ -1603,10 +1612,16 @@ class StrategyEngine:
                         )
                         bar_orders += n_orders
                         bar_fills += n_fills
-                except Exception:
-                    self._log.exception(
+                except Exception as exc:
+                    self._log.error(
                         "engine.trailing_stop_error",
                         symbol=symbol,
+                        **exc_log_fields(exc),
+                    )
+                    self._log.debug(
+                        "engine.trailing_stop_error.trace",
+                        symbol=symbol,
+                        exc_info=exc,
                     )
 
         self._total_orders += bar_orders
@@ -4141,15 +4156,28 @@ class StrategyEngine:
                     symbol=symbol,
                     bars_loaded=len(bars),
                 )
-            except MarketDataError:
-                self._log.exception(
+            except MarketDataError as exc:
+                # CF-36 (e): type + location at INFO, traceback behind DEBUG.
+                self._log.error(
                     "engine.warmup_fetch_failed",
                     symbol=symbol,
+                    **exc_log_fields(exc),
                 )
-            except Exception:
-                self._log.exception(
+                self._log.debug(
+                    "engine.warmup_fetch_failed.trace",
+                    symbol=symbol,
+                    exc_info=exc,
+                )
+            except Exception as exc:
+                self._log.error(
                     "engine.warmup_unexpected_error",
                     symbol=symbol,
+                    **exc_log_fields(exc),
+                )
+                self._log.debug(
+                    "engine.warmup_unexpected_error.trace",
+                    symbol=symbol,
+                    exc_info=exc,
                 )
 
         # WP1.3b-a (replaces the WP1.8a A-09 trailing-only seed block): after a
@@ -4199,19 +4227,32 @@ class StrategyEngine:
                 current_bars[symbol] = latest_bar
                 new_bar_found = True
 
-            except MarketDataError:
-                self._log.exception(
+            except MarketDataError as exc:
+                # CF-36 F-08 (per-bar path): same pattern as the warmup sites.
+                self._log.error(
                     "engine.poll_fetch_failed",
                     symbol=symbol,
+                    **exc_log_fields(exc),
+                )
+                self._log.debug(
+                    "engine.poll_fetch_failed.trace",
+                    symbol=symbol,
+                    exc_info=exc,
                 )
                 # Use last known bar if available
                 window = self._bar_windows.get(symbol, [])
                 if window:
                     current_bars[symbol] = window[-1]
-            except Exception:
-                self._log.exception(
+            except Exception as exc:
+                self._log.error(
                     "engine.poll_unexpected_error",
                     symbol=symbol,
+                    **exc_log_fields(exc),
+                )
+                self._log.debug(
+                    "engine.poll_unexpected_error.trace",
+                    symbol=symbol,
+                    exc_info=exc,
                 )
                 window = self._bar_windows.get(symbol, [])
                 if window:

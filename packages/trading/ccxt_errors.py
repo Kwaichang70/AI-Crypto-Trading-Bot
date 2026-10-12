@@ -44,8 +44,9 @@ def translate_ccxt_error(exc: Exception) -> str:
     Return a user-friendly message for a CCXT exception.
 
     Iterates the translation table in order so that more specific subclasses
-    are matched before their parent classes.  Falls back to the raw exception
-    string (truncated to 200 chars) if no entry matches.
+    are matched before their parent classes.  Falls back to a fixed text naming
+    the exception CLASS if no entry matches -- never the exception text, which
+    for exchange/HTTP errors embeds the request URL and response body (CF-36 F-02).
 
     Parameters
     ----------
@@ -60,4 +61,4 @@ def translate_ccxt_error(exc: Exception) -> str:
     for exc_type, message in _TRANSLATIONS:
         if isinstance(exc, exc_type):
             return message
-    return f"Exchange error: {str(exc)[:200]}"
+    return f"Unexpected exchange error ({type(exc).__name__})"

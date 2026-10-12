@@ -100,6 +100,7 @@ from api.services.run_persistence import (
     run_orm_to_detail_response as _run_orm_to_detail_response,
     run_orm_to_response as _run_orm_to_response,
 )
+from common.logging import exc_log_fields
 from common.types import OrderSide, RunMode, TimeFrame
 from trading.exit_config import (
     ExitConfigError,
@@ -515,13 +516,15 @@ async def _fetch_bars_for_backtest(
         return bars_by_symbol
 
     except DataNotAvailableError as exc:
-        log.warning("runs.backtest_data_not_available", error=str(exc))
+        # CF-36 F-13: type/status/location only in the log; the (fixed-text, post
+        # F-09) message stays in the client-facing ``detail`` below.
+        log.warning("runs.backtest_data_not_available", **exc_log_fields(exc))
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Data not available for the requested range: {exc}",
         ) from exc
     except MarketDataError as exc:
-        log.error("runs.backtest_market_data_error", error=str(exc))
+        log.error("runs.backtest_market_data_error", **exc_log_fields(exc))
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"Exchange error fetching historical data: {exc}",

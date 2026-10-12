@@ -66,7 +66,7 @@ hdrs() {  # usage: curl ... -H @<(hdrs api admin live)   (always inline; never s
 - Do not `export` the secret variables. Do not run the session under `script` or any terminal recording.
 - `<FQDN>` is the Tailscale FQDN in the substituted Caddyfile.
 - Keep a deploy log (a file outside the repo) and note each step's result. Section 5.9 lists the evidence to keep.
-- Final step of the session (after 5.9): `unset API_KEY ADMIN_KEY LIVE_CONFIRM_TOKEN; exit`.
+- Final step of the session (after 5.9, and after 5.10 when the image carries CF-36): `unset API_KEY ADMIN_KEY LIVE_CONFIRM_TOKEN; exit`.
 
 ---
 
@@ -394,7 +394,47 @@ curl -fsS -H @<(hdrs api) 'https://<FQDN>/api/v1/strategies?include_diagnostic=t
 
 ### 5.9 Evidence to keep (input for the smoke hand-off)
 
-Deploy log entries: commit hash; `alembic current` output (`019 (head)`); precheck output; backup file name, size and mode (never the dump itself); results of 5.1 to 5.8; effective `ENABLE_LIVE_TRADING` and `DEBUG` state; operator and timestamp.
+Deploy log entries: commit hash; `alembic current` output (`019 (head)`); precheck output; backup file name, size and mode (never the dump itself); results of 5.1 to 5.8; the 5.10 test counts and the `CF36 log hygiene` line (if the image carries CF-36); effective `ENABLE_LIVE_TRADING` and `DEBUG` state; operator and timestamp.
+
+### 5.10 Log hygiene (G-LIVE L-19, CF-36)
+
+**This section applies only to an image built from a commit that contains cf36a and cf36b (Release 2 and later, section 10).** It is not part of a Release-1-only deploy; there L-19 stays open. The checks below do not enable live trading.
+
+**L-19 = (a) + (b+) + (e).**
+- (a) is the redaction processor and final pass on the structlog chain and the stdlib bridge, the uvicorn and `ccxt` logger handling, the secret registry wired to `Settings`, `hide_input_in_errors`, the two counters and the self-check.
+- (b+) is the per-site fixes: `ccxt_retry.*`, `live.ticker_fetch_failed`, `live.invalid_ticker_price`, `network_error_retrying`, `engine.bracket_exit_error`, the eight `live.*` I/O sites, `recovery.scan_*`, `runs.backtest_*`, the FRED and Whale clients and the per-bar `engine.poll_fetch_failed`.
+- (e) is `engine.warmup_fetch_failed`.
+- CF-A (cf36b-fix): uvicorn writes a WebSocket handshake line to `uvicorn.error` for every Upgrade request, with or without a WebSocket route and also under `--no-access-log`; its query string is logged as `?[QUERY_REDACTED]`.
+
+- [ ] **Operator rule:** the live image runs with `LOG_LEVEL` other than `DEBUG`, and with the image CMD unchanged (`--no-access-log`, no uvicorn `--log-level`). The `<event>.trace` events carry tracebacks (redacted, but not minimised), and the self-check fails a live config with `LOG_LEVEL=DEBUG`. At uvicorn `--log-level debug` the `websockets` library logs raw request lines and headers, which no filter covers.
+- [ ] **Step 1, on the image commit, in CI or a clean clone on the source machine (never in `$DEPLOY_DIR`).** The tests run with an empty environment (`env -i`): a `.env` / `.env.local` in the working directory, or an exported secret, makes them false-red, and a failure diff can print a value. Record the commit and the counts:
+  ```bash
+  git rev-parse HEAD      # record; must equal the commit recorded in 5.8
+  if [ -e .env ] || [ -e .env.local ]; then
+    echo "STOP: .env or .env.local present -- run step 1 in CI or a clean clone, never in \$DEPLOY_DIR"
+  else
+    env -i PATH="$PATH" HOME="$HOME" .venv/bin/python -m pytest \
+      tests/unit/test_cf36_*.py tests/integration/test_cf36_*.py -q -rs --no-cov -p no:cacheprovider
+  fi
+  ```
+  Expected: exit 0 and `<N> passed` with no `failed` or `error` (record N; on the cf36b-fix tree without `wsproto` installed: `746 passed, 2 skipped`). A skip is allowed only with the reason `could not import 'wsproto'`. `--no-cov` is required: the repository-wide 80% coverage floor would turn a passing subset into exit 1.
+- [ ] **Step 2, in the deployed container (paper config, baseline).** Prints one line and no value:
+  ```bash
+  $DC exec -T api python -m api.log_hygiene_check
+  ```
+  Expected: exit 0 and a single line beginning `CF36 log hygiene: PASS`. Record the `secrets_registered=<n>` value and any `warn=` field names. A `FAIL <check-id>` line, or any other output, is a NO-GO. This run sees the paper config only: the `log_level_debug` and `live_secret_unregistered` checks apply only while `ENABLE_LIVE_TRADING=true`. The L-19 gate run is the repeat on the live config in `smoke-roundtrip-mechanics-test.md` §4c step 0 (or the equivalent step of any procedure that switches live on); a `FAIL` there means STOP and close the window (smoke §4e). (The `exec -T` form is the convention of this runbook; it has not been run against the deploy host.)
+- [ ] **Step 2b, cf36b in the image.** Step 2 proves cf36a only. This proves cf36b and cf36b-fix (read-only, prints no value):
+  ```bash
+  $DC exec -T api sh -c 'grep -q "market_data.raise.trace" /app/packages/data/services/ccxt_market_data.py \
+    && python -c "from common.logging import bounded_scalar, _WsQueryFilter" && echo CF36B_MARKERS_OK'
+  ```
+  Expected: the single line `CF36B_MARKERS_OK`. Anything else is a NO-GO: the image lacks cf36b. Not run against the deploy host.
+- [ ] **Watch (G-LIVE L-8).** Both series carry the `trading_` exposure prefix:
+  - `trading_log_redaction_hits_total{rule="R-xx"}` above 0 means a site still emits credential-bearing text. Investigate the rule and the event. An R-08 hit on `http.request` with a client-supplied path is client input (pre-auth), not a site leak; check the event before escalating.
+  - `trading_log_redaction_failures_total` above 0 means the redactor failed closed on an event. Investigate.
+- [ ] **Access log.** `infra/Dockerfile.api` runs `--no-access-log`; keep it. If it is ever enabled, request lines show `?[QUERY_REDACTED]`, which is expected. WebSocket handshake lines show it in every case.
+
+Pass requires steps 1, 2 and 2b here, and the step-2 repeat on the live config before the first live order. Step 1 verifies the site fixes on the source commit; steps 2 and 2b verify the image. If any of them fails, G-LIVE does not pass.
 
 Final step: `unset API_KEY ADMIN_KEY LIVE_CONFIRM_TOKEN; exit`.
 
@@ -537,7 +577,7 @@ Residual risks the operator accepts by deploying (unchanged by this deploy): exi
 
 Next procedure: `docs/runbooks/smoke-roundtrip-mechanics-test.md`.
 
-**This runbook is complete when** sections 5.1 to 5.8 pass and 5.9 is recorded. State handed over:
+**This runbook is complete when** sections 5.1 to 5.8 pass and 5.9 is recorded (and 5.10 passes when the image carries CF-36). State handed over:
 
 | Item | Expected at hand-off |
 |---|---|
@@ -583,6 +623,8 @@ Defects still open in existing documents (outside the scope of this file):
 | 2026-09-28 | Initial proposal for branch HEAD `3db9148` (producer draft, pending critic review). |
 | 2026-09-28 (r2) | Revised per `reports/vp2-docs/final-synthesis-docs.md` (WD-01..WD-22): anchored Caddyfile greps, secure backup, `env_set`/`hdrs` helpers, section 4.1a re-check, rollback gate G-RB and RB-2, DC-70-4 renaming, hand-off aligned with the smoke runbook. |
 | 2026-09-28 (r3) | Round-2 fixes per `reports/vp2-docs/final-synthesis-docs.md` Round 2 addendum (WR2-01..WR2-11). |
+| 2026-10-12 | cf36b: added section 5.10 (G-LIVE L-19 log-hygiene verification, operator rule, L-8 counters with the `trading_` prefix, access-log note) per `reports/vp2-cf36/synthesis-spec.md` section 9 and `final-synthesis-cf36a.md` section 6. |
+| 2026-10-12 (cf36b-fix) | Section 5.10 per `reports/vp2-cf36/final-synthesis-cf36b.md`: scoped to CF-36 images; step 1 hermetic (`env -i`, no `.env`, `--no-cov`, commit recorded); step 2 is the paper baseline and the L-19 gate run moves to the live config (smoke §4c step 0); new step 2b (cf36b markers in the image); CF-A note, uvicorn log-level operator rule, R-08 `http.request` note. |
 
 ---
 

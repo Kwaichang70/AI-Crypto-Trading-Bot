@@ -92,6 +92,7 @@ from uuid import UUID, uuid4
 import ccxt.async_support as ccxt_async
 import structlog
 
+from common.logging import bounded_scalar, exc_log_fields
 from common.types import OrderSide, OrderStatus, OrderType, SignalDirection
 from trading.execution import BaseExecutionEngine, EquitySnapshot
 from trading.ccxt_errors import translate_ccxt_error
@@ -1553,7 +1554,7 @@ class LiveExecutionEngine(BaseExecutionEngine):
         except Exception as exc:
             self._log.warning(
                 "live.balance_fetch_failed",
-                error=str(exc),
+                **exc_log_fields(exc),
                 user_message=translate_ccxt_error(exc),
             )
             return None
@@ -1742,8 +1743,7 @@ class LiveExecutionEngine(BaseExecutionEngine):
             self._log.warning(
                 "live.submit_lookup_failed",
                 symbol=symbol,
-                error_type=type(exc).__name__,
-                error=str(exc)[:200],
+                **exc_log_fields(exc),
             )
             return "failed", None
 
@@ -2410,8 +2410,7 @@ class LiveExecutionEngine(BaseExecutionEngine):
                     "live.order_submission_rejected",
                     order_id=str(order.order_id),
                     symbol=order.symbol,
-                    error_type=type(exc).__name__,
-                    error=str(exc)[:200],
+                    **exc_log_fields(exc),
                     cid=order.client_order_id,
                     state=OrderStatus.REJECTED.value,
                 )
@@ -2428,8 +2427,7 @@ class LiveExecutionEngine(BaseExecutionEngine):
                 "live.order_submission_ambiguous",
                 order_id=str(order.order_id),
                 symbol=order.symbol,
-                error_type=type(exc).__name__,
-                error=str(exc)[:200],
+                **exc_log_fields(exc),
                 cid=order.client_order_id,
                 state=order.status.value,
             )
@@ -2552,7 +2550,7 @@ class LiveExecutionEngine(BaseExecutionEngine):
                 "live.cancel_failed",
                 order_id=str(order_id),
                 exchange_order_id=exchange_order_id,
-                error=str(exc),
+                **exc_log_fields(exc),
                 user_message=translate_ccxt_error(exc),
             )
             order = await self._reconcile_order(order)
@@ -2823,14 +2821,19 @@ class LiveExecutionEngine(BaseExecutionEngine):
                     self._log.error(
                         "live.invalid_ticker_price",
                         symbol=signal.symbol,
-                        ticker=ticker,
+                        # CF-36 F-04: bounded scalars, never the whole ticker dict
+                        # (its ``info`` member is the raw exchange response)
+                        last=bounded_scalar(ticker.get("last")),
+                        bid=bounded_scalar(ticker.get("bid")),
+                        ask=bounded_scalar(ticker.get("ask")),
+                        has_info="info" in ticker,
                     )
                     return []
             except Exception as exc:
                 self._log.error(
                     "live.ticker_fetch_failed",
                     symbol=signal.symbol,
-                    error=str(exc),
+                    **exc_log_fields(exc),
                     user_message=translate_ccxt_error(exc),
                 )
                 return []
@@ -3289,7 +3292,7 @@ class LiveExecutionEngine(BaseExecutionEngine):
                 "live.fetch_fills_failed",
                 order_id=str(order_id),
                 exchange_order_id=exchange_order_id,
-                error=str(exc),
+                **exc_log_fields(exc),
                 user_message=translate_ccxt_error(exc),
             )
             return self._synthesize_unrouted_fill(order)
@@ -3487,7 +3490,7 @@ class LiveExecutionEngine(BaseExecutionEngine):
                 "live.reconciliation_failed",
                 order_id=str(order.order_id),
                 exchange_order_id=exchange_order_id,
-                error=str(exc),
+                **exc_log_fields(exc),
                 user_message=translate_ccxt_error(exc),
             )
             return order, False
@@ -4035,7 +4038,7 @@ class LiveExecutionEngine(BaseExecutionEngine):
         except Exception as exc:
             self._log.error(
                 "live.engine_start_failed",
-                error=str(exc),
+                **exc_log_fields(exc),
                 user_message=translate_ccxt_error(exc),
             )
             raise
@@ -4128,7 +4131,7 @@ class LiveExecutionEngine(BaseExecutionEngine):
         except Exception as exc:
             self._log.warning(
                 "live.exchange_close_failed",
-                error=str(exc),
+                **exc_log_fields(exc),
                 user_message=translate_ccxt_error(exc),
             )
 

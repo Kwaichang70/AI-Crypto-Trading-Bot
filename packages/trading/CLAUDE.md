@@ -225,6 +225,13 @@ Core trading engine containing the heart of the system.
   (`LiveExecutionEngine.pending_sell_quantity > 0`) is `inflight_exit_pending`, info, outside the
   streak.
 - Log hygiene (CF-36) for all 1.3b-b code: `error_type` and numbers only, never `str(exc)`, a URL or
-  a raw ticker dict (`test_t68_*`). The pre-existing `str(exc)` sites remain on CF-36.
+  a raw ticker dict (`test_t68_*`). The pre-existing sites are fixed in cf36b (`ccxt_retry.*`,
+  `live.ticker_fetch_failed`, `live.invalid_ticker_price`, the eight `live.*` I/O sites,
+  `engine.bracket_exit_error` / `trailing_stop_error`, `engine.warmup_*` / `poll_*`): they log
+  `**exc_log_fields(exc)`, and the traceback lives only in a DEBUG `<event>.trace` event
+  (`tests/unit/test_cf36_sites.py`, `tests/integration/test_cf36_sites_realio.py`). New code in this
+  package follows the same pattern; `translate_ccxt_error` never returns exception text.
+  Layer 1 only by design (ARB-CF36-06): `live.fill_parse_failed`, `live.reconciliation_transition_failed`
+  and the `.exception` catch-alls (`engine.start_failed`, `runs.live_engine_error`).
 - See `reports/vp2-wp1.3b/synthesis-spec.md` section 5.3 and
   `docs/runbooks/circuit-breaker-halt.md`.

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from typing import Any, Literal
+from urllib.parse import quote
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -215,8 +216,13 @@ class Settings(BaseSettings):
             pw_raw = values.get("postgres_password", "")
             # SecretStr arrives as-is in mode="before"; extract the plain value
             pw = pw_raw.get_secret_value() if isinstance(pw_raw, SecretStr) else pw_raw
+            # CF-36 SEC-07: percent-encode the password.  A raw ``/ # ? @ : %`` in it
+            # either breaks the DSN (asyncpg then raised a ValueError that echoed the
+            # password) or defeats URL-userinfo redaction.  SQLAlchemy's ``make_url``
+            # decodes it again, so the connection uses the original password.
+            pw_q = quote(str(pw), safe="")
             values["database_url"] = (
-                f"postgresql+asyncpg://{user}:{pw}@{host}:{port}/{db}"
+                f"postgresql+asyncpg://{user}:{pw_q}@{host}:{port}/{db}"
             )
         return values
 
@@ -776,6 +782,24 @@ def iter_settings_secrets(settings: Settings) -> list[tuple[str, str, str]]:
     return out
 
 
+def _sqlalchemy_dsn_password(dsn: str) -> str | None:
+    """The password exactly as SQLAlchemy (and so asyncpg) will use it, or ``None``.
+
+    CF-36 SEC-07: ``urlsplit`` and SQLAlchemy disagree about a raw ``/``, ``#`` or
+    ``?`` in a DSN password (SQLAlchemy accepts them), so the generic ``kind="url"``
+    registration can pick a wrong prefix.  ``redaction.py`` stays stdlib-only, hence
+    the SQLAlchemy lookup lives here.  Never raises and never reports the error
+    (``make_url`` messages can echo the DSN).
+    """
+    try:
+        from sqlalchemy.engine import make_url
+
+        password = make_url(dsn).password
+    except Exception:  # malformed DSN: nothing extra to register
+        return None
+    return password if isinstance(password, str) and password.strip() else None
+
+
 def register_settings_secrets(settings: Settings) -> int:
     """Register every configured secret for exact-match log redaction (R-09).
 
@@ -796,6 +820,11 @@ def register_settings_secrets(settings: Settings) -> int:
     skipped: list[tuple[str, str]] = []
     for name, value, kind in iter_settings_secrets(settings):
         added = register_secret(value, name=name, kind=kind)
+        if name == "database_url":
+            # SEC-07: also the password as SQLAlchemy parses it (plain registration)
+            dsn_password = _sqlalchemy_dsn_password(value)
+            if dsn_password:
+                added += register_secret(dsn_password, name=name, kind="plain")
         total += added
         if added:
             registered.append(name)

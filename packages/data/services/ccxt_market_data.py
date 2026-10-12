@@ -40,6 +40,7 @@ from typing import Any
 import ccxt.async_support as ccxt_async
 import structlog
 
+from common.logging import exc_log_fields
 from common.types import TimeFrame
 from common.models import OHLCVBar
 from data.market_data import (
@@ -229,17 +230,23 @@ class CCXTMarketDataService(BaseMarketDataService):
         try:
             self._markets = await self._exchange.load_markets()
         except ccxt_async.AuthenticationError as exc:
+            self._log_raise_trace("connect", exc)
             raise MarketDataError(
-                f"Authentication failed for exchange '{self._exchange_id}': {exc}"
-            ) from exc
+                f"Authentication failed for exchange '{self._exchange_id}' "
+                f"({type(exc).__name__})"
+            ) from None
         except ccxt_async.NetworkError as exc:
+            self._log_raise_trace("connect", exc)
             raise MarketDataError(
-                f"Network error loading markets for '{self._exchange_id}': {exc}"
-            ) from exc
+                f"Network error loading markets for '{self._exchange_id}' "
+                f"({type(exc).__name__})"
+            ) from None
         except ccxt_async.ExchangeError as exc:
+            self._log_raise_trace("connect", exc)
             raise MarketDataError(
-                f"Exchange error loading markets for '{self._exchange_id}': {exc}"
-            ) from exc
+                f"Exchange error loading markets for '{self._exchange_id}' "
+                f"({type(exc).__name__})"
+            ) from None
 
         raw_timeframes: dict[str, str] = getattr(self._exchange, "timeframes", {}) or {}
         self._exchange_timeframes = set(raw_timeframes.keys())
@@ -260,7 +267,25 @@ class CCXTMarketDataService(BaseMarketDataService):
         try:
             await self._exchange.close()
         except Exception as exc:  # noqa: BLE001 — best-effort cleanup
-            self._log.warning("exchange_close_error", error=str(exc))
+            self._log.warning("exchange_close_error", **exc_log_fields(exc))
+
+    def _log_raise_trace(
+        self, op: str, exc: BaseException, *, symbol: str | None = None
+    ) -> None:
+        """
+        CF-36 F-09: debug-only traceback of the ccxt exception that is about to be
+        replaced by a domain error whose text never contains ``str(exc)``.
+
+        ccxt / aiohttp text embeds the request URL (``signature=``, ``api_key=``)
+        and the response body, so the domain errors raised below carry fixed text
+        plus the exception CLASS name and are raised ``from None``.  The original
+        traceback stays available at DEBUG (and is redacted by the layer-1
+        processor); the level filter drops it before any processor at INFO.
+        """
+        fields: dict[str, object] = {"op": op}
+        if symbol is not None:
+            fields["symbol"] = symbol
+        self._log.debug("market_data.raise.trace", exc_info=exc, **fields)
 
     # ------------------------------------------------------------------
     # Public data-fetching API
@@ -621,7 +646,6 @@ class CCXTMarketDataService(BaseMarketDataService):
             Parsed bars, sorted ascending by timestamp.
         """
         attempt = 0
-        last_exc: Exception | None = None
 
         while attempt <= _MAX_RETRIES:
             try:
@@ -656,17 +680,19 @@ class CCXTMarketDataService(BaseMarketDataService):
                     wait_seconds=round(wait, 2),
                 )
                 if attempt >= _MAX_RETRIES:
+                    self._log_raise_trace("fetch_ohlcv", exc, symbol=symbol)
                     raise RateLimitError(
                         f"Rate limit exceeded for {symbol!r} after {_MAX_RETRIES} retries",
                         retry_after=retry_after,
-                    ) from exc
+                    ) from None
                 await asyncio.sleep(wait)
-                last_exc = exc
 
             except ccxt_async.ExchangeNotAvailable as exc:
+                self._log_raise_trace("fetch_ohlcv", exc, symbol=symbol)
                 raise MarketDataError(
-                    f"Exchange '{self._exchange_id}' is currently unavailable: {exc}"
-                ) from exc
+                    f"Exchange '{self._exchange_id}' is currently unavailable "
+                    f"({type(exc).__name__})"
+                ) from None
 
             except ccxt_async.NetworkError as exc:
                 wait = self._backoff(attempt)
@@ -676,37 +702,40 @@ class CCXTMarketDataService(BaseMarketDataService):
                     timeframe=timeframe.value,
                     attempt=attempt,
                     wait_seconds=round(wait, 2),
-                    error=str(exc),
+                    **exc_log_fields(exc),
                 )
                 if attempt >= _MAX_RETRIES:
+                    self._log_raise_trace("fetch_ohlcv", exc, symbol=symbol)
                     raise MarketDataError(
-                        f"Network error fetching {symbol!r}: {exc}"
-                    ) from exc
+                        f"Network error fetching {symbol!r} ({type(exc).__name__})"
+                    ) from None
                 await asyncio.sleep(wait)
-                last_exc = exc
 
             except ccxt_async.BadSymbol as exc:
+                self._log_raise_trace("fetch_ohlcv", exc, symbol=symbol)
                 raise DataNotAvailableError(
                     f"Symbol {symbol!r} is not available on exchange "
-                    f"'{self._exchange_id}': {exc}"
-                ) from exc
+                    f"'{self._exchange_id}' ({type(exc).__name__})"
+                ) from None
 
             except ccxt_async.BadRequest as exc:
+                self._log_raise_trace("fetch_ohlcv", exc, symbol=symbol)
                 raise DataNotAvailableError(
-                    f"Bad request for {symbol!r} / {timeframe.value}: {exc}"
-                ) from exc
+                    f"Bad request for {symbol!r} / {timeframe.value} ({type(exc).__name__})"
+                ) from None
 
             except ccxt_async.ExchangeError as exc:
+                self._log_raise_trace("fetch_ohlcv", exc, symbol=symbol)
                 raise MarketDataError(
-                    f"Exchange error fetching OHLCV for {symbol!r}: {exc}"
-                ) from exc
+                    f"Exchange error fetching OHLCV for {symbol!r} ({type(exc).__name__})"
+                ) from None
 
             attempt += 1
 
         # Should be unreachable, but keeps type-checker happy.
         raise MarketDataError(
             f"Failed to fetch OHLCV for {symbol!r} after exhausting retries"
-        ) from last_exc
+        ) from None
 
     # ------------------------------------------------------------------
     # Rate-limit / throttle helpers

@@ -1195,6 +1195,7 @@ _C1_NEGATIVE = [
     "api_key=null",
     "token=TRUE&x=1",
     "auth=None",
+    "token: null",  # CR-FIX2-01: pins the ``\Z`` branch of the R-11 skip
 ]
 _C1_POSITIVE = [f"token: true-{U}", f"token: null.{U}", f"api_key=false-{U}", f"api_key=true{U}"]
 

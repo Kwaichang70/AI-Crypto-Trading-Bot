@@ -77,6 +77,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from api.db.models import FillORM, OrderORM, RunORM
 from api.services.audit_log import record_audit_event
 from api.services.run_persistence import load_resume_snapshot
+from common.logging import exc_log_fields
 from common.types import OrderSide, OrderStatus, OrderType
 from trading.engines.live import _parse_ccxt_trades
 from trading.models import Order
@@ -169,11 +170,14 @@ def _client_order_id_pattern(prefix: str) -> re.Pattern[str]:
 
 
 def _log_exc(log: Any, event: str, exc: Exception, **fields: Any) -> None:  # noqa: ANN401
-    """WP18b-S-07: log the exception TYPE plus a truncated message, never
-    the raw ``str(exc)`` unbounded -- a signed ccxt GET request's URL can
-    appear in some adapters' error messages (never the key/secret itself,
-    but still needlessly verbose/potentially sensitive query data)."""
-    log.error(event, error_type=type(exc).__name__, error=str(exc)[:200], **fields)
+    """Log the exception TYPE, HTTP status and code location -- never its text.
+
+    WP18b-S-07 truncated ``str(exc)`` to 200 characters; CF-36 F-12 removes it
+    altogether: a truncated signed ccxt/aiohttp URL (``signature=``, ``api_key=``)
+    is still a credential, and 200 characters comfortably contain one.  Covers
+    every ``recovery.scan_*`` caller (``exc_log_fields``: ``error_type``,
+    ``http_status``, ``error_at``)."""
+    log.error(event, **exc_log_fields(exc), **fields)
 
 
 @dataclass(frozen=True)

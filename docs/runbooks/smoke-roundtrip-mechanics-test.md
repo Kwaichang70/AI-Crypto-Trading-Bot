@@ -346,6 +346,13 @@ Expected benign lines: `smoke_roundtrip.entry`, `smoke_roundtrip.exit_attempt` (
    $DC ps api                                                   # wait for "healthy"
    $DC exec -T api printenv ENABLE_LIVE_TRADING EXCHANGE_ID     # evidence; MUST print: true / coinbase
    [ "$($DC exec -T api printenv ENABLE_LIVE_TRADING)" = true ] || echo "STOP: flag is not true in the container -- run §4e, then escalate"
+   if $DC exec -T api test -f /app/api/log_hygiene_check.py; then   # image carries CF-36 (DEP §5.10)
+     HYG=$($DC exec -T api python -m api.log_hygiene_check); echo "$HYG"   # G-LIVE L-19 on the LIVE config: one line, no values
+     case "$HYG" in "CF36 log hygiene: PASS"*) ;; *) echo "STOP: log hygiene not PASS -- run §4e, then escalate" ;; esac
+     unset HYG
+   else
+     echo "no CF-36 in this image: G-LIVE L-19 is open (allowed only for a Release-1-only image)"
+   fi
    date -u +%FT%TZ                                              # evidence: "window opened at"
    ```
    From here until §4e the window is open. Do not leave the sitting without closing it. Continue to step 1 only if no `STOP:` line was printed.
@@ -661,6 +668,7 @@ EVID=~/smoke-evidence/$(date +%F); install -d -m 700 "$EVID"
 
 **Live window**
 - [ ] Window opened and closed timestamps, both `printenv` outputs (`true / coinbase` and `false`), the `token rotated: yes` lines printed by §4c step 0 and §4e, copied from the terminal (never the value), "CDP key disabled: yes".
+- [ ] The §4c step 0 log-hygiene line (`CF36 log hygiene: PASS ...`, the G-LIVE L-19 run on the live config), or the `no CF-36 in this image` line.
 
 **Per live run (A and B)**
 - [ ] `KEY_*` (and the second key if §7 branch (b) was used), `RUN_*`, `T_REQ`, T0, the full create response headers (`Idempotency-Key`, `Idempotent-Replay`).
@@ -685,6 +693,7 @@ unset API_KEY ADMIN_KEY LIVE_CONFIRM_TOKEN; exit
 
 ## 10. Change log
 
+- **2026-10-12 (cf36b-fix)** — §4c step 0 re-runs the CF-36 log-hygiene self-check on the live config (G-LIVE L-19 gate run; `reports/vp2-cf36/final-synthesis-cf36b.md`, CF36B-SEC-03); §9 records its line.
 - **2026-09-28 (r3)** — Round-2 fixes per `reports/vp2-docs/final-synthesis-docs.md` Round 2 addendum (WR2-01..WR2-11).
 - **2026-09-28 (r2)** — Revised per `reports/vp2-docs/final-synthesis-docs.md` (WD-01..WD-22): server-side shell with `--env-file`, `hdrs`/`env_set` helpers, live window (§2d phase 1, §4c step 0, §4e), fixed pre-flight script, P12 Run A only, kill-switch step 0 (AM-S12a), error-replay branch (O-3a), evidence handling.
 - **2026-09-28** — Initial runbook (CF-SMK-S15), consolidating `reports/vp2-smoke/synthesis-spec.md` §10–§12 with the Round 2 addendum O-1..O-9 / D-1..D-6 of `reports/vp2-smoke/final-synthesis-smoke.md`. Verified against commit `3db9148`.

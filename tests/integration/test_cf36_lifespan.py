@@ -41,6 +41,13 @@ REDIS_PW = f"{S}-RedisPw-0123456789"
 FRED = f"{S}-fred-key-0123456789"
 
 
+@pytest.fixture(autouse=True)
+def _no_dotenv(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``Settings`` reads ``.env`` / ``.env.local`` from the CWD: never let a developer or
+    deploy checkout's real values into these tests (or into a failure diff). CF36B-SEC-02."""
+    monkeypatch.chdir(tmp_path)
+
+
 def _env(monkeypatch: pytest.MonkeyPatch, *, debug: bool) -> None:
     monkeypatch.setenv("REQUIRE_API_AUTH", "false")
     monkeypatch.setenv("RATE_LIMIT_ENABLED", "false")
