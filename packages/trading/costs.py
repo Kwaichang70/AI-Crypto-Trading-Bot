@@ -131,7 +131,7 @@ class CostProfile:
     base_id: str | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.id, str) or not _ID_RE.match(self.id):
+        if not isinstance(self.id, str) or not _ID_RE.fullmatch(self.id):
             raise CostProfileError("id must match ^[a-z0-9_]{3,48}$")
         if not isinstance(self.exchange, str) or not self.exchange:
             raise CostProfileError("exchange must be a non-empty string")
@@ -156,7 +156,7 @@ class CostProfile:
         if self.source not in _SOURCES:
             raise CostProfileError("source must be registry/override/legacy_inferred")
         if self.base_id is not None and (
-            not isinstance(self.base_id, str) or not _ID_RE.match(self.base_id)
+            not isinstance(self.base_id, str) or not _ID_RE.fullmatch(self.base_id)
         ):
             raise CostProfileError("base_id must match ^[a-z0-9_]{3,48}$ or be None")
 
@@ -575,11 +575,11 @@ def match_fee_tier(taker_rate: object, maker_rate: object) -> str | None:
             return None
         try:
             rate = Decimal(value.strip() if isinstance(value, str) else value)
-        except InvalidOperation:
+            if not rate.is_finite():
+                return None
+            return rate * _BPS
+        except ArithmeticError:  # InvalidOperation, Overflow (WP21A-CR-03/SEC-03): never raises
             return None
-        if not rate.is_finite():
-            return None
-        return rate * _BPS
 
     taker_bps = _bps(taker_rate)
     maker_bps = _bps(maker_rate)

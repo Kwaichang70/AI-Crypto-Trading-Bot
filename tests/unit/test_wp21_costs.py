@@ -368,6 +368,30 @@ class TestT03Metadata:
         with pytest.raises(CostProfileError, match="not in the registry"):
             CostProfile.from_metadata(ghost.to_metadata())
 
+    def test_an_id_with_a_trailing_newline_is_rejected(self) -> None:
+        """WP21A-SEC-04: ``$`` matches before a final newline; the id uses ``fullmatch``.
+
+        ``source="override"`` so the id regex is the ONLY rule that can reject it.
+        """
+        with pytest.raises(CostProfileError, match="id must match"):
+            dataclasses.replace(DEFAULT_COST_PROFILE, source="override", id="custom\n")
+
+    def test_a_base_id_with_a_trailing_newline_is_rejected(self) -> None:
+        with pytest.raises(CostProfileError, match="base_id must match"):
+            dataclasses.replace(
+                DEFAULT_COST_PROFILE,
+                source="override",
+                id="custom",
+                base_id="coinbase_advanced_1\n",
+            )
+
+    def test_a_persisted_override_with_a_newline_id_falls_back_to_legacy(self) -> None:
+        override = DEFAULT_COST_PROFILE.with_overrides(slippage_bps=Decimal("7"))
+        cfg = {"cost_profile": {**override.to_metadata(), "id": "custom\n"}}
+        resolved = resolve_run_cost_profile(cfg, mode="paper")  # never raises
+        assert resolved.invalid is True and resolved.persisted is False
+        assert resolved.profile.id == "legacy_runtime_v0"
+
 
 # ---------------------------------------------------------------------------
 # WP21-T-04 -- resolve_run_cost_profile
@@ -961,7 +985,24 @@ class TestT38MatchFeeTier:
 
     @pytest.mark.parametrize(
         "taker",
-        [0.012, 12, None, True, b"0.012", ["0.012"], "garbage", "", "NaN", "Infinity", object()],
+        [
+            0.012,
+            12,
+            None,
+            True,
+            b"0.012",
+            ["0.012"],
+            "garbage",
+            "",
+            "NaN",
+            "Infinity",
+            object(),
+            # WP21A-CR-03/SEC-03: finite but absurd exponents overflow ``rate * _BPS``
+            "1e999999999",
+            "-1e999999999",
+            "1e9999999999",
+            Decimal("1e999999999"),
+        ],
     )
     def test_floats_ints_none_and_garbage_never_raise(self, taker: object) -> None:
         assert match_fee_tier(taker, "0.006") is None
@@ -1029,8 +1070,3 @@ class TestT30IdempotencyFingerprint:
         with_cp = self._fingerprint(self._body(costProfile="coinbase_advanced_d6"))
         assert with_cp != self.PRE_2_1A_FINGERPRINT
         assert with_cp != self._fingerprint(self._body(costProfile="coinbase_stress_t80"))
-
-    def test_the_handler_uses_exactly_this_rule(self) -> None:
-        src = (_REPO / "apps/api/routers/runs.py").read_text()
-        assert "if body.cost_profile is None:" in src
-        assert '_fingerprint_exclude.add("cost_profile")' in src

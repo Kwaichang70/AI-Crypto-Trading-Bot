@@ -364,6 +364,12 @@ class TestT26Eligibility:
         assert leaderboard_eligible(500, "high", _cfg(override)) is False
         assert leaderboard_eligible(500, "high", {"cost_profile": {"junk": 1}}) is False
 
+    def test_override_source_is_never_eligible_even_with_live_equivalent_numbers(self) -> None:
+        """WP21A-CR-05: the ``source == "registry"`` clause (mutation X04) is load-bearing."""
+        override = {**DEFAULT_COST_PROFILE.to_metadata(), "source": "override", "id": "custom"}
+        cfg = {"cost_profile": override}
+        assert leaderboard_eligible(50, "high", cfg) is False
+
     def test_the_trade_and_confidence_thresholds_still_apply(self) -> None:
         good = _cfg(DEFAULT_COST_PROFILE)
         assert leaderboard_eligible(10, "medium", good) is True

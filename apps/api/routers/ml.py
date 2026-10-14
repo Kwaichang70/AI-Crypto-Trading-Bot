@@ -294,8 +294,8 @@ def _train_model_with_wf_sync(
     2. A ``ModelStrategy`` loads that fold model and is run through a real
        ``BacktestRunner`` mini-backtest over ``train_tail[-200:] + test_bars``.
     3. The backtest computes a REALIZED out-of-sample trading Sharpe over the
-       test (OOS) window only, net of Coinbase 60/40 bps fees + the Sprint-42
-       slippage default, with fixed-fractional sizing (A1 — no ATR plumb-through).
+       test (OOS) window only, net of the platform default CostProfile fees and
+       slippage (WP2.1), with fixed-fractional sizing (A1 — no ATR plumb-through).
 
     The MEDIAN realized OOS Sharpe across folds is the canonical gate value
     persisted to ``ModelVersionORM.walk_forward_oos_skill_score`` (column name
@@ -741,8 +741,8 @@ async def activate_model_version(
 
     Sprint 50 Cycle 6: checks the walk-forward REALIZED OOS Sharpe gate before
     activation.  The gate value is the MEDIAN realized out-of-sample trading
-    Sharpe across walk-forward folds (net Coinbase 60/40 fees + Sprint-42
-    slippage), with a worst-fold floor and a per-fold max-drawdown floor (B1).
+    Sharpe across walk-forward folds (net of the platform default CostProfile
+    fees and slippage, WP2.1), with a worst-fold floor and a per-fold max-drawdown floor (B1).
     If the model's OOS Sharpe is below ``min_oos_skill_score`` (or a fold's
     drawdown exceeds ``max_fold_drawdown``) the endpoint returns HTTP 422 with
     ``oos_gate_failed``.  Legacy models tagged ``metric_type=directional_zscore_proxy``

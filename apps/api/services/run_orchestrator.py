@@ -51,7 +51,7 @@ from api.db.models import (
 from api.services.audit_log import record_audit_event
 from common.types import TimeFrame
 from trading.costs import CostProfile
-from trading.exit_config import ExitConfigError, resolve_run_exit_check
+from trading.exit_config import ExitConfigError, ExitCostModel, resolve_run_exit_check
 from trading.recovery import ResumeSnapshot
 from trading.safety import (
     CircuitBreakerResponse,
@@ -1746,6 +1746,9 @@ async def run_live_engine(
             bracket=bracket_config,
             trailing_stop_pct=trailing_stop_pct,
             exit_config_waived=exit_config_waived,
+            # WP21A-CR-01/SEC-01: the SAME basis as the StrategyEngine parse
+            # below (the run's own profile), never the module default.
+            cost=ExitCostModel.from_cost_profile(cost_profile),
         )
         if _exit_check.interval_s is not None:
             live_engine_config["exit_check_interval_s"] = _exit_check.interval_s

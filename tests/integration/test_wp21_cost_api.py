@@ -573,6 +573,91 @@ class TestT22LegacyRunsStayResumable:
             if key not in ("bracket_config", "allow_pyramiding"):
                 assert run_row.config[key] == value
 
+    @pytest.mark.parametrize(
+        "bracket",
+        [
+            pytest.param(dict(_LEGACY_BRACKET), id="sl_0.0068"),
+            pytest.param(
+                {
+                    "bracket_mode": "fixed",
+                    "bracket_stop_loss_pct": 0.03,
+                    "bracket_take_profit_pct": 0.01,
+                },
+                id="tp_0.01",
+            ),
+        ],
+    )
+    def test_live_resume_of_a_legacy_run_keeps_the_intrabar_check_basis(
+        self, monkeypatch: pytest.MonkeyPatch, bracket: dict[str, object]
+    ) -> None:
+        """WP21A-CR-01/SEC-01: the W8 helper parses at the run's OWN basis on resume.
+
+        The resume response never surfaces the validator warnings, so the oracle is a
+        recording wrapper at the call boundary: the validator was handed
+        ``intrabar_exit_checks=True`` and therefore emitted no W8.
+        """
+        from tests.integration import test_wp18a_resume_endpoint as resume_mod
+
+        monkeypatch.setenv("REQUIRE_API_AUTH", "false")
+        monkeypatch.setenv("RATE_LIMIT_ENABLED", "false")
+        monkeypatch.setenv("PROMETHEUS_ENABLED", "false")
+        monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://test:test@localhost:5432/test")
+        monkeypatch.setenv("DEBUG", "true")
+        monkeypatch.setenv("ENABLE_LIVE_TRADING", "true")
+        monkeypatch.setenv("EXCHANGE_API_KEY", "k")
+        monkeypatch.setenv("EXCHANGE_API_SECRET", "s")
+        monkeypatch.setenv("LIVE_TRADING_CONFIRM_TOKEN", resume_mod.CONFIRM_TOKEN)
+        monkeypatch.setenv("ADMIN_API_KEY", resume_mod.ADMIN_KEY)
+        monkeypatch.setenv("LIVE_EXIT_CHECK_INTERVAL_S", "300")
+        get_settings.cache_clear()
+        from api.main import create_app
+
+        app = create_app()
+        monkeypatch.setattr(runs_module, "_STRATEGY_REGISTRY", {"grid_trading": MagicMock()})
+        run_row = resume_mod._make_run_row(status="orphaned")
+        run_row.config["bracket_config"] = dict(bracket)
+        session = resume_mod._DispatchSession(run_row=run_row, runs_update_rowcounts=[1, 1])
+        client = resume_mod._client(app, session)
+
+        async def _scan(db: Any, run: Any, exchange: Any, *, fence: Any = None) -> Any:
+            from api.services.run_recovery import ImportReport
+
+            return ImportReport()
+
+        import api.services.run_recovery as run_recovery_module
+
+        monkeypatch.setattr(run_recovery_module, "scan_and_import", _scan)
+        _real_validate = runs_module.validate_run_exit_config
+        verdicts: list[tuple[dict[str, Any], Any]] = []
+
+        def _recording_validate(*a: Any, **kw: Any) -> Any:
+            verdict = _real_validate(*a, **kw)
+            verdicts.append((kw, verdict))
+            return verdict
+
+        spy = AsyncMock()
+        try:
+            with (
+                patch("api.routers.runs._run_live_engine", spy),
+                patch("api.routers.runs.validate_run_exit_config", _recording_validate),
+            ):
+                resp = client.post(
+                    f"/api/v1/runs/{resume_mod.RUN_ID}/resume",
+                    headers={
+                        "X-Live-Confirm-Token": resume_mod.CONFIRM_TOKEN,
+                        "X-Admin-Key": resume_mod.ADMIN_KEY,
+                    },
+                )
+        finally:
+            get_settings.cache_clear()
+            runs_module._RUN_TASKS.clear()
+        assert resp.status_code == 200, resp.text
+        assert spy.call_args.kwargs["cost_profile"].id == "legacy_runtime_v0"
+        assert len(verdicts) == 1
+        kw, verdict = verdicts[0]
+        assert kw["intrabar_exit_checks"] is True
+        assert "bar_close_exit_checks_only" not in [w.code for w in verdict.warnings]
+
     async def test_paper_boot_recovery_of_a_legacy_run_uses_legacy_runtime(self) -> None:
         from tests.unit import test_sprint24_run_recovery as rec
 
@@ -647,6 +732,53 @@ class TestT22LegacyRunsStayResumable:
             await runs_module.recover_orphaned_runs()
         runs_module._RUN_TASKS.clear()
         assert spy.call_args.kwargs["cost_profile"] == d6
+
+
+# ---------------------------------------------------------------------------
+# WP21-T-30 (handler half) -- the WP7.0 idempotency fingerprint rule, through create_run
+# ---------------------------------------------------------------------------
+
+
+class TestT30HandlerFingerprint:
+    """WP21A-CR-02: the rule is asserted on what the HANDLER hands to ``compute_fingerprint``.
+
+    (The unit half only mirrors the rule; mutation X10 -- keep the exclude set but stop
+    passing it to ``model_dump`` -- survived it.)  The fingerprint is computed before any
+    validation, so the response status of the POST is irrelevant here.
+    """
+
+    @pytest.mark.parametrize(
+        ("extra", "has_key"),
+        [
+            pytest.param({}, False, id="no_cost_profile"),
+            pytest.param({"costProfile": "coinbase_advanced_d6"}, True, id="cost_profile"),
+        ],
+    )
+    def test_the_handler_fingerprints_cost_profile_only_when_it_was_sent(
+        self, c: _C, extra: dict[str, Any], has_key: bool
+    ) -> None:
+        from api.schemas import RunCreateRequest
+        from api.services.idempotency import CREATE_ENDPOINT, compute_fingerprint
+        from tests.unit.test_wp21_costs import TestT30IdempotencyFingerprint as _T30
+
+        body = _T30._body(**extra).model_dump(mode="json", by_alias=True, exclude_unset=True)
+        spy = MagicMock(wraps=compute_fingerprint)
+        with (
+            patch("api.routers.runs.compute_fingerprint", spy),
+            patch("api.routers.runs._fetch_bars_for_backtest", return_value=_BARS),
+        ):
+            c.client.post("/api/v1/runs", json=body, headers=_hdr())
+        create_calls = [call for call in spy.call_args_list if call.args[0] == CREATE_ENDPOINT]
+        assert len(create_calls) == 1
+        args = create_calls[0].args
+        assert ("cost_profile" in args[2]) is has_key
+        if has_key:
+            assert args[2]["cost_profile"] == "coinbase_advanced_d6"
+        else:
+            assert args[2] == RunCreateRequest.model_validate(body).model_dump(
+                mode="json", exclude={"confirm_token", "cost_profile"}
+            )
+            assert compute_fingerprint(*args) == _T30.PRE_2_1A_FINGERPRINT
 
 
 # ---------------------------------------------------------------------------

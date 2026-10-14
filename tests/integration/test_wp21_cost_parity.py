@@ -104,6 +104,8 @@ async def _backtest(profile: CostProfile) -> tuple[list[_FillKey], Any]:
     bars = scripted_path(CLOSES, first_open=datetime(2026, 3, 10, 10, 0, tzinfo=UTC), symbol=SYMBOL)
     await runner.run({SYMBOL: bars})
     assert runner.last_execution_engine is not None
+    # WP21A-CR-07: the engine that actually ran carries the very profile object we passed
+    assert runner.last_execution_engine.cost_profile is profile
     engine, *_ = runner._build_engine("parity-bt")
     return _keys(runner.last_execution_engine.get_all_fills()), engine
 
@@ -282,6 +284,82 @@ async def test_t16_the_logs_never_change_fills_orders_sizing_or_exits(
     assert stack_a.portfolio.current_equity == stack_b.portfolio.current_equity
     assert stack_a.portfolio.total_fees_paid == stack_b.portfolio.total_fees_paid
     assert stack_a.engine.bar_count == stack_b.engine.bar_count
+
+
+class _RaisingMarkets(dict[str, Any]):
+    """``exchange.markets`` whose lookup fails with a secret-looking message."""
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        raise RuntimeError("SENTINEL-secret")
+
+
+class _FeeRaisingFill:
+    """Proxy of a real fill whose ``fee`` read fails; everything else is delegated."""
+
+    def __init__(self, fill: Fill) -> None:
+        self._fill = fill
+
+    @property
+    def fee(self) -> Decimal:
+        raise RuntimeError("SENTINEL-secret")
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._fill, name)
+
+
+@pytest.mark.parametrize("check", ["tier", "fill"])
+async def test_t16_a_failing_check_traces_the_type_only_and_changes_nothing(
+    monkeypatch: pytest.MonkeyPatch, check: str
+) -> None:
+    """WP21A-CR-08: the swallowed error leaves ONE debug trace (type only, CF-36)."""
+    from trading.engines.live import LiveExecutionEngine
+
+    default = get_cost_profile("coinbase_advanced_1")
+    with monkeypatch.context() as mp:
+        base_fills, base_stack, base_logs = await _live(mp, default)
+
+    original_tier = LiveExecutionEngine._check_tier
+    original_fill = LiveExecutionEngine._observe_fill_cost
+
+    def _failing_tier(self: Any) -> None:
+        real = self._exchange.markets
+        self._exchange.markets = _RaisingMarkets(real)
+        try:
+            original_tier(self)
+        finally:
+            self._exchange.markets = real
+
+    def _failing_fill(self: Any, fill: Fill) -> None:
+        original_fill(self, _FeeRaisingFill(fill))  # type: ignore[arg-type]
+
+    with monkeypatch.context() as mp:
+        if check == "tier":
+            mp.setattr(LiveExecutionEngine, "_check_tier", _failing_tier)
+        else:
+            mp.setattr(LiveExecutionEngine, "_observe_fill_cost", _failing_fill)
+        fills, stack, logs = await _live(mp, default)
+
+    assert [e for e in base_logs if e["event"] == "cost_profile.check_failed"] == []
+    failed = [e for e in logs if e["event"] == "cost_profile.check_failed"]
+    assert len(failed) == (1 if check == "tier" else len(fills))
+    assert len(fills) == 2
+    for event in failed:
+        assert event["check"] == check
+        assert event["error_type"] == "RuntimeError"
+        assert event["log_level"] == "debug"
+        assert "SENTINEL" not in str(event)
+        assert "exc_info" not in event
+    assert "SENTINEL" not in str(logs)
+
+    # the engine carried on: fills, orders, equity and fees are exactly the baseline's
+    assert fills == base_fills
+
+    def _orders(stack_: Any) -> list[tuple[str, Decimal, Decimal]]:
+        return [(o["side"], o["amount"], o["price"]) for o in stack_.exchange.order_log]
+
+    assert _orders(stack) == _orders(base_stack)
+    assert stack.portfolio.current_equity == base_stack.portfolio.current_equity
+    assert stack.portfolio.total_fees_paid == base_stack.portfolio.total_fees_paid
 
 
 def _fill(order_id: Any, *, fee: Decimal, maker: bool = False) -> Fill:

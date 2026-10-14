@@ -461,6 +461,7 @@ class TestGateRealizedSharpeThreshold:
         assert result.eligible is False
         assert result.reason == "oos_skill_below_min"
         assert result.oos_skill_score == pytest.approx(0.8)
+        assert "CostProfile" in result.detail  # WP21A-CR-04: the API detail names the profile
 
     def test_median_at_or_above_threshold_eligible(self) -> None:
         """TEST-C6-051: realized row, median 1.5 >= 1.0 -> eligible."""

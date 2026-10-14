@@ -374,6 +374,7 @@ def resolve_run_exit_check(
     bracket: Mapping[str, object] | None,
     trailing_stop_pct: object,
     exit_config_waived: bool = False,
+    cost: ExitCostModel,
 ) -> ExitCheckResolution:
     """Run-level wrapper of :func:`resolve_exit_check_interval` (WP1.3b-b).
 
@@ -383,12 +384,18 @@ def resolve_run_exit_check(
     bracket stop-loss or a trailing stop (an unparsable or waived exit config has
     none).  Used by the orchestrator (to configure the engine) and by the
     routers (to decide whether warning W8 applies).
+
+    ``cost`` is REQUIRED (WP21A-CR-01/SEC-01): the basis must equal the one the
+    caller validates (or the engine parses) the same exit config with.  Parsing
+    at a module default instead would reject a legacy run's fixed SL/TP that sits
+    between the legacy and the default floor, report "no protective exit" and
+    silently switch the live intra-bar check off.
     """
     has_protective_exit = False
     if not exit_config_waived:
         try:
             has_protective_exit = parse_exit_config(
-                bracket=bracket, trailing_stop_pct=trailing_stop_pct
+                bracket=bracket, trailing_stop_pct=trailing_stop_pct, cost=cost
             ).has_downside_exit
         except ExitConfigError:
             has_protective_exit = False

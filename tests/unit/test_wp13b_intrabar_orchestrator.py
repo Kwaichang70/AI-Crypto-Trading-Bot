@@ -43,7 +43,7 @@ from tests.unit.test_live_engine_wiring import (
     _make_strategy_engine_mock,
     _risk_mgr_cls,
 )
-from trading.costs import DEFAULT_COST_PROFILE
+from trading.costs import DEFAULT_COST_PROFILE, CostProfile, get_cost_profile
 
 _RUN_ID = "bbbb0000-0000-0000-0000-0000000013bb"
 _SL = {"bracket_mode": "fixed", "bracket_stop_loss_pct": 0.05}
@@ -59,6 +59,7 @@ async def _run(
     trailing_stop_pct: float | None = None,
     protective_mode: bool = False,
     exit_config_waived: bool = False,
+    cost_profile: CostProfile = DEFAULT_COST_PROFILE,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Run ``run_live_engine`` over mocks; return (engine config, intrabar log records)."""
     settings_mock = _make_settings_mock()
@@ -94,7 +95,7 @@ async def _run(
             symbols=["BTC/USDT"],
             timeframe=timeframe,
             initial_capital="10000",
-            cost_profile=DEFAULT_COST_PROFILE,
+            cost_profile=cost_profile,
             bracket_config=bracket_config,
             trailing_stop_pct=trailing_stop_pct,
             protective_mode=protective_mode,
@@ -154,3 +155,32 @@ async def test_t65_a_bad_setting_fails_the_run_instead_of_silently_running_unche
     """Settings validates at startup, so this is defence in depth: the run ends in error."""
     with pytest.raises(AssertionError, match="called once"):
         await _run(interval=59)  # the run errored out: StrategyEngine was never constructed
+
+
+# ---------------------------------------------------------------------------
+# WP21A-CR-01 / SEC-01: the resolver parses at the RUN's own cost basis
+# ---------------------------------------------------------------------------
+
+_LEGACY_BAND = [
+    {"bracket_mode": "fixed", "bracket_stop_loss_pct": 0.0068, "bracket_take_profit_pct": 0.05},
+    {"bracket_mode": "fixed", "bracket_stop_loss_pct": 0.03, "bracket_take_profit_pct": 0.01},
+]
+
+
+@pytest.mark.parametrize("bracket", _LEGACY_BAND)
+async def test_wp21a_cr01_legacy_run_in_the_band_keeps_the_intrabar_check(
+    bracket: dict[str, object],
+) -> None:
+    """A legacy run (floor 0.0065) with a fixed SL/TP in (0.0065, 0.0130] stays protected."""
+    config, logs = await _run(
+        bracket_config=bracket, cost_profile=get_cost_profile("legacy_runtime_v0")
+    )
+    assert config["exit_check_interval_s"] == 300
+    assert logs[0]["interval_s"] == 300 and "reason" not in logs[0]
+
+
+async def test_wp21a_cr01_the_basis_is_the_runs_profile_not_the_default() -> None:
+    """The same bracket at the default profile is below its floor: the basis is honoured."""
+    config, logs = await _run(bracket_config=_LEGACY_BAND[0], cost_profile=DEFAULT_COST_PROFILE)
+    assert "exit_check_interval_s" not in config
+    assert logs[0]["reason"] == "no_protective_exit"

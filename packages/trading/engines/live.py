@@ -1093,8 +1093,11 @@ class LiveExecutionEngine(BaseExecutionEngine):
                         profile_taker_bps=str(profile_taker_bps),
                         profile_id=profile.id,
                     )
-        except Exception:
+        except Exception as exc:  # never raises; trace the type only (CF-36)
             # a log-only check must never break a start (and never echoes the error)
+            self._log.debug(
+                "cost_profile.check_failed", check="tier", error_type=type(exc).__name__
+            )
             return
 
     def _observe_fill_cost(self, fill: Fill) -> None:
@@ -1130,8 +1133,11 @@ class LiveExecutionEngine(BaseExecutionEngine):
                 profile_bps=str(profile_bps),
                 profile_id=profile.id,
             )
-        except Exception:
+        except Exception as exc:  # never raises; trace the type only (CF-36)
             # a log-only check must never break fill routing (and never echoes the error)
+            self._log.debug(
+                "cost_profile.check_failed", check="fill", error_type=type(exc).__name__
+            )
             return
 
     # ------------------------------------------------------------------

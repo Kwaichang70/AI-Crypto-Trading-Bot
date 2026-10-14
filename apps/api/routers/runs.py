@@ -142,12 +142,17 @@ def _intrabar_exit_checks_effective(
     strategy_name: str,
     bracket: dict[str, object] | None,
     trailing_stop_pct: object,
+    cost: ExitCostModel,
 ) -> bool:
     """WP1.3b-b: will the live intra-bar exit check be effective for this run?
 
     Feeds the W8 gate of ``validate_run_exit_config``.  Any failure (settings not
     loadable, a bad value) answers ``False``: the "bar close only" warning is then
     shown, which is the safe direction.
+
+    ``cost`` is REQUIRED (WP21A-CR-01): pass the SAME model as the neighbouring
+    ``validate_run_exit_config(..., cost=...)`` call.  Then "validation passed"
+    implies "this parse passes" and W8 is never spurious.
     """
     try:
         from api.config import get_settings
@@ -160,6 +165,7 @@ def _intrabar_exit_checks_effective(
                 strategy_name=strategy_name,
                 bracket=bracket,
                 trailing_stop_pct=trailing_stop_pct,
+                cost=cost,
             ).interval_s
             is not None
         )
@@ -801,6 +807,7 @@ async def create_run(
                 strategy_name=strategy_name,
                 bracket=_bracket_config,
                 trailing_stop_pct=_raw_trailing_stop_pct,
+                cost=policy_cost_model(_cost_profile),
             ),
             # WP2.1 (SY-21-06): the stricter of the default and the run's own
             # profile, so create-pass => engine-pass => promote-pass.
@@ -2857,6 +2864,7 @@ async def promote_to_live(
                 strategy_name=promotion_strategy_name,
                 bracket=source_run.config.get("bracket_config") or {},
                 trailing_stop_pct=_source_strategy_params.get("trailing_stop_pct"),
+                cost=policy_cost_model(_promote_cost_profile),
             ),
             cost=policy_cost_model(_promote_cost_profile),
         )
@@ -3427,6 +3435,7 @@ async def resume_run(
                     strategy_name=strategy_name,
                     bracket=_bracket_config_raw,
                     trailing_stop_pct=_raw_trailing_for_validation,
+                    cost=_resume_cost_model,
                 ),
                 cost=_resume_cost_model,
             )

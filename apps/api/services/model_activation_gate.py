@@ -9,8 +9,8 @@ NULL OOS skill score (pre-Cycle-5 models) passes with a diagnostic warning --
 operators are informed but not blocked on legacy models.
 
 IMPORTANT (Sprint 50 Cycle 6): the gate metric is now a REALIZED out-of-sample
-trading Sharpe computed by a per-fold BacktestRunner mini-backtest (net Coinbase
-60/40 bps fees + Sprint-42 slippage), persisted on
+trading Sharpe computed by a per-fold BacktestRunner mini-backtest (net of the
+platform default CostProfile fees and slippage, WP2.1), persisted on
 ``ModelVersionORM.walk_forward_oos_skill_score`` (column name retained).  Legacy
 models tagged ``metric_type=directional_zscore_proxy`` (Cycle 5) are not
 comparable to the realized-Sharpe threshold and pass with a retrain warning.
@@ -263,7 +263,7 @@ def check_oos_eligibility(
             detail=(
                 f"Median realized OOS Sharpe {oos_skill_score:.4f} is below the "
                 f"configured minimum {min_oos_skill_score:.4f} "
-                "(net Coinbase 60/40 fees + Sprint-42 slippage)."
+                "(net of the platform default CostProfile fees and slippage, WP2.1)."
             ),
         )
 

@@ -161,7 +161,7 @@ async def test_wp16_t32_default_runner_builds_no_breaker(monkeypatch: pytest.Mon
     assert t is not None and t.halt_entry == Decimal("0.3")  # paper/backtest default limit
 
 
-async def test_wp16_t32_reference_backtest_is_byte_identical_to_head(
+async def test_wp16_t32_reference_backtest_matches_the_c25_repinned_golden(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     out = await _run("reduce_daily", enable=False, monkeypatch=monkeypatch)

@@ -1054,7 +1054,7 @@ Expected: `exchange=coinbase` (the compose default is `binance`; a different exc
 
 **Block L-19.** No separate block: section 5.10 is the procedure (steps 1, 2 and 2b, the L-8 counters), and smoke §4c step 0 runs the live-config repeat. The former informational grep (`error=str(exc)` / `ticker=ticker`) is retired: after cf36b it still lists `live.fill_parse_failed` and `live.reconciliation_transition_failed`, which stay on layer 1 by design and are not a failure.
 
-**Block L-21 (WP2.1, G-LIVE L-21; read-only; no order, no secret printed).** Prerequisite: the Coinbase API key is present in the api container's environment (smoke O-1). Without credentials, ccxt reports its hardcoded "Advanced 1" rate (taker 0.012) for every market, so `markets[...]['taker']` alone proves nothing. Do **not** use `fetch_trading_fees()`: ccxt 4.5.40 swaps maker and taker in its result. The script reads the raw `transaction_summary` response instead.
+**Block L-21 (WP2.1, G-LIVE L-21; read-only; no order, no secret printed).** Prerequisite: the Coinbase API key is present in the api container's environment (smoke O-1). Without credentials, ccxt reports its hardcoded "Advanced 1" rate (taker 0.012) for every EUR market, so `markets[...]['taker']` alone proves nothing. (ccxt's stable pairs use 0.00001/0.) Do **not** use `fetch_trading_fees()`: ccxt 4.5.40 swaps maker and taker in its result. The script reads the raw `transaction_summary` response instead. The block refuses every non-GET request at ccxt's single HTTP choke point (`Exchange.fetch`), so it cannot place, cancel or transfer anything even with the trade-enabled container key.
 
 ```bash
 $DC exec -T api python - <<'PY'
@@ -1066,13 +1066,6 @@ import asyncio
 from api.services.run_orchestrator import build_live_ccxt_exchange
 
 SYMBOLS = ["XRP/EUR", "BTC/EUR", "ETH/EUR", "SOL/EUR"]   # edit: the live run's symbols
-BLOCKED = ["create_order", "create_market_order", "create_limit_order", "edit_order",
-           "cancel_order", "cancel_all_orders", "withdraw", "transfer"]
-
-
-def camel(name: str) -> str:
-    head, *rest = name.split("_")
-    return head + "".join(part.title() for part in rest)
 
 
 async def main() -> None:
@@ -1081,20 +1074,38 @@ async def main() -> None:
         s = _gs()
         print("exchange_id:", s.exchange_id)
         ex = build_live_ccxt_exchange(s)
-        for n in BLOCKED:                       # read-only guard: order/transfer calls now raise TypeError
-            for attr in (n, camel(n)):
-                setattr(ex, attr, None)
+        _orig_fetch = ex.fetch
+
+        async def _get_only(url, method="GET", headers=None, body=None):
+            # read-only guard: every ccxt REST call passes through Exchange.fetch;
+            # any non-GET (order, cancel, edit, transfer, withdraw) raises before any I/O
+            if str(method).upper() != "GET":
+                raise PermissionError("L-21 is read-only")
+            return await _orig_fetch(url, method, headers, body)
+
+        ex.fetch = _get_only
         await ex.load_markets()
         for sym in SYMBOLS:
             m = ex.market(sym)
             print(f"market {sym}: taker={m.get('taker')} maker={m.get('maker')}")
         raw = await ex.v3PrivateGetBrokerageTransactionSummary({"product_type": "SPOT"})
         tier = (raw or {}).get("fee_tier") or {}
+        promo = (raw or {}).get("has_promo_fee")
         print("fee_tier.pricing_tier  :", tier.get("pricing_tier"))
         print("fee_tier.taker_fee_rate:", tier.get("taker_fee_rate"))
         print("fee_tier.maker_fee_rate:", tier.get("maker_fee_rate"))
         print("fee_tier.usd_from/to   :", tier.get("usd_from"), "/", tier.get("usd_to"))
-        print("has_promo_fee:", (raw or {}).get("has_promo_fee"))
+        print("has_promo_fee:", promo)
+        try:
+            tier_taker = float(tier.get("taker_fee_rate"))
+        except (TypeError, ValueError):
+            tier_taker = None
+        if tier_taker is None or any(ex.market(sym).get("taker") != tier_taker for sym in SYMBOLS):
+            print("FEE_TIER: MARKETS DO NOT CARRY THE TIER -- stop")
+            return
+        if promo:
+            print("FEE_TIER: PROMO -- do not switch")
+            return
         try:
             from trading.costs import DEFAULT_COST_PROFILE_ID, match_fee_tier
         except ImportError:
@@ -1122,9 +1133,12 @@ PY
 
 **Expected result.**
 - `exchange_id: coinbase`.
-- Every `market … taker=` equals `fee_tier.taker_fee_rate`. If they differ, the markets were loaded without the tier: stop and escalate.
-- `has_promo_fee: False`.
-- `FEE_TIER: DEFAULT CONFIRMED`.
+- `FEE_TIER: DEFAULT CONFIRMED`. The block prints it only when every listed market's taker equals `fee_tier.taker_fee_rate` and `has_promo_fee` is falsy.
+- Other results:
+  - `MARKETS DO NOT CARRY THE TIER`: stop and escalate.
+  - `PROMO`: §8.4 step 4.
+  - `DIFFERS` / `NOT IN REGISTRY`: §8.4.
+  - `L-21 check failed: PermissionError`: the script attempted a non-GET request. This is a defect; stop.
 - Save the output to `~/deploy-logs/<date>/glive-l21.txt` (`umask 077`). It contains rates only, no keys.
 
 **If the tier differs (exact rule).**
