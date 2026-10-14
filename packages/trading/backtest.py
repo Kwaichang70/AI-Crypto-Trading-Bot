@@ -44,6 +44,7 @@ from __future__ import annotations
 import math
 import random
 import uuid
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -251,26 +252,24 @@ class BacktestRunner:
             allow_pyramiding, self._strategies
         )
 
-        # Build risk parameters with explicit fee overrides
+        # Build risk parameters with explicit fee overrides.  C25 (WP2.1a-1):
+        # ``dataclasses.replace`` keeps EVERY field of a caller-supplied
+        # ``RiskParameters`` (sizing_mode, atr_risk_multiplier,
+        # max_cluster_exposure_pct, ...) -- the old hand rebuild silently reset
+        # the fields it did not list to their defaults.
+        _taker_fee_pct = taker_fee_bps / 10_000
+        _maker_fee_pct = maker_fee_bps / 10_000
         if risk_params is not None:
-            self._risk_params = RiskParameters(
-                max_open_positions=risk_params.max_open_positions,
-                max_position_size_pct=risk_params.max_position_size_pct,
-                per_trade_risk_pct=risk_params.per_trade_risk_pct,
-                max_order_size_quote=risk_params.max_order_size_quote,
-                max_daily_loss_pct=risk_params.max_daily_loss_pct,
-                max_drawdown_pct=risk_params.max_drawdown_pct,
-                taker_fee_pct=taker_fee_bps / 10_000,
-                maker_fee_pct=maker_fee_bps / 10_000,
+            self._risk_params = replace(
+                risk_params,
+                taker_fee_pct=_taker_fee_pct,
+                maker_fee_pct=_maker_fee_pct,
                 slippage_bps=slippage_bps,
-                cooldown_after_loss_streak=risk_params.cooldown_after_loss_streak,
-                loss_streak_count=risk_params.loss_streak_count,
-                max_portfolio_exposure_pct=risk_params.max_portfolio_exposure_pct,
             )
         else:
             self._risk_params = RiskParameters(
-                taker_fee_pct=taker_fee_bps / 10_000,
-                maker_fee_pct=maker_fee_bps / 10_000,
+                taker_fee_pct=_taker_fee_pct,
+                maker_fee_pct=_maker_fee_pct,
                 slippage_bps=slippage_bps,
             )
 
