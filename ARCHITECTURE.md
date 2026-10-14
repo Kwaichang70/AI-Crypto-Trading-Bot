@@ -209,7 +209,7 @@ flowchart TB
 **Files:** `packages/trading/execution.py`, `packages/trading/engines/paper.py`, `packages/trading/engines/live.py`
 
 **Current state:**
-- PaperExecutionEngine: simulated fills, fee model (Coinbase 0.60/0.40%), slippage with Almgren market-impact (Sprint 42 QT-001), expected_price + slippage_bps_realized telemetry (Sprint 42 QT-009).
+- PaperExecutionEngine: simulated fills; fees and slippage from the run's `CostProfile` (`packages/trading/costs.py`; default = `DEFAULT_COST_PROFILE_ID`, WP2.1), with the optional Almgren market-impact term (Sprint 42 QT-001), expected_price + slippage_bps_realized telemetry (Sprint 42 QT-009).
 - LiveExecutionEngine: CCXT MARKET/LIMIT, idempotency via client_order_id, exchange_order_id persistence (Sprint 18), reconciliation map.
 - Order state machine: NEW → PARTIAL → FILLED/CANCELED/REJECTED.
 

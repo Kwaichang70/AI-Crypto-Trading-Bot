@@ -43,6 +43,7 @@ from tests.unit.test_live_engine_wiring import (
     _make_strategy_engine_mock,
     _risk_mgr_cls,
 )
+from trading.costs import DEFAULT_COST_PROFILE
 
 _RUN_ID = "bbbb0000-0000-0000-0000-0000000013bb"
 _SL = {"bracket_mode": "fixed", "bracket_stop_loss_pct": 0.05}
@@ -93,6 +94,7 @@ async def _run(
             symbols=["BTC/USDT"],
             timeframe=timeframe,
             initial_capital="10000",
+            cost_profile=DEFAULT_COST_PROFILE,
             bracket_config=bracket_config,
             trailing_stop_pct=trailing_stop_pct,
             protective_mode=protective_mode,

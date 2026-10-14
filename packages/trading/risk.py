@@ -129,10 +129,9 @@ class RiskParameters:
     # default; LIVE runs use LIVE_MAX_DRAWDOWN_PCT via live_risk_parameters().
     max_drawdown_pct: float = 0.30
 
-    # Fee / slippage model (Coinbase Advanced Trade lowest tier)
-    taker_fee_pct: float = 0.006          # 0.60% taker fee
-    maker_fee_pct: float = 0.004          # 0.40% maker fee
-    slippage_bps: int = 5                 # 5 basis points slippage
+    # WP2.1: fees / slippage are NOT risk limits.  They live in
+    # ``trading.costs.CostProfile`` (one profile per run).  Do not add cost
+    # fields here (CF-21-07): two cost sources is exactly what C25 was.
 
     # Cooldown
     cooldown_after_loss_streak: int = 3   # bars to pause after N consecutive losses

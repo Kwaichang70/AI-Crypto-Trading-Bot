@@ -250,7 +250,7 @@ PY
   - [ ] Spread ≤ **0.5%**.
   - [ ] EUR free ≥ **€65**.
   - [ ] Base coin total = **0**. If it cannot be 0, record it as `pre_total` and never use "Max" in a manual sell.
-  - [ ] Record `taker` (= `t` in §5), `maker`, `limits.amount.min`, `precision.amount` (= 1 step).
+  - [ ] Record `taker` (= `t` in §5), `maker`, `limits.amount.min`, `precision.amount` (= 1 step). (WP2.1: the `taker` printed here should equal `fee_tier.taker_fee_rate` of the deploy runbook's Block L-21; see `docs/runbooks/deploy-fase1-minimumset.md` section 10.9.4.)
 
   If any required result fails, do not start. For a spread above 0.5%, wait or switch to the alternative pair (then re-run everything in §2e). If the pre-flight cannot be completed at all (O-1 unmet, or the script fails), stop here and escalate; if the window is open, go to §4e.
 
@@ -273,6 +273,8 @@ curl -sS -i -X POST "$API_BASE/runs" \
 ```
 
 Expect 201, `Idempotent-Replay: false`, `"status":"running"`. Store the id: `RUN_P=<id>`.
+
+> **WP2.1 note (X-8, X-15).** A new paper run is priced with the default cost profile (`DEFAULT_COST_PROFILE_ID`, `packages/trading/costs.py`), which is stricter than before: the all-in bracket basis moves the stop closer to the market by about the profile's per-side cost, so a 3% stop-loss is only about 1.7% below the entry close in this rehearsal (live, at a 1.2% taker tier, is already the same). Prefer a stop-loss of 0.05 or more when the pair is volatile; a `stop_loss` exit in the rehearsal is slightly more likely and inconclusive for P5, not a failure. The rehearsal's expected round-trip cost is informational only: about N x 2 x (taker + slippage) (about EUR 0.23 at N = EUR 9 under the default tier); this section has no PnL band.
 
 Pass (O-7): **one** run shows exactly one BUY of about €9.00, then one SELL, then flat:
 ```bash
@@ -508,6 +510,8 @@ TF = 300 s. step = `precision.amount`. N = BUY notional. t = recorded taker. s =
 
 *Footnote (P12):* interpretation of spec §11, which lists P12 for Run B literally; confirm at sign-off (`reports/vp2-docs/final-synthesis-docs.md` R-09).
 
+*Note (P3, WP2.1):* the engine now logs two warnings that corroborate the effective rate: `cost_profile.tier_mismatch` at engine start (the market's taker differs from the run's cost-profile estimate by more than 1 bp) and `cost_profile.fill_fee_drift` on the first real fill whose fee is more than 5 bps off the profile. Neither blocks anything; the P3 record is still the Coinbase commission. If P3 shows a different tier than the deploy runbook's L-21 recorded, stop and follow L-21's rule for a differing tier.
+
 ### 5a. Expected PnL — worked example at N = €9.00
 
 R ≈ −N·(2t + s) + N·δ. Realised PnL includes both fees: the entry fee sits in the all-in entry price, and the exit fee is subtracted.
@@ -693,6 +697,7 @@ unset API_KEY ADMIN_KEY LIVE_CONFIRM_TOKEN; exit
 
 ## 10. Change log
 
+- **2026-10-14 (WP2.1a)** — §2e pointer to deploy-runbook Block L-21, §3 note on the stricter paper cost model (X-8, X-15), and the P3 corroboration note under §5 (`cost_profile.fill_fee_drift` / `tier_mismatch`).
 - **2026-10-12 (cf36b-fix)** — §4c step 0 re-runs the CF-36 log-hygiene self-check on the live config (G-LIVE L-19 gate run; `reports/vp2-cf36/final-synthesis-cf36b.md`, CF36B-SEC-03); §9 records its line.
 - **2026-09-28 (r3)** — Round-2 fixes per `reports/vp2-docs/final-synthesis-docs.md` Round 2 addendum (WR2-01..WR2-11).
 - **2026-09-28 (r2)** — Revised per `reports/vp2-docs/final-synthesis-docs.md` (WD-01..WD-22): server-side shell with `--env-file`, `hdrs`/`env_set` helpers, live window (§2d phase 1, §4c step 0, §4e), fixed pre-flight script, P12 Run A only, kill-switch step 0 (AM-S12a), error-replay branch (O-3a), evidence handling.

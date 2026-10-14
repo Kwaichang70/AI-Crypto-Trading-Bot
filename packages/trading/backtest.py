@@ -18,7 +18,8 @@ Design principles
 - **No look-ahead bias**: bars are fed chronologically; the growing
   window passed to strategies never includes future data.
 - **Strategy-agnostic**: works with any ``BaseStrategy`` subclass.
-- **Fee-aware**: all PnL metrics are net of trading fees.
+- **Cost-aware**: all PnL metrics are net of the run's ``CostProfile`` (fees and
+  slippage, WP2.1); without one the default profile applies.
 - **Decimal precision**: monetary values use ``Decimal``; statistical
   ratios use ``float``.
 
@@ -31,9 +32,7 @@ Usage
         symbols=["BTC/USDT"],
         timeframe=TimeFrame.ONE_HOUR,
         initial_capital=Decimal("10000"),
-        slippage_bps=5,
-        maker_fee_bps=5,
-        taker_fee_bps=10,
+        cost_profile=get_cost_profile("coinbase_advanced_d6"),  # trading.costs
     )
     result = await runner.run(bars_by_symbol)
     print(f"CAGR: {result.cagr:.2%}, Sharpe: {result.sharpe_ratio:.2f}")
@@ -44,7 +43,6 @@ from __future__ import annotations
 import math
 import random
 import uuid
-from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -55,8 +53,10 @@ import structlog
 from common.models import OHLCVBar
 from data.market_data import BaseMarketDataService
 from common.types import QuoteCurrency, RunMode, TimeFrame
+from trading.costs import CostProfile, default_cost_profile
 from trading.engines.paper import PaperExecutionEngine
 from trading.exit_config import (
+    ExitCostModel,
     parse_exit_config,
     require_exit_manager,
     resolve_allow_pyramiding,
@@ -149,6 +149,18 @@ convergence.
 """
 
 
+def _total_slippage_cost(exec_engine: PaperExecutionEngine) -> Decimal:
+    """SY-21-15: sum over all fills of ``|fill price - expected price| * quantity``.
+
+    Fills without an expectation (none in the paper engine) contribute 0.
+    """
+    total = Decimal("0")
+    for fill in exec_engine.get_all_fills():
+        if fill.expected_price is not None:
+            total += abs(fill.price - fill.expected_price) * fill.quantity
+    return total
+
+
 class BacktestRunner:
     """
     High-level backtest orchestrator.
@@ -168,17 +180,14 @@ class BacktestRunner:
     initial_capital : Decimal
         Starting cash in quote currency.  Default 10000.
     risk_params : RiskParameters | None
-        Risk manager configuration.  If None, default parameters are
-        used.  Fee percentages in risk_params are overridden by the
-        explicit ``maker_fee_bps`` / ``taker_fee_bps`` arguments if
-        both are provided.
-    slippage_bps : int
-        Slippage in basis points applied to market orders.
-        Default 5 (0.05%).
-    maker_fee_bps : int
-        Maker fee in basis points.  Default 10 (0.10%).
-    taker_fee_bps : int
-        Taker fee in basis points.  Default 15 (0.15%).
+        Risk manager configuration, used UNCHANGED (C25: every field reaches
+        the risk manager).  If None, default parameters are used.  Costs are
+        not risk parameters (WP2.1).
+    cost_profile : CostProfile | None
+        WP2.1: the ONE cost model (fees, slippage, impact) for this run.
+        ``None`` -> the current default profile (``coinbase_advanced_1``).
+        Use ``get_cost_profile("legacy_backtest_v0")`` to reproduce pre-WP2.1
+        results (10/15 bps fees, 5 bps slippage).
     seed : int | None
         Random seed for deterministic backtests.  If provided, sets
         ``random.seed(seed)`` before execution.  Default None.
@@ -196,14 +205,12 @@ class BacktestRunner:
         timeframe: TimeFrame,
         initial_capital: Decimal = Decimal("10000"),
         risk_params: RiskParameters | None = None,
-        slippage_bps: int = 5,
-        maker_fee_bps: int = 10,
-        taker_fee_bps: int = 15,
         seed: int | None = None,
         trailing_stop_pct: float | None = None,
         bracket_config: dict[str, object] | None = None,
         allow_pyramiding: bool | None = None,
         enable_circuit_breaker: bool = False,
+        cost_profile: CostProfile | None = None,
     ) -> None:
         if not strategies:
             raise ValueError("At least one strategy is required")
@@ -218,9 +225,10 @@ class BacktestRunner:
         self._symbols = list(symbols)
         self._timeframe = timeframe
         self._initial_capital = initial_capital
-        self._slippage_bps = slippage_bps
-        self._maker_fee_bps = maker_fee_bps
-        self._taker_fee_bps = taker_fee_bps
+        # WP2.1: one cost profile for the whole run (None -> current default).
+        self._cost_profile: CostProfile = (
+            cost_profile if cost_profile is not None else default_cost_profile()
+        )
         # M7 (Sprint 49 INF-9): auto-generate a reproducible seed when caller
         # omits one so every backtest can be replayed.  Use OS-seeded random
         # to produce a 32-bit integer (safe range for both Python and numpy).
@@ -235,6 +243,14 @@ class BacktestRunner:
         # atr_period).  Passed verbatim into the StrategyEngine config.
         self._bracket_config: dict[str, object] = dict(bracket_config or {})
 
+        # C25 (WP2.1a-1/2): a caller-supplied ``RiskParameters`` is used
+        # UNCHANGED (every field -- sizing_mode, atr_risk_multiplier,
+        # max_cluster_exposure_pct, ... -- reaches the risk manager).  Costs
+        # are no longer risk parameters, so there is nothing to override.
+        self._risk_params: RiskParameters = (
+            risk_params if risk_params is not None else RiskParameters()
+        )
+
         # WP1.3a (SY-13a-01/17): validate eagerly at construction (defence
         # in depth -- create_run already validates before the bar fetch;
         # this covers any caller that builds a BacktestRunner directly,
@@ -243,35 +259,16 @@ class BacktestRunner:
         # ``validate_run_exit_config``, which takes one strategy) so every
         # strategy in ``self._strategies`` is covered, matching the engine's
         # own ``require_exit_manager(self._strategies, ...)`` call.
+        # WP2.1 (SY-21-05): parse at the run's OWN cost profile.
         _parsed_cfg = parse_exit_config(
             bracket=self._bracket_config,
             trailing_stop_pct=self._trailing_stop_pct,
+            cost=ExitCostModel.from_cost_profile(self._cost_profile, self._risk_params),
         )
         require_exit_manager(self._strategies, _parsed_cfg)
         self._allow_pyramiding: bool = resolve_allow_pyramiding(
             allow_pyramiding, self._strategies
         )
-
-        # Build risk parameters with explicit fee overrides.  C25 (WP2.1a-1):
-        # ``dataclasses.replace`` keeps EVERY field of a caller-supplied
-        # ``RiskParameters`` (sizing_mode, atr_risk_multiplier,
-        # max_cluster_exposure_pct, ...) -- the old hand rebuild silently reset
-        # the fields it did not list to their defaults.
-        _taker_fee_pct = taker_fee_bps / 10_000
-        _maker_fee_pct = maker_fee_bps / 10_000
-        if risk_params is not None:
-            self._risk_params = replace(
-                risk_params,
-                taker_fee_pct=_taker_fee_pct,
-                maker_fee_pct=_maker_fee_pct,
-                slippage_bps=slippage_bps,
-            )
-        else:
-            self._risk_params = RiskParameters(
-                taker_fee_pct=_taker_fee_pct,
-                maker_fee_pct=_maker_fee_pct,
-                slippage_bps=slippage_bps,
-            )
 
         # Compute warmup: max of all strategy requirements * multiplier
         max_min_bars = max(
@@ -294,6 +291,11 @@ class BacktestRunner:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    @property
+    def cost_profile(self) -> CostProfile:
+        """The cost profile this runner simulates with (WP2.1)."""
+        return self._cost_profile
 
     @property
     def seed(self) -> int:
@@ -365,9 +367,11 @@ class BacktestRunner:
             "backtest.starting",
             run_id=run_id,
             initial_capital=str(self._initial_capital),
-            slippage_bps=self._slippage_bps,
-            maker_fee_bps=self._maker_fee_bps,
-            taker_fee_bps=self._taker_fee_bps,
+            cost_profile_id=self._cost_profile.id,
+            cost_profile_fingerprint=self._cost_profile.fingerprint(),
+            slippage_bps=str(self._cost_profile.slippage_bps),
+            maker_fee_bps=str(self._cost_profile.maker_fee_bps),
+            taker_fee_bps=str(self._cost_profile.taker_fee_bps),
         )
 
         # 4. Start engine
@@ -637,6 +641,10 @@ class BacktestRunner:
             open_positions_mtm=open_positions_mtm,
             # Fees
             total_fees_paid=portfolio.total_fees_paid,
+            # WP2.1 (SY-21-15): the cost model behind the numbers above
+            cost_profile_id=self._cost_profile.id,
+            cost_profile_fingerprint=self._cost_profile.fingerprint(),
+            total_slippage_cost=_total_slippage_cost(exec_engine),
             # M4 (Sprint 49): PSR + statistical significance
             psr=psr,
             n_observations=n_obs,
@@ -732,7 +740,7 @@ class BacktestRunner:
         execution_engine = PaperExecutionEngine(
             run_id=run_id,
             risk_manager=risk_manager,
-            slippage_bps=self._slippage_bps,
+            cost_profile=self._cost_profile,
             initial_cash=self._initial_capital,
         )
 
@@ -761,6 +769,7 @@ class BacktestRunner:
                 if self._enable_circuit_breaker
                 else None
             ),
+            cost_profile=self._cost_profile,
         )
 
         return engine, portfolio, risk_manager, execution_engine

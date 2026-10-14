@@ -860,6 +860,8 @@ Log events worth an alert in addition to those in section 7 (all present in the 
 
 Source: the consolidated list L-1 to L-20 in `reports/vp2-wp1.3b/final-synthesis-1.3b-b.md` section 12, which supersedes 1.5b F.3, WP1.6 R3-7 and 1.3b-a R2-5 for an image that contains WP1.3b. **All rows must hold, or be recorded where the table allows it, before the live restart.** Release 2 itself is deployed with live off; this checklist does not gate that deploy except for the rows in table A.
 
+**L-21 (WP2.1, Release 3 images only)** is the one-time fee-tier check: the default cost profile (`DEFAULT_COST_PROFILE_ID` in `packages/trading/costs.py`) assumes a Coinbase tier, and L-21 compares it with the account's real tier before the first live run on a WP2.1 image. Block L-21 is in 10.9.4; the 2.1 spec is `reports/vp2-wp2.1/synthesis-spec.md` section 8.
+
 Gate in words: `6511af1`, `206eb12`, `bf2b27f` and `d7a9956` are in the image, and so are `6047162` (cf36a) and cf36b with cf36b-fix (L-19); if intra-bar exits are wanted, `dc8cf83` is too (1.3b-b without 1.3b-a, or without its fix patch, is not allowed); the acceptance reports are green (1.5b F.5, WP1.6 R3-5, 1.3b-a ACCEPT 13/13, 1.3b-b ACCEPT 13/13); L-1 to L-20 below are satisfied. 1.3b is recommended, not minimum-set: an image without 1.3b-b runs bar-close-only exits, and W8 says so.
 
 Commands containing a pipe are in the numbered blocks of 10.9.4 (`Block L-n`), not in the table cells. Everything marked read-only changes nothing. Define `API_BASE="https://<FQDN>/api/v1"` and, for a live run, `RUN=<id>`.
@@ -885,6 +887,7 @@ Commands containing a pipe are in the numbered blocks of 10.9.4 (`Block L-n`), n
 | L-17 | Operator rules recorded: (a) D12, no backtest or optimizer on the live API process while live holds positions; (b) live stops are bid-touch with a 10 s confirm, the validated backtest is close-based; (c) TP is bar-close only; (d) flatten during an intra-bar exit can return `lock_timeout`: re-read positions, retry, do not sell by hand while a bot SELL is open; (e) a stop or shutdown can wait up to 15 s: keep `stop_grace_period: 30s` | `grep -n 'stop_grace_period' "$DEPLOY_DIR/infra/docker-compose.yml"` (read-only) | Rules (a) to (e) recorded in the deploy log; the first `stop_grace_period` (api) is `30s` | WP1.3b-a, WP1.3b-b |
 | L-18 | Trailing-gap seed: CF-13b-20 is in the image; record that a resume can take up to 40 s per held trailing symbol before the loop starts | Block L-1 (markers) plus a recorded note | 1.3b-b in the image, or acceptance of `seed_partial` for downtimes above 300 bars recorded | WP1.3b-b (CF-13b-20) |
 | L-19 | Log hygiene: CF-36 (a)+(b+)+(e) and CF-A are in the image and hold ((b+) includes `ccxt_retry.retrying`, `ccxt_retry.exhausted`, `live.ticker_fetch_failed`, `live.invalid_ticker_price`; (e) is `engine.warmup_fetch_failed`). With intra-bar enabled the four (b) sites are a prerequisite because ticks reach them every interval | Section 5.10 steps 1, 2 and 2b (R2-8); then the step-2 repeat on the live config when the flag is switched on (smoke §4c step 0, or the equivalent step of the live-restart procedure), before the first live order | Step 1 exit 0, commit and count recorded; `CF36 log hygiene: PASS` on the paper config and again on the live config; `CF36B_MARKERS_OK`; L-8 counters at 0 or each hit explained | CF-36 (cf36a `6047162`; cf36b with cf36b-fix; raised by WP1.6, 1.3b-a, 1.3b-b) |
+| L-21 | Coinbase fee tier (WP2.1, U-1): one read-only check that the account's real spot fee tier matches `DEFAULT_COST_PROFILE_ID` | Block L-21 (read-only, no order, no secret printed) | `FEE_TIER: DEFAULT CONFIRMED`; the four `market … taker=` values equal `fee_tier.taker_fee_rate`; `has_promo_fee: False`. Any other result: §8.4 | WP2.1 |
 
 #### 10.9.3 Table C: at and after the live restart (observed, not gating the Release 2 deploy)
 
@@ -1051,6 +1054,88 @@ Expected: `exchange=coinbase` (the compose default is `binance`; a different exc
 
 **Block L-19.** No separate block: section 5.10 is the procedure (steps 1, 2 and 2b, the L-8 counters), and smoke §4c step 0 runs the live-config repeat. The former informational grep (`error=str(exc)` / `ticker=ticker`) is retired: after cf36b it still lists `live.fill_parse_failed` and `live.reconciliation_transition_failed`, which stay on layer 1 by design and are not a failure.
 
+**Block L-21 (WP2.1, G-LIVE L-21; read-only; no order, no secret printed).** Prerequisite: the Coinbase API key is present in the api container's environment (smoke O-1). Without credentials, ccxt reports its hardcoded "Advanced 1" rate (taker 0.012) for every market, so `markets[...]['taker']` alone proves nothing. Do **not** use `fetch_trading_fees()`: ccxt 4.5.40 swaps maker and taker in its result. The script reads the raw `transaction_summary` response instead.
+
+```bash
+$DC exec -T api python - <<'PY'
+from api.config import get_settings as _gs, register_settings_secrets as _rs
+from common.logging import configure_logging as _cl
+_cl(log_level="INFO", json_output=False, service_name="glive-l21")  # CF-36 layer 1 on
+_rs(_gs())
+import asyncio
+from api.services.run_orchestrator import build_live_ccxt_exchange
+
+SYMBOLS = ["XRP/EUR", "BTC/EUR", "ETH/EUR", "SOL/EUR"]   # edit: the live run's symbols
+BLOCKED = ["create_order", "create_market_order", "create_limit_order", "edit_order",
+           "cancel_order", "cancel_all_orders", "withdraw", "transfer"]
+
+
+def camel(name: str) -> str:
+    head, *rest = name.split("_")
+    return head + "".join(part.title() for part in rest)
+
+
+async def main() -> None:
+    ex = None
+    try:
+        s = _gs()
+        print("exchange_id:", s.exchange_id)
+        ex = build_live_ccxt_exchange(s)
+        for n in BLOCKED:                       # read-only guard: order/transfer calls now raise TypeError
+            for attr in (n, camel(n)):
+                setattr(ex, attr, None)
+        await ex.load_markets()
+        for sym in SYMBOLS:
+            m = ex.market(sym)
+            print(f"market {sym}: taker={m.get('taker')} maker={m.get('maker')}")
+        raw = await ex.v3PrivateGetBrokerageTransactionSummary({"product_type": "SPOT"})
+        tier = (raw or {}).get("fee_tier") or {}
+        print("fee_tier.pricing_tier  :", tier.get("pricing_tier"))
+        print("fee_tier.taker_fee_rate:", tier.get("taker_fee_rate"))
+        print("fee_tier.maker_fee_rate:", tier.get("maker_fee_rate"))
+        print("fee_tier.usd_from/to   :", tier.get("usd_from"), "/", tier.get("usd_to"))
+        print("has_promo_fee:", (raw or {}).get("has_promo_fee"))
+        try:
+            from trading.costs import DEFAULT_COST_PROFILE_ID, match_fee_tier
+        except ImportError:
+            print("FEE_TIER: REGISTRY NOT IN IMAGE (pre-WP2.1) -- compare by hand with the WP2.1 registry table")
+            return
+        match = match_fee_tier(tier.get("taker_fee_rate"), tier.get("maker_fee_rate"))
+        print("default profile :", DEFAULT_COST_PROFILE_ID)
+        print("matching profile:", match)
+        if match == DEFAULT_COST_PROFILE_ID:
+            print("FEE_TIER: DEFAULT CONFIRMED")
+        elif match is not None:
+            print("FEE_TIER: DIFFERS -- reviewed one-line change of DEFAULT_COST_PROFILE_ID to", match)
+        else:
+            print("FEE_TIER: NOT IN REGISTRY -- reviewed change: add a registry id, then switch the default")
+    except Exception as exc:
+        print("L-21 check failed:", type(exc).__name__)   # type only (CF-36): never the message
+    finally:
+        if ex is not None:
+            await ex.close()
+
+
+asyncio.run(main())
+PY
+```
+
+**Expected result.**
+- `exchange_id: coinbase`.
+- Every `market … taker=` equals `fee_tier.taker_fee_rate`. If they differ, the markets were loaded without the tier: stop and escalate.
+- `has_promo_fee: False`.
+- `FEE_TIER: DEFAULT CONFIRMED`.
+- Save the output to `~/deploy-logs/<date>/glive-l21.txt` (`umask 077`). It contains rates only, no keys.
+
+**If the tier differs (exact rule).**
+1. **Never edit `.env`, and never set an environment variable, to change the default.** `DEFAULT_COST_PROFILE` in the environment is ignored and logged as `cost_profile.env_ignored` (SY-21-02).
+2. If `FEE_TIER: DIFFERS`, open a reviewed change. Its only production edit is the one line `DEFAULT_COST_PROFILE_ID: Final[str] = "<matching id>"` in `packages/trading/costs.py`. It passes the normal chain (producer → code-critic + security → executor → testing) and ships in the next release. The per-profile goldens (WP21-T-13) need no re-pin.
+3. If `FEE_TIER: NOT IN REGISTRY`, the reviewed change **adds** a `live_equivalent` registry id with the measured rates (and its fingerprint pin in WP21-T-02), and flips the same one line. Existing ids are never edited.
+4. If `has_promo_fee: True`, do **not** switch. Record the rates and re-run L-21 after the promotion ends.
+5. Until a switch ships, WP2.8's go/no-go is judged at **both** the current default and the measured tier.
+6. Already-persisted runs keep their own profiles (resume never re-resolves).
+7. Corroboration: the first real live fill logs `cost_profile.fill_fee_drift` if the fee is more than 5 bps off the profile, and smoke P3 records the effective rate.
+
 **Block L-6.**
 ```bash
 $DC logs --since 15m api 2>&1 | grep -E 'resume\.(risk_state_seeded|daily_seed_invalid|daily_state_unknown)'
@@ -1160,6 +1245,7 @@ Nothing in this section was executed against a server, a Docker daemon, a databa
 | 2026-10-12 (r4, Release 2) | Release 2 (WP1.5a/b, WP1.6, WP1.3b-a/b, HEAD `dc8cf83` plus CF-36 (`6047162`, cf36b)): new section 10 (delta, G-LIVE table, rollback note), Appendix B, six corrections of statements that the merge of Release 1 made stale (scope and Related line, section 1 migrations row, 3.2, 5.8, 7) and four pointers (sections 2, 3.3, 8, 9). The change log moved from section 10 to section 11. Producer draft `reports/vp2-docs-b/`; reconciled with CF-36 (sections 5.10, 10.2, 10.5 P-7, 10.7 R2-8, 10.8, 10.9 L-1/L-19 and Block L-8, Appendix B) per `reports/vp2-cf36/final-synthesis-cf36b.md` part B. Review fixes per its Round 2 addendum: Block L-12 unwraps the `SecretStr` token and stops when Telegram is not configured, Blocks L-12 and L-14 turn on CF-36 logging first, `.env` live-flag check in 10.6 D-2 and the 10.10 gate, fail-closed 10.10 restore, "already Release 2" branch in 10.3, symbol citations for the setting, `UVICORN_*` in the 5.10 operator rule. |
 | 2026-10-12 | cf36b: added section 5.10 (G-LIVE L-19 log-hygiene verification, operator rule, L-8 counters with the `trading_` prefix, access-log note) per `reports/vp2-cf36/synthesis-spec.md` section 9 and `final-synthesis-cf36a.md` section 6. |
 | 2026-10-12 (cf36b-fix) | Section 5.10 per `reports/vp2-cf36/final-synthesis-cf36b.md`: scoped to CF-36 images; step 1 hermetic (`env -i`, no `.env`, `--no-cov`, commit recorded); step 2 is the paper baseline and the L-19 gate run moves to the live config (smoke §4c step 0); new step 2b (cf36b markers in the image); CF-A note, uvicorn log-level operator rule, R-08 `http.request` note. |
+| 2026-10-14 (WP2.1a) | Added G-LIVE row L-21 (Table B) and Block L-21 (10.9.4): the one-time Coinbase fee-tier verification for the WP2.1 default cost profile, verbatim per `reports/vp2-wp2.1/synthesis-spec.md` section 8. Reads the raw `transaction_summary` `fee_tier` (ccxt 4.5.40 `fetch_trading_fees()` swaps maker and taker; unauthenticated `load_markets()` reports the hardcoded 0.012/0.006). Not run against a container in this change. |
 
 ---
 

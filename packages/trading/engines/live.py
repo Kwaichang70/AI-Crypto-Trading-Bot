@@ -97,6 +97,7 @@ from common.types import OrderSide, OrderStatus, OrderType, SignalDirection
 from trading.execution import BaseExecutionEngine, EquitySnapshot
 from trading.ccxt_errors import translate_ccxt_error
 from trading.ccxt_retry import ccxt_retry
+from trading.costs import CostProfile
 from trading.models import Fill, Order, Position, Signal
 from trading.risk import BaseRiskManager
 
@@ -637,6 +638,12 @@ class LiveExecutionEngine(BaseExecutionEngine):
     enable_live_trading:
         Explicit gate. If False (default), any call to submit_order
         raises RuntimeError. This is the outermost safety gate.
+    cost_profile:
+        WP2.1: the run's cost-profile ESTIMATE.  The live ledger always uses
+        the exchange's real fees; the profile feeds only two LOG-ONLY drift
+        checks (``cost_profile.tier_mismatch`` at start,
+        ``cost_profile.fill_fee_drift`` per real fill) and never touches
+        sizing, orders, fills or exits.  ``None`` disables both checks.
     """
 
     def __init__(
@@ -650,11 +657,16 @@ class LiveExecutionEngine(BaseExecutionEngine):
         buy_cap_slippage_pct: Decimal = Decimal("0.005"),
         buy_inflight_stale_after_s: float = 900.0,
         unknown_submit_settle_s: float = 120.0,
+        cost_profile: CostProfile | None = None,
     ) -> None:
         super().__init__(run_id=run_id, config=config)
         self._risk_manager = risk_manager
         self._exchange = exchange
         self._enable_live_trading = enable_live_trading
+        # WP2.1 (AG-05): estimate + drift logs ONLY -- see class docstring.
+        self._cost_profile: CostProfile | None = cost_profile
+        # (symbol, liquidity) pairs already warned about by _observe_fill_cost.
+        self._fee_drift_warned: set[tuple[str, str]] = set()
 
         # WP1.4 (S-02, security round 2): additional margin folded into the
         # BUY affordability cap's buf, on top of the market's own taker fee
@@ -1044,6 +1056,83 @@ class LiveExecutionEngine(BaseExecutionEngine):
         if not buf.is_finite() or buf < Decimal("0"):
             return Decimal("0.01")
         return buf
+
+    # ------------------------------------------------------------------
+    # WP2.1: cost-profile drift logs (LOG-ONLY; never touch the ledger)
+    # ------------------------------------------------------------------
+
+    @property
+    def cost_profile(self) -> CostProfile | None:
+        """The run's cost-profile estimate (``None`` when not supplied)."""
+        return self._cost_profile
+
+    def _check_tier(self) -> None:
+        """Warn (once per symbol, at start) when a market's taker fee differs
+        from the cost profile's taker rate by more than 1 bp.
+
+        Log-only: ``cost_profile.tier_mismatch`` with numbers / ids only (CF-36:
+        no exception text, no raw market dict).  Never raises.
+        """
+        profile = self._cost_profile
+        if profile is None:
+            return
+        try:
+            markets: dict[str, Any] = getattr(self._exchange, "markets", {}) or {}
+            profile_taker_bps = profile.taker_fee_bps
+            for symbol in self._run_symbols:
+                market = markets.get(symbol) or {}
+                market_taker = _safe_decimal(market.get("taker"), default=None)
+                if market_taker is None or not market_taker.is_finite():
+                    continue
+                market_taker_bps = market_taker * Decimal(10_000)
+                if abs(market_taker_bps - profile_taker_bps) > Decimal(1):
+                    self._log.warning(
+                        "cost_profile.tier_mismatch",
+                        symbol=symbol,
+                        market_taker_bps=str(market_taker_bps.normalize()),
+                        profile_taker_bps=str(profile_taker_bps),
+                        profile_id=profile.id,
+                    )
+        except Exception:
+            # a log-only check must never break a start (and never echoes the error)
+            return
+
+    def _observe_fill_cost(self, fill: Fill) -> None:
+        """Warn when a REAL fill's fee differs from the profile by more than 5 bps.
+
+        ``cost_profile.fill_fee_drift`` is logged at WARNING once per
+        ``(symbol, liquidity)`` per run, DEBUG afterwards.  Skips fills without a
+        positive fee.  Log-only: never touches the ledger, sizing, orders or
+        exits, and never raises (CF-36: numbers / ids only).
+        """
+        profile = self._cost_profile
+        if profile is None:
+            return
+        try:
+            if fill.fee <= Decimal(0):
+                return
+            notional = fill.quantity * fill.price
+            if notional <= Decimal(0):
+                return
+            liquidity = "maker" if fill.is_maker else "taker"
+            profile_bps = profile.maker_fee_bps if fill.is_maker else profile.taker_fee_bps
+            fee_bps = fill.fee / notional * Decimal(10_000)
+            if abs(fee_bps - profile_bps) <= Decimal(5):
+                return
+            key = (fill.symbol, liquidity)
+            log = self._log.debug if key in self._fee_drift_warned else self._log.warning
+            self._fee_drift_warned.add(key)
+            log(
+                "cost_profile.fill_fee_drift",
+                symbol=fill.symbol,
+                liquidity=liquidity,
+                fee_bps=str(fee_bps.quantize(Decimal("0.01"))),
+                profile_bps=str(profile_bps),
+                profile_id=profile.id,
+            )
+        except Exception:
+            # a log-only check must never break fill routing (and never echoes the error)
+            return
 
     # ------------------------------------------------------------------
     # WP1.1: held-quantity / SELL cap (WP11-A-03, D9, I1; round 2 S-03/S-07)
@@ -3326,6 +3415,9 @@ class LiveExecutionEngine(BaseExecutionEngine):
             )
         for fill in pending_fills:
             self._fills.setdefault(order_id, []).append(fill)
+            # WP2.1: log-only drift check on the REAL fee (synthesised fills
+            # never reach this loop -- they return from the branches above).
+            self._observe_fill_cost(fill)
 
         return sorted(pending_fills, key=lambda f: f.executed_at)
 
@@ -3983,6 +4075,8 @@ class LiveExecutionEngine(BaseExecutionEngine):
                 self._exchange.load_markets,
                 max_retries=3, base_delay=2.0, operation="load_markets",
             )
+            # WP2.1: log-only fee-tier drift check (never blocks a start).
+            self._check_tier()
             # WP1.4 (S-03/A-05): no peak seed here -- the portfolio is the
             # sole peak owner once a source is attached (guaranteed at this
             # point: the S-09 gate above already raised otherwise), so

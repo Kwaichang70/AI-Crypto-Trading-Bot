@@ -50,6 +50,7 @@ from api.db.models import (
 )
 from api.services.audit_log import record_audit_event
 from common.types import TimeFrame
+from trading.costs import CostProfile
 from trading.exit_config import ExitConfigError, resolve_run_exit_check
 from trading.recovery import ResumeSnapshot
 from trading.safety import (
@@ -815,9 +816,15 @@ async def _auto_retry_paper_run(
     bracket_config: dict[str, object] | None,
     enable_adaptive_learning: bool,
     auto_apply_learning: bool,
+    cost_profile: CostProfile,
     allow_pyramiding: bool = False,
 ) -> None:
     """Recreate a crashed paper run after a backoff (bounded attempts).
+
+    WP2.1 (AG-04): the crashed run's RESOLVED ``cost_profile`` is COPIED onto
+    the new run (a legacy run stays legacy: ``legacy_runtime_v0`` metadata with
+    ``source="legacy_inferred"``), so a retry never silently re-prices a run
+    under today's default.
 
     ``auto_retry_attempt`` is the attempt counter of the CRASHED run (0 for
     an original run); the new run carries ``auto_retry_attempt + 1``.
@@ -896,6 +903,8 @@ async def _auto_retry_paper_run(
             # at its call site; nothing else consumes it (CR-006).
             new_config["auto_retry_attempt"] = next_attempt
             new_config["auto_retried_from"] = crashed_run_id
+            # WP2.1: copy the crashed run's resolved profile (paper => model fees).
+            new_config["cost_profile"] = cost_profile.to_metadata(fee_source="model")
             now = datetime.now(tz=UTC)
             db.add(
                 RunORM(
@@ -924,6 +933,7 @@ async def _auto_retry_paper_run(
                 auto_apply_learning=auto_apply_learning,
                 auto_retry_attempt=next_attempt,
                 allow_pyramiding=allow_pyramiding,
+                cost_profile=cost_profile,
             ),
             name=f"paper-engine-retry-{new_run_id}",
         )
@@ -956,6 +966,7 @@ async def run_paper_engine(
     elapsed_seconds: float = 0.0,
     entries_latch_reason: str | None = None,
     allow_pyramiding: bool = False,
+    cost_profile: CostProfile,
 ) -> None:
     """
     Background coroutine that runs a paper trading engine for a single run.
@@ -1018,6 +1029,12 @@ async def run_paper_engine(
         recovering/resuming a run that has one. ``None`` for a fresh run
         (``create_run`` never sets one -- a brand-new row has no history to
         latch on).
+    cost_profile:
+        WP2.1 (SY-21-14): the run's resolved :class:`~trading.costs.CostProfile`.
+        REQUIRED (keyword), so a start site that forgets it fails mypy / at
+        call time instead of silently pricing the run at the default.  Reaches
+        both ``PaperExecutionEngine`` (fees, slippage) and ``StrategyEngine``
+        (exit-cost floor / stop-cost log).
     """
     from api.config import get_settings
     from api.db.models import RunORM
@@ -1118,6 +1135,7 @@ async def run_paper_engine(
         execution = PaperExecutionEngine(
             run_id=run_id_str,
             risk_manager=risk_manager,
+            cost_profile=cost_profile,
             initial_cash=capital,
         )
         if resume is not None:
@@ -1189,6 +1207,7 @@ async def run_paper_engine(
             run_mode=RunMode.PAPER,
             config=engine_config,
             circuit_breaker=circuit_breaker,
+            cost_profile=cost_profile,
         )
 
         _RUN_ENGINES[run_id_str] = engine
@@ -1437,6 +1456,7 @@ async def run_paper_engine(
                     enable_adaptive_learning=enable_adaptive_learning,
                     auto_apply_learning=auto_apply_learning,
                     allow_pyramiding=allow_pyramiding,
+                    cost_profile=cost_profile,
                 ),
                 name=f"auto-retry-{run_id_str[:8]}",
             )
@@ -1460,6 +1480,7 @@ async def run_live_engine(
     entries_latch_reason: str | None = None,
     allow_pyramiding: bool = False,
     exit_config_waived: bool = False,
+    cost_profile: CostProfile,
 ) -> None:
     """
     Background coroutine that runs a live trading engine for a single run.
@@ -1495,6 +1516,10 @@ async def run_live_engine(
         (0.0 for a fresh run) -- see ``run_paper_engine``.
     entries_latch_reason:
         WP1.7a (SY-02) -- see ``run_paper_engine``.
+    cost_profile:
+        WP2.1 (SY-21-14): REQUIRED keyword.  In live this is an ESTIMATE (the
+        ledger always uses the exchange's real fees): it feeds the exit-cost
+        floor, the stop-cost log and the two log-only drift checks.
     """
     from api.config import get_settings
     from api.db.models import RunORM
@@ -1641,6 +1666,7 @@ async def run_live_engine(
             exchange=exchange,
             # Gate already enforced by LiveTradingGate in POST handler
             enable_live_trading=True,
+            cost_profile=cost_profile,
         )
         if resume is not None:
             # WP1.8a S6: rebuild the portfolio from persisted fills instead
@@ -1739,6 +1765,7 @@ async def run_live_engine(
             config=live_engine_config,
             protective_mode=protective_mode,
             circuit_breaker=circuit_breaker,
+            cost_profile=cost_profile,
         )
 
         _RUN_ENGINES[run_id_str] = engine

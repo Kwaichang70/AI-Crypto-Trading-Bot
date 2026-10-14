@@ -41,6 +41,7 @@ from api.db.models import EquitySnapshotORM
 from common.types import TimeFrame
 from tests.integration.test_wp15b_resume_seed_wiring import _session_factory, _settings
 from tests.unit._wp15_support import make_fill
+from trading.costs import DEFAULT_COST_PROFILE
 from trading.recovery import ResumeSnapshot
 
 SYM = "BTC/USD"
@@ -88,6 +89,7 @@ async def _run_until_final_flush(
         "symbols": [SYM],
         "timeframe": TimeFrame.ONE_HOUR,
         "initial_capital": "10000",
+        "cost_profile": DEFAULT_COST_PROFILE,  # WP2.1: required keyword
         "resume": snapshot,
     }
     patches: list[Any] = [

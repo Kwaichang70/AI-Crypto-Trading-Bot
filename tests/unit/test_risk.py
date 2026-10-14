@@ -65,9 +65,6 @@ def _make_params(**overrides) -> RiskParameters:
         "max_order_size_quote": Decimal("10000"),
         "max_daily_loss_pct": 0.05,
         "max_drawdown_pct": 0.15,
-        "taker_fee_pct": 0.001,
-        "maker_fee_pct": 0.0005,
-        "slippage_bps": 5,
         "cooldown_after_loss_streak": 3,
         "loss_streak_count": 3,
         # QT-003 (Sprint 46): disable cluster cap by default so tests that

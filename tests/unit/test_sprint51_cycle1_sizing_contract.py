@@ -48,6 +48,7 @@ from uuid import uuid4
 import pytest
 
 from common.types import OrderSide, OrderStatus, OrderType, SignalDirection
+from trading.costs import CostProfile
 from trading.engines.live import LiveExecutionEngine
 from trading.engines.paper import PaperExecutionEngine
 from trading.models import Order, Position, RiskCheckResult, Signal
@@ -110,6 +111,19 @@ def _make_risk_params(
     )
 
 
+def _cost_profile(slippage_bps: int) -> CostProfile:
+    """WP2.1: legacy runtime fees (maker 40 / taker 60 bps) at the given slippage --
+    the cost model these tests were calibrated on before fees left RiskParameters."""
+    return CostProfile(
+        id="test_sizing_profile",
+        exchange="generic",
+        tier="test_sizing_tier",
+        maker_fee_bps=Decimal(40),
+        taker_fee_bps=Decimal(60),
+        slippage_bps=Decimal(slippage_bps),
+    )
+
+
 def _make_real_paper_engine(
     *,
     params: RiskParameters | None = None,
@@ -125,7 +139,7 @@ def _make_real_paper_engine(
         run_id=_RUN_ID,
         risk_manager=rm,
         fill_latency_ms=0,
-        slippage_bps=slippage_bps,
+        cost_profile=_cost_profile(slippage_bps),
         initial_cash=initial_cash,
     )
     engine.set_last_price(_SYMBOL, _LAST_PRICE)

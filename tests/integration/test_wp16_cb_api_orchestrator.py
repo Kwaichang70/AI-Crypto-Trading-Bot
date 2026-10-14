@@ -37,6 +37,7 @@ from tests.integration.test_wp15b_resume_flush_watermark import _run_until_final
 from tests.integration.test_wp15b_resume_seed_wiring import _session_factory
 from tests.unit._wp15_support import make_fill
 from tests.unit._wp16_support import HALT_ONLY, OTHER, bar, build_engine, buy, live_cb, snap
+from trading.costs import DEFAULT_COST_PROFILE
 from trading.recovery import ResumeSnapshot
 from trading.safety import CircuitBreaker, CircuitBreakerResponse, build_run_circuit_breaker
 
@@ -112,6 +113,7 @@ async def _drive(mode: str, *, resume: bool, protective: bool = False) -> _Captu
         "symbols": [SYM],
         "timeframe": TimeFrame.ONE_HOUR,
         "initial_capital": "10000",
+        "cost_profile": DEFAULT_COST_PROFILE,  # WP2.1: required keyword
         "resume": _empty_resume() if resume else None,
     }
     patches: list[Any] = [

@@ -57,6 +57,7 @@ from tests.integration.fakes.scripted_strategy import (
     ScriptedSequenceStrategy,
 )
 from trading.backtest import BacktestRunner
+from trading.costs import DEFAULT_COST_PROFILE, CostProfile, get_cost_profile
 from trading.models import Fill, Order
 
 SYMBOL = "BTC/EUR"
@@ -789,6 +790,7 @@ async def _backtest(
     trailing: float | None = None,
     pyramiding: bool = False,
     targets: dict[int, str] | None = None,
+    cost_profile: CostProfile | None = None,
 ) -> dict[str, Any]:
     strategy = ScriptedSequenceStrategy(
         "wp13b-bt", {"script": script, "target_notional": "3000", "targets": targets or {}}
@@ -802,6 +804,7 @@ async def _backtest(
         bracket_config=bracket,
         trailing_stop_pct=trailing,
         allow_pyramiding=pyramiding,
+        cost_profile=cost_profile,
     )
     bars = scripted_path(
         closes,
@@ -832,12 +835,19 @@ _FIXED_SCRIPT = {0: "buy", 5: "buy"}
 
 # Golden digest of the fixed-bracket reference backtest (no trailing, no adds), taken at
 # HEAD bf2b27f BEFORE any WP1.3b change.  If it fails the default fixed path changed
-# (AC-13B-08).
+# (AC-13B-08).  WP2.1: the constant is UNCHANGED; the test now pins the pre-WP2.1 backtest
+# costs (``legacy_backtest_v0`` = maker 10 / taker 15 / slippage 5 bps) explicitly, because
+# the default profile moved to coinbase_advanced_1 (60/120 + 10 bps).
 GOLDEN_FIXED_DIGEST = "94015f75e15178a7d197488360f8cc72a0f6243cbf8dfde63c88fd46be3d3a5c"
 
 
 async def test_t30_fixed_bracket_backtest_is_byte_identical_to_head() -> None:
-    out = await _backtest(_FIXED_CLOSES, _FIXED_SCRIPT, bracket=_FIXED_BRACKET)
+    out = await _backtest(
+        _FIXED_CLOSES,
+        _FIXED_SCRIPT,
+        bracket=_FIXED_BRACKET,
+        cost_profile=get_cost_profile("legacy_backtest_v0"),
+    )
     assert len(out["fills"]) >= 4  # two round trips actually happened
     assert _digest(out) == GOLDEN_FIXED_DIGEST
 
@@ -993,6 +1003,7 @@ async def _drive_orchestrator(mode: str, resume: Any) -> _RecordingEngine:
         "timeframe": TimeFrame.ONE_HOUR,
         "initial_capital": "10000",
         "resume": resume,
+        "cost_profile": DEFAULT_COST_PROFILE,  # WP2.1: required keyword
     }
     patches: list[Any] = [
         patch("api.db.session.get_session_factory", _session_factory()),

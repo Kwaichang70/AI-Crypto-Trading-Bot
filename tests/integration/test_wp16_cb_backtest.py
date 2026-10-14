@@ -31,6 +31,7 @@ from tests._wp15_logging import _structlog_unfiltered  # noqa: F401
 from tests.integration.fakes.bar_paths import scripted_path
 from tests.integration.fakes.scripted_strategy import ScriptedSequenceStrategy
 from trading.backtest import BacktestRunner
+from trading.costs import get_cost_profile
 from trading.risk import RiskParameters
 from trading.safety import CircuitBreaker, CircuitBreakerTransition
 
@@ -74,6 +75,11 @@ def _runner(scenario: str, *, enable: bool) -> tuple[BacktestRunner, dict[str, l
         risk_params=_RISK,
         seed=7,
         allow_pyramiding=True,
+        # WP2.1: the goldens below are calibrated on the pre-WP2.1 backtest costs
+        # (maker 10 / taker 15 / slippage 5 bps); pinned explicitly because the default
+        # profile moved to coinbase_advanced_1.  Both T-32 scenarios and every T-33
+        # assertion run under this one profile, so the C25 re-pin stays single-cause.
+        cost_profile=get_cost_profile("legacy_backtest_v0"),
         **({"enable_circuit_breaker": True} if enable else {}),
     )
     bars = scripted_path(closes, first_open=FIRST_OPEN, symbol=SYMBOL, timeframe=TimeFrame.ONE_HOUR)

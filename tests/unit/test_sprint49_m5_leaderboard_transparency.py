@@ -37,6 +37,7 @@ from api.schemas import (
     RunResponse,
 )
 from api.services.run_persistence import run_orm_to_response
+from trading.costs import DEFAULT_COST_PROFILE
 
 
 # ---------------------------------------------------------------------------
@@ -71,6 +72,12 @@ def _config_with_metrics(**kwargs: Any) -> dict[str, Any]:
     return {"backtest_metrics": kwargs}
 
 
+# WP2.1 (U-5): leaderboard eligibility now also requires a live-equivalent REGISTRY cost
+# profile -- a run WITHOUT a persisted profile is a legacy-cost run and never qualifies.
+# The M5 threshold tests below therefore run on a run that carries the default profile.
+_COST_CFG: dict[str, Any] = {"cost_profile": DEFAULT_COST_PROFILE.to_metadata()}
+
+
 # ---------------------------------------------------------------------------
 # Tests: RunResponse.leaderboard_eligible computation
 # ---------------------------------------------------------------------------
@@ -85,7 +92,7 @@ class TestLeaderboardEligibleField:
             id=_UUID,
             run_mode="backtest",
             status="stopped",
-            config={},
+            config=dict(_COST_CFG),
             started_at=_NOW,
             stopped_at=None,
             created_at=_NOW,
@@ -101,7 +108,7 @@ class TestLeaderboardEligibleField:
             id=_UUID,
             run_mode="backtest",
             status="stopped",
-            config={},
+            config=dict(_COST_CFG),
             started_at=_NOW,
             stopped_at=None,
             created_at=_NOW,
@@ -198,7 +205,7 @@ class TestLeaderboardEligibleField:
             id=_UUID,
             run_mode="backtest",
             status="stopped",
-            config={},
+            config=dict(_COST_CFG),
             started_at=_NOW,
             stopped_at=None,
             created_at=_NOW,
@@ -264,7 +271,7 @@ class TestRunOrmToResponseJsonbExtraction:
         """leaderboard_eligible reflects JSONB-extracted data via call-site computation."""
         ns = _make_run_ns(
             n_closed_trades=15,
-            config=_config_with_metrics(confidence_flag="high", psr=0.96),
+            config={**_COST_CFG, **_config_with_metrics(confidence_flag="high", psr=0.96)},
         )
         r = run_orm_to_response(ns)  # type: ignore[arg-type]
         assert r.leaderboard_eligible is True

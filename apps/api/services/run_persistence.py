@@ -50,12 +50,12 @@ from api.db.models import (
 )
 from api.schemas import (
     BacktestMetricsResponse,
-    LEADERBOARD_ELIGIBLE_FLAGS,
-    LEADERBOARD_MIN_CLOSED_TRADES,
     OpenPositionMTMResponse,
     RunDetailResponse,
     RunResponse,
+    leaderboard_eligible,
 )
+from api.services.cost_profiles import cost_response_fields
 from common.types import OrderSide, OrderStatus, OrderType
 from trading.models import Fill, Order
 from trading.recovery import ResumeRejected, ResumeSnapshot
@@ -99,6 +99,12 @@ def run_orm_to_response(run: RunORM) -> RunResponse:
     # n_closed_trades maps automatically (top-level column, field default=None).
     response = RunResponse.model_validate(run)
 
+    # WP2.1: the cost-model fields are computed BEFORE the no-metrics early
+    # return below, so a run without backtest_metrics (paper / live /
+    # errored) still carries its cost profile and legacy flags.  A malformed
+    # persisted value degrades to a legacy flag -- it never 500s a GET.
+    response = response.model_copy(update=cost_response_fields(run.config, run.run_mode))
+
     # Step 2: extract JSONB-resident leaderboard fields (confidence_flag, psr).
     # These are NOT top-level SQL columns; they live in config["backtest_metrics"].
     # Best-effort: a parse failure must not crash a list-runs GET.
@@ -126,11 +132,8 @@ def run_orm_to_response(run: RunORM) -> RunResponse:
     # a validate= parameter and does NOT re-trigger validators.
     final_flag = updates.get("confidence_flag", response.confidence_flag)
     final_n = response.n_closed_trades
-    updates["leaderboard_eligible"] = (
-        final_n is not None
-        and final_n >= LEADERBOARD_MIN_CLOSED_TRADES
-        and final_flag in LEADERBOARD_ELIGIBLE_FLAGS
-    )
+    # WP2.1: the ONE eligibility helper (also adds the cost-model gate).
+    updates["leaderboard_eligible"] = leaderboard_eligible(final_n, final_flag, run.config)
 
     return response.model_copy(update=updates)
 
@@ -151,6 +154,8 @@ def run_orm_to_detail_response(run: RunORM) -> RunDetailResponse:
         The extended API response model with optional backtest metrics.
     """
     base = RunDetailResponse.model_validate(run)
+    # WP2.1: cost-model transparency fields (see run_orm_to_response).
+    base = base.model_copy(update=cost_response_fields(run.config, run.run_mode))
 
     # Attempt to populate backtest_metrics from the JSONB config blob
     raw_metrics: dict[str, Any] | None = (run.config or {}).get("backtest_metrics")
@@ -599,6 +604,24 @@ async def persist_backtest_results(
     if position_orms:
         db.add_all(position_orms)
         log.info("runs.backtest_positions_inserted", count=len(position_orms))
+
+    # --- WP2.1: the result must carry the cost model the run's config froze ---
+    _frozen = (run_orm.config or {}).get("cost_profile")
+    _result_fp = getattr(result, "cost_profile_fingerprint", "")
+    if (
+        isinstance(_frozen, dict)
+        and isinstance(_result_fp, str)
+        and _result_fp
+        and _frozen.get("fingerprint") != _result_fp
+    ):
+        # Error log only (no raise): the numbers are already computed; the
+        # operator must know they were not produced under the frozen profile.
+        log.error(
+            "runs.cost_profile_fingerprint_mismatch",
+            run_id=str(run_id),
+            config_fingerprint=str(_frozen.get("fingerprint"))[:32],
+            result_fingerprint=_result_fp[:32],
+        )
 
     # --- Merge metrics into run.config JSONB ---
     metrics_response = build_backtest_metrics(result)

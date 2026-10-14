@@ -28,13 +28,19 @@ from sqlalchemy.orm import selectinload
 
 from api.db import get_db
 from api.db.models import OptimizationEntryORM, OptimizationRunORM
+from api.schemas import CostProfileSummary, build_cost_profile_summary
+from api.services.cost_profiles import new_run_cost_profile_or_422
 from common.types import TimeFrame
 # TODO(sprint-30): extract to api.services.market_data / api.services.strategy_registry
 from api.routers.runs import (
     _fetch_bars_for_backtest,
     _get_strategy_registry,
 )
-from trading.exit_config import ExitConfigError, validate_param_grid_exit_config
+from trading.exit_config import (
+    ExitConfigError,
+    policy_cost_model,
+    validate_param_grid_exit_config,
+)
 from trading.optimizer import SUPPORTED_METRICS, ParameterOptimizer
 
 __all__ = ["router"]
@@ -135,6 +141,15 @@ class OptimizeRequest(BaseModel):
         le=1000,
         description="Hard cap on total parameter combinations",
     )
+    cost_profile: str | None = Field(
+        default=None,
+        max_length=64,
+        description=(
+            "WP2.1: cost-profile registry id applied to EVERY combination "
+            "(any registry id, legacy / stress / diagnostic included).  None -> "
+            "the platform default profile.  Unknown ids give 422 'unknown_cost_profile'."
+        ),
+    )
 
 
 class OptimizeEntryResponse(BaseModel):
@@ -188,6 +203,14 @@ class OptimizeResponse(BaseModel):
     failed_combinations: int
     elapsed_seconds: float
     entries: list[OptimizeEntryResponse]
+    cost_profile: CostProfileSummary | None = Field(
+        default=None,
+        description=(
+            "WP2.1: the cost profile every combination was simulated with "
+            "(POST).  None on GET: it is not persisted before WP2.1b, so an "
+            "older optimization run is reported as 'unknown / legacy'."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -234,6 +257,10 @@ async def run_optimization(
         )
 
     strategy_cls = registry[strategy_name]
+
+    # WP2.1 (U-2, SY-21-03): optimize accepts ANY registry id (the same rule
+    # as backtest).  Resolved first: it is the exit-validation basis below.
+    cost_profile = new_run_cost_profile_or_422(body.cost_profile, mode="optimize")
 
     # Validate rank_by metric
     if body.rank_by not in SUPPORTED_METRICS:
@@ -289,7 +316,10 @@ async def run_optimization(
     # subclass, so it MUST be caught before the generic ``except
     # ValueError`` below (G-3) or it would silently map to 400.
     try:
-        validate_param_grid_exit_config(strategy_cls, body.param_grid)
+        # WP2.1 (SY-21-06): the stricter of the default and the run's profile.
+        validate_param_grid_exit_config(
+            strategy_cls, body.param_grid, cost=policy_cost_model(cost_profile)
+        )
     except ExitConfigError as exc:
         log.warning(
             "optimize.exit_config_invalid",
@@ -323,6 +353,7 @@ async def run_optimization(
             rank_by=body.rank_by,
             top_n=body.top_n,
             max_combinations=body.max_combinations,
+            cost_profile=cost_profile,
         )
     except ExitConfigError as exc:
         # Defence in depth: ParameterOptimizer.__init__ also validates.
@@ -399,6 +430,9 @@ async def run_optimization(
         failed_combinations=result.failed_combinations,
         elapsed_seconds=result.elapsed_seconds,
         entries=entries,
+        cost_profile=build_cost_profile_summary(
+            result.cost_profile if result.cost_profile is not None else cost_profile
+        ),
     )
 
 

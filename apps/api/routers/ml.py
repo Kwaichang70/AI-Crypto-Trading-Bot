@@ -27,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.db import get_db
 from api.schemas import ModelVersionListResponse, ModelVersionResponse
+from trading.costs import default_cost_profile
 
 __all__ = ["router"]
 
@@ -191,6 +192,9 @@ async def train_model(
         "fold_sharpes": result.get("walk_forward_fold_sharpes", []),
         "worst_fold_drawdown": result.get("walk_forward_worst_fold_drawdown"),
     }
+    # WP2.1: the cost model the walk-forward gate was run under (the platform
+    # default); a model without this key was gated under the legacy 60/40 + 5 bps.
+    existing_extra["cost_profile"] = default_cost_profile().to_metadata()
     model_version.extra = existing_extra
     # The typed column now stores the MEDIAN REALIZED OOS trading Sharpe across
     # walk-forward folds (Cycle 6). Column name unchanged for backward compat.
@@ -467,17 +471,17 @@ def _train_model_with_wf_sync(
                     },
                 )
 
-                # 4d. Run the real mini-backtest. Coinbase taker/maker 60/40 bps,
-                # Sprint-42 default slippage (BacktestRunner default slippage_bps=5),
+                # 4d. Run the real mini-backtest under the platform DEFAULT cost
+                # profile (WP2.1, X-13: stricter than the old 60/40 bps + 5 bps
+                # slippage; the profile is recorded in ModelVersionORM.extra),
                 # fixed-fractional sizing (A1 — no ATR risk_params), seed=42.
                 runner = BacktestRunner(
                     strategies=[strat],
                     symbols=[symbol],
                     timeframe=tf_enum,
                     initial_capital=_Decimal("10000"),
-                    taker_fee_bps=60,
-                    maker_fee_bps=40,
                     seed=42,
+                    cost_profile=default_cost_profile(),
                 )
 
                 # OOS window starts where the test bars begin within bt_series.
@@ -563,7 +567,7 @@ def _train_model_with_wf_sync(
         "ml.walk_forward_realized_oos_sharpe",
         msg=(
             "OOS gate now uses a REALIZED trading Sharpe over the OOS window "
-            "(net Coinbase 60/40 fees + Sprint-42 slippage), replacing the "
+            "(net of the default CostProfile fees + slippage, WP2.1), replacing the "
             "Cycle-5 directional z-score proxy."
         ),
         oos_sharpe_median=oos_sharpe_median,

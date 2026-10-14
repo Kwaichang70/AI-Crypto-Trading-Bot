@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import math
 import uuid
+from collections.abc import Mapping
 from datetime import datetime
 from decimal import Decimal
 from typing import Any, Generic, Literal, Self, TypeVar
@@ -38,6 +39,7 @@ from pydantic import (
 from pydantic.alias_generators import to_camel
 
 from common.types import OrderSide, OrderStatus, OrderType, RunMode, TimeFrame
+from trading.costs import CostProfile, FeeSource, is_leaderboard_cost_eligible
 
 __all__ = [
     # Pagination
@@ -45,6 +47,7 @@ __all__ = [
     "PaginatedResponse",
     # Runs
     "RunCreateRequest",
+    "CostProfileSummary",
     "RunResponse",
     "RunListResponse",
     "BacktestMetricsResponse",
@@ -87,6 +90,9 @@ __all__ = [
     # M5 (Sprint 49): leaderboard eligibility constants
     "LEADERBOARD_MIN_CLOSED_TRADES",
     "LEADERBOARD_ELIGIBLE_FLAGS",
+    "build_cost_profile_summary",
+    "leaderboard_eligible",
+    "meets_trade_confidence_thresholds",
 ]
 
 # ---------------------------------------------------------------------------
@@ -269,6 +275,17 @@ class RunCreateRequest(BaseModel):
             "Ignored for paper and live modes."
         ),
     )
+    cost_profile: str | None = Field(
+        default=None,
+        max_length=64,
+        description=(
+            "WP2.1: cost-profile registry id (e.g. 'coinbase_advanced_d6').  None "
+            "(the default) uses the platform default profile.  backtest accepts "
+            "any registry id; paper only live-equivalent ids; live accepts none "
+            "(422 'cost_profile_not_allowed_for_live').  Unknown ids give 422 "
+            "'unknown_cost_profile'."
+        ),
+    )
     allow_pyramiding: StrictBool | None = Field(
         default=None,
         description=(
@@ -336,6 +353,84 @@ LEADERBOARD_MIN_CLOSED_TRADES: int = 10
 LEADERBOARD_ELIGIBLE_FLAGS: frozenset[str] = frozenset({"high", "medium"})
 
 
+def meets_trade_confidence_thresholds(n_trades: object, confidence_flag: object) -> bool:
+    """The trade-count + confidence half of leaderboard eligibility (M5)."""
+    return (
+        isinstance(n_trades, int)
+        and not isinstance(n_trades, bool)
+        and n_trades >= LEADERBOARD_MIN_CLOSED_TRADES
+        and confidence_flag in LEADERBOARD_ELIGIBLE_FLAGS
+    )
+
+
+def leaderboard_eligible(
+    n_trades: object,
+    confidence_flag: object,
+    config: Mapping[str, object] | None,
+) -> bool:
+    """The ONE leaderboard-eligibility rule (M5 + WP2.1 SY-21-10).
+
+    ``n_trades >= LEADERBOARD_MIN_CLOSED_TRADES`` AND ``confidence_flag`` in
+    the eligible tiers AND the run's cost model is a valid, persisted,
+    ``live_equivalent`` registry profile that is not legacy.  Legacy, stress,
+    diagnostic, override and invalid cost models are never eligible.  Used by
+    ``RunResponse`` and by the portfolio aggregate so the two cannot drift.
+    """
+    return meets_trade_confidence_thresholds(
+        n_trades, confidence_flag
+    ) and is_leaderboard_cost_eligible(config)
+
+
+class CostProfileSummary(BaseModel):
+    """WP2.1: the cost model a run was (or, for live, is estimated to be) priced with."""
+
+    model_config = _API_MODEL_CONFIG
+
+    id: str
+    exchange: str
+    tier: str
+    maker_fee_bps: str
+    taker_fee_bps: str
+    slippage_bps: str
+    round_trip_bps: str = Field(description="2 * (taker fee + slippage), in bps")
+    source: Literal["registry", "override", "legacy_inferred"]
+    fingerprint: str
+    fee_source: Literal["model", "exchange_fills"] = Field(
+        description="'exchange_fills': live ledger uses the exchange's real fees"
+    )
+    live_equivalent: bool
+    diagnostic: bool
+    legacy: bool
+    stress: bool
+
+
+def build_cost_profile_summary(
+    profile: CostProfile, *, fee_source: FeeSource = "model"
+) -> CostProfileSummary:
+    """Wire summary of a :class:`CostProfile` (Decimals as plain strings)."""
+
+    def _s(value: Decimal) -> str:
+        return format(value.normalize(), "f")
+
+    round_trip_bps = 2 * (profile.taker_fee_bps + profile.slippage_bps)
+    return CostProfileSummary(
+        id=profile.id,
+        exchange=profile.exchange,
+        tier=profile.tier,
+        maker_fee_bps=_s(profile.maker_fee_bps),
+        taker_fee_bps=_s(profile.taker_fee_bps),
+        slippage_bps=_s(profile.slippage_bps),
+        round_trip_bps=_s(round_trip_bps),
+        source=profile.source,
+        fingerprint=profile.fingerprint(),
+        fee_source=fee_source,
+        live_equivalent=profile.live_equivalent,
+        diagnostic=profile.diagnostic,
+        legacy=profile.legacy,
+        stress=profile.stress,
+    )
+
+
 class RunResponse(BaseModel):
     """
     Response model for a single trading run.
@@ -353,7 +448,14 @@ class RunResponse(BaseModel):
     - ``psr``: extracted from config["backtest_metrics"] JSONB.
       NULL when not computable.
     - ``leaderboard_eligible``: computed field; True iff n_closed_trades >= 10
-      AND confidence_flag in {"high", "medium"}.
+      AND confidence_flag in {"high", "medium"} AND (WP2.1) the run's cost
+      model is a valid live-equivalent registry profile (not legacy / stress /
+      diagnostic / override).
+
+    WP2.1 adds the cost-model transparency fields ``cost_profile`` (the
+    inferred legacy profile for a legacy run), ``legacy_costs``,
+    ``cost_profile_invalid`` and ``legacy_exit_semantics``; they are computed
+    server-side in ``run_orm_to_response`` and never re-derived by the UI.
     """
 
     model_config = _API_MODEL_CONFIG
@@ -395,23 +497,45 @@ class RunResponse(BaseModel):
         default=False,
         description=(
             "True iff n_closed_trades >= 10 AND confidence_flag in {'high', 'medium'}. "
-            "False when data is missing or below threshold."
+            "False when data is missing, below threshold, or the run's cost "
+            "model is not a live-equivalent registry profile (WP2.1)."
         ),
+    )
+
+    # WP2.1: cost-model transparency (server-computed; see run_orm_to_response)
+    cost_profile: CostProfileSummary | None = Field(
+        default=None,
+        description=(
+            "Cost profile the run was priced with.  For a legacy run (no persisted "
+            "profile) this is the inferred legacy profile with source='legacy_inferred'."
+        ),
+    )
+    legacy_costs: bool = Field(
+        default=False,
+        description=(
+            "True iff the run has no persisted cost profile, or its profile is a "
+            "legacy_* id, or the persisted value is invalid."
+        ),
+    )
+    cost_profile_invalid: bool = Field(
+        default=False,
+        description="True iff a cost profile was persisted but is malformed (treated as legacy).",
+    )
+    legacy_exit_semantics: bool = Field(
+        default=False,
+        description="True iff the run predates config['engine_semantics'] (CF-13b-16).",
     )
 
     @model_validator(mode="after")
     def _compute_leaderboard_eligible(self) -> Self:
-        """Compute leaderboard eligibility from n_closed_trades and confidence_flag.
+        """Compute leaderboard eligibility from n_closed_trades, confidence_flag
+        and the run's cost model.
 
-        Runs after all field population so both source fields are available.
+        Runs after all field population so the source fields are available.
         This executes even when constructed via model_validate(orm_object).
         """
-        n = self.n_closed_trades
-        flag = self.confidence_flag
-        self.leaderboard_eligible = (
-            n is not None
-            and n >= LEADERBOARD_MIN_CLOSED_TRADES
-            and flag in LEADERBOARD_ELIGIBLE_FLAGS
+        self.leaderboard_eligible = leaderboard_eligible(
+            self.n_closed_trades, self.confidence_flag, self.config
         )
         return self
 
@@ -963,8 +1087,17 @@ class AggregatePortfolioResponse(BaseModel):
         default=0,
         description=(
             "Number of backtest runs that satisfy leaderboard eligibility criteria "
-            "(n_closed_trades>=10, confidence_flag in {'high','medium'}). "
+            "(n_closed_trades>=10, confidence_flag in {'high','medium'}, and a "
+            "live-equivalent registry cost profile). "
             "Shows as denominator: 'best return from N of M runs'."
+        ),
+    )
+    legacy_cost_runs_excluded: int = Field(
+        default=0,
+        description=(
+            "WP2.1 (U-5): runs that meet the trade-count and confidence criteria but "
+            "were excluded from best/worst because their cost model is legacy, stress, "
+            "diagnostic, an override or invalid."
         ),
     )
 

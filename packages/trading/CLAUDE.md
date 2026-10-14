@@ -235,3 +235,27 @@ Core trading engine containing the heart of the system.
   and the `.exception` catch-alls (`engine.start_failed`, `runs.live_engine_error`).
 - See `reports/vp2-wp1.3b/synthesis-spec.md` section 5.3 and
   `docs/runbooks/circuit-breaker-halt.md`.
+
+### WP2.1a (one cost model: `trading/costs.py`)
+- `CostProfile` (frozen, Decimal-only, bps) is the ONLY cost source. `RiskParameters` has NO fee or
+  slippage field (do not add one: C25 was two cost sources). `costs.py` is a leaf: stdlib only,
+  reads no environment (AST-pinned, `tests/unit/test_wp21_costs.py`).
+- Registry `COST_PROFILES` is append-only; every fingerprint is pinned by a test. The default is the
+  code constant `DEFAULT_COST_PROFILE_ID` (one reviewed line; never env: a `*COST_PROFILE*` env var
+  is ignored and logged by name only as `cost_profile.env_ignored`). Docs name the default by id,
+  not by number.
+- Wiring: `BacktestRunner` / `ParameterOptimizer` / `PaperExecutionEngine` / `StrategyEngine` take
+  `cost_profile` (`None` -> the current default). `run_paper_engine` / `run_live_engine` take it as a
+  REQUIRED keyword. `LiveExecutionEngine(cost_profile=...)` is an ESTIMATE: the live ledger always
+  books the exchange's real fees; the profile only feeds the log-only `cost_profile.tier_mismatch`
+  (start) and `cost_profile.fill_fee_drift` (per real fill, 5 bps) checks.
+- The run's profile is frozen in `RunORM.config["cost_profile"]` (+ `engine_semantics`) at create;
+  promote overwrites it with the default; auto-retry copies it; resume / boot / salvage resolve it
+  WITHOUT writing (`resolve_run_cost_profile`; absent or invalid -> a legacy profile, never raises).
+- Exit-floor basis: the API validates at `policy_cost_model(run_profile)` = the stricter of the
+  default and the run's own profile; the engines and a resume use the run's own profile (API pass
+  implies engine pass).
+- Bracket levels sit on the all-in (fee-inclusive) basis (WP1.3b), so a higher taker moves every stop
+  closer to the market (X-15). Goldens calibrated on the old costs pin `legacy_backtest_v0`
+  explicitly; per-profile goldens are pinned per profile id with analytic per-fill checks.
+- See `reports/vp2-wp2.1/synthesis-spec.md`.

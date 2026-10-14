@@ -59,7 +59,7 @@ from fastapi.responses import JSONResponse
 
 from api.auth import require_api_key
 from api.body_size_limit import BodySizeLimitMiddleware
-from api.config import get_settings, register_settings_secrets
+from api.config import get_settings, register_settings_secrets, warn_ignored_cost_profile_env
 from api.prometheus import setup_prometheus
 from api.rate_limit import setup_rate_limiting
 from common.logging import configure_logging
@@ -182,6 +182,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     register_settings_secrets(settings)
 
     log = structlog.get_logger(__name__)
+    # WP2.1 (SY-21-02): a cost-profile env var is ignored -- say so (names only).
+    warn_ignored_cost_profile_env()
     log.info(
         "api.starting",
         app=settings.app_name,

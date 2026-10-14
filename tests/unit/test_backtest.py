@@ -45,6 +45,7 @@ import pytest
 from common.models import MultiTimeframeContext, OHLCVBar
 from common.types import TimeFrame
 from trading.backtest import BacktestRunner
+from trading.costs import CostProfile, get_cost_profile
 from trading.metrics import BacktestResult
 from trading.models import Signal
 from trading.strategy import BaseStrategy, StrategyMetadata
@@ -108,9 +109,7 @@ def _make_runner(
     symbols: list[str] | None = None,
     initial_capital: Decimal = Decimal("10000"),
     seed: int | None = 42,
-    slippage_bps: int = 5,
-    maker_fee_bps: int = 10,
-    taker_fee_bps: int = 15,
+    cost_profile: CostProfile | None = None,
 ) -> BacktestRunner:
     """
     Convenience factory for BacktestRunner with sane test defaults.
@@ -127,9 +126,9 @@ def _make_runner(
         symbols=symbols,
         timeframe=TimeFrame.ONE_HOUR,
         initial_capital=initial_capital,
-        slippage_bps=slippage_bps,
-        maker_fee_bps=maker_fee_bps,
-        taker_fee_bps=taker_fee_bps,
+        # WP2.1: this module's numbers are calibrated on the pre-WP2.1 backtest
+        # costs (maker 10 / taker 15 / slippage 5 bps) -> pin them explicitly.
+        cost_profile=cost_profile or get_cost_profile("legacy_backtest_v0"),
         seed=seed,
     )
 

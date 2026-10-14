@@ -206,7 +206,9 @@ class TestBounds:
             strategyParams={
                 **_base_payload()["strategyParams"],
                 "bracket_mode": "fixed",
-                "bracket_stop_loss_pct": 0.0066,
+                # WP2.1: the default profile's side cost is 0.0130 (taker 120 + slippage
+                # 10 bps); HEAD's was 0.0065, so this boundary case moved 0.0066 -> 0.0131.
+                "bracket_stop_loss_pct": 0.0131,
                 "bracket_take_profit_pct": 0.2,
             }
         )
