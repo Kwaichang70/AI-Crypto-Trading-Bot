@@ -13,7 +13,18 @@ Design notes
 - All monetary values are in quote currency (e.g. USDT).
 - Drawdown is computed from peak equity, which is updated on every
   equity recalculation.
-- Daily PnL is reset at day boundaries by calling ``reset_daily_pnl()``.
+- Daily PnL (realised) rolls at the UTC day boundary: ``get_daily_pnl()``
+  is realised-only (FIX-07) and reads as 0 on a new UTC day even before the
+  first fill of that day (WP1.5 / C5).
+- WP1.5 (D-WP15-A): the daily-loss *gate* is driven by the mark-to-market
+  NAV change since the UTC day start, not by the realised figure.  This
+  class is the single owner of that state (``nav_day_start``, the running
+  worst NAV change = the latch, the peak).  Engines and the risk manager
+  are stateless readers of :meth:`PortfolioAccounting.risk_snapshot`.
+- Risk-day clock: wall clock (UTC) in paper/live; in a backtest
+  ``StrategyEngine.run_backtest`` pushes the bar *close* time through
+  :meth:`PortfolioAccounting.advance_clock`.  The wall clock is never read
+  on the risk path (``_now`` is the single seam).
 - The equity curve is stored as a list of (timestamp, equity) tuples
   for charting and analysis.
 - TradeResult records are created when positions are fully closed and
@@ -23,21 +34,214 @@ Design notes
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import UTC, datetime, date
-from decimal import Decimal, ROUND_HALF_UP
-from typing import Any, Callable
+from dataclasses import dataclass
+from datetime import UTC, date, datetime
+from decimal import ROUND_HALF_UP, Decimal
+from typing import Callable, Literal, TypedDict
 
 import structlog
 
 from common.types import OrderSide
 from trading.models import Fill, Position, TradeResult
-from trading.recovery import replay_sort_key
+from trading.recovery import ResumeDailySeed, replay_sort_key
 
-__all__ = ["PortfolioAccounting"]
+__all__ = [
+    "DayStartSource",
+    "PortfolioAccounting",
+    "PortfolioSummary",
+    "RiskSnapshot",
+    "blend_entry_price",
+]
 
 logger = structlog.get_logger(__name__)
 
 _PRECISION = Decimal("0.00000001")
+
+
+def blend_entry_price(prev_qty: Decimal, prev_avg: Decimal, fill: Fill) -> Decimal:
+    """All-in average entry price after applying a BUY ``fill`` (WP1.3b).
+
+    Extracted verbatim from :meth:`PortfolioAccounting._apply_fill` (same
+    ``_PRECISION`` / ``ROUND_HALF_UP``) so the bracket anchor's entry basis is
+    byte-identical to ``Position.average_entry_price`` for every lot without
+    adds.  ``prev_qty <= 0`` means a new position: the basis is the fill price
+    plus the entry fee spread over the fill quantity.  Otherwise the previous
+    cost (``prev_qty * prev_avg``) is blended with the fill cost
+    (``quantity * price + fee``).
+    """
+    if prev_qty <= Decimal("0"):
+        return ((fill.price * fill.quantity + fill.fee) / fill.quantity).quantize(
+            _PRECISION, rounding=ROUND_HALF_UP
+        )
+    old_cost = prev_qty * prev_avg
+    new_cost = fill.quantity * fill.price + fill.fee
+    total_qty = prev_qty + fill.quantity
+    return ((old_cost + new_cost) / total_qty).quantize(_PRECISION, rounding=ROUND_HALF_UP)
+
+#: Where the current UTC day's ``nav_day_start`` came from (WP1.5 §5.1).
+#:
+#: ``run_start``       the run started today; day start is ``initial_cash``.
+#: ``roll``            captured at a UTC day roll (the NAV at the previous marks).
+#: ``snapshot``        resume: seeded from the persisted equity-snapshot hint.
+#: ``replay_estimate`` resume without a seed: ``rebuilt_nav - realised_today``.
+#: ``unknown``         resume could not establish the day start; BUYs stay
+#:                     blocked until the next UTC roll (fail closed).
+DayStartSource = Literal["run_start", "roll", "snapshot", "replay_estimate", "unknown"]
+
+
+def _utc_now() -> datetime:
+    """Default risk-day clock (wall clock, UTC).
+
+    Module-level on purpose: it is the one monkeypatch seam the determinism
+    tests (WP15-T-23) use to prove a backtest never reads the wall clock.
+    """
+    return datetime.now(tz=UTC)
+
+
+def _utc_day(at: datetime) -> date:
+    """UTC calendar day of ``at``.
+
+    Aware datetimes are converted to UTC; a naive datetime (replayed or
+    persisted data) is *treated as* UTC rather than rejected (WP1.5 C-12).
+    """
+    if at.tzinfo is None:
+        return at.replace(tzinfo=UTC).date()
+    return at.astimezone(UTC).date()
+
+
+def _invalid_seed_field(seed: object) -> tuple[str, str] | None:
+    """Strict type check of a resume seed (WP1.5b R-1 / SEC-05 / SEC-208).
+
+    Returns ``(field_name, type_name)`` of the first invalid field, or ``None``
+    if the seed is valid (or absent).  **No coercion**: a ``float``, ``int``,
+    ``str`` or ``bool`` hint, a NaN / infinite / negative ``Decimal``, a
+    ``datetime`` ``as_of_day`` and a naive ``run_started_at`` are all
+    rejected.  The persisted column is ``Numeric(20, 8)`` and yields
+    ``Decimal``, so a non-``Decimal`` hint is an upstream defect that must not
+    be silently repaired.  Only field and type *names* are returned, never
+    values.
+    """
+    if seed is None:
+        return None
+    if not isinstance(seed, ResumeDailySeed):
+        return ("daily_seed", type(seed).__name__)
+    as_of = seed.as_of_day
+    if not isinstance(as_of, date) or isinstance(as_of, datetime):
+        return ("as_of_day", type(as_of).__name__)
+    for name in ("day_start_equity", "day_min_equity", "day_first_equity"):
+        value = getattr(seed, name)
+        if value is None:
+            continue
+        # ``is_finite()`` first: ordering a NaN raises.  ``>= 0`` mirrors the
+        # DB check ``ck_equity_snapshots_equity_non_negative``.
+        if not isinstance(value, Decimal) or not value.is_finite() or value < 0:
+            return (name, type(value).__name__)
+    started = seed.run_started_at
+    if started is not None and (not isinstance(started, datetime) or started.utcoffset() is None):
+        return ("run_started_at", type(started).__name__)
+    return None
+
+
+class PortfolioSummary(TypedDict):
+    """Typed return of :meth:`PortfolioAccounting.get_summary` (WP1.6, C3).
+
+    The keys equal the runtime dict keys exactly (pinned by a contract test),
+    so a typo such as ``summary["realised_pnl"]`` is a mypy error instead of a
+    silent default.  ``get_summary`` is display / API data only: risk
+    decisions read :class:`RiskSnapshot`, never these keys.
+    """
+
+    run_id: str
+    initial_cash: str
+    current_cash: str
+    current_equity: str
+    peak_equity: str
+    total_return_pct: float
+    total_realised_pnl: str
+    total_fees_paid: str
+    daily_pnl: str
+    drawdown_pct: float
+    max_drawdown_pct: float
+    total_trades: int
+    winning_trades: int
+    losing_trades: int
+    win_rate: float
+    open_positions: int
+    equity_curve_length: int
+
+
+@dataclass(frozen=True, slots=True)
+class RiskSnapshot:
+    """Read-only risk state at one instant (WP1.5 §6).
+
+    Produced by :meth:`PortfolioAccounting.risk_snapshot`, which is pure:
+    taking a snapshot never changes the peak, the latch or the day.  This is
+    the single typed surface the engines (and, from WP1.6, the circuit
+    breaker) read; never ``get_summary()`` string keys.
+
+    Attributes
+    ----------
+    as_of:
+        The risk clock reading used for the snapshot.
+    day:
+        The UTC risk day the figures belong to.
+    nav:
+        ``current_equity`` at the portfolio's marks.
+    peak_equity:
+        ``max(running peak, nav)``.
+    drawdown_pct:
+        ``(peak - nav) / peak``, ``>= 0``; ``0`` when ``peak <= 0``.
+    nav_day_start:
+        ``max(NAV at the last pre-roll observation, NAV at the first
+        observation of the day)``.  Provisional until that first observation
+        (it equals the pre-roll NAV until then) and can only rise, once
+        (SYN-01 / Option B).
+    daily_loss_basis:
+        ``max(0, min(nav_day_start, initial_cash))`` -- the denominator of
+        the daily-loss threshold (D5 / D-WP15-B), fixed from the first NAV
+        observation of the UTC day.
+    nav_pnl:
+        ``nav - nav_day_start``.
+    worst_nav_pnl:
+        Running minimum of the NAV change since day start (``<= 0``); the
+        latch.  Once at or below ``-threshold`` BUYs stay blocked for the
+        rest of the UTC day even if NAV recovers.
+    realised_pnl:
+        Realised PnL of the risk day (the FIX-07 figure the API shows).
+    day_start_source:
+        Provenance of ``nav_day_start`` (:data:`DayStartSource`).
+    open_position_count:
+        Number of non-flat positions.
+    """
+
+    as_of: datetime
+    day: date
+    nav: Decimal
+    peak_equity: Decimal
+    drawdown_pct: Decimal
+    nav_day_start: Decimal
+    daily_loss_basis: Decimal
+    nav_pnl: Decimal
+    worst_nav_pnl: Decimal
+    realised_pnl: Decimal
+    day_start_source: DayStartSource
+    open_position_count: int
+
+    @property
+    def state_unknown(self) -> bool:
+        """True when a resume could not establish the day start (fail closed)."""
+        return self.day_start_source == "unknown"
+
+    def gate_daily_pnl(self, nav: Decimal) -> Decimal:
+        """The ``daily_pnl`` value the risk gate must be fed (§5.3). Pure.
+
+        - ``state_unknown`` -> ``-daily_loss_basis`` (forces a block).
+        - otherwise ``min(worst_nav_pnl, nav - nav_day_start)``, where ``nav``
+          is the caller's own NAV (live passes the ticker-adjusted one).
+        """
+        if self.state_unknown:
+            return -self.daily_loss_basis
+        return min(self.worst_nav_pnl, nav - self.nav_day_start)
 
 
 class PortfolioAccounting:
@@ -51,12 +255,18 @@ class PortfolioAccounting:
         Unique identifier for the trading run.
     initial_cash:
         Starting cash balance in quote currency.
+    clock:
+        Risk-day clock (UTC).  Defaults to the wall clock (:func:`_utc_now`);
+        injectable for paper/live tests.  A backtest overrides it by pushing
+        bar time through :meth:`advance_clock`.
     """
 
     def __init__(
         self,
         run_id: str,
         initial_cash: Decimal = Decimal("10000"),
+        *,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._run_id = run_id
         self._initial_cash = initial_cash
@@ -65,9 +275,27 @@ class PortfolioAccounting:
         # Peak equity tracking (starts at initial cash)
         self._peak_equity = initial_cash
 
-        # Daily PnL accumulator (reset at day boundary)
+        # Risk-day clock (WP1.5 C-06).  ``_clock`` None -> module ``_utc_now``,
+        # looked up at call time so tests can monkeypatch the seam.
+        self._clock: Callable[[], datetime] | None = clock
+        self._sim_now: datetime | None = None
+
+        # Daily PnL accumulator (realised only; rolls at the UTC day boundary).
+        # ``_daily_pnl_date`` stays None until the first event: the constructor
+        # must NOT initialise the day from the wall clock, or every backtest
+        # bar (in the past) would look like a clock regression (V5).
         self._daily_pnl = Decimal("0")
         self._daily_pnl_date: date | None = None
+
+        # WP1.5 mark-to-market day state (the daily-loss gate input).
+        self._nav_day_start: Decimal = initial_cash
+        self._worst_nav_pnl: Decimal = Decimal("0")
+        self._day_start_source: DayStartSource = "run_start"
+        # One-shot re-base flag (SYN-01 / Option B): set by an in-run roll (and
+        # by some resume seeds), consumed by the first NAV observation of the
+        # day in :meth:`_record_nav`.
+        self._day_start_pending: bool = False
+        self._regression_logged_day: date | None = None
 
         # Cumulative metrics
         self._total_realised_pnl = Decimal("0")
@@ -211,7 +439,11 @@ class PortfolioAccounting:
         current_price:
             Current market price of the asset (for unrealised PnL).
         """
-        self._apply_fill(fill, current_price, at=datetime.now(tz=UTC))
+        # ``at`` (position/curve stamps) stays wall time until WP2.2; the risk
+        # day is resolved through the single ``_now()`` seam (WP1.5 C-06).
+        self._apply_fill(
+            fill, current_price, at=datetime.now(tz=UTC), day_at=self._now()
+        )
 
     def _apply_fill(
         self,
@@ -219,6 +451,7 @@ class PortfolioAccounting:
         current_price: Decimal,
         *,
         at: datetime,
+        day_at: datetime | None = None,
         record_curve_point: bool = True,
     ) -> None:
         """
@@ -244,15 +477,22 @@ class PortfolioAccounting:
             passes the latest bar close; the replay passes the fill's own
             price -- there is no other price available for a past fill).
         at:
-            Timestamp to stamp on new/updated positions and to resolve the
-            daily-PnL day boundary.
+            Timestamp to stamp on new/updated positions (and, when ``day_at``
+            is not given, to resolve the risk-day boundary).
+        day_at:
+            WP1.5: the risk-clock reading that decides which UTC day this
+            fill belongs to.  ``update_position`` passes ``_now()`` (bar time
+            in a backtest); a resume replay leaves it ``None`` so the fill's
+            own ``executed_at`` decides.
         record_curve_point:
             When ``True`` (the default, used by ``update_position``), append
             ``(at, equity)`` to the equity curve.  ``from_fills`` passes
             ``False`` for every replayed fill.
         """
-        # Auto-reset daily PnL if day boundary has been crossed
-        self._ensure_daily_pnl_date(at)
+        # Roll the risk day if a UTC day boundary has been crossed.  This runs
+        # BEFORE the fill changes anything, so the day-start NAV captured by a
+        # roll is the NAV at the previous marks (WP1.5 §5.1).
+        self._ensure_daily_pnl_date(day_at if day_at is not None else at)
 
         # Track fees
         self._total_fees_paid += fill.fee
@@ -274,9 +514,9 @@ class PortfolioAccounting:
         if fill.side == OrderSide.BUY:
             if position is None or position.is_flat:
                 # New position -- use all-in cost basis (includes entry fee)
-                all_in_entry_price = (
-                    (fill.price * fill.quantity + fill.fee) / fill.quantity
-                ).quantize(_PRECISION, rounding=ROUND_HALF_UP)
+                all_in_entry_price = blend_entry_price(
+                    Decimal("0"), Decimal("0"), fill
+                )
                 self._position_snapshots[fill.symbol] = Position(
                     symbol=fill.symbol,
                     run_id=self._run_id,
@@ -291,12 +531,10 @@ class PortfolioAccounting:
                 )
             else:
                 # Add to existing position
-                old_cost = position.quantity * position.average_entry_price
-                new_cost = fill.quantity * fill.price + fill.fee
                 total_qty = position.quantity + fill.quantity
-                new_avg = (
-                    (old_cost + new_cost) / total_qty
-                ).quantize(_PRECISION, rounding=ROUND_HALF_UP)
+                new_avg = blend_entry_price(
+                    position.quantity, position.average_entry_price, fill
+                )
 
                 unrealised = (current_price - new_avg) * total_qty
 
@@ -357,9 +595,9 @@ class PortfolioAccounting:
         if record_curve_point:
             self._equity_curve.append((now, current_equity))
 
-        # Update peak equity
-        if current_equity > self._peak_equity:
-            self._peak_equity = current_equity
+        # Update peak equity and the daily-loss latch (one of the only two
+        # writers of peak / worst -- the other is update_market_prices).
+        self._record_nav(current_equity)
 
         self._log.debug(
             "portfolio.position_updated",
@@ -381,6 +619,8 @@ class PortfolioAccounting:
         *,
         peak_equity_hint: Decimal | None = None,
         now: datetime | None = None,
+        clock: Callable[[], datetime] | None = None,
+        daily_seed: ResumeDailySeed | None = None,
     ) -> PortfolioAccounting:
         """
         Rebuild a :class:`PortfolioAccounting` from persisted fill history
@@ -407,6 +647,11 @@ class PortfolioAccounting:
           accumulator if the last replayed day has rolled over relative to
           ``now`` (yesterday's realised losses/gains never count against
           today's daily-loss gate after a resume).
+        - WP1.5 (§5.7): the mark-to-market day state (``nav_day_start``,
+          ``worst``, source) is *overwritten* from ``daily_seed`` after the
+          replay.  The rebuilt NAV values positions at old fill prices, so it
+          is never fed into ``worst`` (it would fabricate a loss for a
+          position bought last week at 100 and now worth 80).
 
         Parameters
         ----------
@@ -420,8 +665,22 @@ class PortfolioAccounting:
             The highest known equity value before the replay (e.g. the max
             persisted equity snapshot).  Never lowers the computed peak.
         now:
-            Injectable clock for deterministic tests; defaults to
-            ``datetime.now(tz=UTC)``.
+            Injectable clock for deterministic tests; defaults to the risk
+            clock (wall clock UTC).
+        clock:
+            Risk-day clock for the rebuilt portfolio (see ``__init__``).
+        daily_seed:
+            Persisted day-start hints (WP1.5b: ``ResumeSnapshot.daily_seed``,
+            read from the equity-snapshot table).  Every field is
+            type-validated strictly (no coercion); an invalid seed degrades to
+            ``unknown`` and never aborts the resume.  ``None`` (legacy / test
+            callers, or a snapshot that never read hints) uses
+            ``replay_estimate``: the gate *value* is never weaker than HEAD's
+            realised-today value (``worst = min(0, realised_today)``), but the
+            threshold uses the fixed day-start basis (C-02) and mark drift
+            since the original fills counts toward the resume day until
+            00:00 UTC (it can be stricter *or*, at the threshold, looser than
+            HEAD).
 
         Returns
         -------
@@ -430,8 +689,8 @@ class PortfolioAccounting:
             matches sequential ``update_position`` application of the same
             fills.
         """
-        portfolio = cls(run_id=run_id, initial_cash=initial_cash)
-        resolved_now = now if now is not None else datetime.now(tz=UTC)
+        portfolio = cls(run_id=run_id, initial_cash=initial_cash, clock=clock)
+        resolved_now = now if now is not None else portfolio._now()
 
         ordered_fills = sorted(fills, key=replay_sort_key)
         for fill in ordered_fills:
@@ -449,6 +708,12 @@ class PortfolioAccounting:
         portfolio._equity_curve = [(resolved_now, rebuilt_equity)]
         if rebuilt_equity > portfolio._peak_equity:
             portfolio._peak_equity = rebuilt_equity
+
+        portfolio._seed_daily_state(
+            daily_seed=daily_seed,
+            resolved_now=resolved_now,
+            rebuilt_nav=rebuilt_equity,
+        )
 
         portfolio._log.info(
             "portfolio.rebuilt_from_fills",
@@ -469,12 +734,19 @@ class PortfolioAccounting:
         Call this on every bar to keep the equity curve and unrealised
         PnL accurate between fills.
 
+        WP1.5: this is (with fills) one of the only two writers of the peak
+        and of the daily-loss latch.  It first rolls the risk day (using the
+        NAV at the *previous* marks as a provisional new day start), then
+        re-marks; the first NAV observation of the new day may raise that
+        start once (:meth:`_record_nav`, SYN-01 / Option B).
+
         Parameters
         ----------
         prices:
             Mapping of symbol -> current market price.
         """
-        now = datetime.now(tz=UTC)
+        self._ensure_daily_pnl_date(self._now())
+        now = datetime.now(tz=UTC)  # curve / position stamps stay wall time (WP2.2)
         for symbol, price in prices.items():
             position = self._position_snapshots.get(symbol)
             if position is not None and not position.is_flat:
@@ -495,9 +767,8 @@ class PortfolioAccounting:
         )
         self._equity_curve.append((now, current_equity))
 
-        # Update peak equity
-        if current_equity > self._peak_equity:
-            self._peak_equity = current_equity
+        # Update peak equity and the daily-loss latch
+        self._record_nav(current_equity)
 
     # ------------------------------------------------------------------
     # Equity calculations
@@ -539,20 +810,22 @@ class PortfolioAccounting:
 
     def get_daily_pnl(self) -> Decimal:
         """
-        Return the net PnL for the current trading day.
+        Return the realised net PnL for the current UTC trading day.
 
-        This includes only realised PnL from closed positions.
-        Unrealised PnL is not included in the daily figure.
+        FIX-07: realised-only -- unrealised mark-to-market moves never change
+        this figure (the API / UI keep showing it).  WP1.5 (C5): the read is
+        *rolled* -- on a new UTC day it reports 0 even before the first fill
+        or mark of that day, without mutating anything (pure read).
 
-        Does NOT auto-reset on day boundary -- call ``reset_daily_pnl()``
-        explicitly, or rely on the auto-reset in ``update_position()``.
+        The daily-loss *gate* does not use this number; it uses the
+        mark-to-market :meth:`risk_snapshot` (D-WP15-A).
 
         Returns
         -------
         Decimal:
-            Net daily PnL in quote currency.
+            Realised daily PnL in quote currency.
         """
-        return self._daily_pnl
+        return self._realised_today(self._now())
 
     def get_drawdown(self) -> float:
         """
@@ -682,11 +955,17 @@ class PortfolioAccounting:
 
     def reset_daily_pnl(self) -> None:
         """
-        Reset the daily PnL accumulator.
+        Reset the realised daily PnL accumulator.
 
-        Call this at the start of each trading day (or at day boundary
-        in backtesting). The previous day's PnL is logged before reset.
+        Manual hook (no production caller): the UTC day roll in
+        :meth:`_ensure_daily_pnl_date` is automatic.  Uses the risk clock
+        (:meth:`_now`), never the wall clock directly.  It rolls the risk day
+        first (MTM-aware) so the hook can never pre-empt the roll and strand
+        the previous day's latch, and it deliberately does NOT touch the
+        mark-to-market day state otherwise (``nav_day_start`` / latch): a
+        manual call must not be usable to lift a same-day daily-loss latch.
         """
+        self._ensure_daily_pnl_date(self._now())
         if self._daily_pnl != Decimal("0"):
             self._log.info(
                 "portfolio.daily_pnl_reset",
@@ -694,35 +973,315 @@ class PortfolioAccounting:
                 date=str(self._daily_pnl_date),
             )
         self._daily_pnl = Decimal("0")
-        self._daily_pnl_date = datetime.now(tz=UTC).date()
 
-    def _ensure_daily_pnl_date(self, at: datetime | None = None) -> None:
+    # ------------------------------------------------------------------
+    # Risk clock and day roll (WP1.5)
+    # ------------------------------------------------------------------
+
+    def _now(self) -> datetime:
+        """The risk clock: simulated time if one was pushed, else the clock.
+
+        The single seam every risk-day decision goes through (WP2.2 reuses it
+        for curve / trade stamps).
         """
-        Auto-reset daily PnL if the date has rolled over.
+        if self._sim_now is not None:
+            return self._sim_now
+        clock = self._clock if self._clock is not None else _utc_now
+        return clock()
 
-        This provides automatic day-boundary handling even if
-        reset_daily_pnl() is not explicitly called.
+    def advance_clock(self, at: datetime) -> None:
+        """Push simulated (bar) time and roll the risk day if it advanced.
+
+        Used by ``StrategyEngine.run_backtest`` once per bar, warmup
+        included, so a backtest never reads the wall clock on the risk path.
+        Forward-only: an equal or earlier time is a no-op (multi-symbol bar
+        misalignment, pre-WP2.3).  The first push sets the day if no event
+        has set it yet (the constructor leaves it ``None``).  If a mutator
+        already stamped the risk day from the wall clock, an earlier pushed
+        time is a regression (warning, no re-base).
+
+        Raises
+        ------
+        ValueError
+            If ``at`` is naive.  Bars are always timezone-aware, so a naive
+            value is a programming error, not data to be normalised (C-12).
+        """
+        if at.tzinfo is None or at.utcoffset() is None:
+            raise ValueError("advance_clock requires a timezone-aware datetime")
+        at = at.astimezone(UTC)
+        if self._sim_now is not None and at <= self._sim_now:
+            if at < self._sim_now:
+                self._log.debug(
+                    "portfolio.advance_clock_ignored",
+                    at=at.isoformat(),
+                    sim_now=self._sim_now.isoformat(),
+                )
+            return
+        self._sim_now = at
+        self._ensure_daily_pnl_date(at, from_clock=True)
+
+    def _ensure_daily_pnl_date(
+        self,
+        at: datetime | None = None,
+        *,
+        from_clock: bool = False,
+    ) -> None:
+        """
+        Roll the risk day forward if ``at`` is on a later UTC day (mutating).
+
+        Forward-only.  On the first call the day is simply set and nothing
+        else is reset (the run starts with ``nav_day_start = initial_cash``).
+        On a roll: the new ``nav_day_start`` is provisionally the NAV at the
+        previous marks (``current_equity``) and a one-shot re-base is armed
+        (``_day_start_pending``; consumed by the first NAV observation of the
+        day in :meth:`_record_nav`, which may raise the start to that NAV --
+        a depressed pre-roll mark must not become the day's cushion), the
+        realised accumulator and the latch reset, and the source becomes
+        ``roll``.  A time on an earlier day never
+        rolls back (NTP step, mis-ordered replay): it only logs
+        ``portfolio.clock_regression`` once per risk day.
 
         Parameters
         ----------
         at:
-            The timestamp to resolve "today" from.  Defaults to
-            ``datetime.now(tz=UTC)``.  ``from_fills`` (WP1.8a) passes each
-            fill's own ``executed_at`` during replay so day-boundary resets
-            follow the fills' own chronology, not wall-clock time.
+            The reading to resolve "today" from; defaults to :meth:`_now`.
+            ``from_clock`` marks a call from :meth:`advance_clock` (the roll
+            is logged at debug level -- a backtest rolls once per bar-day).
         """
-        today = (at if at is not None else datetime.now(tz=UTC)).date()
-        if self._daily_pnl_date is None:
-            self._daily_pnl_date = today
-        elif self._daily_pnl_date != today:
-            self._log.info(
-                "portfolio.auto_daily_reset",
-                previous_date=str(self._daily_pnl_date),
-                new_date=str(today),
-                previous_pnl=str(self._daily_pnl),
-            )
+        day = _utc_day(at if at is not None else self._now())
+        current = self._daily_pnl_date
+        if current is None:
+            self._daily_pnl_date = day
+            return
+        if day > current:
+            nav = self.current_equity
+            prev_realised = self._daily_pnl
+            prev_worst = self._worst_nav_pnl
+            self._nav_day_start = nav
+            self._day_start_pending = True
             self._daily_pnl = Decimal("0")
-            self._daily_pnl_date = today
+            self._worst_nav_pnl = Decimal("0")
+            self._day_start_source = "roll"
+            self._daily_pnl_date = day
+            log = self._log.debug if from_clock else self._log.info
+            log(
+                "portfolio.daily_roll",
+                prev_day=str(current),
+                day=str(day),
+                prev_realised=str(prev_realised),
+                prev_worst=str(prev_worst),
+                nav_day_start=str(nav),
+            )
+        elif day < current and self._regression_logged_day != current:
+            self._regression_logged_day = current
+            self._log.warning(
+                "portfolio.clock_regression",
+                risk_day=str(current),
+                seen_day=str(day),
+            )
+
+    def _record_nav(self, nav: Decimal) -> None:
+        """Fold a fresh NAV into the peak and the latch (R-09).
+
+        Called only from :meth:`_apply_fill` and :meth:`update_market_prices`
+        -- reads (``risk_snapshot``, engine NAV snapshots) never get here.
+        """
+        if nav > self._peak_equity:
+            self._peak_equity = nav
+        if self._day_start_pending:
+            # One-shot re-base (SYN-01): the first NAV observation of the day
+            # (mark or fill) raises the provisional start if it is higher, so a
+            # depressed last pre-roll mark never becomes the day's cushion.
+            # Done before folding into ``worst``; ``worst`` is not re-expressed.
+            self._day_start_pending = False
+            if nav > self._nav_day_start:
+                self._log.debug(
+                    "portfolio.day_start_rebased",
+                    prev_nav_day_start=str(self._nav_day_start),
+                    nav_day_start=str(nav),
+                )
+                self._nav_day_start = nav
+        self._worst_nav_pnl = min(self._worst_nav_pnl, nav - self._nav_day_start)
+
+    def _realised_today(self, now: datetime) -> Decimal:
+        """Realised daily PnL as of ``now`` (virtual roll, pure)."""
+        if self._daily_pnl_date is not None and _utc_day(now) > self._daily_pnl_date:
+            return Decimal("0")
+        return self._daily_pnl
+
+    def risk_snapshot(self) -> RiskSnapshot:
+        """Pure read of the risk state (WP1.5 C-05).
+
+        Never mutates anything.  When the risk clock is already on a later
+        UTC day than the stored day but no mutator has rolled it yet, the
+        snapshot reports what a roll *would* produce (``nav_day_start = nav``,
+        ``worst = 0``, ``realised = 0``, source ``roll``): the NAV at the
+        existing marks equals the NAV a mutating roll would have captured.
+        While a re-base is pending (:meth:`_record_nav`) the snapshot reports
+        the stored provisional start and never consumes the flag.
+        """
+        now = self._now()
+        nav = self.current_equity
+        peak = max(self._peak_equity, nav)
+        today = _utc_day(now)
+        stored_day = self._daily_pnl_date
+        if stored_day is not None and today > stored_day:
+            day = today
+            nav_day_start = nav
+            worst = Decimal("0")
+            realised = Decimal("0")
+            source: DayStartSource = "roll"
+        else:
+            day = stored_day if stored_day is not None else today
+            nav_day_start = self._nav_day_start
+            worst = min(self._worst_nav_pnl, nav - nav_day_start)
+            realised = self._daily_pnl
+            source = self._day_start_source
+        drawdown = (peak - nav) / peak if peak > Decimal("0") else Decimal("0")
+        return RiskSnapshot(
+            as_of=now,
+            day=day,
+            nav=nav,
+            peak_equity=peak,
+            drawdown_pct=max(Decimal("0"), drawdown),
+            nav_day_start=nav_day_start,
+            daily_loss_basis=max(Decimal("0"), min(nav_day_start, self._initial_cash)),
+            nav_pnl=nav - nav_day_start,
+            worst_nav_pnl=worst,
+            realised_pnl=realised,
+            day_start_source=source,
+            open_position_count=len(self.get_open_positions()),
+        )
+
+    def _seed_daily_state(
+        self,
+        *,
+        daily_seed: ResumeDailySeed | None,
+        resolved_now: datetime,
+        rebuilt_nav: Decimal,
+    ) -> None:
+        """Overwrite the MTM day state after a resume replay (§5.7).
+
+        The rebuilt NAV never feeds ``worst`` (C-07a); ``worst`` comes only
+        from persisted equity-snapshot hints.  Evaluated in table order.
+
+        WP1.5b (R-1 / C-3): every seed field is type-validated first, before
+        any comparison, arithmetic or assignment
+        (:func:`_invalid_seed_field`), and the whole computation is guarded.
+        An invalid seed or any exception degrades to
+        ``day_start_source="unknown"`` (``resume.daily_state_unknown`` with
+        ``reason="seed_invalid"``; BUYs blocked until 00:00 UTC, exits
+        unaffected) -- seeding never aborts a resume, a protective resume
+        included.
+
+        ``_day_start_pending`` (the one-shot re-base, SYN-01) is assigned
+        unconditionally here -- the replay's own value is overwritten.  It is
+        armed only where a higher first observation could not lift a seeded
+        latch (``worst == 0``) and the start is not already hardened by a
+        persisted first-of-day equity.
+        """
+        today = _utc_day(resolved_now)
+        realised_today = self._daily_pnl
+        self._daily_pnl_date = today
+        self._regression_logged_day = None
+
+        nav_day_start: Decimal
+        worst: Decimal
+        source: DayStartSource
+        unknown_reason = "no_day_start_hint"
+        pending: bool
+        failure: tuple[str, str] | None = None
+        try:
+            failure = _invalid_seed_field(daily_seed)
+            if failure is None:
+                if daily_seed is None:
+                    # Legacy / test callers: the gate value is never weaker than HEAD's
+                    # realised-today value (worst = min(0, realised_today)); the
+                    # threshold uses the fixed day-start basis and mark drift since the
+                    # fills counts (see ``from_fills``).
+                    nav_day_start = rebuilt_nav - realised_today
+                    worst = min(Decimal("0"), realised_today)
+                    source = "replay_estimate"
+                elif daily_seed.as_of_day < today:
+                    # Midnight race: the hints describe yesterday -> roll semantics.
+                    nav_day_start = rebuilt_nav
+                    worst = Decimal("0")
+                    source = "roll"
+                elif daily_seed.as_of_day > today:
+                    nav_day_start = rebuilt_nav
+                    worst = Decimal("0")
+                    source = "unknown"
+                    unknown_reason = "seed_from_the_future"
+                else:
+                    day_min = daily_seed.day_min_equity
+                    if daily_seed.day_start_equity is not None:
+                        nav_day_start = daily_seed.day_start_equity
+                        source = "snapshot"
+                    elif (
+                        daily_seed.run_started_at is not None
+                        and _utc_day(daily_seed.run_started_at) == today
+                    ):
+                        nav_day_start = self._initial_cash
+                        source = "run_start"
+                    else:
+                        nav_day_start = rebuilt_nav
+                        day_min = None
+                        source = "unknown"
+                    if (
+                        source == "snapshot"
+                        and daily_seed.day_first_equity is not None
+                        and daily_seed.day_first_equity > nav_day_start
+                    ):
+                        # Robust day start: a depressed pre-midnight snapshot never
+                        # becomes the day's cushion (SYN-01 / Option B).
+                        nav_day_start = daily_seed.day_first_equity
+                    if day_min is not None:
+                        worst = min(Decimal("0"), day_min - nav_day_start)
+                    else:
+                        worst = Decimal("0")
+
+                # One-shot re-base flag per the 1.5a synthesis seed table.  Never armed
+                # when the seed carries a loss (a latch can never be relaxed).
+                pending = False
+                if worst == Decimal("0"):
+                    if source in ("roll", "replay_estimate"):
+                        pending = True
+                    elif source == "snapshot" and (
+                        daily_seed is not None
+                        and daily_seed.day_first_equity is None
+                        and daily_seed.day_min_equity is None
+                    ):
+                        pending = True
+        except Exception as exc:  # seeding must never abort a resume
+            failure = ("seeding", type(exc).__name__)
+        if failure is not None:
+            nav_day_start = rebuilt_nav
+            worst = Decimal("0")
+            source = "unknown"
+            unknown_reason = "seed_invalid"
+            pending = False
+
+        self._nav_day_start = nav_day_start
+        self._worst_nav_pnl = worst
+        self._day_start_source = source
+        self._day_start_pending = pending
+        if source == "unknown":
+            self._log.error(
+                "resume.daily_state_unknown",
+                reason=unknown_reason,
+                # field / type names only, never the offending value
+                **({"field": failure[0], "value_type": failure[1]} if failure else {}),
+                nav_day_start=str(nav_day_start),
+                peak_equity=str(self._peak_equity),
+            )
+        else:
+            self._log.info(
+                "resume.risk_state_seeded",
+                source=source,
+                nav_day_start=str(nav_day_start),
+                worst=str(worst),
+                peak_equity=str(self._peak_equity),
+            )
 
     # ------------------------------------------------------------------
     # Equity curve access
@@ -743,7 +1302,7 @@ class PortfolioAccounting:
     # Summary / snapshot
     # ------------------------------------------------------------------
 
-    def get_summary(self) -> dict[str, Any]:
+    def get_summary(self) -> PortfolioSummary:
         """
         Return a comprehensive portfolio summary dict.
 
@@ -751,8 +1310,8 @@ class PortfolioAccounting:
 
         Returns
         -------
-        dict[str, Any]:
-            Portfolio summary with all key metrics.
+        PortfolioSummary:
+            Portfolio summary with all key metrics (a ``TypedDict``; WP1.6).
         """
         current_equity = self.get_equity(
             list(self._position_snapshots.values())
@@ -766,7 +1325,7 @@ class PortfolioAccounting:
             "total_return_pct": self.get_total_return(),
             "total_realised_pnl": str(self._total_realised_pnl),
             "total_fees_paid": str(self._total_fees_paid),
-            "daily_pnl": str(self._daily_pnl),
+            "daily_pnl": str(self.get_daily_pnl()),
             "drawdown_pct": self.get_drawdown(),
             "max_drawdown_pct": self.get_max_drawdown(),
             "total_trades": self._total_trades,

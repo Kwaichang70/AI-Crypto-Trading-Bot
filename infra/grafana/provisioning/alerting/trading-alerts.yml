@@ -31,8 +31,10 @@ groups:
           severity: critical
         annotations:
           summary: >-
-            A run's graduated circuit breaker reached HALT (state >= 3) —
-            trading on that run is fully stopped. Investigate immediately.
+            A run's circuit breaker is in HALT (state >= 3): new entries are
+            blocked, exits keep running, the run is NOT stopped. HALT clears
+            automatically after 3 bars below 0.9x the drawdown limit. Review
+            the run; use flatten to exit.
         data:
           - refId: A
             relativeTimeRange: { from: 300, to: 0 }

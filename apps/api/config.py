@@ -10,11 +10,17 @@ from __future__ import annotations
 
 from functools import lru_cache
 from typing import Any, Literal
+from urllib.parse import quote
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-__all__ = ["Settings", "get_settings"]
+__all__ = [
+    "Settings",
+    "get_settings",
+    "iter_settings_secrets",
+    "register_settings_secrets",
+]
 
 
 class Settings(BaseSettings):
@@ -31,6 +37,10 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
+        # CF36-SEC-08: a ValidationError would echo ``input_value`` (DB password,
+        # admin key).  ``get_settings()`` runs at import (``app = create_app()``)
+        # before any logging exists, so this is the only possible control.
+        hide_input_in_errors=True,
     )
 
     # ------------------------------------------------------------------
@@ -206,8 +216,13 @@ class Settings(BaseSettings):
             pw_raw = values.get("postgres_password", "")
             # SecretStr arrives as-is in mode="before"; extract the plain value
             pw = pw_raw.get_secret_value() if isinstance(pw_raw, SecretStr) else pw_raw
+            # CF-36 SEC-07: percent-encode the password.  A raw ``/ # ? @ : %`` in it
+            # either breaks the DSN (asyncpg then raised a ValueError that echoed the
+            # password) or defeats URL-userinfo redaction.  SQLAlchemy's ``make_url``
+            # decodes it again, so the connection uses the original password.
+            pw_q = quote(str(pw), safe="")
             values["database_url"] = (
-                f"postgresql+asyncpg://{user}:{pw}@{host}:{port}/{db}"
+                f"postgresql+asyncpg://{user}:{pw_q}@{host}:{port}/{db}"
             )
         return values
 
@@ -245,9 +260,9 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     # Redis (optional caching / job queue)
     # ------------------------------------------------------------------
-    redis_url: str | None = Field(
+    redis_url: SecretStr | None = Field(
         default=None,
-        description="Redis DSN. Omit to disable Redis integration.",
+        description="Redis DSN (may embed a password). Omit to disable Redis integration.",
     )
 
     # ------------------------------------------------------------------
@@ -283,6 +298,20 @@ class Settings(BaseSettings):
     live_trading_confirm_token: SecretStr | None = Field(
         default=None,
         description="Extra safety token required alongside enable_live_trading=True",
+    )
+
+    # ------------------------------------------------------------------
+    # Live intra-bar exit check (WP1.3b-b)
+    # ------------------------------------------------------------------
+    live_exit_check_interval_s: int = Field(
+        default=300,
+        description=(
+            "Seconds between intra-bar stop-loss / trailing-stop checks of a LIVE run "
+            "(bid-based, confirmed by a second reading ~10 s later; take-profit stays "
+            "bar-close only). 0 = off (bar-close exits only). Otherwise an integer in "
+            "60..3600; the check is effective only when the interval is below the run's "
+            "timeframe. Always off for paper, backtest and smoke runs."
+        ),
     )
 
     # ------------------------------------------------------------------
@@ -590,9 +619,9 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     # Telegram alerts (optional)
     # ------------------------------------------------------------------
-    telegram_bot_token: str | None = Field(
+    telegram_bot_token: SecretStr | None = Field(
         default=None,
-        description="Telegram Bot API token for alerts (from @BotFather)",
+        description="Telegram Bot API token for alerts (from @BotFather) -- never logged",
     )
     telegram_chat_id: str | None = Field(
         default=None,
@@ -636,6 +665,35 @@ class Settings(BaseSettings):
             raise ValueError(
                 "database_url must use the 'postgresql+asyncpg://' scheme for async support"
             )
+        return v
+
+    @field_validator("live_exit_check_interval_s", mode="before")
+    @classmethod
+    def validate_live_exit_check_interval(cls, v: object) -> object:
+        """WP1.3b-b: 0 (off) or an integer in 60..3600; ``bool`` and non-integral
+        values are rejected at startup (pydantic's lax int mode would coerce them)."""
+        from trading.exit_config import ExitConfigError, resolve_exit_check_interval
+
+        if isinstance(v, str):
+            text = v.strip()
+            try:
+                v = int(text)
+            except ValueError as exc:
+                raise ValueError(
+                    "live_exit_check_interval_s must be 0 or an integer 60..3600"
+                ) from exc
+        try:
+            resolve_exit_check_interval(
+                v,
+                mode="paper",
+                timeframe_s=1,
+                is_smoke=False,
+                has_protective_exit=False,
+            )
+        except ExitConfigError as exc:
+            raise ValueError(
+                "live_exit_check_interval_s must be 0 (off) or an integer 60..3600"
+            ) from exc
         return v
 
     @field_validator("api_key_hash", "api_key_hash_secondary")
@@ -684,3 +742,101 @@ def get_settings() -> Settings:
     In tests, call get_settings.cache_clear() before patching env vars.
     """
     return Settings()
+
+
+# ---------------------------------------------------------------------------
+# CF-36: exact-match log redaction registry
+# ---------------------------------------------------------------------------
+
+#: Plain ``str`` fields that hold secret-derived material (hashes of the client
+#: API keys).  Everything typed ``SecretStr`` is discovered from the model.
+_PLAIN_SECRET_FIELDS: tuple[str, ...] = ("api_key_hash", "api_key_hash_secondary")
+
+#: ``SecretStr`` fields whose value needs a non-default registration kind.
+_SECRET_KINDS: dict[str, str] = {
+    "database_url": "url",  # register the password component only
+    "redis_url": "url",
+    "telegram_bot_token": "telegram",  # also the secret half after ':'
+    "exchange_api_secret": "pem",  # may be a PEM / base64 body
+}
+
+
+def iter_settings_secrets(settings: Settings) -> list[tuple[str, str, str]]:
+    """Return ``(field_name, raw_value, kind)`` for every non-empty secret field.
+
+    Single source of truth shared by :func:`register_settings_secrets` and the
+    deploy self-check (``python -m api.log_hygiene_check``).  Callers must never
+    log the returned values.
+    """
+    out: list[tuple[str, str, str]] = []
+    for name in type(settings).model_fields:
+        raw = getattr(settings, name, None)
+        if isinstance(raw, SecretStr):
+            value = raw.get_secret_value()
+        elif name in _PLAIN_SECRET_FIELDS and isinstance(raw, str):
+            value = raw
+        else:
+            continue
+        if value and value.strip():
+            out.append((name, value, _SECRET_KINDS.get(name, "plain")))
+    return out
+
+
+def _sqlalchemy_dsn_password(dsn: str) -> str | None:
+    """The password exactly as SQLAlchemy (and so asyncpg) will use it, or ``None``.
+
+    CF-36 SEC-07: ``urlsplit`` and SQLAlchemy disagree about a raw ``/``, ``#`` or
+    ``?`` in a DSN password (SQLAlchemy accepts them), so the generic ``kind="url"``
+    registration can pick a wrong prefix.  ``redaction.py`` stays stdlib-only, hence
+    the SQLAlchemy lookup lives here.  Never raises and never reports the error
+    (``make_url`` messages can echo the DSN).
+    """
+    try:
+        from sqlalchemy.engine import make_url
+
+        password = make_url(dsn).password
+    except Exception:  # malformed DSN: nothing extra to register
+        return None
+    return password if isinstance(password, str) and password.strip() else None
+
+
+def register_settings_secrets(settings: Settings) -> int:
+    """Register every configured secret for exact-match log redaction (R-09).
+
+    Called from the API lifespan immediately after ``configure_logging`` and
+    before the first application log line.  ``Settings`` is the primary source
+    (it also reads ``.env`` / ``.env.local`` files, whose values are not in
+    ``os.environ``); ``configure_logging`` registers the environment as a
+    fallback.  Logs only field names and a variant count, never a value or a
+    length.  Returns the number of variants added.
+    """
+    import structlog
+
+    from common.redaction import register_secret, secret_skip_reason
+
+    log = structlog.get_logger(__name__)
+    total = 0
+    registered: list[str] = []
+    skipped: list[tuple[str, str]] = []
+    for name, value, kind in iter_settings_secrets(settings):
+        added = register_secret(value, name=name, kind=kind)
+        if name == "database_url":
+            # SEC-07: also the password as SQLAlchemy parses it (plain registration)
+            dsn_password = _sqlalchemy_dsn_password(value)
+            if dsn_password:
+                added += register_secret(dsn_password, name=name, kind="plain")
+        total += added
+        if added:
+            registered.append(name)
+        else:
+            reason = secret_skip_reason(value, kind)
+            if reason is not None:
+                skipped.append((name, reason))
+    log.info(
+        "log_redaction.secrets_registered",
+        fields=sorted(registered),
+        variants=total,
+    )
+    for name, reason in sorted(skipped):
+        log.warning("log_redaction.secret_not_registered", field=name, reason=reason)
+    return total

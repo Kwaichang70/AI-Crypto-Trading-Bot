@@ -62,6 +62,15 @@ class Signal(BaseModel):
         default_factory=dict,
         description="Arbitrary strategy-specific context (indicator values, etc.)",
     )
+    entry_size_multiplier: Decimal = Field(
+        default=Decimal("1"),
+        gt=Decimal(0),
+        le=Decimal(1),
+        description=(
+            "Engine-owned BUY size multiplier (circuit-breaker REDUCE, WP1.6); "
+            "ignored for SELL. Strategies must not set it."
+        ),
+    )
 
 
 class Order(BaseModel):

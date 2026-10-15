@@ -516,12 +516,19 @@ class TestConfidenceAppliedOnce:
     """Confidence is applied exactly once (on the target); ceiling uses conf=1.0."""
 
     def test_cb_reduce_times_confidence_composes_single_application(self) -> None:
-        """TEST-S51-014 (T-12): a CB-REDUCE-halved target composes with confidence, strictly smaller.
+        """TEST-S51-014 (T-12): a halved target composes with confidence, strictly smaller.
 
-        CircuitBreaker REDUCE halves target_position upstream (in StrategyEngine).
-        The resolver then applies confidence ONCE. So resolving a halved target at
+        Confidence is applied ONCE, on the target.  So resolving a halved target at
         conf=c yields exactly half the qty of resolving the full target at conf=c,
         and confidence is applied a single time (no double-count).
+
+        WP1.6 note (WP16-T-44): before WP1.6 this was described as "CB REDUCE halves
+        target_position upstream in StrategyEngine".  That claim is no longer true:
+        REDUCE now acts on the FINAL resolved quantity (after the risk ceiling) via
+        ``Signal.entry_size_multiplier`` and ``target_position`` is never mutated
+        (see WP16-T-16 / WP16-T-19).  This test therefore pins only the
+        confidence-composition property of the resolver, with a hand-built halved
+        target as the stand-in input.
         """
         engine, _ = _make_real_paper_engine()
         conf = 0.8

@@ -229,24 +229,42 @@ class TestBounds:
                 )
             assert exc.value.issues[0].reason == "out_of_range"
 
-    def test_atr_period_upper_bound_99_uniform(self) -> None:
+    def test_atr_period_upper_bound_49_uniform(self) -> None:
+        """WP1.3b-a FX-01: W = 6*period+1 must fit one ccxt Coinbase call (300 bars),
+        so 49 is the ceiling in EVERY mode (a config that passes a backtest must never
+        fail at promote)."""
+        bracket = {"bracket_mode": "atr", "bracket_atr_sl_multiplier": 1.5}
         parse_exit_config(
-            bracket={
-                "bracket_mode": "atr",
-                "bracket_atr_sl_multiplier": 1.5,
-                "bracket_atr_period": 99,
-            },
-            trailing_stop_pct=None,
+            bracket={**bracket, "bracket_atr_period": 49}, trailing_stop_pct=None
         )
-        with pytest.raises(ExitConfigError):
-            parse_exit_config(
-                bracket={
-                    "bracket_mode": "atr",
-                    "bracket_atr_sl_multiplier": 1.5,
-                    "bracket_atr_period": 100,
-                },
+        for bad in (50, 99, 100):
+            with pytest.raises(ExitConfigError) as exc:
+                parse_exit_config(
+                    bracket={**bracket, "bracket_atr_period": bad}, trailing_stop_pct=None
+                )
+            assert exc.value.issues[0].reason == "out_of_range"
+            assert exc.value.issues[0].field == "bracket_atr_period"
+            assert exc.value.issues[0].max == 49
+        # the SAME bound in every run mode (a backtest-valid config must not fail at promote)
+        for mode in (RunMode.BACKTEST, RunMode.PAPER, RunMode.LIVE):
+            validate_run_exit_config(
+                _Requires,
+                bracket={**bracket, "bracket_atr_period": 49},
                 trailing_stop_pct=None,
+                mode=mode,
+                allow_pyramiding=False,
             )
+            for bad in (50, 99):
+                with pytest.raises(ExitConfigError) as exc:
+                    validate_run_exit_config(
+                        _Requires,
+                        bracket={**bracket, "bracket_atr_period": bad},
+                        trailing_stop_pct=None,
+                        mode=mode,
+                        allow_pyramiding=False,
+                    )
+                assert exc.value.issues[0].reason == "out_of_range", (mode, bad)
+                assert exc.value.issues[0].max == 49, (mode, bad)
 
     def test_trailing_out_of_range(self) -> None:
         for bad in (0.6, 1.0, 0.004):

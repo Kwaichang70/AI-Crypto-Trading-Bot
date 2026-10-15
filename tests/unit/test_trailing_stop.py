@@ -559,12 +559,14 @@ class TestTrailingStopCheck:
         mgr.check("BTC/USD", Decimal("44000"), None)
         assert "BTC/USD" not in mgr.pending_stop_symbols
 
-    def test_trigger_clears_peak_tracking_for_that_symbol(self) -> None:
+    def test_trigger_keeps_peak_until_flat(self) -> None:
         """
-        After a trigger fires, the peak for that symbol must be cleared.
+        WP1.3b-a (SY-13b-05, AC-13B-06): a trigger KEEPS the high-water mark.
 
-        This prevents the manager from re-triggering on every subsequent bar
-        until the position is actually flat and the engine re-registers it.
+        Pre-1.3b the peak was popped on trigger, so an exit that was not
+        submitted or only partly filled re-seeded the stop from the (lower)
+        current price.  Re-triggering is prevented by the pending guard; the
+        mark is dropped only when the position is flat.
         """
         mgr = TrailingStopManager(trailing_stop_pct=0.03)
         pos = _make_position()
@@ -573,6 +575,9 @@ class TestTrailingStopCheck:
         signal = mgr.check("BTC/USD", Decimal("45000"), pos)
 
         assert signal is not None
+        assert mgr.peak_prices["BTC/USD"] == Decimal("50000")
+        assert "BTC/USD" in mgr.pending_stop_symbols
+        mgr.check("BTC/USD", Decimal("45000"), _flat_position())
         assert "BTC/USD" not in mgr.peak_prices
 
     def test_very_small_pct_with_realistic_btc_prices(self) -> None:
@@ -633,8 +638,10 @@ class TestTrailingPartialFillSafety:
     the position quantity while a stop SELL is pending must resume trailing
     protection for the live size immediately; a stuck order (quantity
     unchanged) is force-cleared after ``pending_stop_ttl`` checks.  Trailing
-    semantics: after the guard clears, the peak re-seeds from the current
-    price — a fresh trailing stop, not an immediate re-emit.
+    semantics (WP1.3b-a, SY-13b-05): after the guard clears, tracking resumes
+    against the SAME high-water mark -- never a re-seed from the current
+    price, which would loosen the stop -- so a residual that is still below
+    the trailing level is re-protected (re-emitted) at once.
     """
 
     def test_ttl_validation(self) -> None:
@@ -649,15 +656,15 @@ class TestTrailingPartialFillSafety:
         full = _make_position(quantity="0.01")
         mgr.check("BTC/USD", Decimal("50000"), full)
         assert mgr.check("BTC/USD", Decimal("45000"), full) is not None  # stop emitted
-        # Partial fill left a residual -> guard cleared, peak re-seeds at 45000.
+        # Partial fill left a residual -> guard cleared; the peak is KEPT at
+        # 50000 (WP1.3b-a), so the residual is below the trailing level and
+        # is re-protected immediately instead of waiting for a fresh 3% drop.
         residual = _make_position(quantity="0.004")
-        assert mgr.check("BTC/USD", Decimal("45000"), residual) is None
-        assert "BTC/USD" not in mgr.pending_stop_symbols
-        assert mgr.peak_prices["BTC/USD"] == Decimal("45000")
-        # A further 3%+ drop from the new peak re-triggers for the residual.
-        sig = mgr.check("BTC/USD", Decimal("43000"), residual)
+        sig = mgr.check("BTC/USD", Decimal("45000"), residual)
         assert sig is not None
         assert sig.direction == SignalDirection.SELL
+        assert sig.metadata["peak_price"] == "50000"
+        assert mgr.peak_prices["BTC/USD"] == Decimal("50000")
 
     def test_quantity_increase_resumes_tracking(self) -> None:
         mgr = TrailingStopManager(trailing_stop_pct=0.03, pending_stop_ttl=5)
@@ -665,9 +672,11 @@ class TestTrailingPartialFillSafety:
         mgr.check("BTC/USD", Decimal("50000"), full)
         assert mgr.check("BTC/USD", Decimal("45000"), full) is not None
         bigger = _make_position(quantity="0.02")  # re-entry while pending
-        assert mgr.check("BTC/USD", Decimal("45000"), bigger) is None
-        assert "BTC/USD" not in mgr.pending_stop_symbols
-        assert "BTC/USD" in mgr.peak_prices  # fresh tracking armed
+        # WP1.3b-a: guard cleared, same mark kept -> the bigger size is
+        # re-protected at once (no re-seed from the current price).
+        sig = mgr.check("BTC/USD", Decimal("45000"), bigger)
+        assert sig is not None
+        assert mgr.peak_prices["BTC/USD"] == Decimal("50000")
 
     def test_stuck_order_cleared_after_ttl(self) -> None:
         mgr = TrailingStopManager(trailing_stop_pct=0.03, pending_stop_ttl=2)
@@ -677,10 +686,10 @@ class TestTrailingPartialFillSafety:
         # age 1 < ttl 2 -> still suppressed
         assert mgr.check("BTC/USD", Decimal("45000"), pos) is None
         assert "BTC/USD" in mgr.pending_stop_symbols
-        # age 2 >= ttl 2 -> force-clear; tracking resumes (peak re-seeds)
-        assert mgr.check("BTC/USD", Decimal("45000"), pos) is None
-        assert "BTC/USD" not in mgr.pending_stop_symbols
-        assert mgr.peak_prices["BTC/USD"] == Decimal("45000")
+        # age 2 >= ttl 2 -> force-clear; tracking resumes against the SAME
+        # mark (WP1.3b-a: no re-seed), so the stuck stop is re-emitted.
+        assert mgr.check("BTC/USD", Decimal("45000"), pos) is not None
+        assert mgr.peak_prices["BTC/USD"] == Decimal("50000")
 
     def test_full_fill_flat_clears_all_pending_state(self) -> None:
         mgr = TrailingStopManager(trailing_stop_pct=0.03)

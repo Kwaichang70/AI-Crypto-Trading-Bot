@@ -65,6 +65,8 @@ class DefaultRiskManager(BaseRiskManager):
         daily_pnl: Decimal,
         peak_equity: Decimal,
         market_price: Decimal | None = None,
+        *,
+        daily_loss_basis: Decimal | None = None,
     ) -> RiskCheckResult:
         """
         Evaluate **all** risk rules against a proposed order.
@@ -198,7 +200,7 @@ class DefaultRiskManager(BaseRiskManager):
         _gate(self._check_max_positions(open_positions))
 
         # 4. Daily loss
-        _gate(self._check_daily_loss(daily_pnl, current_equity))
+        _gate(self._check_daily_loss(daily_pnl, current_equity, daily_loss_basis))
 
         # 5. Drawdown
         _gate(self._check_drawdown(current_equity, peak_equity))

@@ -406,9 +406,20 @@ class MetricsCollector:
             "signals_generated_total",
             "orders_submitted_total",
             "fills_executed_total",
+            # CF-36: redaction safety net.  ``failures`` is unlabelled; hits are
+            # pre-registered per rule label (an unlabelled sibling would collide
+            # with the labelled series in the Prometheus bridge).
+            "log_redaction_failures_total",
         )
         for counter_name in _default_counters:
             self._counters.setdefault(counter_name, 0)
+        for rule_id in (
+            "R-01", "R-02", "R-03", "R-04", "R-05",
+            "R-06", "R-07", "R-08", "R-09", "R-10", "R-11",
+        ):
+            self._counters.setdefault(
+                _label_key("log_redaction_hits_total", {"rule": rule_id}), 0
+            )
 
         # Gauges: all start at 0.0
         _default_gauges = (

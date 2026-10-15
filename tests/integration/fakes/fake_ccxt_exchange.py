@@ -101,6 +101,25 @@ WP1.4b (Verbeterplan v2 idempotent-submit spec, A-13) extensions
   wall-clock ``since`` filter (the live engine's cid lookup computes
   ``since`` from ``datetime.now(tz=UTC)``) would silently drop. Pass
   ``None`` to go back to bar time.
+
+WP1.3b-b additions (live intra-bar exit check)
+----------------------------------------------
+- ``set_ticker(symbol, *, bid, ask=..., last=..., timestamp_ms=None)``: script the
+  top of the book.  Unspecified ``ask``/``last`` default to ``bid``; an explicit
+  ``None`` / ``""`` / ``float("nan")`` / ``0`` is passed through verbatim (an
+  INVALID reading).  The ticker's ``last`` is also the price a market order fills
+  at until the next ``push_bar`` for that symbol (which clears the override).
+- ``queue_ticker_error(symbol, exc, times=1, after=0)``: ``fetch_ticker(symbol)`` raises
+  ``exc`` ``times`` times, after letting ``after`` calls through.
+- ``ticker_calls`` / ``ticker_call_log``: every ``fetch_ticker`` call (any caller --
+  the market-data handle and the trading handle share this fake).
+- ``fetch_ticker`` now returns ``bid``/``ask``/``last``/``timestamp``; the default
+  is ``bid = ask = last = last bar close``, so existing tests are unaffected.
+- ``queue_partial_execution(symbol, fraction)`` / ``complete_partial_execution(order_id)``:
+  a REAL partial fill.  Unlike ``queue_partial_fill`` (a status-only artefact: the whole
+  trade is recorded at ``create_order``), only ``fraction`` of the next order executes --
+  balances and the trade record move by that part only and the order stays ``open`` --
+  until the test completes the rest.
 """
 
 from __future__ import annotations
@@ -111,6 +130,9 @@ from typing import Any
 import ccxt
 
 __all__ = ["FakeCCXTExchange"]
+
+#: sentinel: "argument not given" (distinct from an explicit ``None`` reading)
+_UNSET: Any = object()
 
 # Candle duration in milliseconds per TimeFrame value. Mirrors
 # ``data.services.ccxt_market_data._TIMEFRAME_DURATION_MS`` (kept as a
@@ -237,6 +259,28 @@ class FakeCCXTExchange:
         # WP1.4b (A-13): overrides bar-time as this fake's notion of "now"
         # for new order/trade timestamps -- see set_now_ms().
         self._now_ms_override: int | None = None
+
+        # WP1.3b-a: ``ohlcv_calls`` records every ``fetch_ohlcv`` call as
+        # (symbol, timeframe, since_ms, limit).  ``pad_forming_bar=False`` drops
+        # the "still forming" duplicate of the last closed bar that
+        # ``fetch_ohlcv(limit < len(bars))`` normally appends (needed to model a
+        # warmup window that is SHORTER than the exchange history).
+        self.ohlcv_calls: list[tuple[str, str, int | None, int | None]] = []
+        self.pad_forming_bar: bool = True
+        # WP1.3b-a (FX-01): models the exchange page cap (ccxt Coinbase
+        # ``limit = min(limit, 300)``): when set, every ``fetch_ohlcv`` returns at
+        # most this many rows, on the ``since`` and on the non-``since`` branch.
+        self.max_ohlcv_limit: int | None = None
+
+        # WP1.3b-b: scripted top of the book per symbol (see ``set_ticker``), one-shot
+        # ticker faults, and a record of every ``fetch_ticker`` call.
+        self._tickers: dict[str, dict[str, Any]] = {}
+        # symbol -> (exception, remaining raises, calls to let through first)
+        self._queued_ticker_errors: dict[str, tuple[Exception, int, int]] = {}
+        # symbol -> fraction of the NEXT order that really executes (see queue_partial_execution)
+        self._queued_partial_exec: dict[str, Decimal] = {}
+        self.ticker_calls: int = 0
+        self.ticker_call_log: list[str] = []
 
         # Test-visible audit log of every create_order call, in call order.
         # Each entry: {"id", "symbol", "side", "amount" (Decimal), "price" (Decimal)}.
@@ -384,6 +428,83 @@ class FakeCCXTExchange:
         high = max(open_, close_f)
         low = min(open_, close_f)
         bars.append([ts, open_, high, low, close_f, 1.0])
+        # WP1.3b-b: a new closed bar ends any scripted ticker for the symbol.
+        self._tickers.pop(symbol, None)
+
+    def set_ticker(
+        self,
+        symbol: str,
+        *,
+        bid: Any,
+        ask: Any = _UNSET,
+        last: Any = _UNSET,
+        timestamp_ms: int | None = None,
+    ) -> None:
+        """WP1.3b-b: script ``symbol``'s ticker (see the module docstring).
+
+        ``ask`` and ``last`` default to ``bid``.  Any explicit value is passed
+        through verbatim, so a test can model an invalid reading (``None``,
+        ``""``, ``float("nan")``, ``0``, a crossed book).  The ticker's ``last``
+        is the market fill price until the next ``push_bar`` for ``symbol``.
+        """
+        self._tickers[symbol] = {
+            "bid": bid,
+            "ask": bid if ask is _UNSET else ask,
+            "last": bid if last is _UNSET else last,
+            "timestamp": timestamp_ms,
+        }
+
+    def queue_ticker_error(
+        self, symbol: str, exc: Exception, *, times: int = 1, after: int = 0
+    ) -> None:
+        """WP1.3b-b: ``fetch_ticker(symbol)`` raises ``exc`` ``times`` times, after
+        letting the next ``after`` calls through (e.g. the two intra-bar readings, so
+        that the failure lands inside ``process_signal``'s own ticker fetch)."""
+        self._queued_ticker_errors[symbol] = (exc, times, after)
+
+    def queue_partial_execution(self, symbol: str, fraction: Decimal) -> None:
+        """WP1.3b-b: the next order for ``symbol`` executes only ``fraction`` of its amount
+        (balances + one trade record for that part); it stays ``open`` with that ``filled``
+        until :meth:`complete_partial_execution` executes the rest."""
+        self._queued_partial_exec[symbol] = fraction
+
+    def complete_partial_execution(self, exchange_order_id: str) -> None:
+        """Execute the remaining part of a partially executed order and close it."""
+        order = self._orders[exchange_order_id]
+        remaining = Decimal(str(order["_exec_remaining"]))
+        if remaining <= 0:
+            return
+        symbol, side = order["symbol"], order["side"]
+        market = self.markets.get(symbol) or self._market_defs[symbol]
+        base, quote = market["base"], market["quote"]
+        price = Decimal(str(order["average_fill_price"]))
+        notional = remaining * price
+        fee_currency = quote
+        fee_cost = (notional * self._taker_fee_pct).quantize(_QTY_PRECISION)
+        self._apply_fill(
+            base=base,
+            quote=quote,
+            side=side,
+            qty=remaining,
+            price=price,
+            fee=fee_cost,
+            fee_currency=fee_currency,
+        )
+        self._trades.append(
+            {
+                "order": exchange_order_id,
+                "symbol": symbol,
+                "side": side,
+                "amount": float(remaining),
+                "price": float(price),
+                "fee": {"cost": float(fee_cost), "currency": fee_currency},
+                "takerOrMaker": "taker",
+                "timestamp": order["timestamp"],
+            }
+        )
+        order["_exec_remaining"] = "0"
+        order["status"] = "closed"
+        order["filled"] = order["amount"]
 
     def queue_order_error(self, symbol: str, exc: Exception) -> None:
         """Make the *next* ``create_order`` call for ``symbol`` raise ``exc``.
@@ -597,7 +718,30 @@ class FakeCCXTExchange:
     async def fetch_ticker(
         self, symbol: str, params: dict[str, Any] | None = None
     ) -> dict[str, Any]:
-        return {"symbol": symbol, "last": float(self._last_price(symbol))}
+        self.ticker_calls += 1
+        self.ticker_call_log.append(symbol)
+        queued = self._queued_ticker_errors.get(symbol)
+        if queued is not None:
+            exc, remaining, skip = queued
+            if skip > 0:
+                self._queued_ticker_errors[symbol] = (exc, remaining, skip - 1)
+            else:
+                if remaining <= 1:
+                    del self._queued_ticker_errors[symbol]
+                else:
+                    self._queued_ticker_errors[symbol] = (exc, remaining - 1, 0)
+                raise exc
+        scripted = self._tickers.get(symbol)
+        if scripted is not None:
+            return {"symbol": symbol, **scripted}
+        last = float(self._last_price(symbol))
+        return {
+            "symbol": symbol,
+            "bid": last,
+            "ask": last,
+            "last": last,
+            "timestamp": self._now_ms(symbol),
+        }
 
     async def fetch_ohlcv(
         self,
@@ -607,11 +751,25 @@ class FakeCCXTExchange:
         limit: int | None = None,
         params: dict[str, Any] | None = None,
     ) -> list[list[Any]]:
+        self.ohlcv_calls.append((symbol, timeframe, since, limit))
+        if self.max_ohlcv_limit is not None:
+            limit = (
+                self.max_ohlcv_limit if limit is None else min(limit, self.max_ohlcv_limit)
+            )
         bars = self._closed_bars.get(symbol, [])
         if not bars:
             return []
 
+        if since is not None:
+            # WP1.3b-a: a ``since`` query returns real closed bars only (no
+            # forming-bar padding), oldest first, from ``since`` on.
+            ranged = [row for row in bars if row[0] >= since]
+            return [list(row) for row in (ranged[:limit] if limit is not None else ranged)]
+
         n = limit if limit is not None else len(bars)
+
+        if not self.pad_forming_bar and n < len(bars):
+            return [list(row) for row in (bars[-n:] if n > 0 else [])]
 
         if n >= len(bars):
             # WP10-C-05 fix: the caller wants (at least) the full seeded
@@ -711,11 +869,22 @@ class FakeCCXTExchange:
         else:
             fee_cost = (notional * self._taker_fee_pct).quantize(_QTY_PRECISION)
 
+        # WP1.3b-b: a real partial execution -- only this part moves balances / trades now.
+        exec_fraction = self._queued_partial_exec.pop(symbol, None)
+        exec_qty = qty
+        if exec_fraction is not None:
+            exec_qty = (qty * exec_fraction).quantize(_QTY_PRECISION)
+            fee_cost = (
+                (exec_qty * self._taker_fee_pct).quantize(_QTY_PRECISION)
+                if fee_currency == base
+                else (exec_qty * fill_price * self._taker_fee_pct).quantize(_QTY_PRECISION)
+            )
+
         self._apply_fill(
             base=base,
             quote=quote,
             side=side,
-            qty=qty,
+            qty=exec_qty,
             price=fill_price,
             fee=fee_cost,
             fee_currency=fee_currency,
@@ -759,7 +928,11 @@ class FakeCCXTExchange:
             "timestamp": ts_ms,
             "_partial_fraction": (str(partial_fraction) if partial_fraction is not None else None),
             "_partial_polled_once": False,
+            "_exec_remaining": str(qty - exec_qty),
         }
+        if exec_fraction is not None:
+            order_record["filled"] = float(exec_qty)
+            order_record["average"] = float(fill_price)
         self._orders[exchange_order_id] = order_record
 
         self._trades.append(
@@ -767,7 +940,7 @@ class FakeCCXTExchange:
                 "order": exchange_order_id,
                 "symbol": symbol,
                 "side": side,
-                "amount": float(qty),
+                "amount": float(exec_qty),
                 "price": float(fill_price),
                 "fee": {"cost": float(fee_cost), "currency": fee_currency},
                 "takerOrMaker": "taker",
@@ -826,6 +999,12 @@ class FakeCCXTExchange:
             settled["filled"] = float(partial_amount)
             settled["average"] = order["average_fill_price"]
             return settled
+
+        if Decimal(str(order.get("_exec_remaining", "0"))) > 0:
+            # WP1.3b-b: a really partially executed order stays open until completed.
+            partial = dict(order)
+            partial["status"] = "open"
+            return partial
 
         if order.get("_seeded_resting", False):
             # WP1.8b: a seeded exchange-side order reports its OWN current
@@ -958,6 +1137,14 @@ class FakeCCXTExchange:
     # ------------------------------------------------------------------
 
     def _last_price(self, symbol: str) -> Decimal:
+        scripted = self._tickers.get(symbol)
+        if scripted is not None:
+            try:
+                value = Decimal(str(scripted["last"]))
+            except Exception:
+                value = Decimal("0")
+            if value.is_finite() and value > 0:
+                return value
         bars = self._closed_bars.get(symbol)
         if not bars:
             raise ccxt.BadSymbol(f"no price history seeded for {symbol!r} yet")

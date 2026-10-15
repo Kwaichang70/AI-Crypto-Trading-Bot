@@ -193,6 +193,8 @@ services:
       TELEGRAM_CHAT_ID:             ${TELEGRAM_CHAT_ID:-}
       # -- Run management --
       MAX_RUN_DURATION_HOURS:       ${MAX_RUN_DURATION_HOURS:-168}
+      # -- Live intra-bar exit check (WP1.3b-b): 0 = off, else 60..3600 seconds --
+      LIVE_EXIT_CHECK_INTERVAL_S:   ${LIVE_EXIT_CHECK_INTERVAL_S:-300}
       # -- External signal APIs --
       FRED_API_KEY:                 ${FRED_API_KEY:-}
       WHALE_ALERT_API_KEY:          ${WHALE_ALERT_API_KEY:-}

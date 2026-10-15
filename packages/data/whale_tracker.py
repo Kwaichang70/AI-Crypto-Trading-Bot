@@ -51,6 +51,8 @@ from typing import Any
 import structlog
 from pydantic import BaseModel, Field
 
+from common.logging import exc_log_fields
+
 __all__ = [
     "WhaleFlowSnapshot",
     "WhaleAlertClient",
@@ -285,9 +287,10 @@ class WhaleAlertClient:
             return snapshot
 
         except Exception as exc:
+            # CF-36 F-10: never ``str(exc)`` -- the URL carries ``api_key=``.
             self._log.warning(
                 "whale_alert_client.fetch_failed",
-                error=str(exc),
+                **exc_log_fields(exc),
             )
             if self._latest_cache is not None:
                 self._log.debug("whale_alert_client.stale_cache_used")

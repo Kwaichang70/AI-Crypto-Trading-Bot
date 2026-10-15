@@ -7,24 +7,55 @@ price crosses a stop-loss (below entry) or take-profit (above entry) level.
 
 This is the fixed/volatility-scaled counterpart to
 :class:`trading.trailing_stop.TrailingStopManager`.  Whereas the trailing
-stop floats with the price peak, brackets are anchored to the position's
-``average_entry_price`` and never move.
+stop floats with the price peak, brackets are **anchored once per lot** and
+never move (WP1.3b-a, see below).
 
 Designed to be composed into ``StrategyEngine._process_bar()`` without
 modifying execution engines (paper or live), exactly like the trailing stop.
 
 Two modes (``bracket_mode``)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-* ``"fixed"`` — levels are a fixed fraction of entry price::
+* ``"fixed"`` — levels are a fixed fraction of the entry basis::
 
       stop_price        = entry * (1 - stop_loss_pct)
       take_profit_price = entry * (1 + take_profit_pct)
 
-* ``"atr"`` — levels are an ATR multiple away from entry (volatility
-  adaptive).  The engine recomputes ATR each bar and passes it in::
+* ``"atr"`` — levels are an ATR multiple away from the entry basis
+  (volatility adaptive).  The ATR is computed **once per lot** (the ATR of
+  the signal bar, frozen) and never re-read::
 
-      stop_price        = entry - atr_sl_multiplier * atr
-      take_profit_price = entry + atr_tp_multiplier * atr
+      stop_price        = entry - atr_sl_multiplier * atr0
+      take_profit_price = entry + atr_tp_multiplier * atr0
+
+Anchoring (WP1.3b-a, SY-13b-01..03, D-13b-04: all modes)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+1. A *lot* runs from the BUY fill that takes a symbol from flat to open until
+   it is flat again.  A partial SELL does not end it.  The *opening order* is
+   the order of that first fill.
+2. The entry basis ``E`` is the all-in blended average over the opening
+   order's BUY fills (``portfolio.blend_entry_price``).  Adds from other
+   orders never change ``E`` or the levels, up or down (user decision U-6).
+3. Levels are stored as prices in a :class:`BracketAnchor`.  They change only
+   when a further fill of the opening order re-blends ``E`` (the ATR stays
+   frozen) or once on finalisation of a provisional/deferred anchor.
+4. The anchor bar is a pure function of persisted data
+   (:func:`select_anchor_bar`, ``anchor_at = min(order.created_at,
+   first fill executed_at)``) so a resume recomputes exactly what the live
+   run anchored.
+5. A lot without an anchor (hook exception, direct unit use) is anchored
+   lazily at the first :meth:`BracketExitManager.check` from the position's
+   ``average_entry_price`` and the caller's ``atr_value`` (source ``late``).
+
+Intra-bar mode (WP1.3b-b, live only)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+``check(..., intrabar=True)`` is the read-only variant the live engine's
+intra-bar exit task calls between bar closes with a confirmed BID.  It uses the
+existing anchor only (no anchor, or an anchor of another lot: ``None``; nothing
+is created, dropped or finalised), evaluates the **stop-loss only** (take-profit
+is bar-close only, D-13b-02), never ages the pending-exit TTL (only bar-close
+checks do) and does not clean up a flat position.  A quantity change while an
+exit is pending still re-protects the residual.  The signal it emits carries
+``exit_path="intrabar"``, ``trigger_source="bid"`` and ``trigger_price``.
 
 Precedence
 ~~~~~~~~~~
@@ -46,19 +77,36 @@ detector labels the trade correctly.
 """
 from __future__ import annotations
 
-from decimal import Decimal
+from collections.abc import Sequence
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime, timedelta
+from decimal import ROUND_HALF_UP, Decimal
+from typing import Literal
+from uuid import UUID
 
 import structlog
 
-from common.types import SignalDirection
-from trading.models import Position, Signal
+from common.models import OHLCVBar
+from common.types import OrderSide, SignalDirection
+from trading.models import Fill, Order, Position, Signal
+from trading.portfolio import blend_entry_price
+from trading.recovery import replay_sort_key
 
 __all__ = [
     "ATR_MULTIPLIER_RANGE",
     "ATR_PERIOD_MIN",
     "FIXED_PCT_RANGE",
     "VALID_BRACKET_MODES",
+    "AnchorSource",
+    "BracketAnchor",
     "BracketExitManager",
+    "LotEntry",
+    "anchor_bar_timestamp",
+    "lot_entry_from_fills",
+    "lot_entry_from_opening_fills",
+    "open_lot_fills",
+    "select_anchor_bar",
+    "window_is_contiguous",
 ]
 
 logger = structlog.get_logger(__name__)
@@ -74,6 +122,184 @@ VALID_BRACKET_MODES: frozenset[str] = _VALID_MODES
 FIXED_PCT_RANGE: tuple[float, float] = (0.001, 0.95)
 ATR_MULTIPLIER_RANGE: tuple[float, float] = (0.1, 20.0)
 ATR_PERIOD_MIN: int = 2
+
+_PRECISION = Decimal("0.00000001")
+
+#: FX-07: a finalisation that moves the stop DOWN by more than this many bps
+#: (the interim stop was tighter than the exact one, i.e. the accepted RK-11
+#: one-time loosening) is logged at warning level; any other move at info level.
+_FINALIZE_WARN_DELTA_BPS: float = -25.0
+
+#: Where a :class:`BracketAnchor` came from (logged and metric-tagged).
+AnchorSource = Literal[
+    "entry",
+    "entry_provisional",
+    "entry_deferred",
+    "entry_unverified",
+    "resume_recomputed",
+    "resume_fallback_current_atr",
+    "late",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class LotEntry:
+    """Entry facts of the open lot, derived purely from persisted fills/orders.
+
+    ``entry_basis`` is the all-in blend over the opening order's BUY fills
+    (``blend_entry_price``); ``entry_gross_vwap`` is the fee-free VWAP of the
+    same fills (the trailing stop's initial high-water mark).  ``anchor_at`` is
+    ``min(order.created_at, first opening fill executed_at)`` (SY-13b-01).
+    """
+
+    symbol: str
+    opening_order_id: UUID | None
+    anchor_at: datetime
+    entry_basis: Decimal
+    entry_gross_vwap: Decimal
+    basis_qty: Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class BracketAnchor:
+    """The frozen bracket levels of one lot (prices, not formulas)."""
+
+    symbol: str
+    lot_key: datetime
+    opening_order_id: UUID | None
+    anchor_at: datetime | None
+    anchor_bar_ts: datetime | None
+    entry_basis: Decimal
+    basis_qty: Decimal
+    atr: Decimal | None
+    stop_price: Decimal | None
+    take_profit_price: Decimal | None
+    source: AnchorSource
+    final: bool
+
+
+def _as_utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value
+
+
+def select_anchor_bar(
+    bars: Sequence[OHLCVBar], anchor_at: datetime, timeframe_s: int
+) -> int | None:
+    """Index of the last bar whose close (``timestamp + timeframe``) is at or
+    before ``anchor_at`` (inclusive), or ``None`` when no bar qualifies.
+
+    ``bars`` must be ascending by timestamp.  Pure (no clock).
+    """
+    tf = timedelta(seconds=timeframe_s)
+    at = _as_utc(anchor_at)
+    for i in range(len(bars) - 1, -1, -1):
+        if _as_utc(bars[i].timestamp) + tf <= at:
+            return i
+    return None
+
+
+def anchor_bar_timestamp(
+    bars: Sequence[OHLCVBar], anchor_at: datetime, timeframe_s: int
+) -> datetime | None:
+    """Open time of the rule bar for ``anchor_at`` on the bar grid of ``bars``.
+
+    Unlike :func:`select_anchor_bar` this is arithmetic: it also yields the
+    timestamp when the rule bar is *newer* than the newest bar in the window
+    (a bar boundary passed between the fetch and the order) or *older* than
+    the oldest (a resumed lot older than the warmup window).  ``None`` for an
+    empty ``bars``.
+    """
+    if not bars:
+        return None
+    tf = timedelta(seconds=timeframe_s)
+    ref = _as_utc(bars[-1].timestamp)
+    steps = (_as_utc(anchor_at) - tf - ref) // tf
+    return ref + steps * tf
+
+
+def window_is_contiguous(bars: Sequence[OHLCVBar], timeframe_s: int) -> bool:
+    """True when every consecutive pair of bars is exactly one timeframe apart."""
+    tf = timedelta(seconds=timeframe_s)
+    return all(
+        _as_utc(bars[i + 1].timestamp) - _as_utc(bars[i].timestamp) == tf
+        for i in range(len(bars) - 1)
+    )
+
+
+def lot_entry_from_opening_fills(
+    symbol: str, order: Order | None, fills: Sequence[Fill]
+) -> LotEntry | None:
+    """Build the :class:`LotEntry` from the opening order's BUY fills.
+
+    The single computation shared by the live hook and the resume recompute
+    (so both derive the same numbers).  ``None`` when there are no fills.
+    """
+    ordered = sorted(fills, key=replay_sort_key)
+    if not ordered:
+        return None
+    basis = Decimal("0")
+    qty = Decimal("0")
+    gross_cost = Decimal("0")
+    for fill in ordered:
+        basis = blend_entry_price(qty, basis, fill)
+        qty += fill.quantity
+        gross_cost += fill.price * fill.quantity
+    anchor_at = ordered[0].executed_at
+    if order is not None:
+        anchor_at = min(_as_utc(order.created_at), _as_utc(anchor_at))
+    return LotEntry(
+        symbol=symbol,
+        opening_order_id=ordered[0].order_id,
+        anchor_at=_as_utc(anchor_at),
+        entry_basis=basis,
+        entry_gross_vwap=(gross_cost / qty).quantize(_PRECISION, rounding=ROUND_HALF_UP),
+        basis_qty=qty,
+    )
+
+
+def open_lot_fills(fills: Sequence[Fill], symbol: str) -> list[Fill]:
+    """The opening order's BUY fills of the lot still open for ``symbol``.
+
+    Replays ``fills`` in ``replay_sort_key`` order with the portfolio's own
+    quantity arithmetic.  The lot opens at a BUY that takes the quantity from
+    zero; only fills of that opening order are returned (adds from other
+    orders are ignored, SY-13b-03).  Partial SELLs do not end the lot.
+    ``[]`` when the symbol is flat.
+    """
+    qty = Decimal("0")
+    opening_order_id: UUID | None = None
+    opening_fills: list[Fill] = []
+    for fill in sorted((f for f in fills if f.symbol == symbol), key=replay_sort_key):
+        if fill.side == OrderSide.BUY:
+            if qty <= Decimal("0"):
+                opening_order_id = fill.order_id
+                opening_fills = [fill]
+                qty = fill.quantity
+            else:
+                qty += fill.quantity
+                if fill.order_id == opening_order_id:
+                    opening_fills.append(fill)
+        elif fill.side == OrderSide.SELL:
+            qty -= min(fill.quantity, qty)
+    if qty <= Decimal("0"):
+        return []
+    return opening_fills
+
+
+def lot_entry_from_fills(
+    fills: Sequence[Fill], orders: Sequence[Order], symbol: str
+) -> LotEntry | None:
+    """Entry facts of the lot still open for ``symbol`` (``None`` when flat).
+
+    Pure function of persisted fills/orders: the resume recompute (WP1.3b-a,
+    SY-13b-01) and the live hook both end in :func:`lot_entry_from_opening_fills`.
+    """
+    opening_fills = open_lot_fills(fills, symbol)
+    if not opening_fills:
+        return None
+    order_id = opening_fills[0].order_id
+    order = next((o for o in orders if o.order_id == order_id), None)
+    return lot_entry_from_opening_fills(symbol, order, opening_fills)
 
 
 class BracketExitManager:
@@ -102,8 +328,9 @@ class BracketExitManager:
         ATR-mode take-profit multiplier (e.g. 3.0 = 3x ATR above entry).
         Must be in [0.1, 20.0] when set.  Used only in ``"atr"`` mode.
     atr_period : int
-        ATR look-back period the engine should use when computing the ATR
-        value passed to :meth:`check`.  Must be >= 2.  Default 14.
+        ATR look-back period the engine uses when it freezes the lot's ATR at
+        entry (and for the lazy ``late`` anchor's ``atr_value``).  Must be
+        >= 2.  Default 14.
     strategy_id : str
         Strategy ID on emitted signals.  Must NOT contain the substring
         ``"trailing_stop"`` (see module docstring).  Default ``"bracket_exit"``.
@@ -212,6 +439,10 @@ class BracketExitManager:
         self._pending_age: dict[str, int] = {}
         # ATR-mode symbols already warned about a missing ATR (log once).
         self._atr_warned_symbols: set[str] = set()
+        # WP1.3b-a: the frozen per-lot levels (one anchor per open symbol).
+        self._anchors: dict[str, BracketAnchor] = {}
+        # Symbols already warned about a lazily-created ("late") anchor.
+        self._late_warned: set[str] = set()
 
         self._log = structlog.get_logger(__name__).bind(
             component="bracket_exit",
@@ -240,6 +471,13 @@ class BracketExitManager:
         return self._mode == "atr"
 
     @property
+    def has_stop_loss(self) -> bool:
+        """True iff the active mode configures a stop-loss leg (a TP-only bracket has none)."""
+        if self._mode == "fixed":
+            return self._stop_loss_pct is not None
+        return self._atr_sl_multiplier is not None
+
+    @property
     def pending_exit_symbols(self) -> set[str]:
         """Symbols with emitted but unfilled exit signals (read-only copy)."""
         return set(self._pending_exit_symbols)
@@ -260,9 +498,10 @@ class BracketExitManager:
         position: Position | None,
         *,
         atr_value: Decimal | None = None,
+        intrabar: bool = False,
     ) -> Signal | None:
         """
-        Check stop-loss / take-profit brackets for a single symbol.
+        Check the lot's frozen stop-loss / take-profit levels for one symbol.
 
         Parameters
         ----------
@@ -271,21 +510,35 @@ class BracketExitManager:
         current_price : Decimal
             Latest close price for this symbol.
         position : Position | None
-            Current position (None or flat = nothing to protect).
+            Current position (None or flat = nothing to protect; the anchor
+            and any pending exit are dropped).
         atr_value : Decimal | None
-            Latest ATR in price units.  Required in ``"atr"`` mode; ignored
-            in ``"fixed"`` mode.  When None/<=0 in ATR mode, no exit is
-            emitted (the position is held) and a warning is logged once.
+            Only used when the lot has **no anchor** (lazy ``late`` path:
+            hook exception, direct unit use): the ATR is then frozen at the
+            first value passed.  Ignored for anchored lots -- their levels are
+            prices and never follow a later ATR (WP1.3b-a, AC-13B-01).  In ATR
+            mode, no anchor and no usable ATR means no exit and a warning
+            (logged once).
+        intrabar : bool
+            WP1.3b-b: evaluate as the live intra-bar check -- ``current_price``
+            is a confirmed BID, only the stop-loss is evaluated, the pending TTL
+            is not aged and no state other than the pending guard is touched
+            (see the module docstring).  ``atr_value`` is ignored.
 
         Returns
         -------
         Signal | None
             A full-close SELL signal if a bracket is breached, else None.
         """
+        if intrabar:
+            return self._check_intrabar(symbol, current_price, position)
+
         # No position or flat — clean up tracking (the exit filled fully).
         if position is None or position.is_flat:
             self._clear_pending(symbol)
             self._atr_warned_symbols.discard(symbol)
+            self._late_warned.discard(symbol)
+            self._anchors.pop(symbol, None)
             return None
 
         # An exit was emitted but the position is not yet flat.  Decide
@@ -334,7 +587,10 @@ class BracketExitManager:
         if entry <= Decimal(0):
             return None
 
-        stop_price, take_profit_price = self._levels(symbol, entry, atr_value)
+        anchor = self._anchor_for(symbol, position, atr_value)
+        if anchor is None:
+            return None
+        stop_price, take_profit_price = anchor.stop_price, anchor.take_profit_price
         if stop_price is None and take_profit_price is None:
             return None
 
@@ -347,6 +603,7 @@ class BracketExitManager:
                 level=stop_price,
                 quantity=position.quantity,
                 is_stop_loss=True,
+                anchor=anchor,
             )
 
         if take_profit_price is not None and current_price >= take_profit_price:
@@ -357,9 +614,359 @@ class BracketExitManager:
                 level=take_profit_price,
                 quantity=position.quantity,
                 is_stop_loss=False,
+                anchor=anchor,
             )
 
         return None
+
+    def _check_intrabar(
+        self,
+        symbol: str,
+        current_price: Decimal,
+        position: Position | None,
+    ) -> Signal | None:
+        """Read-only stop-loss check against a confirmed BID (WP1.3b-b)."""
+        if position is None or position.is_flat:
+            return None
+        if symbol in self._pending_exit_symbols:
+            prev_qty = self._pending_qty.get(symbol)
+            if prev_qty is not None and position.quantity != prev_qty:
+                self._log.info(
+                    "bracket_exit.quantity_changed_reprotect",
+                    symbol=symbol,
+                    prev_quantity=str(prev_qty),
+                    new_quantity=str(position.quantity),
+                    direction=(
+                        "partial_fill" if position.quantity < prev_qty else "increase"
+                    ),
+                )
+                self._clear_pending(symbol)
+            else:
+                # An exit is in flight: never age it from a tick (only bar-close
+                # checks count towards the TTL).
+                return None
+        entry = position.average_entry_price
+        if entry <= Decimal(0):
+            return None
+        anchor = self._anchors.get(symbol)
+        if anchor is None or anchor.lot_key != position.opened_at:
+            return None
+        stop_price = anchor.stop_price
+        if stop_price is None or current_price > stop_price:
+            return None
+        return self._emit(
+            symbol=symbol,
+            entry=entry,
+            current_price=current_price,
+            level=stop_price,
+            quantity=position.quantity,
+            is_stop_loss=True,
+            anchor=anchor,
+            intrabar=True,
+        )
+
+    def has_unchanged_pending(self, symbol: str, position: Position | None) -> bool:
+        """True iff an exit for ``symbol`` is in flight with the position quantity
+        unchanged since it was emitted (pure; used to skip pointless intra-bar reads)."""
+        if symbol not in self._pending_exit_symbols:
+            return False
+        prev_qty = self._pending_qty.get(symbol)
+        return prev_qty is None or position is None or position.quantity == prev_qty
+
+    # ------------------------------------------------------------------ #
+    # Anchor book (WP1.3b-a)
+    # ------------------------------------------------------------------ #
+
+    def get_anchor(self, symbol: str) -> BracketAnchor | None:
+        """The lot's anchor, or ``None`` (read-only; anchors are frozen)."""
+        return self._anchors.get(symbol)
+
+    def projected_levels(
+        self, entry_price: Decimal, atr_value: Decimal | None
+    ) -> tuple[Decimal | None, Decimal | None]:
+        """Pure ``(stop, take_profit)`` for a hypothetical entry (WP1.10 hook).
+
+        The exact formula the anchor uses, so a sizing step can price the stop
+        before the order exists.  No state, no logging.
+        """
+        return self._compute_levels(entry_price, atr_value)
+
+    def protective_level(self, symbol: str, position: Position | None) -> Decimal | None:
+        """The anchored stop-loss price for an open lot, else ``None`` (pure)."""
+        if position is None or position.is_flat:
+            return None
+        anchor = self._anchors.get(symbol)
+        if anchor is None or anchor.lot_key != position.opened_at:
+            return None
+        return anchor.stop_price
+
+    def open_lot(
+        self,
+        symbol: str,
+        *,
+        lot_key: datetime,
+        opening_order_id: UUID | None,
+        anchor_at: datetime | None,
+        anchor_bar_ts: datetime | None,
+        entry_basis: Decimal,
+        basis_qty: Decimal,
+        atr: Decimal | None,
+        source: AnchorSource,
+        final: bool,
+    ) -> BracketAnchor:
+        """Create (replace) the anchor for a lot that just went flat -> open."""
+        stop, tp = self._compute_levels(entry_basis, atr)
+        anchor = BracketAnchor(
+            symbol=symbol,
+            lot_key=lot_key,
+            opening_order_id=opening_order_id,
+            anchor_at=anchor_at,
+            anchor_bar_ts=anchor_bar_ts,
+            entry_basis=entry_basis,
+            basis_qty=basis_qty,
+            atr=atr,
+            stop_price=stop,
+            take_profit_price=tp,
+            source=source,
+            final=final,
+        )
+        self._anchors[symbol] = anchor
+        self._clear_pending(symbol)
+        self._atr_warned_symbols.discard(symbol)
+        self._late_warned.discard(symbol)
+        self._log_anchor(anchor)
+        return anchor
+
+    def add_opening_fill(
+        self,
+        symbol: str,
+        *,
+        order_id: UUID,
+        entry_basis: Decimal,
+        basis_qty: Decimal,
+    ) -> BracketAnchor | None:
+        """A further BUY fill in the lot.
+
+        A fill of the **opening order** re-blends the entry basis (the ATR
+        stays frozen) and recomputes the levels.  A fill of any other order is
+        an add: the levels stay (user decision U-6) and
+        ``bracket_exit.anchor_kept_on_add`` is logged.  No-op without an anchor.
+        """
+        anchor = self._anchors.get(symbol)
+        if anchor is None:
+            return None
+        if anchor.opening_order_id != order_id:
+            self._log.info(
+                "bracket_exit.anchor_kept_on_add",
+                symbol=symbol,
+                stop_price=str(anchor.stop_price) if anchor.stop_price is not None else None,
+                take_profit_price=(
+                    str(anchor.take_profit_price)
+                    if anchor.take_profit_price is not None
+                    else None
+                ),
+            )
+            return anchor
+        stop, tp = self._compute_levels(entry_basis, anchor.atr)
+        updated = replace(
+            anchor,
+            entry_basis=entry_basis,
+            basis_qty=basis_qty,
+            stop_price=stop,
+            take_profit_price=tp,
+        )
+        self._anchors[symbol] = updated
+        self._log_anchor(updated)
+        return updated
+
+    def arm_interim(
+        self,
+        symbol: str,
+        *,
+        atr: Decimal,
+        anchor_bar_ts: datetime | None,
+        source: AnchorSource,
+    ) -> BracketAnchor | None:
+        """Arm the INTERIM levels of a pending anchor that has none yet (FX-02/03).
+
+        The interim ATR is a tightest-estimate stand-in while the exact window is
+        unavailable (SEC-01).  It is written **once**: a no-op returning ``None``
+        when the anchor is missing, already final, or already armed (carries an
+        ATR or any level), so a pending anchor can never be re-armed or loosened
+        bar to bar.  Otherwise the levels come from ``_compute_levels`` on the
+        existing ``entry_basis``; the anchor stays ``final=False`` and is logged.
+        """
+        anchor = self._anchors.get(symbol)
+        if anchor is None or anchor.final:
+            return None
+        if (
+            anchor.atr is not None
+            or anchor.stop_price is not None
+            or anchor.take_profit_price is not None
+        ):
+            return None
+        stop, tp = self._compute_levels(anchor.entry_basis, atr)
+        updated = replace(
+            anchor,
+            atr=atr,
+            anchor_bar_ts=anchor_bar_ts if anchor_bar_ts is not None else anchor.anchor_bar_ts,
+            stop_price=stop,
+            take_profit_price=tp,
+            source=source,
+            final=False,
+        )
+        self._anchors[symbol] = updated
+        self._log_anchor(updated)
+        return updated
+
+    def finalize_anchor(
+        self,
+        symbol: str,
+        *,
+        atr: Decimal | None,
+        anchor_bar_ts: datetime | None,
+        source: AnchorSource,
+    ) -> BracketAnchor | None:
+        """Finalise a provisional/deferred anchor **exactly once**.
+
+        A second call (or a call on an already-final anchor) is a no-op that
+        returns ``None``.  ``atr=None`` keeps the existing ATR (and levels).
+        Logs ``bracket_exit.anchor_finalized`` with ``prev_stop_price``,
+        ``stop_price`` and ``delta_bps`` (WP13BA-SEC-07): warning when the stop
+        moved down by more than 25 bps, info otherwise.
+        """
+        anchor = self._anchors.get(symbol)
+        if anchor is None or anchor.final:
+            return None
+        new_atr = atr if atr is not None else anchor.atr
+        stop, tp = self._compute_levels(anchor.entry_basis, new_atr)
+        updated = replace(
+            anchor,
+            atr=new_atr,
+            anchor_bar_ts=anchor_bar_ts if anchor_bar_ts is not None else anchor.anchor_bar_ts,
+            stop_price=stop,
+            take_profit_price=tp,
+            source=source,
+            final=True,
+        )
+        self._anchors[symbol] = updated
+        self._log_anchor(updated)
+        self._log_finalized(anchor, updated)
+        return updated
+
+    def _log_finalized(self, prev: BracketAnchor, new: BracketAnchor) -> None:
+        """``bracket_exit.anchor_finalized``: the size of the interim -> final move."""
+        delta_bps: float | None = None
+        if (
+            prev.stop_price is not None
+            and new.stop_price is not None
+            and new.entry_basis > Decimal(0)
+        ):
+            delta_bps = round(
+                float((new.stop_price - prev.stop_price) / new.entry_basis * 10_000), 4
+            )
+        emit = (
+            self._log.warning
+            if delta_bps is not None and delta_bps < _FINALIZE_WARN_DELTA_BPS
+            else self._log.info
+        )
+        emit(
+            "bracket_exit.anchor_finalized",
+            symbol=new.symbol,
+            source=new.source,
+            prev_stop_price=str(prev.stop_price) if prev.stop_price is not None else None,
+            stop_price=str(new.stop_price) if new.stop_price is not None else None,
+            delta_bps=delta_bps,
+        )
+
+    def restore_anchor(self, anchor: BracketAnchor) -> None:
+        """Install an anchor recomputed by a resume (replaces any existing)."""
+        self._anchors[anchor.symbol] = anchor
+        self._clear_pending(anchor.symbol)
+        self._log_anchor(anchor)
+
+    def clear_pending(self, symbol: str) -> None:
+        """Drop the pending-exit guard for ``symbol`` (R-04).
+
+        Called by the engine when an exit signal was **not submitted** (empty
+        order list, every order terminal and unfilled, or ``process_signal``
+        raised): the next evaluation may then re-emit instead of waiting for
+        the TTL.
+        """
+        self._clear_pending(symbol)
+
+    def _log_anchor(self, anchor: BracketAnchor) -> None:
+        self._log.info(
+            "bracket_exit.anchored",
+            symbol=anchor.symbol,
+            source=anchor.source,
+            final=anchor.final,
+            anchor_bar_ts=str(anchor.anchor_bar_ts) if anchor.anchor_bar_ts else None,
+            entry_basis=str(anchor.entry_basis),
+            atr0=str(anchor.atr) if anchor.atr is not None else None,
+            stop_price=str(anchor.stop_price) if anchor.stop_price is not None else None,
+            take_profit_price=(
+                str(anchor.take_profit_price) if anchor.take_profit_price is not None else None
+            ),
+        )
+
+    def _anchor_for(
+        self,
+        symbol: str,
+        position: Position,
+        atr_value: Decimal | None,
+    ) -> BracketAnchor | None:
+        """The anchor protecting ``position`` (creating a ``late`` one lazily)."""
+        anchor = self._anchors.get(symbol)
+        if anchor is not None and anchor.lot_key != position.opened_at:
+            self._log.warning(
+                "bracket_exit.anchor_lot_mismatch",
+                symbol=symbol,
+                anchor_lot_key=str(anchor.lot_key),
+                position_opened_at=str(position.opened_at),
+            )
+            del self._anchors[symbol]
+            anchor = None
+        if anchor is not None:
+            return anchor
+
+        entry = position.average_entry_price
+        if self._mode == "atr" and (atr_value is None or atr_value <= Decimal(0)):
+            if symbol not in self._atr_warned_symbols:
+                self._atr_warned_symbols.add(symbol)
+                self._log.warning(
+                    "bracket_exit.atr_unavailable",
+                    symbol=symbol,
+                    note="holding position; no ATR bracket this bar",
+                )
+            return None
+        atr0 = atr_value if self._mode == "atr" else None
+        stop, tp = self._compute_levels(entry, atr0)
+        late = BracketAnchor(
+            symbol=symbol,
+            lot_key=position.opened_at,
+            opening_order_id=None,
+            anchor_at=None,
+            anchor_bar_ts=None,
+            entry_basis=entry,
+            basis_qty=position.quantity,
+            atr=atr0,
+            stop_price=stop,
+            take_profit_price=tp,
+            source="late",
+            final=True,
+        )
+        self._anchors[symbol] = late
+        if symbol not in self._late_warned:
+            self._late_warned.add(symbol)
+            self._log.warning(
+                "bracket_exit.anchor_late",
+                symbol=symbol,
+                note="no entry anchor for the open lot; anchored from the average "
+                "entry price at the first check",
+            )
+        self._log_anchor(late)
+        return late
 
     def _clear_pending(self, symbol: str) -> None:
         """Drop all pending-exit tracking for ``symbol``."""
@@ -367,13 +974,12 @@ class BracketExitManager:
         self._pending_qty.pop(symbol, None)
         self._pending_age.pop(symbol, None)
 
-    def _levels(
+    def _compute_levels(
         self,
-        symbol: str,
         entry: Decimal,
         atr_value: Decimal | None,
     ) -> tuple[Decimal | None, Decimal | None]:
-        """Return ``(stop_price, take_profit_price)`` for the active mode."""
+        """Return ``(stop_price, take_profit_price)`` for the active mode (pure)."""
         if self._mode == "fixed":
             stop = (
                 entry * (Decimal("1") - self._stop_loss_pct)
@@ -389,13 +995,6 @@ class BracketExitManager:
 
         # ATR mode.
         if atr_value is None or atr_value <= Decimal(0):
-            if symbol not in self._atr_warned_symbols:
-                self._atr_warned_symbols.add(symbol)
-                self._log.warning(
-                    "bracket_exit.atr_unavailable",
-                    symbol=symbol,
-                    note="holding position; no ATR bracket this bar",
-                )
             return None, None
 
         stop = (
@@ -422,6 +1021,8 @@ class BracketExitManager:
         level: Decimal,
         quantity: Decimal,
         is_stop_loss: bool,
+        anchor: BracketAnchor,
+        intrabar: bool = False,
     ) -> Signal:
         """Build the full-close SELL signal and mark the symbol pending."""
         self._pending_exit_symbols.add(symbol)
@@ -437,6 +1038,8 @@ class BracketExitManager:
             entry_price=str(entry),
             level_price=str(level),
             current_price=str(current_price),
+            anchor_source=anchor.source,
+            exit_path="intrabar" if intrabar else "bar_close",
         )
 
         metadata: dict[str, object] = {
@@ -444,7 +1047,14 @@ class BracketExitManager:
             "bracket_mode": self._mode,
             "entry_price": str(entry),
             "current_price": str(current_price),
+            "anchor_source": anchor.source,
+            "atr_anchor": str(anchor.atr) if anchor.atr is not None else None,
         }
+        if intrabar:
+            # A missing ``exit_path`` means bar close (WP1.3b-b).
+            metadata["exit_path"] = "intrabar"
+            metadata["trigger_source"] = "bid"
+            metadata["trigger_price"] = str(current_price)
         # Exactly one of these is set so ExitReasonDetector classifies
         # the trade correctly (it checks stop_loss before take_profit).
         if is_stop_loss:
@@ -469,3 +1079,5 @@ class BracketExitManager:
         self._pending_qty.clear()
         self._pending_age.clear()
         self._atr_warned_symbols.clear()
+        self._anchors.clear()
+        self._late_warned.clear()

@@ -1,8 +1,8 @@
 """
 packages/trading/recovery.py
 -----------------------------
-Pure (no DB, no I/O) domain helpers for the WP1.8 orphan-recovery/resume
-pipeline.
+Pure (no DB, no network I/O; logs only on a degraded seed) domain helpers
+for the WP1.8 orphan-recovery/resume pipeline.
 
 This module holds the value objects and validation logic that both the
 paper boot-resume path (``apps.api.routers.runs.recover_orphaned_runs``)
@@ -23,18 +23,23 @@ from __future__ import annotations
 
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
+
+import structlog
 
 from common.types import OrderSide
 from trading.models import Fill, Order
 
 __all__ = [
+    "ResumeDailySeed",
     "ResumeRejected",
     "ResumeSnapshot",
     "check_fill_integrity",
     "replay_sort_key",
 ]
+
+_log = structlog.get_logger(__name__)
 
 #: Default tolerance for quantity comparisons -- one satoshi-scale unit.
 #: Matches the WP1.1 I8 tolerance convention (one amount step, or this
@@ -86,6 +91,54 @@ class ResumeRejected(Exception):
 
 
 @dataclass(frozen=True)
+class ResumeDailySeed:
+    """
+    Persisted day-start hints for a resume (WP1.5 §5.7 / §6).
+
+    Consumed by ``PortfolioAccounting.from_fills(daily_seed=...)`` to seed the
+    mark-to-market day state (``nav_day_start`` and the daily-loss latch).
+    The mark-to-market day start cannot be rebuilt from fills: the replay
+    values positions at old fill prices.  ``ResumeSnapshot.daily_seed`` (WP1.5b,
+    filled by ``load_resume_snapshot`` from the equity-snapshot table) builds
+    it; ``PortfolioAccounting._seed_daily_state`` consumes it.
+
+    There is deliberately **no** validation or coercion here (WP1.5b R-1 /
+    SEC-05 / SEC-208): construction never raises, and the single validation
+    authority is ``PortfolioAccounting._seed_daily_state``, which checks every
+    field strictly (``Decimal`` / strict ``date`` / aware ``datetime``; floats,
+    ints, strings, NaN and negative values are rejected, never repaired) and
+    degrades a bad seed to ``day_start_source="unknown"`` (BUYs blocked until
+    00:00 UTC, exits unaffected).
+
+    Attributes
+    ----------
+    as_of_day:
+        The UTC day the hints were read on (midnight-race detection: if it is
+        earlier than the resume's "today" the hints describe yesterday).
+    day_start_equity:
+        Equity of the latest snapshot strictly before ``as_of_day`` 00:00 UTC,
+        or ``None`` if the run has none.
+    day_min_equity:
+        Minimum snapshot equity at or after ``as_of_day`` 00:00 UTC, or
+        ``None`` if there is none.
+    run_started_at:
+        ``RunORM.started_at`` -- lets a run that started today use
+        ``initial_cash`` as its day start.
+    day_first_equity:
+        Equity of the earliest snapshot at or after ``as_of_day`` 00:00 UTC
+        (read together with ``day_min_equity``: one is set if and only if the
+        other is).  With it, the snapshot day start is
+        ``max(day_start_equity, day_first_equity)``.
+    """
+
+    as_of_day: date
+    day_start_equity: Decimal | None
+    day_min_equity: Decimal | None
+    run_started_at: datetime | None
+    day_first_equity: Decimal | None = None
+
+
+@dataclass(frozen=True)
 class ResumeSnapshot:
     """
     Everything :meth:`PortfolioAccounting.from_fills` and the paper/live
@@ -101,6 +154,58 @@ class ResumeSnapshot:
     orders: Sequence[Order]
     peak_equity_hint: Decimal | None
     max_bar_index: int
+    # WP1.5b -- daily-risk-state seed hints (all defaulted, so every existing
+    # constructor call keeps working).  Read by ``load_resume_snapshot``;
+    # ``daily_seed`` turns them into a ``ResumeDailySeed``.
+    day_start_equity_hint: Decimal | None = None
+    day_min_equity_hint: Decimal | None = None
+    day_first_equity_hint: Decimal | None = None
+    daily_hints_day: date | None = None
+    run_started_at: datetime | None = None
+
+    @property
+    def daily_seed(self) -> ResumeDailySeed | None:
+        """The ``ResumeDailySeed`` for ``PortfolioAccounting.from_fills``.
+
+        ``None`` if and only if ``daily_hints_day`` is ``None`` (hints were
+        never read: legacy and test snapshots) -- that maps to the weaker
+        ``replay_estimate`` path, so a snapshot that *did* read hints never
+        returns ``None``.
+
+        Never raises (WP1.5b R-1): the hint values are passed through
+        **unmodified** -- no coercion -- so a wrong-typed value is flagged by
+        ``PortfolioAccounting._seed_daily_state`` (``unknown`` /
+        ``seed_invalid``).  If building the seed itself fails, a seed carrying
+        only the day (every hint ``None``) is returned and
+        ``resume.daily_seed_invalid`` is logged at error level (type names
+        only, never values); that maps to ``unknown`` as well.
+        """
+        if self.daily_hints_day is None:
+            return None
+        try:
+            return ResumeDailySeed(
+                as_of_day=self.daily_hints_day,
+                day_start_equity=self.day_start_equity_hint,
+                day_min_equity=self.day_min_equity_hint,
+                run_started_at=self.run_started_at,
+                day_first_equity=self.day_first_equity_hint,
+            )
+        except Exception as exc:  # a resume must never abort on seed data
+            _log.error(
+                "resume.daily_seed_invalid",
+                field="construction",
+                value_type=type(exc).__name__,
+            )
+            as_of = self.daily_hints_day
+            if not isinstance(as_of, date) or isinstance(as_of, datetime):
+                as_of = datetime.now(UTC).date()
+            return ResumeDailySeed(
+                as_of_day=as_of,
+                day_start_equity=None,
+                day_min_equity=None,
+                run_started_at=None,
+                day_first_equity=None,
+            )
 
 
 def check_fill_integrity(

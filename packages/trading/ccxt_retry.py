@@ -30,6 +30,7 @@ from typing import Any, Callable, TypeVar
 
 import structlog
 
+from common.logging import exc_log_fields
 from trading.ccxt_errors import translate_ccxt_error
 
 __all__ = ["ccxt_retry"]
@@ -106,7 +107,8 @@ async def ccxt_retry(
                 attempt=attempt + 1,
                 max_retries=max_retries,
                 delay=round(delay, 2),
-                error=str(exc)[:200],
+                # CF-36 F-01: never str(exc) -- ccxt text embeds the signed URL
+                **exc_log_fields(exc),
                 user_message=translate_ccxt_error(exc),
             )
 
@@ -116,7 +118,7 @@ async def ccxt_retry(
         "ccxt_retry.exhausted",
         operation=operation,
         max_retries=max_retries,
-        error=str(last_exc)[:200],
+        **(exc_log_fields(last_exc) if last_exc is not None else {}),
         user_message=translate_ccxt_error(last_exc) if last_exc is not None else "Unknown error",
     )
     raise last_exc  # type: ignore[misc]

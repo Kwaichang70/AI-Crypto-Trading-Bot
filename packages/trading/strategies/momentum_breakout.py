@@ -77,7 +77,7 @@ class _MomentumBreakoutParams(BaseModel):
         description="ATR-mode take-profit distance (x ATR above entry). Keep > SL.",
     )
     bracket_atr_period: int = Field(
-        default=14, ge=2, le=99,
+        default=14, ge=2, le=49,
         description="ATR look-back used for ATR-mode brackets.",
     )
     bracket_stop_loss_pct: float | None = Field(

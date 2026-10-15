@@ -12,30 +12,30 @@ apps/api/services/audit_log.py       -- 'circuit_breaker_halt_auto_stop' in _VAL
 Coverage groups (8 producer tests + 2 CR4-001 + 1 RISK-CB-008 = 11 tests)
 ---------------------------------------------------------------------------
 TestAutoStopReasonInit           (2) -- initial None value, property read
-TestHaltSetsStopEvent            (3) -- HALT triggers stop, REDUCE no-stop, DAILY_LIMIT no-stop
-TestIdempotentHalt               (1) -- second HALT call does not double-fire
+TestHaltDoesNotStopTheRun        (3) -- WP1.6 / D4: HALT, REDUCE, DAILY_LIMIT never stop the run
+TestRepeatedHaltBars             (1) -- WP1.6 / D4: repeated HALT bars keep the run going
 TestAuditEventTypeRegistered     (1) -- 'circuit_breaker_halt_auto_stop' in _VALID_EVENT_TYPES
 TestAuditLogBehavior             (1) -- record_audit_event accepts the new event type
 TestOrchestratorAuditConditional (2) -- orchestrator audit-called/not-called per auto_stop_reason
 TestNoLiquidationContract        (1) -- HALT does not mutate portfolio positions
 
+WP1.6 rewrite (WP16-T-44)
+-------------------------
+Sprint 50 Cycle 4 made a circuit-breaker HALT stop the run.  WP1.6 (decision D4)
+reverses that: HALT blocks ENTRIES only and the run keeps polling, so
+``TestHaltSetsStopEvent`` (3 tests) and ``TestIdempotentHalt`` (1 test), which
+SIMULATED the removed ``_process_bar`` branch inline and would have stayed green
+while pinning removed behaviour, were rewritten as ``TestHaltDoesNotStopTheRun``
+and ``TestRepeatedHaltBars``.  They now drive the REAL ``StrategyEngine._process_bar``
+(see ``tests/unit/_wp16_support.py``) and assert D4: ``_stop_event`` unset,
+``auto_stop_reason is None``, the next bar processed.  The audit-type, audit-log
+and orchestrator-conditional tests are unchanged: the orchestrator ``finally``
+branches are unreachable legacy until CF-29 (``auto_stop_reason`` is never set).
+
 Design notes
 ------------
-- StrategyEngine is NOT instantiated directly; its __init__ requires many
-  collaborators. We test _auto_stop_reason independently by constructing a
-  minimal mock engine with only the attributes under test.
-- For _process_bar tests: we use a real CircuitBreaker and call _process_bar
-  indirectly via a thin StrategyEngine wrapper built with MagicMock collaborators
-  following the same pattern as test_graduated_circuit_breaker.py.
-- The audit_log test uses the public _VALID_EVENT_TYPES frozenset directly —
+- The audit_log test uses the public _VALID_EVENT_TYPES frozenset directly --
   this is the canonical guard before any DB write.
-- NOTE on branch-simulation scope: TestHaltSetsStopEvent and TestIdempotentHalt
-  simulate the _process_bar HALT branch inline rather than calling _process_bar
-  directly. This is deliberate — instantiating a full StrategyEngine requires
-  ~12 async collaborators and would shift these tests into the integration suite.
-  The branch logic under test is a 3-line if-block; simulation gives 100%
-  logical fidelity at unit-test cost. Insertion position is verified by the
-  bar-loop integration test.
 """
 
 from __future__ import annotations
@@ -47,7 +47,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from trading.safety import CircuitBreaker, CircuitBreakerConfig, CircuitBreakerResponse
+from common.types import RunMode
+from tests.unit._wp16_support import DAILY_ONLY, HALT_ONLY, OTHER, bar, build_engine, buy
+from trading.safety import (
+    CircuitBreaker,
+    CircuitBreakerConfig,
+    CircuitBreakerResponse,
+    build_run_circuit_breaker,
+)
 
 
 # ===========================================================================
@@ -128,88 +135,78 @@ class TestAutoStopReasonInit:
 
 
 # ===========================================================================
-# TestHaltSetsStopEvent
+# TestHaltDoesNotStopTheRun  (WP1.6 / D4; rewrite of TestHaltSetsStopEvent)
 # ===========================================================================
 
 
-class TestHaltSetsStopEvent:
-    """Tests for the HALT branch that sets _stop_event and _auto_stop_reason.
+class TestHaltDoesNotStopTheRun:
+    """Through the REAL ``_process_bar``: no circuit-breaker level stops the run."""
 
-    These tests validate branch semantics by direct simulation; insertion
-    position is verified by the bar-loop integration test.
-    """
+    @pytest.mark.parametrize("mode", [RunMode.PAPER, RunMode.LIVE])
+    async def test_halt_does_not_set_stop_event_or_reason(self, mode: RunMode) -> None:
+        """HALT (data-driven, 20% drawdown) blocks entries but never stops the run."""
+        engine, _ex, _pf = build_engine(
+            cb=build_run_circuit_breaker("test-halt", HALT_ONLY),
+            signals=lambda i: [buy(OTHER)],
+            params=HALT_ONLY,
+            mode=mode,
+        )
+        await engine.start("test-halt")
+        await bar(engine, "800")
+        assert engine.circuit_breaker is not None
+        assert engine.circuit_breaker.current_response == CircuitBreakerResponse.HALT
+        assert not engine._stop_event.is_set()
+        assert engine.auto_stop_reason is None
 
-    def test_halt_sets_stop_event_and_reason(self) -> None:
-        """Simulated HALT response must set _stop_event and _auto_stop_reason."""
-        ns = _make_engine_ns()
-        breaker = CircuitBreaker(config=_breaker_config(), run_id="test-halt")
-        # Force a hard trip so check_graduated returns HALT
-        breaker.trip("test drawdown breach")
-        cb_response = breaker.check_graduated(equity=10_000, daily_pnl=0.0, drawdown=0.20)
-        assert cb_response == CircuitBreakerResponse.HALT
-
-        # Simulate the Sprint 50 Cycle 4 branch
-        if cb_response == CircuitBreakerResponse.HALT and not ns._stop_event.is_set():
-            ns._auto_stop_reason = "circuit_breaker_halt"
-            ns._stop_event.set()
-
-        assert ns._stop_event.is_set()
-        assert ns.auto_stop_reason == "circuit_breaker_halt"
-
-    def test_reduce_does_not_set_stop_event(self) -> None:
+    async def test_reduce_does_not_set_stop_event(self) -> None:
         """REDUCE response must NOT set _stop_event."""
-        ns = _make_engine_ns()
-        breaker = CircuitBreaker(config=_breaker_config(), run_id="test-reduce")
-        cb_response = breaker.check_graduated(equity=10_000, daily_pnl=0.0, drawdown=0.11)
-        assert cb_response == CircuitBreakerResponse.REDUCE
+        engine, _ex, _pf = build_engine(
+            cb=build_run_circuit_breaker("test-reduce", HALT_ONLY),
+            signals=lambda i: [],
+            params=HALT_ONLY,
+        )
+        await bar(engine, "880")
+        assert engine.circuit_breaker is not None
+        assert engine.circuit_breaker.current_response == CircuitBreakerResponse.REDUCE
+        assert not engine._stop_event.is_set()
+        assert engine.auto_stop_reason is None
 
-        # The HALT branch should not fire for REDUCE
-        if cb_response == CircuitBreakerResponse.HALT and not ns._stop_event.is_set():
-            ns._auto_stop_reason = "circuit_breaker_halt"
-            ns._stop_event.set()
-
-        assert not ns._stop_event.is_set()
-        assert ns.auto_stop_reason is None
-
-    def test_daily_limit_does_not_set_stop_event(self) -> None:
-        """DAILY_LIMIT response must NOT set _stop_event (may resume next day)."""
-        ns = _make_engine_ns()
-        breaker = CircuitBreaker(config=_breaker_config(), run_id="test-daily")
-        cb_response = breaker.check_graduated(equity=10_000, daily_pnl=-600.0, drawdown=0.02)
-        assert cb_response == CircuitBreakerResponse.DAILY_LIMIT
-
-        if cb_response == CircuitBreakerResponse.HALT and not ns._stop_event.is_set():
-            ns._auto_stop_reason = "circuit_breaker_halt"
-            ns._stop_event.set()
-
-        assert not ns._stop_event.is_set()
-        assert ns.auto_stop_reason is None
+    async def test_daily_limit_does_not_set_stop_event(self) -> None:
+        """DAILY_LIMIT response must NOT set _stop_event (clears at the next UTC day)."""
+        engine, _ex, _pf = build_engine(
+            cb=build_run_circuit_breaker("test-daily", DAILY_ONLY),
+            signals=lambda i: [],
+            params=DAILY_ONLY,
+        )
+        await bar(engine, "900")
+        assert engine.circuit_breaker is not None
+        assert engine.circuit_breaker.current_response == CircuitBreakerResponse.DAILY_LIMIT
+        assert not engine._stop_event.is_set()
+        assert engine.auto_stop_reason is None
 
 
 # ===========================================================================
-# TestIdempotentHalt
+# TestRepeatedHaltBars  (WP1.6 / D4; rewrite of TestIdempotentHalt)
 # ===========================================================================
 
 
-class TestIdempotentHalt:
-    """Tests for the not-is_set() guard preventing double-fire."""
+class TestRepeatedHaltBars:
+    """Repeated HALT bars keep the run going (nothing to be idempotent about)."""
 
-    def test_second_halt_does_not_re_trigger(self) -> None:
-        """When _stop_event is already set, a second HALT bar must not re-assign reason."""
-        # First HALT fires normally
-        ns = _make_engine_ns()
-        breaker = CircuitBreaker(config=_breaker_config(), run_id="test-idempotent")
-        breaker.trip("first halt")
-
-        for _ in range(2):
-            cb_response = breaker.check_graduated(equity=10_000, daily_pnl=0.0, drawdown=0.20)
-            if cb_response == CircuitBreakerResponse.HALT and not ns._stop_event.is_set():
-                ns._auto_stop_reason = "circuit_breaker_halt"
-                ns._stop_event.set()
-
-        # After two iterations, state must still be exactly what the first HALT set
-        assert ns._stop_event.is_set()
-        assert ns.auto_stop_reason == "circuit_breaker_halt"
+    async def test_repeated_halt_bars_keep_processing(self) -> None:
+        strategy_calls: list[int] = []
+        engine, ex, _pf = build_engine(
+            cb=build_run_circuit_breaker("test-repeat", HALT_ONLY),
+            signals=lambda i: strategy_calls.append(i) or [buy(OTHER)],
+            params=HALT_ONLY,
+        )
+        for _ in range(3):
+            await bar(engine, "800")
+        assert not engine._stop_event.is_set()
+        assert engine.auto_stop_reason is None
+        assert engine._bar_count == 3
+        assert sorted(set(strategy_calls)) == [0, 1, 2]  # the strategy ran on every bar
+        assert ex.signals == []  # BUYs dropped on every HALT bar, no stop
 
 
 # ===========================================================================

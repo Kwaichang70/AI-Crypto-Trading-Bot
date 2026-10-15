@@ -26,8 +26,9 @@ class RiskParameters:
     max_order_size_quote: Decimal = Decimal("10000")  # hard cap per order
 
     # Run-level circuit breakers
-    max_daily_loss_pct: float = 0.05         # halt if daily loss >= 5%
-    max_drawdown_pct: float = 0.15           # halt if drawdown >= 15%
+    max_daily_loss_pct: float = 0.08         # block BUYs at a day's NAV loss >= 8% (WP1.5)
+    max_drawdown_pct: float = 0.30           # block BUYs at drawdown >= 30% (paper/backtest);
+                                             # LIVE runs use 0.20 via live_risk_parameters() (R-02)
 
     # Fee / slippage model
     taker_fee_pct: float = 0.001             # 0.10% taker fee
@@ -76,8 +77,8 @@ Order proposed by ExecutionEngine
          |
          v
 +--------------------+
-| 4. Daily Loss      |  daily_pnl vs current_equity * max_daily_loss_pct
-|    BLOCKING        |  If daily loss exceeds threshold: reject
+| 4. Daily Loss      |  gate daily_pnl vs daily_loss_basis * max_daily_loss_pct
+|    BLOCKING        |  If daily_pnl <= -threshold: reject (BUY only)
 +--------+-----------+
          |
          v
@@ -112,13 +113,29 @@ the consecutive loss counter resets.
 count equals or exceeds `max_open_positions`, new entries are blocked. Closing
 trades (SELL on existing positions) are always allowed.
 
-**Stage 4 -- Daily Loss:** Compares `daily_pnl` (realised only) against
-`current_equity * max_daily_loss_pct`. Daily PnL resets automatically at UTC
-day boundaries. If daily loss exceeds the threshold, all new orders are blocked.
+**Stage 4 -- Daily Loss (WP1.5):** The engines feed the gate the
+mark-to-market NAV change since the UTC day start, taken as a running minimum
+(`RiskSnapshot.gate_daily_pnl(nav) = min(worst_nav_pnl, nav - nav_day_start)`):
+once the loss reaches the limit, BUYs stay blocked for the rest of the UTC
+day even if NAV recovers (the latch). The threshold is
+`daily_loss_basis * max_daily_loss_pct` with the basis
+`daily_loss_basis = max(0, min(nav_day_start, initial_cash))`, fixed from the
+first NAV observation of the UTC day: a gain at that first observation can
+raise it once (never above `initial_cash`); after that it does not move, so a
+profit later in the day never raises it (no compounding). The boundary is
+inclusive: `daily_pnl <= -threshold` blocks. A basis `<= 0` blocks
+(fail closed). The check is BUY-only: a reducing SELL (strategy exit,
+stop-loss, take-profit, trailing stop, flatten) is downgraded to a warning.
+Direct callers that pass no `daily_loss_basis` keep the legacy basis
+`current_equity`.
 
-**Stage 5 -- Max Drawdown:** Computes `(peak_equity - current_equity) / peak_equity`.
-If the drawdown fraction equals or exceeds `max_drawdown_pct`, all new orders
-are blocked. This triggers the circuit breaker.
+**Stage 5 -- Max Drawdown:** Computes `(peak_equity - current_equity) / peak_equity`
+from the portfolio's marked NAV and running peak (WP1.5: paper and backtest no
+longer use the paper engine's own fill-price ledger). If the drawdown fraction
+equals or exceeds `max_drawdown_pct`, new BUY orders are blocked. The limit is
+0.30 for paper and backtest and 0.20 for LIVE runs (R-02, set at the single
+live risk-manager construction site via `live_risk_parameters()`). Exposure-
+reducing SELLs are never blocked by this gate.
 
 **Stage 6 -- Order Size:** Validates the requested order quantity against
 two caps: the absolute notional cap (`max_order_size_quote`) and the
@@ -188,59 +205,93 @@ all-or-nothing positions.
 
 ## Circuit Breaker
 
-The CircuitBreaker is an emergency stop mechanism independent of the
-RiskManager's pre-trade checks. It evaluates risk conditions on every bar
-tick or before every order submission.
+The CircuitBreaker (WP1.6) is a graduated, **auto-recovering entry guard**. It
+is evaluated once per processed bar from `PortfolioAccounting.risk_snapshot()`
+(mark-to-market NAV, running peak, UTC-day start) and uses the run's own
+`RiskParameters` (`build_run_circuit_breaker(run_id, params)`), so it applies
+the same limits as the WP1.5 gates. It never reads `get_summary()` keys, never
+reads the wall clock (the day is `snapshot.day`), never stops the run and
+never writes portfolio state. Nothing is persisted and nothing is
+operator-resettable: every level is re-derived from data.
 
-### Configuration
+**Every effect is BUY-only** (C23). Strategy SELLs, bracket stop-loss /
+take-profit, trailing stops, resting orders and `flatten` are never blocked or
+scaled. A breaker failure (snapshot or evaluation exception, non-finite
+input) drops that bar's BUYs only (fail-closed for entries; exits run).
 
-```python
-class CircuitBreakerConfig:
-    max_daily_loss_pct: float = 0.05      # 5% daily loss limit
-    max_drawdown_pct: float = 0.15        # 15% drawdown limit
-    max_consecutive_losses: int = 5       # 5 consecutive losses
-```
+### Levels and bands
 
-### Triggers
+`L` = the run's `max_drawdown_pct` (live 0.20, paper 0.30), `D` = its
+`max_daily_loss_pct` (0.08). All values are exact `Decimal`.
 
-The circuit breaker trips when any of these conditions is met:
+| Level | Enters (1 bar) | Leaves | Effect |
+|-------|----------------|--------|--------|
+| REDUCE | `dd >= 0.5 L` | `dd < 0.4 L` for 3 consecutive bars | BUY quantity x 0.5 (final quantity, after the risk ceiling) |
+| DAILY_LIMIT | `gate_daily_pnl <= -(daily_loss_basis * D)`, basis `<= 0`, or unknown day state | first bar of the next UTC day (`snapshot.day`), no debounce | BUYs dropped |
+| HALT | `dd >= L` | `dd < 0.9 L` for 3 consecutive bars, then steps down to REDUCE (never straight to OK) | BUYs dropped; run NOT stopped |
 
-| Trigger              | Condition                                          |
-|----------------------|----------------------------------------------------|
-| Daily loss           | `abs(daily_pnl) / equity >= max_daily_loss_pct`    |
-| Drawdown             | `drawdown >= max_drawdown_pct`                     |
-| Consecutive losses   | `consecutive_losses >= max_consecutive_losses`     |
-| Manual trip          | Operator calls `breaker.trip(reason)`              |
+| Run | HALT entry / exit | REDUCE entry / exit |
+|-----|-------------------|---------------------|
+| LIVE | 20% / 18% | 10% / 8% |
+| PAPER | 30% / 27% | 15% / 12% |
 
-### Behavior
+Escalation is immediate; de-escalation needs N = 3 consecutive evaluations
+(processed bars) and an in-band reading resets the count (hysteresis). The
+most severe active condition wins (`HALT > DAILY_LIMIT > REDUCE > OK`), and
+`active_conditions` lists all of them. The raw HALT and DAILY_LIMIT predicates
+are identical to the WP1.5 gates (`>=` / `<=` inclusive), so on any snapshot
+where a gate would block, the breaker has `entries_blocked=True`; its
+recovery is stricter than the gate (in `[0.9 L, L)` the breaker still blocks).
+`pre_trade_check` remains the per-order enforcement of record.
 
-- Once tripped, the breaker stays open -- trading is halted
-- Logs at CRITICAL severity with `alert="TRADING_HALTED"`
-- `is_tripped` returns True until manual reset
-- `reset()` clears the trip state but preserves `trip_count` for audit
-- Trip count is never reset within a session
-- Idempotent: if already tripped, subsequent checks return True without
-  re-evaluating conditions (first trip reason wins)
+A flat run whose NAV is at or beyond the limit has a constant NAV and never
+recovers (neither does the gate); start a new run.
 
-### Manual Controls
+### Restart / resume
 
-```python
-breaker = CircuitBreaker(config=CircuitBreakerConfig(), run_id="run-123")
+A fresh breaker is built on every start and resume; nothing is persisted, so
+it cannot know the level an uninterrupted breaker would hold. It therefore
+runs a **restart watch**: during its first N evaluations it enters HALT at
+`dd >= 0.9 L` (instead of `L`), and during its first 2N evaluations it enters
+REDUCE at `dd >= 0.4 L` (instead of `0.5 L`). Streaks start at 0; a level
+entered during the watch is then held by the ordinary hysteresis. N and 2N
+are exactly how long an uninterrupted breaker that was in HALT can still hold
+HALT and then REDUCE. Measured exhaustively (WP1.6 final synthesis, round 2)
+and pinned by WP16-T-46:
 
-# Automatic check (called on every bar)
-if breaker.check(equity=9500, daily_pnl=-600, drawdown=0.12, consecutive_losses=3):
-    # Trading halted -- do not submit orders
-    ...
+- never laxer than the WP1.5 gate;
+- from the 2N-th evaluation on, never laxer than an uninterrupted breaker;
+- before that, at most 2N-1 = 5 laxer evaluations, only at `dd < 0.9 L`
+  (at full size only at `dd < 0.4 L`);
+- stricter than an uninterrupted breaker for as long as the drawdown stays in
+  `[0.9 L, L)` (HALT instead of REDUCE) or `[0.4 L, 0.5 L)` (REDUCE instead
+  of OK) after a restart there (CF-35, user decision).
 
-# Manual trip
-breaker.trip("Operator initiated emergency stop")
+The watch applies to every new instance, including a brand-new run, whose
+drawdown starts at 0.
 
-# Reset after review (requires explicit operator action)
-breaker.reset()
+### Backtests
 
-# Inspect state
-state = breaker.state  # CircuitBreakerState(is_tripped, trip_reason, tripped_at, trip_count)
-```
+Off by default (`BacktestRunner(enable_circuit_breaker=False)`); WP2.1 turns
+it on by default with a re-baseline.
+
+### Observability
+
+Gauge `circuit_breaker_state` (OK=0, REDUCE=1, DAILY_LIMIT=2, HALT=3; zeroed
+on engine stop); structured events `circuit_breaker.transition`,
+`circuit_breaker.halt_entered` (critical, once per entry),
+`circuit_breaker.halt_cleared`, `engine.circuit_breaker_entries_blocked`,
+`engine.circuit_breaker_eval_failed`; Telegram on HALT entered / cleared;
+`GET /api/v1/runs/{id}/circuit-breaker` (typed state). The reset endpoint is
+retired (410 Gone). See `docs/runbooks/circuit-breaker-halt.md`.
+
+### Legacy API
+
+`check()`, `check_graduated()`, `check_daily_limit_reset()`,
+`get_position_size_multiplier()`, `trip()` and `reset()` (and the
+`max_consecutive_losses` config field) are legacy: unreachable from production
+code (AST-pinned), kept only for the existing unit tests until CF-29. The
+risk manager's loss-streak cooldown is the only consecutive-loss mechanism.
 
 ## Live Trading Gate
 
@@ -308,12 +359,72 @@ For backtest results, max drawdown is computed by iterating the full equity
 curve and finding the worst peak-to-trough decline. Max drawdown duration
 is the longest span (in bars) from a new peak to recovery to that peak.
 
-### Daily PnL Reset
+### Daily PnL, Day Roll and the Daily-Loss Gate (WP1.5)
 
-Daily PnL tracks only realised PnL from closed positions within the current
-UTC day. It resets automatically at day boundaries (detected in
-`update_position`) or explicitly via `reset_daily_pnl()`. Only realised PnL
-contributes -- unrealised PnL is excluded from the daily figure.
+`PortfolioAccounting` is the single owner of the daily state; engines and the
+risk manager only read `risk_snapshot()` (pure).
+
+- **Realised figure (display, API/UI):** `get_daily_pnl()` is realised-only
+  (FIX-07) and reads 0 on a new UTC day even before the first fill.
+- **Gate figure:** the mark-to-market NAV change since the UTC day start, as a
+  running minimum (latch), over the fixed day-start basis (see Stage 4).
+- **UTC day roll:** forward-only, at 00:00:00 UTC. A roll happens in
+  `update_market_prices`, on a fill, or via `advance_clock`; it sets
+  `nav_day_start` provisionally to the NAV at the previous marks, arms a
+  one-shot re-base, and clears the realised accumulator and the latch. The
+  first NAV observation of the new day (mark or fill) raises `nav_day_start`
+  to that NAV if it is higher, before it is folded into the latch, so
+  `nav_day_start = max(NAV at the last pre-roll observation, NAV at the first
+  observation of the day)`. A low outlier on the last pre-roll mark therefore
+  never depresses the next day's start. Asymmetry (RK-05): a loss on the bar
+  spanning 00:00 counts toward the new day, its gain does not create a
+  cushion. Residual: a high outlier on the first mark of a day becomes the
+  day start and can latch that day (fail-closed, BUY-only, until 00:00 UTC).
+  The peak never resets.
+- **Risk-day clock:** wall clock (UTC) in paper and live. In a backtest
+  `StrategyEngine.run_backtest` pushes the bar CLOSE time (bar timestamp +
+  timeframe) once per bar, warmup included, so the wall clock is never read
+  and a backtest is deterministic. An hourly bar opening 23:00 on day D
+  belongs to D+1; every 1d bar is its own day.
+- **Resume:** `PortfolioAccounting.from_fills(daily_seed=...)` seeds the day
+  state from persisted equity-snapshot hints (`ResumeDailySeed`). The day
+  start is unknown, and BUYs stay blocked until the next 00:00 UTC, only when
+  a seed exists but has neither a day-start hint nor a run that started today,
+  when the seed is dated after the resume's UTC day (`seed_from_the_future`),
+  or when any seed field fails the strict type check or seeding raises
+  (`seed_invalid`, see below).
+  Without a seed (legacy callers, `replay_estimate`) the gate *value* is never
+  weaker than HEAD's realised-today value, but the threshold uses the fixed
+  day-start basis, so losses in (pct/(1+pct)*S, pct*S] that HEAD's shrinking
+  `current_equity` basis blocked now pass, by design. The path can also be
+  stricter than HEAD: mark drift since the original fills counts toward the
+  resume day (until 00:00 UTC). A `day_first_equity` hint raises a snapshot
+  day start to `max(day_start_equity, day_first_equity)`.
+- **Resume seed source (WP1.5b):** `run_persistence.load_resume_snapshot`
+  reads three hints with two parameterised statements served by
+  `ix_equity_snapshots_run_id_timestamp` over `equity_snapshots`, with `T` =
+  00:00 UTC of the resume's UTC day:
+  `day_start_equity_hint` (latest row with `timestamp < T`, ties by the higher
+  `bar_index`), and `day_min_equity_hint` / `day_first_equity_hint` (minimum
+  and earliest row with `timestamp >= T`, ties by the lower `bar_index`; one
+  statement, so one is set if and only if the other is), plus
+  `daily_hints_day` and `run_started_at`. `ResumeSnapshot.daily_seed` is
+  `None` only if the hints were never read. Both orchestrator resume paths
+  (paper boot recovery and live/protective resume) pass it to `from_fills`.
+  The rebuild's own equity point (positions valued at their fill prices) is
+  never persisted, so the hints only ever see real marks (WP15B-CR-01).
+- **Seed validation, no coercion (WP1.5b):** every seed field is checked
+  strictly before any comparison: `Decimal` that is finite and `>= 0` for the
+  three equities, a `date` that is not a `datetime` for `as_of_day`, `None` or
+  an aware `datetime` for `run_started_at`. A `float`, `int`, `str`, `bool`,
+  NaN, negative value or naive datetime is **rejected, never repaired** (the
+  column is `Numeric(20, 8)` and yields `Decimal`, so a wrong type is an
+  upstream defect). The result is `day_start_source = "unknown"` (BUYs blocked
+  until 00:00 UTC, exits unaffected) with `resume.daily_state_unknown`
+  (`reason="seed_invalid"`, field and type name only, never the value). Seed
+  construction and seeding never abort a resume, a protective resume included.
+- **Sizing:** paper and backtest BUYs size on `min(NAV, initial_capital)`,
+  exactly like live (D-WP15-B): no compounding.
 
 ## Fee Model
 
