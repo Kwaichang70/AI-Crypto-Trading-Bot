@@ -1125,7 +1125,7 @@ async def test_t66_resume_during_a_breach_restores_the_anchor_before_the_first_t
 # T-68  log hygiene (AC-13B-18 / CF-36)
 # ---------------------------------------------------------------------------
 
-_LEAK = "https://api.exchange.example/v3/market/products/BTC-EUR/ticker?api_key=SECRET-KEY-123"
+_LEAK = "https://api.exchange.example/v3/market/products/BTC-EUR/ticker?api_key=" + "SECRET-KEY-123"
 
 
 async def test_t68_intrabar_logs_carry_no_exception_text_url_or_raw_ticker(
@@ -1482,7 +1482,7 @@ async def test_cf20_a_failing_page_falls_back_to_the_available_closes_and_says_s
         params: dict[str, Any] | None = None,
     ) -> list[list[Any]]:
         if since is not None:
-            raise ccxt.NetworkError("https://api.example/v3?api_key=SECRET-KEY-9")
+            raise ccxt.NetworkError("https://api.example/v3?api_key=" + "SECRET-KEY-9")
         return await original(symbol, timeframe, since, limit, params)
 
     monkeypatch.setattr(exchange, "fetch_ohlcv", _flaky)

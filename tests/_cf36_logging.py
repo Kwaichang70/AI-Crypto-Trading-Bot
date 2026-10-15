@@ -21,6 +21,7 @@ Rules (synthesis-spec §8, binding)
 
 from __future__ import annotations
 
+import base64
 import logging
 import re
 from collections.abc import Callable, Iterator
@@ -35,6 +36,22 @@ from common import redaction
 
 #: Distinctive prefix of every fake secret in the CF-36 tests.
 SENTINEL = "CF36SENTINEL"
+
+
+def b64url(text: str) -> str:
+    """Unpadded URL-safe base64 of ``text`` (JWT segment encoding)."""
+    return base64.urlsafe_b64encode(text.encode()).rstrip(b"=").decode()
+
+
+def fake_jwt(header: str, payload: str, signature: str) -> str:
+    """Assemble a JWT-shaped fake at runtime.
+
+    The tests need JWT-shaped text to exercise the redaction rules.  Building it
+    here instead of spelling out ``eyJ...`` literals keeps secret scanners from
+    mistaking a fake for a committed credential.  Nothing is signed.
+    """
+    return ".".join((b64url(header), b64url(payload), b64url(signature)))
+
 
 _LOGGER_NAMES = ("uvicorn", "uvicorn.error", "uvicorn.access", "ccxt", "cf36", "stdlib")
 

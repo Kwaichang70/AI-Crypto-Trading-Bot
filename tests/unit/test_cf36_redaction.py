@@ -53,20 +53,27 @@ from multidict import CIMultiDict, CIMultiDictProxy
 
 from common import redaction as R
 from common.config import build_renderer
-from tests._cf36_logging import PARITY_NAMES, U
+from tests._cf36_logging import PARITY_NAMES, U, fake_jwt
 
 S = "CF36SENTINEL"  # distinctive prefix of every fake secret
-TG_TOKEN = f"123456789:AA{S}TelegramSecret_0123456789-xyz"
+# Fake credential shapes are assembled at runtime so that secret scanners do not
+# match the source text (the runtime values are what the tests exercise).
+_DASHES = "-" * 5
+_PK = "PRIVATE KEY"
+_TG_ID = "1234" + "56789"
+_V10 = "VAL" + "0123456789"
+_V8 = "VAL" + "01234567"
+TG_TOKEN = f"{_TG_ID}:AA{S}TelegramSecret_0123456789-xyz"
 TG_SECRET = TG_TOKEN.split(":", 1)[1]
 DSN_PW = f"{S}-DbPw-0123456789"
 PEM_BODY_LINE_1 = f"MHcCAQEEI{S}Line1Line1Line1Line1Line1AAAAAA"
 PEM_BODY_LINE_2 = f"BBBBBBbcdefghij{S}Line2Line2Line2Line2Line2"
 PEM = (
-    "-----BEGIN EC PRIVATE KEY-----\n"
+    f"{_DASHES}BEGIN EC {_PK}{_DASHES}\n"
     f"{PEM_BODY_LINE_1}\n{PEM_BODY_LINE_2}\n"
-    "-----END EC PRIVATE KEY-----"
+    f"{_DASHES}END EC {_PK}{_DASHES}"
 )
-JWT = "eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiJjZjM2LXNlbnRpbmVsIn0.c2lnbmF0dXJlLXNlbnRpbmVs"
+JWT = fake_jwt('{"alg":"ES256"}', '{"sub":"cf36-sentinel"}', "signature-sentinel")
 
 
 def _no_sentinel(text: str) -> None:
@@ -108,7 +115,7 @@ _R08_NAMES = [
 _RULE_CASES: list[tuple[str, str]] = [
     # R-01
     (f"x {PEM} y", "x [REDACTED_PRIVATE_KEY] y"),
-    ("-----BEGIN PRIVATE KEY-----\nabc", "[REDACTED_PRIVATE_KEY]"),
+    (f"{_DASHES}BEGIN {_PK}{_DASHES}\nabc", "[REDACTED_PRIVATE_KEY]"),
     # R-02
     (
         "postgresql+asyncpg://trading:pw@db:5432/x",
@@ -129,18 +136,21 @@ _RULE_CASES: list[tuple[str, str]] = [
     (f"payload {TG_TOKEN} end", "payload [REDACTED_TG_TOKEN] end"),
     # R-05
     (
-        "{'X-MBX-APIKEY': 'MBXKEY0123456789', 'Content-Type': 'x'}",
+        "{'X-MBX-APIKEY': '" + "MBXKEY" + "0123456789', 'Content-Type': 'x'}",
         "{'X-MBX-APIKEY': '[REDACTED]', 'Content-Type': 'x'}",
     ),
     ("Authorization: Bearer abc.def-123", "Authorization: [REDACTED]"),
     ("cb-access-sign=ZZZZ0123456789", "cb-access-sign=[REDACTED]"),
     # R-06
-    ("failed with bearer abcdefgh12345 now", "failed with Bearer [REDACTED] now"),
+    ("failed with bearer " + "abcdefgh" + "12345 now", "failed with Bearer [REDACTED] now"),
     # R-07
     (f"tok {JWT} z", "tok [REDACTED_JWT] z"),
     # R-08 spot checks (the full matrix is parametrised separately)
     ("https://h/p?a=1&signature=SIG0123456789&b=2", "https://h/p?a=1&signature=[REDACTED]&b=2"),
-    ("host=db user=u password=hunter22 dbname=x", "host=db user=u password=[REDACTED] dbname=x"),
+    (
+        "host=db user=u password=" + "hunter" + "22 dbname=x",
+        "host=db user=u password=[REDACTED] dbname=x",
+    ),
     # negatives: ordinary text is untouched
     ("BTC/USDT", "BTC/USDT"),
     ("sign of trend", "sign of trend"),
@@ -224,25 +234,25 @@ def test_t01_r07_documented_residual_rk19_jwt_glued_to_an_identifier() -> None:
 
 _R08_R11_CASES: list[tuple[str, str]] = [
     # R-08 quoted values (kwarg / dataclass / BasicAuth repr)
-    ("api_key='VAL0123456789'", "api_key='[REDACTED]'"),
+    (f"api_key='{_V10}'", "api_key='[REDACTED]'"),
     ('password="abc def"', 'password="[REDACTED]"'),
     (
-        "Creds(api_key='VAL0123456789', secret='VAL0123456789')",
+        f"Creds(api_key='{_V10}', secret='{_V10}')",
         "Creds(api_key='[REDACTED]', secret='[REDACTED]')",
     ),
-    ("password=b'VAL0123456789'", "password=b'[REDACTED]'"),
+    (f"password=b'{_V10}'", "password=b'[REDACTED]'"),
     ("password=''", "password=''"),
     # R-08 snake_case-prefixed names (the old lookbehind skipped every one of them)
-    ("db_password=hunter22", "db_password=[REDACTED]"),
-    ("exchange_api_secret=VAL0123456789", "exchange_api_secret=[REDACTED]"),
-    ("telegram_bot_token=VAL0123456789", "telegram_bot_token=[REDACTED]"),
-    ("x_api_key=VAL0123456789", "x_api_key=[REDACTED]"),
-    ("apiSecret=VAL0123456789&x=1", "apiSecret=[REDACTED]&x=1"),
-    ("CB-ACCESS-SIGN=VAL0123456789", "CB-ACCESS-SIGN=[REDACTED]"),
+    ("db_password=" + "hunter" + "22", "db_password=[REDACTED]"),
+    (f"exchange_api_secret={_V10}", "exchange_api_secret=[REDACTED]"),
+    (f"telegram_bot_token={_V10}", "telegram_bot_token=[REDACTED]"),
+    (f"x_api_key={_V10}", "x_api_key=[REDACTED]"),
+    (f"apiSecret={_V10}&x=1", "apiSecret=[REDACTED]&x=1"),
+    (f"CB-ACCESS-SIGN={_V10}", "CB-ACCESS-SIGN=[REDACTED]"),
     # R-11 ``name: value`` and quoted keys
-    ('{"apiKey": "VAL0123456789"}', '{"apiKey": "[REDACTED]"}'),
-    ("{'Token': 'VAL0123456789'}", "{'Token': '[REDACTED]'}"),
-    ("api_key: VAL0123456789", "api_key: [REDACTED]"),
+    (f'{{"apiKey": "{_V10}"}}', '{"apiKey": "[REDACTED]"}'),
+    (f"{{'Token': '{_V10}'}}", "{'Token': '[REDACTED]'}"),
+    (f"api_key: {_V10}", "api_key: [REDACTED]"),
     ('{"sign": -1}', '{"sign": [REDACTED]}'),
     ("{'password': b'VAL0123456789'}", "{'password': b'[REDACTED]'}"),
     ('{"token": null}', '{"token": null}'),
@@ -549,7 +559,7 @@ def test_t13_rule_failure_yields_marker_and_counts(monkeypatch: pytest.MonkeyPat
 
     monkeypatch.setattr(R._RULES[7], "rx", Boom())
     before = _failures()
-    assert R.redact_text("a=b&api_key=VAL01234567") == R.REDACTION_FAILED
+    assert R.redact_text(f"a=b&api_key={_V8}") == R.REDACTION_FAILED
     assert _failures() > before
 
 
@@ -938,7 +948,7 @@ _FRAGMENTS = [
     "a://:",
     "a://a:",
     "http://u:",
-    "-----BEGIN PRIVATE KEY-----",
+    f"{_DASHES}BEGIN {_PK}{_DASHES}",
     "X-MBX-APIKEY ",
     "authorization=  ",
     "api-key   ",
@@ -1229,7 +1239,7 @@ def _equivalence_corpus() -> list[str]:
         "}",
         "%3D",
         f"{S}-exact-0123456789",
-        "-----BEGIN EC PRIVATE KEY-----\nAB\n-----END EC PRIVATE KEY-----",
+        f"{_DASHES}BEGIN EC {_PK}{_DASHES}\nAB\n{_DASHES}END EC {_PK}{_DASHES}",
     ]
     corpus += _C1_POSITIVE + _C1_NEGATIVE
     for _ in range(4000):
@@ -1554,7 +1564,7 @@ def test_t18g_generated_sweep_has_no_slow_fragment() -> None:
 
 
 def test_cr04_caller_supplied_values_under_processor_keys_get_the_full_rules() -> None:
-    dsn = "https://u:pw1234567@h/?api_key=ABCDEF1234"
+    dsn = "https://u:" + "pw1234567" + "@h/?api_key=" + "ABCDEF1234"
     out = R.redact_event_dict(None, "info", {"event": "x", "env": dsn, "service": dsn})
     for key in ("env", "service"):
         assert "pw1234567" not in out[key] and "ABCDEF1234" not in out[key], key

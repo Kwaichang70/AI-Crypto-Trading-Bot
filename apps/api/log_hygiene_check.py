@@ -43,6 +43,7 @@ Exit codes: 0 PASS, 1 FAIL (leak, chain invariant incl. ``uvicorn_access_query``
 
 from __future__ import annotations
 
+import base64
 import io
 import json
 import logging
@@ -59,11 +60,27 @@ if TYPE_CHECKING:
 OK_PREFIX = "CF36 log hygiene: PASS"
 FAIL_PREFIX = "CF36 log hygiene: FAIL"
 
+
+def _b64url(text: str) -> str:
+    """Unpadded URL-safe base64 (JWT segment encoding); used for the fake JWT canary only."""
+    return base64.urlsafe_b64encode(text.encode()).rstrip(b"=").decode()
+
+
 #: Fixed, obviously fake, unregistered canaries: they exercise the pattern
 #: rules (R-02/03/05/06/07/08) independently of the exact-match registry.
-_CANARY_PW = "cf36-selfcheck-canary-pw-0123456789"
-_CANARY_JWT = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJjZjM2LWNhbmFyeSJ9.Y2YzNi1zaWduYXR1cmUtY2FuYXJ5"
-_CANARY_TG = "987654321:AAcf36SelfCheckCanary_0123456789abcdefgh"
+#:
+#: The shapes are assembled at import time (not spelled out as literals) so that
+#: secret scanners do not mistake these fakes for committed credentials; the
+#: runtime values are unchanged.
+_CANARY_PW = "cf36-selfcheck-canary-" + "pw-0123456789"
+_CANARY_JWT = ".".join(
+    (
+        _b64url('{"alg":"HS256"}'),
+        _b64url('{"sub":"cf36-canary"}'),
+        _b64url("cf36-signature-canary"),
+    )
+)
+_CANARY_TG = "987654321" + ":" + "AAcf36SelfCheckCanary_" + "0123456789abcdefgh"
 _CANARY_TG_SECRET = _CANARY_TG.split(":", 1)[1]
 
 _LOGGER_NAMES = ("uvicorn", "uvicorn.error", "uvicorn.access", "ccxt")

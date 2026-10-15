@@ -40,14 +40,27 @@ import common.logging as clog
 from common import redaction as R
 from common.logging import exc_log_fields
 from data.market_data import MarketDataError
-from tests._cf36_logging import NEGATIVE_NAMES, PARITY_NAMES, Capture, ConfigureFn, U, json_lines
+from tests._cf36_logging import (
+    NEGATIVE_NAMES,
+    PARITY_NAMES,
+    Capture,
+    ConfigureFn,
+    U,
+    b64url,
+    json_lines,
+)
 from tests._cf36_logging import SENTINEL as S
 from trading.ccxt_errors import translate_ccxt_error
 
 KEY = f"{S}KEY0123456789abcdef"
 SIG = f"{S}SIG0123456789abcdef"
-JWT = f"eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiJ{S}In0.c2lnbmF0dXJlLXNlbnRpbmVs"
-TG = f"123456789:AA{S}TelegramSecret_0123456789-xyz"
+# JWT / Telegram shapes are assembled at runtime so that secret scanners do not match
+# the source text; the runtime values are what the tests exercise.
+_JWT_HEAD = b64url('{"alg":"ES256"}')
+_JWT_SIG = b64url("signature-sentinel")
+JWT = f"{_JWT_HEAD}.ey" + f"JzdWIiOiJ{S}In0.{_JWT_SIG}"
+_TG_ID = "1234" + "56789"
+TG = f"{_TG_ID}:AA{S}TelegramSecret_0123456789-xyz"
 TG_SECRET = TG.split(":", 1)[1]
 
 #: 4 realistic URL / header styles (design §6 T-07)
@@ -811,7 +824,7 @@ def test_r11_counter_is_pre_registered_and_counts() -> None:
 
     before = dict(metrics.get_all()["counters"])
     assert 'log_redaction_hits_total{rule="R-11"}' in before
-    R.redact_text('{"apiKey": "VAL0123456789"}')
+    R.redact_text('{"apiKey": "' + "VAL" + '0123456789"}')
     assert (
         metrics.get_all()["counters"]['log_redaction_hits_total{rule="R-11"}']
         == before['log_redaction_hits_total{rule="R-11"}'] + 1

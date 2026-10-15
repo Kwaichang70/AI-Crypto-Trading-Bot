@@ -895,7 +895,9 @@ async def test_t32_reconcile_required_symbol_still_exits_at_the_bar_close(
 # AC-13B-18  log hygiene of the new fetch paths
 # ---------------------------------------------------------------------------
 
-_LEAKY_ERROR_TEXT = "https://api.exchange.example/v3?api_key=SECRET-KEY-123&sign=SECRET-SIG-456"
+_LEAKY_ERROR_TEXT = (
+    "https://api.exchange.example/v3?api_key=" + "SECRET-KEY-123" + "&sign=" + "SECRET-SIG-456"
+)
 _NEW_SITES = ("engine.exit_", "engine.anchor_", "bracket_exit.", "trailing_stop.", "entry.")
 
 

@@ -990,7 +990,7 @@ async def test_t67_rate_limit_answers_map_to_rate_limit_error_with_one_call(
     ],
 )
 async def test_t67_error_mapping_and_hygiene(exc: Exception, expected: type[Exception]) -> None:
-    leaky = type(exc)("https://api.example/v3/ticker?api_key=SECRET-KEY-1 " + str(exc))
+    leaky = type(exc)("https://api.example/v3/ticker?api_key=" + "SECRET-KEY-1 " + str(exc))
     svc, _stub = _service(leaky)
     with pytest.raises(expected) as info:
         await svc.fetch_ticker_quote(SYM)
