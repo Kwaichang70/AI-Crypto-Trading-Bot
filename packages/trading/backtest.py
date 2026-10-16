@@ -194,8 +194,8 @@ class BacktestRunner:
     enable_circuit_breaker : bool
         WP1.6 graduated circuit breaker (HALT / DAILY_LIMIT / REDUCE from
         ``RiskSnapshot``, bar-close clock).  Default ``True`` since WP2.1c
-        (SY-21-13, closes CF-26): a backtest has the same entry guard as a paper
-        run.  ``False`` reproduces the pre-WP2.1c (WP1.6 opt-in, byte-identical to
+        (SY-21-13, closes CF-26): a backtest has the same circuit breaker as a
+        paper run.  ``False`` reproduces the pre-WP2.1c (WP1.6 opt-in, byte-identical to
         pre-WP1.6) behaviour exactly -- the baseline-attribution path of the D13
         re-baseline.  The value is NOT an API option; the API persists
         ``engine_semantics.backtest_circuit_breaker`` next to it.

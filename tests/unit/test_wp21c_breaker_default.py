@@ -14,6 +14,8 @@ WP2.1c (SY-21-13, closes CF-26): the circuit breaker is ON by default in backtes
         * the explicit ``False`` path is byte-identical to the 2.1a golden (T-32); the default
           is not
         * every caller is covered: the ML gate, both research scripts (``--no-circuit-breaker``)
+        * WP21C-D-12: ``create_run`` stamps the same constant it hands to the runner, and both
+          research scripts initialise ``_ENABLE_CB`` from it (no second literal ``True``)
 
 The API half (a created backtest / optimization persists ``True``) is in
 ``tests/integration/test_wp21_cost_api.py`` and ``test_wp21b_optimize_api.py``.
@@ -22,6 +24,7 @@ The API half (a created backtest / optimization persists ``True``) is in
 from __future__ import annotations
 
 import argparse
+import ast
 import importlib.util
 import inspect
 import sys
@@ -308,11 +311,59 @@ class TestEveryCallerIsCovered:
         assert args.no_circuit_breaker is False
         assert circuit_breaker_from_args(args) is True
         assert mod._ENABLE_CB is True  # the module-level default
+        # WP21C-D-12: ... which is the one constant, not a second literal
+        assert mod._ENABLE_CB is BACKTEST_CIRCUIT_BREAKER_DEFAULT
         off, _ = mod.parse_args(["--no-circuit-breaker"])
         assert circuit_breaker_from_args(off) is False
         assert (
             "enable_circuit_breaker=_ENABLE_CB" in (_REPO / "scripts" / f"{script}.py").read_text()
         )
+
+    @pytest.mark.parametrize("script", ["research_momentum_brackets", "validate_sl_tp_reversion"])
+    def test_the_scripts_initialise_the_flag_from_the_constant_not_a_literal(
+        self, script: str
+    ) -> None:
+        """WP21C-D-12 (SEC-09): ``_ENABLE_CB: bool = BACKTEST_CIRCUIT_BREAKER_DEFAULT``."""
+        tree = ast.parse((_REPO / "scripts" / f"{script}.py").read_text())
+        inits = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == "_ENABLE_CB"
+        ]
+        assert len(inits) == 1
+        value = inits[0].value
+        assert isinstance(value, ast.Name) and value.id == "BACKTEST_CIRCUIT_BREAKER_DEFAULT"
+        mod = _load_script(script)
+        assert mod.BACKTEST_CIRCUIT_BREAKER_DEFAULT is BACKTEST_CIRCUIT_BREAKER_DEFAULT
+
+    def test_create_run_stamps_the_constant_it_hands_to_the_runner(self) -> None:
+        """WP21C-D-12 (SEC-09): the stamp (``runs.py``, before the runner) names the constant.
+
+        The behavioural twin is in ``tests/integration/test_wp21_cost_api.py``.  Every
+        ``stamp_cost_config`` call that can stamp a backtest (anything but the literal
+        ``mode="live"`` of the promote path) must pass ``backtest_circuit_breaker=`` explicitly.
+        """
+        tree = ast.parse((_REPO / "apps/api/routers/runs.py").read_text())
+        checked = 0
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "stamp_cost_config"
+            ):
+                continue
+            kwargs = {kw.arg: kw.value for kw in node.keywords}
+            mode = kwargs["mode"]
+            if isinstance(mode, ast.Constant) and mode.value == "live":
+                assert "backtest_circuit_breaker" not in kwargs  # promote: live carries no key
+                continue
+            flag = kwargs.get("backtest_circuit_breaker")
+            assert isinstance(flag, ast.Name), "create_run relies on the stamp's own default"
+            assert flag.id == "BACKTEST_CIRCUIT_BREAKER_DEFAULT"
+            checked += 1
+        assert checked == 1  # exactly the create_run stamp
 
     def test_the_cli_helpers(self) -> None:
         parser = argparse.ArgumentParser()

@@ -234,6 +234,29 @@ class TestT20CreatePersistsCostProfile:
         assert seen == [True]
         assert build.call_count == 1  # the engine really built the breaker
 
+    def test_the_stamp_and_the_runner_read_one_constant_wp21_t36(self, c: _C) -> None:
+        """WP21C-D-12 (SEC-09): runner and stamp follow ``runs.BACKTEST_CIRCUIT_BREAKER_DEFAULT``.
+
+        If ``create_run`` relied on the stamp's own default, flipping the constant that the
+        router passes to the runner would leave the persisted value behind.
+        """
+        seen: list[bool] = []
+        original_init = BacktestRunner.__init__
+
+        def _spy(self: BacktestRunner, *args: Any, **kw: Any) -> None:
+            seen.append(kw["enable_circuit_breaker"])
+            original_init(self, *args, **kw)
+
+        with (
+            patch.object(runs_module, "BACKTEST_CIRCUIT_BREAKER_DEFAULT", False),
+            patch.object(BacktestRunner, "__init__", _spy),
+        ):
+            resp = _post_backtest(c)
+        assert resp.status_code == 201, resp.text
+        assert seen == [False]
+        cfg = c.created_run().config
+        assert cfg["engine_semantics"]["backtest_circuit_breaker"] is False
+
     def test_there_is_no_api_toggle_for_the_backtest_breaker_wp21_t36(self, c: _C) -> None:
         seen: list[bool] = []
         original_init = BacktestRunner.__init__

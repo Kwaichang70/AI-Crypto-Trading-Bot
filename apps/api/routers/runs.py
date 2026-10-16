@@ -1078,11 +1078,14 @@ async def create_run(
     config_snapshot["allow_pyramiding"] = _allow_pyramiding
     # WP2.1 (AG-03/AG-06): freeze the run's cost profile + semantics versions.
     # Live: the profile is only an estimate, the ledger uses exchange fills.
+    # WP2.1c (SEC-09): the stamp names the SAME constant the runner below receives (the
+    # stamp precedes the runner), instead of relying on the stamp's own default.
     stamp_cost_config(
         config_snapshot,
         _cost_profile,
         mode=str(body.mode),
         fee_source="exchange_fills" if body.mode == "live" else "model",
+        backtest_circuit_breaker=BACKTEST_CIRCUIT_BREAKER_DEFAULT,
     )
     if body.backtest_start is not None:
         config_snapshot["backtest_start"] = body.backtest_start.isoformat()

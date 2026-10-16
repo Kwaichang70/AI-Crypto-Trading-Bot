@@ -41,6 +41,7 @@ from trading.models import Fill, Order, RiskCheckResult
 from trading.portfolio import PortfolioAccounting
 from trading.risk import RiskParameters
 from trading.risk_manager import DefaultRiskManager
+from trading.trade_journal import TradeSkipLogger
 
 if TYPE_CHECKING:
     from trading.portfolio import RiskSnapshot
@@ -149,6 +150,22 @@ def trace(monkeypatch: pytest.MonkeyPatch) -> Trace:
     return _install_trace(monkeypatch)
 
 
+@pytest.fixture
+def skips(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """The ``skip_reason`` of every skipped trade, in order (the breaker twins, WP21C-D-10)."""
+    reasons: list[str] = []
+    original = TradeSkipLogger.log_skip
+
+    def spy(
+        self: TradeSkipLogger, symbol: str, skip_reason: str, *args: Any, **kwargs: Any
+    ) -> Any:
+        reasons.append(skip_reason)
+        return original(self, symbol, skip_reason, *args, **kwargs)
+
+    monkeypatch.setattr(TradeSkipLogger, "log_skip", spy)
+    return reasons
+
+
 async def _run(
     closes: list[str | int],
     *,
@@ -160,6 +177,7 @@ async def _run(
     pyramiding: bool = False,
     target: str = "1500",
     lead_strategies: list[ScriptedSequenceStrategy] | None = None,
+    breaker: bool = False,
 ) -> BacktestRunner:
     # ``lead_strategies`` run (and their signals are processed) BEFORE the main one.
     strategies = [
@@ -177,8 +195,9 @@ async def _run(
         allow_pyramiding=pyramiding,
         # WP2.1c: these scenarios pin the WP1.5 RISK GATE (daily-loss / drawdown at
         # ``pre_trade_check``).  The default breaker would drop the BUY before the gate
-        # sees it (K-10) and hide exactly what is asserted, so it is pinned off.
-        enable_circuit_breaker=False,
+        # sees it (K-10) and hide exactly what is asserted, so it is pinned off.  The
+        # ``cb_on`` twins (``breaker=True``) pin the reporting layer the other way round.
+        enable_circuit_breaker=breaker,
     )
     bars = scripted_path(closes, first_open=first_open, symbol=SYMBOL, timeframe=timeframe)
     await runner.run({SYMBOL: bars})
@@ -468,3 +487,74 @@ async def test_wp15_t41_control_without_the_decline_the_late_buy_fills(trace: Tr
     )
     assert trace.rejections() == [], trace.gate_calls
     assert [f[1] for f in trace.fills] == ["buy", "buy"]
+
+
+# ---------------------------------------------------------------------------
+# WP21C-D-10: the ``cb_on`` twins of T-20 (daily) and T-22 (drawdown)
+#
+# The scenarios above pin the WP1.5 gate with the breaker OFF.  P-WP16-3 / FS-04 ask for the
+# same scenario with the breaker ON, which pins the reporting layer: the breaker drops the BUY
+# first (a ``circuit_breaker_*`` skip, K-10), the gate is never asked about it, and so the
+# gate records no rejection.
+# ---------------------------------------------------------------------------
+
+
+def _buy_gate_calls(trace: Trace) -> list[GateCall]:
+    return [g for g in trace.gate_calls if g.side == "buy"]
+
+
+async def test_wp15_t20_cb_on_the_breaker_drops_the_daily_loss_buy_before_the_gate(
+    trace: Trace, skips: list[str]
+) -> None:
+    """Twin of ``test_wp15_t20_day1_loss_blocks_rest_of_day_but_not_day2_hourly``."""
+    await _run(
+        [100, 80] + [80] * 16,
+        first_open=datetime(2026, 3, 10, 6, 0, tzinfo=UTC),
+        script={0: "buy", 2: "buy", 17: "buy"},
+        risk=_DAY_LOSS_RISK,
+        bracket=_SL,
+        breaker=True,
+    )
+    # the j=2 BUY (bar close 09:00) is the one the breaker dropped: a circuit_breaker_* skip ...
+    cb_skips = [r for r in skips if r.startswith("circuit_breaker_")]
+    assert cb_skips == ["circuit_breaker_daily_limit"], skips
+    # ... and pre_trade_check was never called for it: 3 BUY signals = 2 gate calls + 1 skip
+    assert len(_buy_gate_calls(trace)) + len(cb_skips) == 3, trace.gate_calls
+    dropped_bar = datetime(2026, 3, 10, 9, 0, tzinfo=UTC)
+    assert [g for g in _buy_gate_calls(trace) if g.bar_close == dropped_bar] == []
+    # ... so the gate records no rejection at all (P-WP16-3)
+    assert trace.rejections() == [], trace.gate_calls
+
+
+async def test_wp15_t22_cb_on_the_breaker_halts_entries_before_the_drawdown_gate(
+    trace: Trace, skips: list[str]
+) -> None:
+    """Twin of ``test_wp15_t22_daily_gate_never_blocks_drawdown_gate_does``."""
+    n = 14
+    closes: list[Decimal] = []
+    price = Decimal(100)
+    for _ in range(n):
+        closes.append(price)
+        price *= Decimal("0.875")
+    sells = ScriptedSequenceStrategy("wp15-sells", {"script": dict.fromkeys(range(1, n), "sell")})
+    await _run(
+        closes,
+        first_open=datetime(2026, 3, 10, tzinfo=UTC),
+        timeframe=TimeFrame.ONE_DAY,
+        script=dict.fromkeys(range(n), "buy"),
+        target="4000",
+        risk=RiskParameters(
+            max_position_size_pct=0.4,
+            loss_streak_count=1000,  # keep the loss-streak cooldown out of the way
+        ),
+        lead_strategies=[sells],  # SELL first, then re-BUY, on the same bar
+        breaker=True,
+    )
+    # the same path that trips the 30% drawdown gate with the breaker off ends in HALT here
+    cb_skips = [r for r in skips if r.startswith("circuit_breaker_")]
+    assert cb_skips and set(cb_skips) == {"circuit_breaker_halt"}, skips
+    # pre_trade_check was never called for a dropped BUY: n BUY signals = gate calls + skips
+    assert len(_buy_gate_calls(trace)) + len(cb_skips) == n, trace.gate_calls
+    # ... so neither the drawdown gate nor any other gate rejected anything (P-WP16-3)
+    assert trace.rejections() == [], trace.gate_calls
+    assert trace.rejections("drawdown") == []

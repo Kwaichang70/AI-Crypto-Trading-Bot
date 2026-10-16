@@ -44,6 +44,7 @@ from trading.costs_cli import (
     cost_header,
     cost_profile_from_args,
 )
+from trading.safety import BACKTEST_CIRCUIT_BREAKER_DEFAULT
 from trading.strategies.sl_tp_reversion import SLTPReversionStrategy
 
 # WP2.1: the cost model every backtest of this script runs under; set in main()
@@ -52,7 +53,7 @@ _COST_PROFILE: CostProfile = DEFAULT_COST_PROFILE
 
 # WP2.1c (SY-21-13): backtests build the circuit breaker by default; ``--no-circuit-breaker``
 # switches it off (the pre-2.1c numbers).  Set in main().
-_ENABLE_CB: bool = True
+_ENABLE_CB: bool = BACKTEST_CIRCUIT_BREAKER_DEFAULT
 
 _PAGE_LIMIT = 300
 _TF_DURATION_MS = {

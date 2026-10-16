@@ -14,8 +14,14 @@ are read, created or sent)::
 
     python scripts/wp21_rebaseline.py --fetch-fixture fixtures/wp21_bars.csv.gz
 
-  writes the gzip-CSV fixture and ``<fixture>.sha256``.  The gzip header carries no
-  timestamp and no file name, so the same bars always give the same sha256.
+  writes the gzip-CSV fixture, ``<fixture>.sha256`` and ``<fixture>.meta.json`` (the
+  provenance: exchange id, ccxt version, window, and per series the bar count, first and
+  last bar, gap count and dropped-invalid count).  The gzip header carries no timestamp and
+  no file name, so the same bars always give the same sha256; the meta file is not part of
+  the pinned bytes.  The target must end in ``.csv.gz``; an existing fixture, sidecar or
+  meta file (or a symlink) is refused unless ``--force`` is given (a symlink never), and
+  every file is written to a temp file in the same directory and ``os.replace``d.  The
+  exchange id is limited to ``coinbaseexchange``.
 
 RUN (offline; refuses to run unless the fixture bytes match the pinned sha256)::
 
@@ -38,8 +44,11 @@ single symbol.  Sharpe is labelled "pre-WP2.5" (the WP2.5 Sharpe fix is not in).
 Breakeven taker: for each baseline x symbol a bisection over the taker fee of
 ``coinbase_advanced_1`` (``CostProfile.with_overrides(taker_fee_bps=...)``, slippage kept at
 10 bps, maker clamped to the taker because the profile requires maker <= taker) on [0, 250]
-bps, stopping at PF = 1.00 +/- 0.01 within 12 bisection steps.  This is NOT the WP2.8
-go/no-go (that uses the section 6.1 grid and walk-forward OOS).
+bps, stopping at PF = 1.00 +/- 0.01 within at most 12 bisection steps after 2 bracket
+evaluations (at most 14 backtests per breakeven row and breaker state).  SA-21C-01: in spec
+section 11 an "iteration" is a bisection step; the two bracket evaluations at 0 and 250 bps
+validate the bracket and are not iterations.  This is NOT the WP2.8 go/no-go (that uses the
+section 6.1 grid and walk-forward OOS).
 
 momentum_breakout parameters: the SY-21-07 fallback (ATR stop 1.5x / take-profit 3.0x,
 registry defaults otherwise).  The live run ``f36fb44e`` params can be supplied with
@@ -60,9 +69,13 @@ import io
 import itertools
 import json
 import math
+import os
 import re
 import sys
+import tempfile
+import threading
 import time
+import zlib
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -90,10 +103,12 @@ from trading.strategy import BaseStrategy
 from trading.trade_journal import TradeSkipLogger
 
 __all__ = [
+    "ALLOWED_EXCHANGES",
     "BASELINES",
     "BREAKEVEN_BASE_PROFILE_ID",
     "BREAKEVEN_HI_BPS",
     "BREAKEVEN_LO_BPS",
+    "BREAKEVEN_MAX_BACKTESTS",
     "BREAKEVEN_MAX_ITERATIONS",
     "BREAKEVEN_PF_TOLERANCE",
     "COLUMNS",
@@ -102,8 +117,12 @@ __all__ = [
     "BreakevenResult",
     "Column",
     "FixtureError",
+    "GateProbe",
     "bisect_breakeven",
+    "classify_rejection_reason",
     "load_fixture",
+    "probe_gates",
+    "read_json_object",
     "render_markdown",
     "run_matrix",
     "write_fixture",
@@ -119,10 +138,17 @@ BREAKEVEN_LO_BPS = Decimal(0)
 BREAKEVEN_HI_BPS = Decimal(250)
 BREAKEVEN_PF_TARGET = 1.0
 BREAKEVEN_PF_TOLERANCE = 0.01
+#: Bisection steps (SA-21C-01).  The 2 bracket evaluations at LO/HI come on top, so a breakeven
+#: row costs at most ``BREAKEVEN_MAX_ITERATIONS + 2`` backtests per breaker state.
 BREAKEVEN_MAX_ITERATIONS = 12
+BREAKEVEN_MAX_BACKTESTS = BREAKEVEN_MAX_ITERATIONS + 2
+
+#: The only exchange FETCH mode talks to (SEC-01): keyless public candles.
+ALLOWED_EXCHANGES: tuple[str, ...] = ("coinbaseexchange",)
 
 FIXTURE_HEADER = ("symbol", "timeframe", "ts_ms", "open", "high", "low", "close", "volume")
 _MAX_FIXTURE_BYTES = 256 * 1024 * 1024  # decompressed cap: a gzip bomb must not fill memory
+_MAX_FIXTURE_FILE_BYTES = 64 * 1024 * 1024  # compressed cap, checked with stat() before a read
 _MAX_PARAMS_BYTES = 1024 * 1024
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -232,8 +258,14 @@ def split_params(
     return strategy_params, bracket, trailing, pyramiding
 
 
-def load_json_object(path: Path) -> dict[str, Any]:
-    """Read a JSON file (bounded size, must be an object)."""
+def read_json_object(path: Path) -> tuple[dict[str, Any], str]:
+    """Read a JSON object file ONCE: ``(object, sha256 of the exact bytes that were parsed)``.
+
+    ``stat`` cap first, then ONE bounded ``read(cap + 1)``, then ``json.loads`` of those same
+    bytes -- so the recorded provenance hash describes what was parsed and a file that grows
+    (or lies about its size) is still never read past the cap (SEC-03).  A missing or
+    unreadable file is an error, never an empty input.
+    """
     try:
         size = path.stat().st_size
     except OSError as exc:
@@ -241,12 +273,24 @@ def load_json_object(path: Path) -> dict[str, Any]:
     if size > _MAX_PARAMS_BYTES:
         raise FixtureError("JSON file is larger than 1 MiB")
     try:
-        doc = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
+        with path.open("rb") as handle:
+            data = handle.read(_MAX_PARAMS_BYTES + 1)
+    except OSError as exc:
+        raise FixtureError(f"cannot read JSON file: {type(exc).__name__}") from exc
+    if len(data) > _MAX_PARAMS_BYTES:
+        raise FixtureError("JSON file is larger than 1 MiB")
+    try:
+        doc = json.loads(data.decode("utf-8"))
+    except (ValueError, RecursionError) as exc:  # JSONDecodeError and UnicodeDecodeError
         raise FixtureError(f"JSON file is not valid: {type(exc).__name__}") from exc
     if not isinstance(doc, dict):
         raise FixtureError("JSON file must contain an object")
-    return doc
+    return doc, sha256_hex(data)
+
+
+def load_json_object(path: Path) -> dict[str, Any]:
+    """Read a JSON file (bounded size, must be an object); see :func:`read_json_object`."""
+    return read_json_object(path)[0]
 
 
 def momentum_spec_from_params(doc: Mapping[str, Any], *, source: str) -> BaselineSpec:
@@ -317,12 +361,42 @@ def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def write_fixture(path: Path, series: Mapping[tuple[str, str], Sequence[Candle]]) -> str:
-    """Write the gzip-CSV fixture and ``<path>.sha256``; return the sha256 of the gz bytes.
+_FIXTURE_SUFFIX = ".csv.gz"
+_META_SCHEMA = "wp21-fixture-meta-1"
 
-    Rows are sorted by (symbol, timeframe, ts) and the gzip header is fixed (mtime 0, no
-    file name), so identical bars always produce identical bytes.
+
+def sidecar_path(path: Path) -> Path:
+    """``<fixture>.sha256``."""
+    return path.with_name(path.name + ".sha256")
+
+
+def meta_path(path: Path) -> Path:
+    """``<fixture>.meta.json`` (the provenance of a FETCH)."""
+    return path.with_name(path.name + ".meta.json")
+
+
+def check_write_targets(path: Path, *, with_meta: bool, force: bool) -> None:
+    """Refuse a bad fixture target BEFORE anything is fetched or written (SEC-04).
+
+    The target must end in ``.csv.gz`` (a typo such as ``docs/risk-model.md`` must never be
+    replaced by gzip).  A symlink -- the fixture, its sidecar or its meta file -- is refused
+    even with ``force``; an existing file is refused unless ``force``.
     """
+    if not path.name.endswith(_FIXTURE_SUFFIX) or path.name == _FIXTURE_SUFFIX:
+        raise FixtureError(f"the fixture target must be a *{_FIXTURE_SUFFIX} file")
+    targets = [path, sidecar_path(path)]
+    if with_meta:
+        targets.append(meta_path(path))
+    for target in targets:
+        if target.is_symlink():
+            raise FixtureError(f"refusing to write through a symlink: {target.name}")
+        if target.is_dir():
+            raise FixtureError(f"{target.name} is a directory")
+        if target.exists() and not force:
+            raise FixtureError(f"{target.name} already exists; pass --force to overwrite it")
+
+
+def _fixture_bytes(series: Mapping[tuple[str, str], Sequence[Candle]]) -> bytes:
     text = io.StringIO(newline="")
     writer = csv.writer(text, lineterminator="\n")
     writer.writerow(FIXTURE_HEADER)
@@ -332,23 +406,94 @@ def write_fixture(path: Path, series: Mapping[tuple[str, str], Sequence[Candle]]
     buffer = io.BytesIO()
     with gzip.GzipFile(filename="", mode="wb", fileobj=buffer, mtime=0, compresslevel=9) as gz:
         gz.write(text.getvalue().encode("utf-8"))
-    payload = buffer.getvalue()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(payload)
+    return buffer.getvalue()
+
+
+def _stage_bytes(directory: Path, data: bytes) -> Path:
+    """Write ``data`` to a fresh (O_EXCL) temp file in ``directory``; the caller replaces it."""
+    fd, name = tempfile.mkstemp(dir=directory, prefix=".wp21-", suffix=".tmp")
+    staged = Path(name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+        staged.chmod(0o644)
+    except BaseException:
+        staged.unlink(missing_ok=True)
+        raise
+    return staged
+
+
+def write_fixture(
+    path: Path,
+    series: Mapping[tuple[str, str], Sequence[Candle]],
+    *,
+    provenance: Mapping[str, Any] | None = None,
+    force: bool = False,
+) -> str:
+    """Write the gzip-CSV fixture, ``<path>.sha256`` and (FETCH) ``<path>.meta.json``.
+
+    Returns the sha256 of the gz bytes.  Rows are sorted by (symbol, timeframe, ts) and the
+    gzip header is fixed (mtime 0, no file name), so identical bars always produce identical
+    bytes; the meta file never changes them.  Every file is staged in a temp file in the same
+    directory and only then ``os.replace``d: a failure while staging touches no target, and a
+    failure while replacing removes the targets this call created.  (Overwriting with
+    ``force`` cannot be rolled back after the first replace; the sidecar and the meta file
+    carry the sha256, so a mixed set is detectable.)
+    """
+    check_write_targets(path, with_meta=provenance is not None, force=force)
+    payload = _fixture_bytes(series)
     digest = sha256_hex(payload)
-    path.with_name(path.name + ".sha256").write_text(f"{digest}  {path.name}\n", encoding="utf-8")
+    files: list[tuple[Path, bytes]] = [
+        (path, payload),
+        (sidecar_path(path), f"{digest}  {path.name}\n".encode()),
+    ]
+    if provenance is not None:
+        meta = {"schema": _META_SCHEMA, "fixture_sha256": digest, **provenance}
+        files.append(
+            (meta_path(path), (json.dumps(meta, indent=2, sort_keys=True) + "\n").encode())
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existed = {target: target.exists() for target, _data in files}
+    staged: list[tuple[Path, Path]] = []
+    replaced: list[Path] = []
+    try:
+        for target, data in files:
+            staged.append((target, _stage_bytes(target.parent, data)))
+        for target, temp in staged:
+            os.replace(temp, target)
+            replaced.append(target)
+    except BaseException:
+        for _target, temp in staged:
+            temp.unlink(missing_ok=True)
+        for target in replaced:
+            if not existed[target]:
+                target.unlink(missing_ok=True)
+        raise
     return digest
 
 
 def verify_fixture_sha256(path: Path, expected: str) -> bytes:
-    """Return the fixture bytes iff their sha256 equals ``expected``; else raise."""
+    """Return the fixture bytes iff their sha256 equals ``expected``; else raise.
+
+    The compressed size is capped (``stat`` first, then a bounded read) before anything is
+    hashed.
+    """
     expected = expected.strip().lower()
     if not _SHA256_RE.fullmatch(expected):
         raise FixtureError("--fixture-sha256 must be 64 lowercase hex characters")
     try:
-        payload = path.read_bytes()
+        size = path.stat().st_size
     except OSError as exc:
         raise FixtureError(f"cannot read fixture: {type(exc).__name__}") from exc
+    if size > _MAX_FIXTURE_FILE_BYTES:
+        raise FixtureError("fixture file is larger than the compressed size cap")
+    try:
+        with path.open("rb") as handle:
+            payload = handle.read(_MAX_FIXTURE_FILE_BYTES + 1)
+    except OSError as exc:
+        raise FixtureError(f"cannot read fixture: {type(exc).__name__}") from exc
+    if len(payload) > _MAX_FIXTURE_FILE_BYTES:
+        raise FixtureError("fixture file is larger than the compressed size cap")
     actual = sha256_hex(payload)
     if actual != expected:
         raise FixtureError(
@@ -361,11 +506,22 @@ def _parse_fixture_bytes(payload: bytes) -> dict[tuple[str, str], list[OHLCVBar]
     try:
         with gzip.GzipFile(fileobj=io.BytesIO(payload), mode="rb") as gz:
             raw = gz.read(_MAX_FIXTURE_BYTES + 1)
-    except (OSError, EOFError) as exc:
+    except (OSError, EOFError, zlib.error) as exc:  # BadGzipFile is an OSError
         raise FixtureError(f"fixture is not a valid gzip file: {type(exc).__name__}") from exc
     if len(raw) > _MAX_FIXTURE_BYTES:
         raise FixtureError("fixture is larger than the decompressed size cap")
-    reader = csv.reader(io.StringIO(raw.decode("utf-8"), newline=""))
+    try:
+        # the pin only proves the bytes are the pinned ones, not that they are well-formed
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise FixtureError(f"fixture is not valid UTF-8 text: {type(exc).__name__}") from exc
+    try:
+        return _parse_fixture_rows(csv.reader(io.StringIO(text, newline="")))
+    except csv.Error as exc:
+        raise FixtureError(f"fixture is not valid CSV: {type(exc).__name__}") from exc
+
+
+def _parse_fixture_rows(reader: Iterator[list[str]]) -> dict[tuple[str, str], list[OHLCVBar]]:
     header = next(reader, None)
     if tuple(header or ()) != FIXTURE_HEADER:
         raise FixtureError("fixture header does not match the expected columns")
@@ -387,7 +543,8 @@ def _parse_fixture_bytes(payload: bytes) -> dict[tuple[str, str], list[OHLCVBar]
                 close=Decimal(c),
                 volume=Decimal(v),
             )
-        except (ValueError, ArithmeticError) as exc:
+        except (ValueError, ArithmeticError, OSError, OverflowError) as exc:
+            # OSError / OverflowError: ``fromtimestamp`` on an out-of-range timestamp
             raise FixtureError(
                 f"fixture line {lineno}: invalid bar ({type(exc).__name__})"
             ) from exc
@@ -474,17 +631,57 @@ def fetch_candles(
     return [seen[k] for k in sorted(seen)], dropped
 
 
-def fetch_fixture(out: Path, *, exchange_id: str, start: str, end: str) -> str:
-    """Fetch every baseline series once and write the fixture; returns its sha256."""
-    import ccxt
+def series_provenance(
+    candles: Sequence[Candle], timeframe: str, *, dropped: int, start_ms: int, end_ms: int
+) -> dict[str, Any]:
+    """Provenance of one fetched series (all integers / ISO strings: deterministic).
 
-    exchange = getattr(ccxt, exchange_id)({"enableRateLimit": True})  # public endpoints only
-    if getattr(exchange, "apiKey", None) or getattr(exchange, "secret", None):
-        raise FixtureError("refusing to fetch with credentials configured")
+    ``gap_count`` counts the expected intervals missing BETWEEN the first and the last bar;
+    ``missing_vs_window`` counts every expected interval of the requested window that has no
+    bar (a late listing or an early end shows up here, not in ``gap_count``).
+    """
+    step = _TF_MS[timeframe]
+    stamps = [c[0] for c in candles]
+    gaps = sum(-(-(b - a) // step) - 1 for a, b in itertools.pairwise(stamps) if b - a > step)
+    expected = -(-(end_ms - start_ms) // step)
+
+    def iso(ms: int) -> str:
+        return datetime.fromtimestamp(ms / 1000, tz=UTC).isoformat()
+
+    return {
+        "bars": len(stamps),
+        "first_ts": iso(stamps[0]) if stamps else None,
+        "last_ts": iso(stamps[-1]) if stamps else None,
+        "gap_count": gaps,
+        "missing_vs_window": max(0, expected - len(stamps)),
+        "dropped_invalid": dropped,
+    }
+
+
+def fetch_fixture(out: Path, *, exchange_id: str, start: str, end: str, force: bool = False) -> str:
+    """Fetch every baseline series once and write the fixture; returns its sha256.
+
+    Everything that can be refused is refused BEFORE the first request: an exchange id outside
+    :data:`ALLOWED_EXCHANGES` (so ``getattr(ccxt, ...)`` never sees an arbitrary name), and a
+    target that is not a fresh ``.csv.gz`` path (see :func:`check_write_targets`).
+    """
+    if exchange_id not in ALLOWED_EXCHANGES:
+        raise FixtureError(f"unsupported exchange id; allowed: {', '.join(ALLOWED_EXCHANGES)}")
+    check_write_targets(out, with_meta=True, force=force)
     start_ms = _day_start_ms(start)
     end_ms = _day_start_ms(end) + 86_400_000  # inclusive end day
+
+    import ccxt
+
+    # Keyless by construction: the only option is the rate limiter, and nothing here reads an
+    # environment variable or a file.  The check below is defence in depth (a ccxt build that
+    # injected credentials would be refused), not the control.
+    exchange = getattr(ccxt, exchange_id)({"enableRateLimit": True})
+    if getattr(exchange, "apiKey", None) or getattr(exchange, "secret", None):
+        raise FixtureError("refusing to fetch with credentials configured")
     wanted = sorted({(s, b.timeframe) for b in BASELINES for s in b.symbols})
     series: dict[tuple[str, str], list[Candle]] = {}
+    provenance_series: dict[str, Any] = {}
     for symbol, timeframe in wanted:
         candles, dropped = fetch_candles(exchange, symbol, timeframe, start_ms, end_ms)
         series[(symbol, timeframe)] = candles
@@ -494,7 +691,16 @@ def fetch_fixture(out: Path, *, exchange_id: str, start: str, end: str) -> str:
         )
         if not candles:
             raise FixtureError(f"no candles returned for {symbol} {timeframe}")
-    return write_fixture(out, series)
+        provenance_series[f"{symbol}|{timeframe}"] = series_provenance(
+            candles, timeframe, dropped=dropped, start_ms=start_ms, end_ms=end_ms
+        )
+    provenance = {
+        "exchange": exchange_id,
+        "ccxt_version": str(getattr(ccxt, "__version__", "unknown")),
+        "window": {"start": start, "end": end},
+        "series": provenance_series,
+    }
+    return write_fixture(out, series, provenance=provenance, force=force)
 
 
 # ---------------------------------------------------------------------------
@@ -502,12 +708,43 @@ def fetch_fixture(out: Path, *, exchange_id: str, start: str, end: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+#: Rejection classes of ``DefaultRiskManager.pre_trade_check``.  ``RiskCheckResult`` carries only
+#: ``rejection_reasons: list[str]`` (built from ``RiskViolation.message``), and both daily-loss
+#: messages share ``rule="max_daily_loss"``, so the classification is by message prefix.  The
+#: contract tests in ``tests/unit/test_wp21c_rebaseline.py`` drive the REAL risk manager into
+#: each state, so a wording change fails a test instead of silently yielding zero (CF-21C-05
+#: would replace this with engine-exposed counters).  Exposure-reducing bypass messages start
+#: with ``bypassed`` and are warnings, never rejection reasons.
+_DAILY_BASIS_PREFIX = "Daily loss basis unavailable"
+_DAILY_PREFIX = "Daily loss "
+_DRAWDOWN_PREFIX = "Drawdown "
+
+
+def classify_rejection_reason(reason: str) -> str:
+    """``daily_basis_unavailable`` | ``daily`` | ``drawdown`` | ``other`` for one reason text."""
+    if reason.startswith(_DAILY_BASIS_PREFIX):  # before ``daily``: it shares the prefix
+        return "daily_basis_unavailable"
+    if reason.startswith(_DAILY_PREFIX):
+        return "daily"
+    if reason.startswith(_DRAWDOWN_PREFIX):
+        return "drawdown"
+    return "other"
+
+
 @dataclass
 class GateProbe:
-    """Counts what the engine does not expose: gate rejections and breaker activity."""
+    """Counts what the engine does not expose: gate rejections and breaker activity.
 
-    daily_rejections: int = 0
+    The gate counters are per rejected ``pre_trade_check``: a check counts once in every class
+    one of its reasons belongs to (so the classes are not additive), and a rejected check
+    always lands in at least one class -- ``other_rejections`` catches every reason that is
+    not a daily-loss or drawdown message, and a rejection without any reason.
+    """
+
+    daily_rejections: int = 0  # daily-loss threshold breached
+    daily_basis_unavailable: int = 0  # fail-closed: the day-start basis was <= 0
     drawdown_rejections: int = 0
+    other_rejections: int = 0
     cb_entry_drops: dict[str, int] = field(default_factory=dict)
     cb_transitions: int = 0
     cb_transitions_to: dict[str, int] = field(default_factory=dict)
@@ -516,55 +753,80 @@ class GateProbe:
     def cb_rejections(self) -> int:
         return sum(self.cb_entry_drops.values())
 
+    def record_rejection(self, reasons: Sequence[str]) -> None:
+        classes = {classify_rejection_reason(r) for r in reasons} or {"other"}
+        if "daily" in classes:
+            self.daily_rejections += 1
+        if "daily_basis_unavailable" in classes:
+            self.daily_basis_unavailable += 1
+        if "drawdown" in classes:
+            self.drawdown_rejections += 1
+        if "other" in classes:
+            self.other_rejections += 1
+
+
+#: ``probe_gates`` patches CLASS attributes, which every thread sees: one probe at a time.
+_PROBE_LOCK = threading.Lock()
+
 
 @contextmanager
 def probe_gates() -> Iterator[GateProbe]:
     """Wrap three engine entry points for the duration of ONE backtest (restored on exit).
 
-    * ``DefaultRiskManager.pre_trade_check``: rejected checks, classified by rule message
-      (``Daily loss ...`` / ``Drawdown ...``) -- the WP1.5 gates; exits bypass them.
+    * ``DefaultRiskManager.pre_trade_check``: rejected checks, classified by
+      :func:`classify_rejection_reason` -- the WP1.5 gates; exits bypass them.
     * ``TradeSkipLogger.log_skip``: BUYs the breaker dropped (``circuit_breaker_*``).
     * ``CircuitBreaker.evaluate``: level changes (``decision.transition``).
 
     The probe only observes; the wrapped calls return exactly what they returned before.
+
+    **Never call this from a process that runs paper or live engines**: the patches are
+    process-global (every thread sees the wrappers) while the probe is active.  It is
+    therefore not re-entrant either: a second ``probe_gates()`` while one is active raises
+    ``RuntimeError`` instead of stacking wrappers.
     """
-    probe = GateProbe()
-    orig_check = cast("Callable[..., RiskCheckResult]", DefaultRiskManager.pre_trade_check)
-    orig_skip = cast("Callable[..., SkippedTrade]", TradeSkipLogger.log_skip)
-    orig_eval = cast("Callable[..., CircuitBreakerDecision]", CircuitBreaker.evaluate)
+    if not _PROBE_LOCK.acquire(blocking=False):
+        raise RuntimeError("probe_gates() is already active; it is not re-entrant")
+    try:
+        probe = GateProbe()
+        orig_check = cast("Callable[..., RiskCheckResult]", DefaultRiskManager.pre_trade_check)
+        orig_skip = cast("Callable[..., SkippedTrade]", TradeSkipLogger.log_skip)
+        orig_eval = cast("Callable[..., CircuitBreakerDecision]", CircuitBreaker.evaluate)
 
-    def check(self: DefaultRiskManager, *args: object, **kwargs: object) -> RiskCheckResult:
-        result = orig_check(self, *args, **kwargs)
-        if not result.approved:
-            reasons = list(result.rejection_reasons)
-            if any(r.startswith("Daily loss") for r in reasons):
-                probe.daily_rejections += 1
-            if any(r.startswith("Drawdown") for r in reasons):
-                probe.drawdown_rejections += 1
-        return result
+        def check(self: DefaultRiskManager, *args: object, **kwargs: object) -> RiskCheckResult:
+            result = orig_check(self, *args, **kwargs)
+            if not result.approved:
+                probe.record_rejection(result.rejection_reasons)
+            return result
 
-    def skip(
-        self: TradeSkipLogger, symbol: str, skip_reason: str, *args: object, **kwargs: object
-    ) -> SkippedTrade:
-        if skip_reason.startswith("circuit_breaker_"):
-            level = skip_reason.removeprefix("circuit_breaker_")
-            probe.cb_entry_drops[level] = probe.cb_entry_drops.get(level, 0) + 1
-        return orig_skip(self, symbol, skip_reason, *args, **kwargs)
+        def skip(
+            self: TradeSkipLogger, symbol: str, skip_reason: str, *args: object, **kwargs: object
+        ) -> SkippedTrade:
+            if skip_reason.startswith("circuit_breaker_"):
+                level = skip_reason.removeprefix("circuit_breaker_")
+                probe.cb_entry_drops[level] = probe.cb_entry_drops.get(level, 0) + 1
+            return orig_skip(self, symbol, skip_reason, *args, **kwargs)
 
-    def evaluate(self: CircuitBreaker, snapshot: RiskSnapshot) -> CircuitBreakerDecision:
-        decision = orig_eval(self, snapshot)
-        if decision.transition is not None:
-            probe.cb_transitions += 1
-            to = str(decision.transition.to_level.value)
-            probe.cb_transitions_to[to] = probe.cb_transitions_to.get(to, 0) + 1
-        return decision
+        def evaluate(self: CircuitBreaker, snapshot: RiskSnapshot) -> CircuitBreakerDecision:
+            decision = orig_eval(self, snapshot)
+            if decision.transition is not None:
+                probe.cb_transitions += 1
+                to = str(decision.transition.to_level.value)
+                probe.cb_transitions_to[to] = probe.cb_transitions_to.get(to, 0) + 1
+            return decision
 
-    with (
-        mock.patch.object(DefaultRiskManager, "pre_trade_check", check),
-        mock.patch.object(TradeSkipLogger, "log_skip", skip),
-        mock.patch.object(CircuitBreaker, "evaluate", evaluate),
-    ):
-        yield probe
+        # ``mock.patch.object`` on purpose: it restores the original on every exit path
+        # (including an exception inside the run) and leaves no other state behind.  This is
+        # a measurement SCRIPT: nothing under ``apps/`` or ``packages/`` imports it or
+        # ``unittest.mock`` (CF-21C-02 will pin that); CF-21C-05 removes the need altogether.
+        with (
+            mock.patch.object(DefaultRiskManager, "pre_trade_check", check),
+            mock.patch.object(TradeSkipLogger, "log_skip", skip),
+            mock.patch.object(CircuitBreaker, "evaluate", evaluate),
+        ):
+            yield probe
+    finally:
+        _PROBE_LOCK.release()
 
 
 # ---------------------------------------------------------------------------
@@ -654,7 +916,9 @@ async def run_cell(
         else None,
         "gate_rejections": {
             "daily": probe.daily_rejections,
+            "daily_basis_unavailable": probe.daily_basis_unavailable,
             "drawdown": probe.drawdown_rejections,
+            "other": probe.other_rejections,
             "circuit_breaker": probe.cb_rejections,
             "circuit_breaker_by_level": dict(sorted(probe.cb_entry_drops.items())),
         },
@@ -708,11 +972,17 @@ async def bisect_breakeven(
     """Find the taker (bps) where PF = ``target`` +/- ``tolerance``.
 
     PF is assumed to fall as the taker rises (the bracket basis moves stops closer too, X-15,
-    so this is not guaranteed -- every evaluation is recorded).  The two end points are
-    evaluated first (they validate the bracket and are not counted as iterations); then at
-    most ``max_iterations`` bisection steps.  Midpoints are rounded to 0.01 bps, the
-    ``CostProfile`` resolution.  ``pf_at`` returns ``None`` when PF is undefined (no trades),
-    may return ``math.inf``, and raises :class:`UnevaluableError` when a taker cannot be priced.
+    so this is not guaranteed -- every evaluation is recorded).
+
+    Budget (SA-21C-01): at most 12 bisection steps after 2 bracket evaluations (at most 14
+    backtests per breakeven row and breaker state), where 12 is ``max_iterations``.  In spec
+    section 11 an "iteration" is a bisection step; the two end points (lo, hi) are evaluated
+    first, validate the bracket and decide the status (``below_target_at_lo`` /
+    ``above_target_at_hi``), and are not iterations.  ``BreakevenResult.iterations`` counts
+    bisection steps only; ``evaluations`` lists every backtest.  Midpoints are rounded to
+    0.01 bps, the ``CostProfile`` resolution.  ``pf_at`` returns ``None`` when PF is undefined
+    (no trades), may return ``math.inf``, and raises :class:`UnevaluableError` when a taker
+    cannot be priced.
     """
     evals: list[tuple[Decimal, float | None]] = []
 
@@ -794,6 +1064,7 @@ async def run_matrix(
     breakeven: bool = True,
     breakeven_breaker: str = "on",
     column_a: Mapping[str, Mapping[str, Any]] | None = None,
+    column_a_source: str | None = None,
     progress: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """Run every (baseline, symbol) row across the columns; the record is deterministic."""
@@ -860,7 +1131,11 @@ async def run_matrix(
             rows.append(row)
 
     has_a = any("A" in r["cells"] for r in rows)
+    provenance: dict[str, Any] = {}
+    if column_a_source is not None and has_a:
+        provenance["column_a_source"] = column_a_source
     return {
+        **provenance,
         "schema": "wp21-rebaseline-1",
         "fixture_sha256": fixture_sha256,
         "window": {"start": start, "end": end},
@@ -883,6 +1158,7 @@ async def run_matrix(
             "target_pf": BREAKEVEN_PF_TARGET,
             "tolerance": BREAKEVEN_PF_TOLERANCE,
             "max_iterations": BREAKEVEN_MAX_ITERATIONS,
+            "max_backtests_per_row": BREAKEVEN_MAX_BACKTESTS,
             "breaker": breakeven_breaker if breakeven else None,
         },
         "sharpe_label": "pre-WP2.5",
@@ -928,7 +1204,12 @@ _METRIC_ROWS: tuple[tuple[str, Callable[[dict[str, Any]], str]], ...] = (
     ("turnover (x capital)", lambda c: _fmt_float(c["turnover_x"])),
     ("cost per trade (bps)", lambda c: _fmt_float(c["cost_per_trade_bps"], 1)),
     ("rejections: daily", lambda c: str(c["gate_rejections"]["daily"])),
+    (
+        "rejections: daily basis unavailable",
+        lambda c: str(c["gate_rejections"]["daily_basis_unavailable"]),
+    ),
     ("rejections: drawdown", lambda c: str(c["gate_rejections"]["drawdown"])),
+    ("rejections: other", lambda c: str(c["gate_rejections"]["other"])),
     ("rejections: breaker", lambda c: str(c["gate_rejections"]["circuit_breaker"])),
     ("breaker transitions", lambda c: str(c["cb_transitions"])),
     ("Sharpe (pre-WP2.5)", lambda c: _fmt_float(c["sharpe_pre_wp25"], 3)),
@@ -943,6 +1224,14 @@ def _render_cell(fmt: Callable[[dict[str, Any]], str], cell: dict[str, Any] | No
         return fmt(cell)
     except (KeyError, TypeError, ValueError, ArithmeticError):
         return "n/a"
+
+
+#: Static caveat of every rendered table (spec X-15; ASCII on purpose).
+X15_NOTE = (
+    "- X-15: bracket levels sit on the all-in (fee-inclusive) entry basis, so a higher taker "
+    "moves every stop closer to the market; the B -> D -> E deltas include earlier stop-outs, "
+    "not only fee drag."
+)
 
 
 def render_markdown(record: Mapping[str, Any]) -> str:
@@ -962,6 +1251,18 @@ def render_markdown(record: Mapping[str, Any]) -> str:
         " (the parts are not claimed to be additive)"
     )
     out.append("- Sharpe is labelled pre-WP2.5 (not comparable with later numbers)")
+    if "column_a_source" in record:
+        out.append(f"- column A source: `{record['column_a_source']}`")
+    out.append(X15_NOTE)
+    be_meta = record.get("breakeven", {})
+    if be_meta.get("breaker") is not None:
+        out.append(
+            f"- breakeven: taker {be_meta['range_bps'][0]}..{be_meta['range_bps'][1]} bps on "
+            f"{be_meta['base_profile']}, PF {be_meta['target_pf']:.2f} +/- "
+            f"{be_meta['tolerance']:.2f}, at most {be_meta['max_iterations']} bisection steps "
+            f"after 2 bracket evaluations (at most {be_meta['max_backtests_per_row']} backtests "
+            "per breakeven row and breaker state)"
+        )
     out.append("")
     out.append("| Col | Cost profile | Fingerprint | Breaker | Isolates |")
     out.append("|---|---|---|---|---|")
@@ -996,8 +1297,8 @@ def render_markdown(record: Mapping[str, Any]) -> str:
                 f"Breakeven taker (breaker {state}): "
                 f"{'n/a' if taker is None else taker + ' bps'} "
                 f"[{be['status']}, PF {_fmt_pf(be['pf_at_breakeven'])}, "
-                f"{be['iterations']} iterations, "
-                f"{len(be['evaluations'])} runs]"
+                f"{be['iterations']} bisection steps, "
+                f"{len(be['evaluations'])} backtests]"
             )
     out.append("")
     return "\n".join(out)
@@ -1024,8 +1325,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ap.add_argument(
         "--exchange",
-        default="coinbaseexchange",
-        help="ccxt exchange id for FETCH mode (public candles only; default: coinbaseexchange)",
+        default=ALLOWED_EXCHANGES[0],
+        choices=ALLOWED_EXCHANGES,
+        help="ccxt exchange id for FETCH mode (public candles only; the only choice and the "
+        "default: coinbaseexchange)",
+    )
+    ap.add_argument(
+        "--force",
+        action="store_true",
+        help="FETCH mode: overwrite an existing fixture, .sha256 and .meta.json "
+        "(a symlink target is always refused)",
     )
     ap.add_argument("--fixture", type=Path, help="RUN mode: the gzip-CSV fixture")
     ap.add_argument(
@@ -1104,15 +1413,28 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.fetch_fixture is not None:
         if args.fixture is not None:
             ap.error("--fetch-fixture and --fixture are mutually exclusive")
+        import ccxt  # lazy: only FETCH mode needs it
+
         try:
             digest = fetch_fixture(
-                args.fetch_fixture, exchange_id=args.exchange, start=args.start, end=args.end
+                args.fetch_fixture,
+                exchange_id=args.exchange,
+                start=args.start,
+                end=args.end,
+                force=args.force,
             )
         except (FixtureError, ValueError) as exc:
             print(f"wp21-rebaseline: {exc}", file=sys.stderr)
             return 2
+        except ccxt.BaseError as exc:
+            # The exception type only (CF-36): a ccxt message embeds the request URL and the
+            # response body.
+            print(f"wp21-rebaseline: fetch failed ({type(exc).__name__})", file=sys.stderr)
+            return 2
         print(f"fixture {args.fetch_fixture} sha256={digest}")
         return 0
+    if args.force:
+        ap.error("--force only applies to --fetch-fixture")
 
     if args.fixture is None or args.fixture_sha256 is None:
         ap.error("RUN mode needs both --fixture and --fixture-sha256 (or use --fetch-fixture)")
@@ -1120,19 +1442,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         series, digest = load_fixture(args.fixture, args.fixture_sha256)
         baselines = list(BASELINES)
         if args.momentum_params is not None:
-            params_bytes = (
-                args.momentum_params.read_bytes() if args.momentum_params.exists() else b""
-            )
-            baselines[0] = momentum_spec_from_params(
-                load_json_object(args.momentum_params),
-                source=f"file:sha256={sha256_hex(params_bytes)[:16]}",
-            )
+            params_doc, params_sha = read_json_object(args.momentum_params)
+            baselines[0] = momentum_spec_from_params(params_doc, source=f"file:sha256={params_sha}")
         column_a: dict[str, Mapping[str, Any]] | None = None
+        column_a_source: str | None = None
         if args.column_a is not None:
-            raw_a = load_json_object(args.column_a)
+            raw_a, a_sha = read_json_object(args.column_a)
             if not all(isinstance(v, dict) for v in raw_a.values()):
                 raise FixtureError("--column-a must map '<baseline>|<symbol>' to metric objects")
             column_a = dict(raw_a)
+            column_a_source = f"file:sha256={a_sha}"
         selected = _select(baselines, args.only)
         record = asyncio.run(
             run_matrix(
@@ -1144,6 +1463,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 breakeven=not args.skip_breakeven,
                 breakeven_breaker=args.breakeven_breaker,
                 column_a=column_a,
+                column_a_source=column_a_source,
                 progress=lambda m: print(f"  running {m}", file=sys.stderr, flush=True),
             )
         )

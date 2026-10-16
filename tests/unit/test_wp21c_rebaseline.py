@@ -10,6 +10,14 @@ WP2.1c: the D13 re-baseline harness ``scripts/wp21_rebaseline.py`` (spec section
         * the matrix order, the cost profile and the breaker state of every column, and the
           fixture sha256 are recorded
 
+    WP2.1c-delta (WP21C-D-01 .. D-09; reviewed fixes of the critic / security round 1)
+        * FETCH: exchange allowlist, CF-36 error output, provenance meta file, target refusals
+          (suffix, existing file, symlink, ``--force``), atomic writes, compressed-size cap
+        * RUN: ``--momentum-params`` / ``--column-a`` read once and bounded, full sha256;
+          a pinned but malformed fixture is a ``FixtureError``
+        * the gate probe's classes against the REAL ``DefaultRiskManager``, its guard
+        * the X-15 caveat and the bisection-step / backtest accounting (SA-21C-01)
+
 Hermetic: a SMALL SYNTHETIC deterministic fixture built in the test.  No network, no exchange,
 no market data; ``ccxt`` is replaced by a fake object wherever the fetch path is exercised.
 """
@@ -20,20 +28,27 @@ import gzip
 import importlib.util
 import json
 import math
+import os
 import random
+import re
+import stat
 import sys
+import types
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, ClassVar
 
+import ccxt
 import pytest
 
-from common.types import TimeFrame
+from common.types import OrderSide, TimeFrame
 from tests.integration.fakes.bar_paths import scripted_path
 from tests.integration.fakes.scripted_strategy import ScriptedSequenceStrategy
+from tests.unit.test_risk import _make_limit_order, _make_manager, _make_position
 from trading.backtest import BacktestRunner
 from trading.costs import DEFAULT_COST_PROFILE, get_cost_profile
+from trading.models import Position, RiskCheckResult
 from trading.risk import RiskParameters
 from trading.risk_manager import DefaultRiskManager
 from trading.safety import CircuitBreaker
@@ -222,6 +237,298 @@ class TestFixture:
         path.write_bytes(payload)
         with pytest.raises(rb.FixtureError, match="strictly increasing"):
             rb.load_fixture(path, rb.sha256_hex(payload))
+
+
+# ---------------------------------------------------------------------------
+# WP21C-D-05 / D-06: fixture writer and reader hardening
+# ---------------------------------------------------------------------------
+
+_HDR = b"symbol,timeframe,ts_ms,open,high,low,close,volume\n"
+
+
+def _pinned(tmp_path: Path, payload: bytes, name: str = "p.csv.gz") -> tuple[Path, str]:
+    path = tmp_path / name
+    path.write_bytes(payload)
+    return path, rb.sha256_hex(payload)
+
+
+def _names(directory: Path) -> set[str]:
+    return {p.name for p in directory.iterdir()}
+
+
+class _Counting:
+    """An open binary handle that counts the bytes read through it."""
+
+    def __init__(self, handle: Any) -> None:
+        self._handle = handle
+        self.bytes_read = 0
+
+    def read(self, size: int = -1) -> bytes:
+        data: bytes = self._handle.read(size)
+        self.bytes_read += len(data)
+        return data
+
+    def __enter__(self) -> _Counting:
+        self._handle.__enter__()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._handle.__exit__(*exc)
+
+
+def _spy_reads(monkeypatch: pytest.MonkeyPatch, victim: Path) -> list[_Counting]:
+    """Count every ``Path.open`` of ``victim``; whole-file helpers on it fail the test."""
+    opened: list[_Counting] = []
+    real_open = Path.open
+
+    def spy_open(self: Path, *args: Any, **kwargs: Any) -> Any:
+        handle = real_open(self, *args, **kwargs)
+        if self != victim:
+            return handle
+        counting = _Counting(handle)
+        opened.append(counting)
+        return counting
+
+    def forbid(name: str) -> None:
+        real = getattr(Path, name)
+
+        def guard(self: Path, *args: Any, **kwargs: Any) -> Any:
+            assert self != victim, f"Path.{name} on {victim.name}"
+            return real(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, name, guard)
+
+    monkeypatch.setattr(Path, "open", spy_open)
+    forbid("read_bytes")
+    forbid("read_text")
+    return opened
+
+
+def _lie_about_size(monkeypatch: pytest.MonkeyPatch, victim: Path, size: int) -> None:
+    """``Path.stat`` reports ``size`` for ``victim`` (a file that grew after the check)."""
+    real_stat = Path.stat
+
+    def fake(self: Path, *args: Any, **kwargs: Any) -> os.stat_result:
+        result = real_stat(self, *args, **kwargs)
+        if self != victim:
+            return result
+        fields = list(result)
+        fields[stat.ST_SIZE] = size
+        return os.stat_result(fields)
+
+    monkeypatch.setattr(Path, "stat", fake)
+
+
+class TestFixtureWriterSafety:
+    """D-05: suffix, refusals, ``--force``, symlinks, atomic writes, the compressed cap."""
+
+    @pytest.mark.parametrize(
+        "name", ["risk-model.md", "bars.csv", "bars.gz", "bars.csv.gz.bak", ".csv.gz"]
+    )
+    def test_the_target_must_be_a_csv_gz_file_and_is_never_touched_otherwise(
+        self, tmp_path: Path, name: str
+    ) -> None:
+        target = tmp_path / name
+        target.write_text("keep")
+        with pytest.raises(rb.FixtureError, match=r"\.csv\.gz"):
+            rb.write_fixture(target, _series(), force=True)
+        assert target.read_text() == "keep"
+        assert _names(tmp_path) == {name}
+
+    @pytest.mark.parametrize("which", ["fixture", "sidecar", "meta"])
+    def test_an_existing_file_is_refused_without_force_and_nothing_else_is_written(
+        self, tmp_path: Path, which: str
+    ) -> None:
+        path = tmp_path / "bars.csv.gz"
+        existing = {
+            "fixture": path,
+            "sidecar": rb.sidecar_path(path),
+            "meta": rb.meta_path(path),
+        }[which]
+        existing.write_bytes(b"precious")
+        with pytest.raises(rb.FixtureError, match="already exists"):
+            rb.write_fixture(path, _series(), provenance={"exchange": "x"})
+        assert existing.read_bytes() == b"precious"
+        assert _names(tmp_path) == {existing.name}
+
+    def test_force_overwrites_all_three_files_and_leaves_no_temp_file(self, tmp_path: Path) -> None:
+        path = tmp_path / "bars.csv.gz"
+        for stale in (path, rb.sidecar_path(path), rb.meta_path(path)):
+            stale.write_bytes(b"stale")
+        digest = rb.write_fixture(path, _series(), provenance={"exchange": "x"}, force=True)
+        assert rb.sha256_hex(path.read_bytes()) == digest
+        assert rb.sidecar_path(path).read_text() == f"{digest}  bars.csv.gz\n"
+        meta = json.loads(rb.meta_path(path).read_text())
+        assert meta["fixture_sha256"] == digest and meta["exchange"] == "x"
+        assert _names(tmp_path) == {"bars.csv.gz", "bars.csv.gz.sha256", "bars.csv.gz.meta.json"}
+        assert stat.S_IMODE(path.stat().st_mode) == 0o644
+
+    @pytest.mark.parametrize("which", ["fixture", "sidecar", "meta"])
+    @pytest.mark.parametrize("dangling", [False, True])
+    def test_a_symlink_is_refused_even_with_force(
+        self, tmp_path: Path, which: str, dangling: bool
+    ) -> None:
+        path = tmp_path / "bars.csv.gz"
+        link = {
+            "fixture": path,
+            "sidecar": rb.sidecar_path(path),
+            "meta": rb.meta_path(path),
+        }[which]
+        victim = tmp_path / "victim.txt"
+        if not dangling:
+            victim.write_text("do not overwrite")
+        link.symlink_to(victim)
+        with pytest.raises(rb.FixtureError, match="symlink"):
+            rb.write_fixture(path, _series(), provenance={"exchange": "x"}, force=True)
+        assert link.is_symlink()
+        assert (victim.read_text() if not dangling else "") == (
+            "" if dangling else "do not overwrite"
+        )
+        assert _names(tmp_path) == ({link.name} if dangling else {link.name, "victim.txt"})
+
+    def test_a_directory_in_the_way_is_refused(self, tmp_path: Path) -> None:
+        path = tmp_path / "bars.csv.gz"
+        path.mkdir()
+        with pytest.raises(rb.FixtureError, match="directory"):
+            rb.write_fixture(path, _series(), force=True)
+
+    def test_meta_never_changes_the_fixture_bytes_or_the_sha(self, tmp_path: Path) -> None:
+        plain = rb.write_fixture(tmp_path / "a.csv.gz", _series())
+        with_meta = rb.write_fixture(
+            tmp_path / "b.csv.gz", _series(), provenance={"exchange": "coinbaseexchange"}
+        )
+        assert plain == with_meta
+        assert (tmp_path / "a.csv.gz").read_bytes() == (tmp_path / "b.csv.gz").read_bytes()
+        assert not rb.meta_path(tmp_path / "a.csv.gz").exists()
+
+    def test_a_failure_while_staging_touches_no_target_and_leaves_no_temp_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "bars.csv.gz"
+        real_stage = rb._stage_bytes
+        calls = 0
+
+        def flaky(directory: Path, data: bytes) -> Path:
+            nonlocal calls
+            calls += 1
+            if calls == 3:  # the meta file, after the fixture and the sidecar were staged
+                raise OSError("disk full")
+            return Path(real_stage(directory, data))
+
+        monkeypatch.setattr(rb, "_stage_bytes", flaky)
+        with pytest.raises(OSError, match="disk full"):
+            rb.write_fixture(path, _series(), provenance={"exchange": "x"})
+        assert calls == 3 and _names(tmp_path) == set()
+
+    def test_a_forced_overwrite_that_fails_while_staging_keeps_the_old_files(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "bars.csv.gz"
+        old = {
+            p: b"old " + p.name.encode() for p in (path, rb.sidecar_path(path), rb.meta_path(path))
+        }
+        for p, data in old.items():
+            p.write_bytes(data)
+        real_stage = rb._stage_bytes
+        calls = 0
+
+        def flaky(directory: Path, data: bytes) -> Path:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("disk full")
+            return Path(real_stage(directory, data))
+
+        monkeypatch.setattr(rb, "_stage_bytes", flaky)
+        with pytest.raises(OSError, match="disk full"):
+            rb.write_fixture(path, _series(), provenance={"exchange": "x"}, force=True)
+        assert {p: p.read_bytes() for p in old} == old
+        assert _names(tmp_path) == {p.name for p in old}
+
+    def test_a_failure_while_replacing_removes_what_this_call_created(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "bars.csv.gz"
+        real_replace = os.replace
+        calls = 0
+
+        def flaky(src: Any, dst: Any) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("cannot replace")
+            real_replace(src, dst)
+
+        monkeypatch.setattr(rb.os, "replace", flaky)
+        with pytest.raises(OSError, match="cannot replace"):
+            rb.write_fixture(path, _series(), provenance={"exchange": "x"})
+        assert calls == 2 and _names(tmp_path) == set()  # no partial fixture, no temp file
+
+    def test_the_compressed_size_is_capped_by_stat_before_the_file_is_read(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path, digest = _pinned(tmp_path, b"x" * 200)
+        monkeypatch.setattr(rb, "_MAX_FIXTURE_FILE_BYTES", 100)
+        opened = _spy_reads(monkeypatch, path)
+        with pytest.raises(rb.FixtureError, match="compressed size cap"):
+            rb.load_fixture(path, digest)
+        assert opened == []  # refused on the size alone
+
+    def test_a_file_that_grew_after_the_stat_is_still_read_only_up_to_the_cap(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path, digest = _pinned(tmp_path, b"x" * 5000)
+        monkeypatch.setattr(rb, "_MAX_FIXTURE_FILE_BYTES", 100)
+        _lie_about_size(monkeypatch, path, 10)
+        opened = _spy_reads(monkeypatch, path)
+        with pytest.raises(rb.FixtureError, match="compressed size cap"):
+            rb.load_fixture(path, digest)
+        assert [h.bytes_read for h in opened] == [101]  # cap + 1, never the 5000
+
+
+class TestFixtureParseHardening:
+    """D-06: a payload that matches its pin but is not well-formed is a ``FixtureError``."""
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            pytest.param(_HDR + b"BTC/EUR,1d,1,\xff\xfe,1,1,1,1\n", id="not-utf8"),
+            pytest.param(
+                _HDR + b"BTC/EUR,1d,1," + b"9" * 200_000 + b",1,1,1,1\n", id="csv-field-limit"
+            ),
+            pytest.param(
+                _HDR + b"BTC/EUR,1d," + b"9" * 40 + b",1,1,1,1,1\n", id="timestamp-overflow"
+            ),
+            pytest.param(_HDR + b"BTC/EUR,1d," + b"9" * 20 + b",1,1,1,1,1\n", id="timestamp-huge"),
+            pytest.param(
+                _HDR + b"BTC/EUR,1d,-" + b"9" * 20 + b",1,1,1,1,1\n", id="timestamp-negative"
+            ),
+            pytest.param(_HDR + b"BTC/EUR,1d,253402300800000,1,1,1,1,1\n", id="year-10000"),
+        ],
+    )
+    def test_a_pinned_but_malformed_payload_is_refused_with_a_fixture_error(
+        self, tmp_path: Path, body: bytes
+    ) -> None:
+        path, digest = _pinned(tmp_path, gzip.compress(body))
+        with pytest.raises(rb.FixtureError):
+            rb.load_fixture(path, digest)
+
+    def test_a_corrupt_deflate_stream_is_a_fixture_error_too(self, tmp_path: Path) -> None:
+        good = bytearray(gzip.compress(_HDR + b"BTC/EUR,1d,86400000,1,1,1,1,1\n" * 50))
+        good[14:30] = bytes(range(16))  # garbage inside the deflate stream, header intact
+        path, digest = _pinned(tmp_path, bytes(good))
+        with pytest.raises(rb.FixtureError, match="gzip"):
+            rb.load_fixture(path, digest)
+
+    def test_the_cli_returns_2_for_a_non_utf8_payload_with_a_matching_pin(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        path, digest = _pinned(tmp_path, gzip.compress(_HDR + b"BTC/EUR,1d,1,\xff\xfe,1,1,1,1\n"))
+        out = tmp_path / "out"
+        code = rb.main(["--fixture", str(path), "--fixture-sha256", digest, "--out-dir", str(out)])
+        assert code == 2 and not out.exists()
+        err = capsys.readouterr().err
+        assert "UnicodeDecodeError" in err and "Traceback" not in err
 
 
 # ---------------------------------------------------------------------------
@@ -468,7 +775,13 @@ class TestMatrix:
         }
         for key, cell in row["cells"].items():
             assert needed <= set(cell), key
-            assert set(cell["gate_rejections"]) >= {"daily", "drawdown", "circuit_breaker"}
+            assert set(cell["gate_rejections"]) >= {
+                "daily",
+                "daily_basis_unavailable",
+                "drawdown",
+                "other",
+                "circuit_breaker",
+            }
         assert (
             row["cells"]["C"]["total_fees"] == "0.00000000"
             or Decimal(row["cells"]["C"]["total_fees"]) == 0
@@ -483,6 +796,9 @@ class TestMatrix:
             "stop-loss share",
             "total slippage cost",
             "rejections: daily",
+            "rejections: daily basis unavailable",
+            "rejections: drawdown",
+            "rejections: other",
             "rejections: breaker",
             "breaker transitions",
             "Sharpe (pre-WP2.5)",
@@ -549,6 +865,13 @@ class TestMatrix:
             md.count("Breakeven taker (breaker on)") == 2
             and md.count("Breakeven taker (breaker off)") == 2
         )
+        # D-09 (SA-21C-01): "N bisection steps, M backtests" -- steps are the iterations, the
+        # backtests also count the 2 bracket evaluations
+        lines = re.findall(r"(\d+) bisection steps, (\d+) backtests\]", md)
+        assert len(lines) == 4
+        for steps, backtests in lines:
+            assert int(steps) <= 12 and int(backtests) <= 14 and int(backtests) <= int(steps) + 2
+        assert " iterations," not in md and " runs]" not in md
 
     async def test_a_converging_real_row(self, tmp_path: Path) -> None:
         """A series built so PF crosses 1.00 inside [0, 250]: the bisection finds it."""
@@ -609,6 +932,84 @@ class TestMatrix:
                 start="2030-01-01",
                 end="2030-02-01",
             )
+
+
+class TestX15AndBudgetNotes:
+    """D-08 (X-15) and D-09 (SA-21C-01): what the rendered record says about itself."""
+
+    async def test_a_path_that_hits_the_stop_counts_real_stop_loss_exits(self) -> None:
+        # bought at bar 0, the price falls 20% through the 5% stop: the exit is a stop_loss
+        spec = rb.BaselineSpec(
+            "scripted",
+            ScriptedSequenceStrategy,
+            "1h",
+            (_SYMBOL,),
+            strategy_params={"script": {0: "buy"}, "target_notional": "1500"},
+            bracket={"bracket_stop_loss_pct": 0.05},
+        )
+        bars = scripted_path(
+            [100, 100, 80, 80], first_open=_FIRST_OPEN, symbol=_SYMBOL, timeframe=TimeFrame.ONE_HOUR
+        )
+        cell = await rb.run_cell(spec, _SYMBOL, bars, DEFAULT_COST_PROFILE, breaker=False)
+        assert cell["trades"] == 1
+        assert cell["stop_loss_exits"] >= 1  # not the tautology "n == n": a stop really fired
+        assert cell["exit_reasons"] == {
+            "stop_loss": 1,
+            "take_profit": 0,
+            "trailing_stop": 0,
+            "signal_exit": 0,
+        }
+        assert cell["stop_loss_share"] == 1.0
+
+    async def test_the_real_momentum_fallback_stops_out_on_the_synthetic_fixture(
+        self, fixture_path: tuple[Path, str]
+    ) -> None:
+        path, digest = fixture_path
+        series, _ = rb.load_fixture(path, digest)
+        spec = rb.BASELINES[0]  # momentum_breakout, ATR 1.5x stop / 3.0x target
+        cell = await rb.run_cell(
+            spec, "BTC/EUR", series[("BTC/EUR", "1d")], DEFAULT_COST_PROFILE, breaker=False
+        )
+        assert cell["trades"] >= 1 and cell["stop_loss_exits"] >= 1
+        assert 0 < cell["stop_loss_share"] <= 1.0
+        assert cell["stop_loss_share"] == round(cell["stop_loss_exits"] / cell["trades"], 10)
+
+    async def test_the_x15_caveat_is_a_static_ascii_line_of_every_table(
+        self, fixture_path: tuple[Path, str]
+    ) -> None:
+        path, digest = fixture_path
+        expected = (
+            "- X-15: bracket levels sit on the all-in (fee-inclusive) entry basis, so a higher "
+            "taker moves every stop closer to the market; the B -> D -> E deltas include earlier "
+            "stop-outs, not only fee drag."
+        )
+        assert rb.X15_NOTE == expected
+        for breakeven in (False, True):
+            rec = await _record(
+                path, digest, "grid_trading:BTC/EUR", breakeven=breakeven, breakeven_breaker="off"
+            )
+            md = rb.render_markdown(rec)
+            assert md.splitlines().count(expected) == 1
+            assert md.isascii()
+
+    async def test_the_header_and_the_docstrings_state_the_budget(
+        self, fixture_path: tuple[Path, str]
+    ) -> None:
+        budget = (
+            "at most 12 bisection steps after 2 bracket evaluations "
+            "(at most 14 backtests per breakeven row and breaker state)"
+        )
+        assert rb.BREAKEVEN_MAX_BACKTESTS == rb.BREAKEVEN_MAX_ITERATIONS + 2 == 14
+        assert budget in " ".join((rb.__doc__ or "").split())
+        assert budget in " ".join((rb.bisect_breakeven.__doc__ or "").split())
+        path, digest = fixture_path
+        with_be = await _record(
+            path, digest, "grid_trading:BTC/EUR", breakeven=True, breakeven_breaker="on"
+        )
+        assert rb.render_markdown(with_be).count(f", {budget}") == 1
+        assert with_be["breakeven"]["max_backtests_per_row"] == 14
+        without = await _record(path, digest, "grid_trading:BTC/EUR", breakeven=False)
+        assert budget not in rb.render_markdown(without)  # no breakeven section, no budget line
 
 
 # ---------------------------------------------------------------------------
@@ -712,6 +1113,137 @@ class TestBaselines:
             rb._select(rb.BASELINES, ["nope"])
 
 
+class TestJsonInputs:
+    """D-04: ``--momentum-params`` / ``--column-a`` are read once, bounded, and hashed in full."""
+
+    def test_one_bounded_read_and_the_hash_is_of_the_parsed_bytes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        raw = b'{"lookback": 20, "note": "\xc3\xa9"}'
+        path = tmp_path / "p.json"
+        path.write_bytes(raw)
+        opened = _spy_reads(monkeypatch, path)  # read_bytes / read_text on it would fail
+        doc, digest = rb.read_json_object(path)
+        assert doc == json.loads(raw) == {"lookback": 20, "note": "é"}
+        assert digest == rb.sha256_hex(raw) and len(digest) == 64
+        assert [h.bytes_read for h in opened] == [len(raw)]  # one open, one pass over the bytes
+
+    def test_a_2_mib_file_is_refused_by_stat_without_being_read(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        big = tmp_path / "big.json"
+        big.write_text('{"a": "' + "x" * (2 * 1024 * 1024) + '"}')
+        opened = _spy_reads(monkeypatch, big)
+        with pytest.raises(rb.FixtureError, match="larger than 1 MiB"):
+            rb.read_json_object(big)
+        assert sum(h.bytes_read for h in opened) <= rb._MAX_PARAMS_BYTES + 1
+
+    def test_a_file_that_grew_after_the_stat_is_read_at_most_cap_plus_one(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        big = tmp_path / "big.json"
+        big.write_text('{"a": "' + "x" * (2 * 1024 * 1024) + '"}')
+        _lie_about_size(monkeypatch, big, 100)
+        opened = _spy_reads(monkeypatch, big)
+        with pytest.raises(rb.FixtureError, match="larger than 1 MiB"):
+            rb.read_json_object(big)
+        assert [h.bytes_read for h in opened] == [rb._MAX_PARAMS_BYTES + 1]
+
+    @pytest.mark.parametrize(
+        ("raw", "kind"),
+        [
+            (b"\xff\xfe{", "UnicodeDecodeError"),
+            (b"{nope", "JSONDecodeError"),
+            (b"[" * 200_000, "RecursionError"),
+        ],
+    )
+    def test_undecodable_json_is_a_fixture_error_naming_only_the_type(
+        self, tmp_path: Path, raw: bytes, kind: str
+    ) -> None:
+        path = tmp_path / "bad.json"
+        path.write_bytes(raw)
+        with pytest.raises(rb.FixtureError, match=kind):
+            rb.read_json_object(path)
+
+    def test_a_missing_file_is_an_error_never_an_empty_input(self, tmp_path: Path) -> None:
+        with pytest.raises(rb.FixtureError, match="cannot read JSON file: FileNotFoundError"):
+            rb.read_json_object(tmp_path / "missing.json")
+        with pytest.raises(rb.FixtureError, match="cannot read JSON file"):
+            rb.read_json_object(tmp_path)  # a directory
+
+    def test_the_cli_refuses_a_2_mib_params_file_with_rc_2(
+        self, fixture_path: tuple[Path, str], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        path, digest = fixture_path
+        big = tmp_path / "big.json"
+        big.write_text('{"lookback": "' + "x" * (2 * 1024 * 1024) + '"}')
+        out = tmp_path / "out"
+        code = rb.main(
+            [
+                "--fixture",
+                str(path),
+                "--fixture-sha256",
+                digest,
+                "--momentum-params",
+                str(big),
+                "--out-dir",
+                str(out),
+            ]
+        )
+        assert code == 2 and not out.exists()
+        assert "larger than 1 MiB" in capsys.readouterr().err
+
+    @pytest.mark.parametrize("flag", ["--momentum-params", "--column-a"])
+    def test_the_cli_refuses_a_missing_file_with_rc_2(
+        self,
+        fixture_path: tuple[Path, str],
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        flag: str,
+    ) -> None:
+        path, digest = fixture_path
+        out = tmp_path / "out"
+        argv = ["--fixture", str(path), "--fixture-sha256", digest, "--out-dir", str(out)]
+        assert rb.main([*argv, flag, str(tmp_path / "missing.json")]) == 2
+        assert "cannot read JSON file" in capsys.readouterr().err and not out.exists()
+
+    def test_the_cli_records_the_full_sha_of_the_parsed_column_a_file(
+        self, fixture_path: tuple[Path, str], tmp_path: Path
+    ) -> None:
+        path, digest = fixture_path
+        raw = json.dumps({"grid_trading|BTC/EUR": {"trades": 12, "profit_factor": 1.5}}).encode()
+        column_a = tmp_path / "a.json"
+        column_a.write_bytes(raw)
+        out = tmp_path / "out"
+        code = rb.main(
+            [
+                "--fixture",
+                str(path),
+                "--fixture-sha256",
+                digest,
+                "--column-a",
+                str(column_a),
+                "--only",
+                "grid_trading:BTC/EUR",
+                "--skip-breakeven",
+                "--out-dir",
+                str(out),
+            ]
+        )
+        assert code == 0
+        record = json.loads((out / "rebaseline-matrix.json").read_text())
+        expected = f"file:sha256={rb.sha256_hex(raw)}"
+        assert record["column_a_source"] == expected and len(expected) == len("file:sha256=") + 64
+        assert f"- column A source: `{expected}`" in (out / "rebaseline-matrix.md").read_text()
+
+    async def test_a_run_without_column_a_has_no_column_a_source(
+        self, fixture_path: tuple[Path, str]
+    ) -> None:
+        path, digest = fixture_path
+        rec = await _record(path, digest, "grid_trading:BTC/EUR", breakeven=False)
+        assert "column_a_source" not in rec
+
+
 # ---------------------------------------------------------------------------
 # Instrumentation (gate rejections / breaker transitions)
 # ---------------------------------------------------------------------------
@@ -724,28 +1256,211 @@ _RISK = RiskParameters(
 
 
 async def _probe_run(
-    *, breaker: bool, script: dict[int, str], targets: dict[int, str], closes: list[int]
+    *,
+    breaker: bool,
+    script: dict[int, str],
+    targets: dict[int, str],
+    closes: list[int],
+    risk: RiskParameters = _RISK,
+    target_notional: str = "3000",
+    first_open: datetime = _FIRST_OPEN,
 ) -> tuple[Any, Any]:
     strategy = ScriptedSequenceStrategy(
-        "t37", {"script": script, "target_notional": "3000", "targets": targets}
+        "t37", {"script": script, "target_notional": target_notional, "targets": targets}
     )
     runner = BacktestRunner(
         strategies=[strategy],
         symbols=[_SYMBOL],
         timeframe=TimeFrame.ONE_HOUR,
         initial_capital=Decimal("10000"),
-        risk_params=_RISK,
+        risk_params=risk,
         seed=7,
         allow_pyramiding=True,
         cost_profile=get_cost_profile("legacy_backtest_v0"),
         enable_circuit_breaker=breaker,
     )
     bars = scripted_path(
-        closes, first_open=_FIRST_OPEN, symbol=_SYMBOL, timeframe=TimeFrame.ONE_HOUR
+        closes, first_open=first_open, symbol=_SYMBOL, timeframe=TimeFrame.ONE_HOUR
     )
     with rb.probe_gates() as probe:
         result = await runner.run({_SYMBOL: bars})
     return probe, result
+
+
+# ---------------------------------------------------------------------------
+# WP21C-D-07: the probe's classes, against the REAL DefaultRiskManager
+# ---------------------------------------------------------------------------
+
+
+def _gate(
+    manager: DefaultRiskManager,
+    *,
+    pnl: str = "0",
+    equity: str = "10000",
+    peak: str = "10000",
+    basis: str | None = "10000",
+    side: OrderSide = OrderSide.BUY,
+    quantity: str = "0.01",
+    positions: list[Position] | None = None,
+) -> RiskCheckResult:
+    return manager.pre_trade_check(
+        order=_make_limit_order(side=side, quantity=Decimal(quantity)),
+        current_equity=Decimal(equity),
+        open_positions=positions or [],
+        daily_pnl=Decimal(pnl),
+        peak_equity=Decimal(peak),
+        daily_loss_basis=None if basis is None else Decimal(basis),
+    )
+
+
+def _counts(probe: Any) -> dict[str, int]:
+    return {
+        "daily": probe.daily_rejections,
+        "basis": probe.daily_basis_unavailable,
+        "drawdown": probe.drawdown_rejections,
+        "other": probe.other_rejections,
+    }
+
+
+class TestGateProbeContract:
+    """Each state is driven through the real risk manager, so a wording change fails here."""
+
+    def test_a_daily_loss_breach_is_a_daily_rejection(self) -> None:
+        manager = _make_manager()  # 5% daily limit on a 10 000 basis
+        with rb.probe_gates() as probe:
+            result = _gate(manager, pnl="-600")
+        assert result.approved is False
+        assert [rb.classify_rejection_reason(r) for r in result.rejection_reasons] == ["daily"]
+        assert _counts(probe) == {"daily": 1, "basis": 0, "drawdown": 0, "other": 0}
+
+    @pytest.mark.parametrize("basis", ["0", "-5"])
+    def test_an_unavailable_basis_is_its_own_class_not_a_daily_breach(self, basis: str) -> None:
+        manager = _make_manager()
+        with rb.probe_gates() as probe:
+            result = _gate(manager, pnl="0", basis=basis)  # no loss at all: fail-closed
+        assert result.approved is False
+        assert "basis unavailable" in result.rejection_reasons[0]
+        assert [rb.classify_rejection_reason(r) for r in result.rejection_reasons] == [
+            "daily_basis_unavailable"
+        ]
+        assert _counts(probe) == {"daily": 0, "basis": 1, "drawdown": 0, "other": 0}
+
+    def test_a_drawdown_breach_is_a_drawdown_rejection(self) -> None:
+        manager = _make_manager()  # 15% drawdown limit
+        with rb.probe_gates() as probe:
+            result = _gate(manager, equity="8000", peak="10000", pnl="0")
+        assert result.approved is False
+        assert [rb.classify_rejection_reason(r) for r in result.rejection_reasons] == ["drawdown"]
+        assert _counts(probe) == {"daily": 0, "basis": 0, "drawdown": 1, "other": 0}
+
+    def test_any_other_rule_lands_in_other_so_no_rejection_disappears(self) -> None:
+        manager = _make_manager(max_open_positions=1)
+        with rb.probe_gates() as probe:
+            result = _gate(manager, positions=[_make_position()])
+        assert result.approved is False
+        assert result.rejection_reasons and all(
+            rb.classify_rejection_reason(r) == "other" for r in result.rejection_reasons
+        )
+        assert _counts(probe) == {"daily": 0, "basis": 0, "drawdown": 0, "other": 1}
+
+    def test_one_check_counts_once_in_every_class_it_belongs_to(self) -> None:
+        manager = _make_manager(max_open_positions=1)
+        with rb.probe_gates() as probe:
+            result = _gate(
+                manager,
+                pnl="-600",
+                equity="8000",
+                peak="10000",
+                positions=[_make_position()],
+            )
+        classes = {rb.classify_rejection_reason(r) for r in result.rejection_reasons}
+        assert classes == {"daily", "drawdown", "other"}
+        assert _counts(probe) == {"daily": 1, "basis": 0, "drawdown": 1, "other": 1}
+
+    def test_an_approved_check_and_a_bypassed_exit_count_nothing(self) -> None:
+        manager = _make_manager()
+        held = [_make_position(quantity=Decimal("0.1"))]
+        with rb.probe_gates() as probe:
+            buy = _gate(manager)
+            # an exposure-reducing SELL during a daily-loss AND drawdown breach is approved:
+            # the gates become ``bypassed ...`` warnings, never rejection reasons
+            sell = _gate(
+                manager,
+                pnl="-600",
+                equity="8000",
+                peak="10000",
+                side=OrderSide.SELL,
+                quantity="0.05",
+                positions=held,
+            )
+        assert buy.approved is True and sell.approved is True
+        assert sell.rejection_reasons == []
+        assert any(w.startswith("bypassed") for w in sell.warnings)
+        assert _counts(probe) == {"daily": 0, "basis": 0, "drawdown": 0, "other": 0}
+
+    def test_a_rejection_without_a_reason_is_still_counted(self) -> None:
+        probe = rb.GateProbe()
+        probe.record_rejection([])
+        assert _counts(probe) == {"daily": 0, "basis": 0, "drawdown": 0, "other": 1}
+
+    @pytest.mark.parametrize(
+        ("reason", "expected"),
+        [
+            ("Daily loss -801.00 at or beyond threshold -800.00 (8.0% of basis 10000.00)", "daily"),
+            (
+                "Daily loss basis unavailable (basis 0.00 <= 0); entries blocked",
+                "daily_basis_unavailable",
+            ),
+            ("Drawdown 16.3% exceeds limit 10.0%", "drawdown"),
+            ("bypassed (exposure-reducing SELL): Daily loss -801.00 at or beyond", "other"),
+            ("Max open positions reached: 1/1", "other"),
+            ("", "other"),
+        ],
+    )
+    def test_the_classifier_on_literal_messages(self, reason: str, expected: str) -> None:
+        assert rb.classify_rejection_reason(reason) == expected
+
+
+class TestGateProbeGuard:
+    def test_a_second_probe_while_one_is_active_raises_and_the_first_survives(self) -> None:
+        originals = (
+            DefaultRiskManager.pre_trade_check,
+            TradeSkipLogger.log_skip,
+            CircuitBreaker.evaluate,
+        )
+        with rb.probe_gates():
+            active = DefaultRiskManager.pre_trade_check
+            assert active is not originals[0]
+            with pytest.raises(RuntimeError, match="not re-entrant"), rb.probe_gates():
+                raise AssertionError("the nested probe must not be entered")
+            assert DefaultRiskManager.pre_trade_check is active  # the outer wrapper is untouched
+        assert (
+            DefaultRiskManager.pre_trade_check,
+            TradeSkipLogger.log_skip,
+            CircuitBreaker.evaluate,
+        ) == originals
+
+    def test_the_guard_is_released_after_a_normal_exit_and_after_an_exception(self) -> None:
+        with rb.probe_gates():
+            pass
+        with pytest.raises(RuntimeError, match="boom"), rb.probe_gates():
+            raise RuntimeError("boom")
+        with rb.probe_gates():  # still available
+            pass
+
+    def test_the_docstring_says_never_to_call_it_next_to_paper_or_live_engines(self) -> None:
+        doc = " ".join((rb.probe_gates.__doc__ or "").split())
+        assert "Never call this from a process that runs paper or live engines" in doc
+
+
+#: WP15 T-21 limits (10% drawdown) with the exposure caps lifted so only the drawdown gate decides.
+_DD_RISK = RiskParameters(
+    max_position_size_pct=0.4,
+    max_daily_loss_pct=0.5,
+    max_drawdown_pct=0.10,
+    max_portfolio_exposure_pct=1.0,
+    max_cluster_exposure_pct=1.0,
+)
 
 
 class TestGateProbe:
@@ -760,7 +1475,28 @@ class TestGateProbe:
         )
         assert probe.daily_rejections >= 1
         assert probe.cb_rejections == 0 and probe.cb_transitions == 0
-        assert result.total_trades >= 0
+        assert (probe.daily_basis_unavailable, probe.drawdown_rejections) == (0, 0)
+        # the gate-rejected second BUY (300) never filled: only the first 30-unit BUY is open
+        assert [p.quantity for p in result.open_positions_mtm] == [Decimal(30)]
+
+    async def test_the_drawdown_gate_rejection_is_counted_when_the_breaker_is_off(self) -> None:
+        # the WP15 T-21 path: the position rises 50% and falls back, so the BUY at bar 3 meets a
+        # 16% drawdown against the 10% limit and the BUY is rejected by the gate
+        probe, result = await _probe_run(
+            breaker=False,
+            script={0: "buy", 3: "buy", 4: "sell"},
+            targets={},
+            closes=[100, 150, 100, 100, 100],
+            risk=_DD_RISK,
+            target_notional="3900",
+            first_open=datetime(2026, 3, 10, 6, 0, tzinfo=UTC),
+        )
+        assert probe.drawdown_rejections == 1
+        assert (probe.daily_rejections, probe.daily_basis_unavailable) == (0, 0)
+        assert probe.cb_rejections == 0 and probe.cb_transitions == 0
+        # the rejected BUY never filled: one 39-unit entry, closed by the strategy SELL
+        assert [t.quantity for t in result.trades] == [Decimal(39)]
+        assert result.open_positions_mtm == []
 
     async def test_the_breaker_drops_the_entry_before_the_gate_and_counts_transitions(self) -> None:
         probe, _ = await _probe_run(
@@ -945,6 +1681,261 @@ class TestFetch:
             assert needle not in text, needle
 
 
+class _RaisingExchange(_FakeExchange):
+    """An exchange whose every ``fetch_ohlcv`` raises ``exc`` (no network, no keys)."""
+
+    def __init__(self, exc: Exception) -> None:
+        super().__init__()
+        self._exc = exc
+
+    def fetch_ohlcv(
+        self,
+        symbol: str,
+        timeframe: str = "1m",
+        since: int | None = None,
+        limit: int | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> list[list[float]]:
+        raise self._exc
+
+
+class _PoisonedCcxt(types.ModuleType):
+    """Stands in for ``ccxt``: ANY attribute access fails the test (no exchange is touched)."""
+
+    def __getattr__(self, name: str) -> Any:
+        raise AssertionError(f"ccxt.{name} was touched")
+
+
+def _install_exchange(monkeypatch: pytest.MonkeyPatch, exchange: _FakeExchange) -> list[Any]:
+    created: list[Any] = []
+
+    def factory(config: dict[str, Any]) -> _FakeExchange:
+        created.append(config)
+        return exchange
+
+    monkeypatch.setattr(ccxt, "coinbaseexchange", factory)
+    return created
+
+
+_FETCH_WINDOW = ["--start", "2023-01-01", "--end", "2023-01-02"]
+
+
+class TestFetchHardening:
+    """D-01 (exchange allowlist), D-02 (CF-36 errors), D-03 (provenance), D-05 (CLI refusals)."""
+
+    @pytest.mark.parametrize(
+        "exchange",
+        ["__name__", "__class__", "binance", "does_not_exist", "coinbase", "Exchange", ""],
+    )
+    def test_the_cli_refuses_an_unknown_exchange_id_with_rc_2_and_writes_nothing(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        exchange: str,
+    ) -> None:
+        monkeypatch.setitem(sys.modules, "ccxt", _PoisonedCcxt("ccxt"))  # any use fails
+        with pytest.raises(SystemExit) as exc:
+            rb.main(["--fetch-fixture", str(tmp_path / "f.csv.gz"), "--exchange", exchange])
+        assert exc.value.code == 2
+        assert "invalid choice" in capsys.readouterr().err
+        assert _names(tmp_path) == set()
+
+    @pytest.mark.parametrize("exchange", ["__name__", "binance", "does_not_exist", ""])
+    def test_fetch_fixture_checks_the_same_allowlist_before_any_getattr_on_ccxt(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exchange: str
+    ) -> None:
+        monkeypatch.setitem(sys.modules, "ccxt", _PoisonedCcxt("ccxt"))
+        with pytest.raises(rb.FixtureError, match="unsupported exchange id"):
+            rb.fetch_fixture(
+                tmp_path / "f.csv.gz", exchange_id=exchange, start="2023-01-01", end="2023-01-02"
+            )
+        assert _names(tmp_path) == set()
+
+    def test_the_allowlist_is_exactly_the_keyless_public_coinbase_exchange(self) -> None:
+        assert rb.ALLOWED_EXCHANGES == ("coinbaseexchange",)
+        action = next(a for a in rb.build_parser()._actions if a.dest == "exchange")
+        assert tuple(action.choices or ()) == rb.ALLOWED_EXCHANGES
+        assert action.default == "coinbaseexchange"
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            pytest.param(
+                ccxt.BadSymbol(
+                    "coinbaseexchange GET https://api.exchange.coinbase.com/products/SOL-EUR/"
+                    'candles 404 {"message":"NotFound-body-text"}'
+                ),
+                id="BadSymbol",
+            ),
+            pytest.param(
+                ccxt.ExchangeError(
+                    "coinbaseexchange https://api.exchange.coinbase.com/products 500 "
+                    '{"message":"Boom-body-text"}'
+                ),
+                id="ExchangeError",
+            ),
+            pytest.param(
+                ccxt.NetworkError(
+                    "coinbaseexchange GET https://api.exchange.coinbase.com/time "
+                    "timed out-body-text"
+                ),
+                id="NetworkError-exhausted",
+            ),
+        ],
+    )
+    def test_a_ccxt_error_is_rc_2_with_only_the_type_name_on_stderr(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        exc: ccxt.BaseError,
+    ) -> None:
+        _install_exchange(monkeypatch, _RaisingExchange(exc))
+        real_fetch_candles = rb.fetch_candles  # the retries must not really sleep
+        monkeypatch.setattr(
+            rb, "fetch_candles", lambda *a, **k: real_fetch_candles(*a, sleep=lambda _s: None, **k)
+        )
+        code = rb.main(["--fetch-fixture", str(tmp_path / "f.csv.gz"), *_FETCH_WINDOW])
+        assert code == 2
+        err = capsys.readouterr().err
+        assert f"fetch failed ({type(exc).__name__})" in err
+        for leak in ("https://", "api.exchange", "SOL-EUR", "-body-text", "Traceback", "GET "):
+            assert leak not in err, leak
+        assert _names(tmp_path) == set()
+
+    def test_a_non_ccxt_exception_is_not_swallowed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _install_exchange(monkeypatch, _RaisingExchange(RuntimeError("a bug, not the exchange")))
+        with pytest.raises(RuntimeError, match="a bug"):
+            rb.main(["--fetch-fixture", str(tmp_path / "f.csv.gz"), *_FETCH_WINDOW])
+
+    def test_fetch_writes_the_provenance_meta_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _install_exchange(monkeypatch, _FakeExchange())
+        digest = rb.fetch_fixture(
+            tmp_path / "f.csv.gz",
+            exchange_id="coinbaseexchange",
+            start="2023-01-01",
+            end="2023-01-02",
+        )
+        meta = json.loads((tmp_path / "f.csv.gz.meta.json").read_text())
+        assert meta["schema"] == "wp21-fixture-meta-1"
+        assert (
+            meta["fixture_sha256"] == digest == rb.sha256_hex((tmp_path / "f.csv.gz").read_bytes())
+        )
+        assert meta["exchange"] == "coinbaseexchange"
+        assert meta["ccxt_version"] == ccxt.__version__
+        assert meta["window"] == {"start": "2023-01-01", "end": "2023-01-02"}
+        assert sorted(meta["series"]) == [
+            "BTC/EUR|1d",
+            "BTC/EUR|1h",
+            "ETH/EUR|1d",
+            "ETH/EUR|1h",
+            "SOL/EUR|1d",
+        ]
+        daily = meta["series"]["BTC/EUR|1d"]
+        assert daily == {
+            "bars": 2,
+            "first_ts": "2023-01-01T00:00:00+00:00",
+            "last_ts": "2023-01-02T00:00:00+00:00",
+            "gap_count": 0,
+            "missing_vs_window": 0,
+            "dropped_invalid": 1,  # the fake adds one invalid row per page
+        }
+        assert meta["series"]["ETH/EUR|1h"]["bars"] == 48
+        # no clock, no host, no path: the same bars give the same meta bytes
+        assert _names(tmp_path) == {"f.csv.gz", "f.csv.gz.sha256", "f.csv.gz.meta.json"}
+
+    def test_the_meta_file_and_the_fixture_bytes_are_reproducible(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _install_exchange(monkeypatch, _FakeExchange())
+        kw: dict[str, Any] = {
+            "exchange_id": "coinbaseexchange",
+            "start": "2023-01-01",
+            "end": "2023-01-02",
+        }
+        first = rb.fetch_fixture(tmp_path / "f.csv.gz", **kw)
+        meta_1 = (tmp_path / "f.csv.gz.meta.json").read_bytes()
+        second = rb.fetch_fixture(tmp_path / "f.csv.gz", force=True, **kw)
+        assert first == second
+        assert (tmp_path / "f.csv.gz.meta.json").read_bytes() == meta_1
+
+    def test_series_provenance_counts_gaps_dropped_bars_and_the_missing_window(self) -> None:
+        day = 86_400_000
+        candles = [(d * day, "1", "1", "1", "1", "1") for d in (0, 1, 4, 5)]
+        prov = rb.series_provenance(candles, "1d", dropped=3, start_ms=0, end_ms=8 * day)
+        assert prov == {
+            "bars": 4,
+            "first_ts": "1970-01-01T00:00:00+00:00",
+            "last_ts": "1970-01-06T00:00:00+00:00",
+            "gap_count": 2,  # days 2 and 3 are missing between the first and the last bar
+            "missing_vs_window": 4,  # 8 expected days, 4 bars
+            "dropped_invalid": 3,
+        }
+        empty = rb.series_provenance([], "1h", dropped=0, start_ms=0, end_ms=24 * 3_600_000)
+        assert (empty["bars"], empty["first_ts"], empty["last_ts"]) == (0, None, None)
+        assert (empty["gap_count"], empty["missing_vs_window"]) == (0, 24)
+
+    def test_a_bad_target_is_refused_before_the_first_request(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ex = _FakeExchange()
+        created = _install_exchange(monkeypatch, ex)
+        (tmp_path / "f.csv.gz").write_bytes(b"precious")
+        with pytest.raises(rb.FixtureError, match="already exists"):
+            rb.fetch_fixture(
+                tmp_path / "f.csv.gz",
+                exchange_id="coinbaseexchange",
+                start="2023-01-01",
+                end="2023-01-02",
+            )
+        with pytest.raises(rb.FixtureError, match=r"\.csv\.gz"):
+            rb.fetch_fixture(
+                tmp_path / "notes.md",
+                exchange_id="coinbaseexchange",
+                start="2023-01-01",
+                end="2023-01-02",
+            )
+        assert created == [] and ex.calls == []  # not even the exchange object was built
+        assert (tmp_path / "f.csv.gz").read_bytes() == b"precious"
+
+    def test_the_cli_refuses_to_overwrite_without_force_and_overwrites_with_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _install_exchange(monkeypatch, _FakeExchange())
+        target = tmp_path / "f.csv.gz"
+        assert rb.main(["--fetch-fixture", str(target), *_FETCH_WINDOW]) == 0
+        before = target.read_bytes()
+        capsys.readouterr()
+        assert rb.main(["--fetch-fixture", str(target), *_FETCH_WINDOW]) == 2
+        assert "already exists" in capsys.readouterr().err and target.read_bytes() == before
+        assert rb.main(["--fetch-fixture", str(target), "--force", *_FETCH_WINDOW]) == 0
+        assert target.read_bytes() == before  # same bars, same bytes
+
+    def test_force_is_a_fetch_mode_flag_only(self, fixture_path: tuple[Path, str]) -> None:
+        path, digest = fixture_path
+        with pytest.raises(SystemExit) as exc:
+            rb.main(["--fixture", str(path), "--fixture-sha256", digest, "--force"])
+        assert exc.value.code == 2
+
+    def test_the_credential_check_is_defence_in_depth_and_the_construction_stays_keyless(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        created = _install_exchange(monkeypatch, _FakeExchange())
+        rb.fetch_fixture(
+            tmp_path / "f.csv.gz",
+            exchange_id="coinbaseexchange",
+            start="2023-01-01",
+            end="2023-01-02",
+        )
+        assert created == [{"enableRateLimit": True}]
+        assert "defence in depth" in Path(rb.__file__).read_text()
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -1061,6 +2052,8 @@ class TestCli:
             == 0
         )
         row = json.loads((out / "rebaseline-matrix.json").read_text())["rows"][0]
-        assert row["params_source"].startswith("file:sha256=")
+        # D-04: the FULL sha256 of the bytes that were parsed
+        assert row["params_source"] == f"file:sha256={rb.sha256_hex(params.read_bytes())}"
+        assert re.fullmatch(r"file:sha256=[0-9a-f]{64}", row["params_source"])
         assert row["strategy_params"] == {"lookback": 20, "trend_sma_period": 50}
         assert row["bracket"]["bracket_atr_sl_multiplier"] == 2.0

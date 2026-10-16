@@ -476,8 +476,9 @@ def _train_model_with_wf_sync(
                 # profile (WP2.1, X-13: stricter than the old 60/40 bps + 5 bps
                 # slippage; the profile is recorded in ModelVersionORM.extra),
                 # fixed-fractional sizing (A1 — no ATR risk_params), seed=42.
-                # WP2.1c (SY-21-13): with the circuit breaker, like every backtest (a
-                # model gated before 2.1c was gated without it; the gate is stricter now).
+                # WP2.1c (SY-21-13): gated with the breaker, as paper/live run; not
+                # monotonically stricter (the breaker can lower worst-fold drawdown).
+                # A model gated before 2.1c was gated without it.
                 runner = BacktestRunner(
                     strategies=[strat],
                     symbols=[symbol],

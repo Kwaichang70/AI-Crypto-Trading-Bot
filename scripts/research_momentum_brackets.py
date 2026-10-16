@@ -40,6 +40,7 @@ from trading.costs_cli import (
     cost_profile_from_args,
 )
 from trading.models import Signal
+from trading.safety import BACKTEST_CIRCUIT_BREAKER_DEFAULT
 from trading.strategy import BaseStrategy, StrategyMetadata
 
 _PAGE_LIMIT = 300
@@ -52,7 +53,7 @@ _COST_PROFILE: CostProfile = DEFAULT_COST_PROFILE
 
 # WP2.1c (SY-21-13): backtests build the circuit breaker by default; ``--no-circuit-breaker``
 # switches it off (the pre-2.1c numbers).  Set in main().
-_ENABLE_CB: bool = True
+_ENABLE_CB: bool = BACKTEST_CIRCUIT_BREAKER_DEFAULT
 
 SCAN = ["BTC/USDT", "ETH/USDT"]
 HELD_OUT = ["SOL/USDT", "BNB/USDT", "XRP/USDT"]
