@@ -7,9 +7,10 @@ the additive ``optimization_runs.run_metadata JSONB NULL`` column.
 Two groups of tests:
 
 1. Static / offline (always run, no database needed): the Alembic revision
-   chain (019 -> 020, single head 020) read straight from the migration
-   scripts, and the exact DDL the migration emits in offline (``--sql``)
-   mode for upgrade and downgrade.
+   chain (019 -> 020, a single head whose ancestry contains 020, so the
+   test keeps passing once later migrations land) read straight from the
+   migration scripts, and the exact DDL the migration emits in offline
+   (``--sql``) mode for upgrade and downgrade.
 
 2. Real Postgres (SKIPPED unless ``MIGRATION_TEST_DATABASE_URL`` is set,
    same convention as ``test_019_idempotency_keys.py``): upgrade adds a
@@ -19,8 +20,15 @@ Two groups of tests:
    ``postgresql+asyncpg://user:pass@host:port/dbname``; see
    ``test_018_kill_switch_latch.py`` for the scratch-DB setup.
 
+The round trip downgrades to the explicit revision ``019`` (never a
+relative ``-1``), so it stays correct when a later migration sits above 020.
+
+Rollback caveat (documented by migration 020): an image older than 020
+cannot start on a DB at 020 (unknown revision); rollback = stop api ->
+downgrade to 019 with the new image -> deploy the older image.
+
 Out of scope here: the ORM declaration ``OptimizationRunORM.run_metadata``
-and the optimize router write/read (python-backend-specialist, WP21-T-34).
+and the optimize router write/read (WP21-T-34).
 """
 
 from __future__ import annotations
@@ -63,6 +71,17 @@ def _script_directory() -> Any:
     return ScriptDirectory(str(_ALEMBIC_DIR))
 
 
+def _head_and_ancestry() -> tuple[str, set[str]]:
+    """Return the single script head and the revisions reachable from it
+    (the head itself included). Fails if there is more than one head."""
+    script = _script_directory()
+    heads = script.get_heads()
+    assert len(heads) == 1
+    head = heads[0]
+    assert script.get_current_head() == head
+    return head, {r.revision for r in script.walk_revisions(base="base", head=head)}
+
+
 def _offline_sql(direction: str) -> str:
     """Run migration 020's ``upgrade``/``downgrade`` against a Postgres
     dialect in offline (as_sql) mode and return the emitted SQL."""
@@ -96,10 +115,14 @@ def test_revision_chain_019_to_020() -> None:
     assert parent.down_revision == "018"
 
 
-def test_head_is_020_and_single() -> None:
-    script = _script_directory()
-    assert script.get_heads() == ["020"]
-    assert script.get_current_head() == "020"
+def test_single_head_descends_from_020() -> None:
+    """Exactly one head, and 020 is in that head's ancestry (or is the head).
+
+    Deliberately not pinned to ``== ["020"]``: a later migration (021, ...)
+    becomes the head without having to edit this test.
+    """
+    _head, ancestry = _head_and_ancestry()
+    assert "020" in ancestry
 
 
 def test_revision_file_name_matches_spec() -> None:
@@ -261,7 +284,7 @@ def test_round_trip_adds_and_removes_nullable_jsonb_column() -> None:
     assert info["is_nullable"] == "YES"
     assert info["column_default"] is None
 
-    command.downgrade(cfg, "-1")
+    command.downgrade(cfg, "019")
     assert asyncio.run(_column_info(dsn)) is None
 
     command.upgrade(cfg, "head")
@@ -272,7 +295,10 @@ def test_round_trip_adds_and_removes_nullable_jsonb_column() -> None:
 
 
 @requires_postgres
-def test_head_revision_applied_is_020() -> None:
+def test_head_revision_applied_matches_script_head_and_includes_020() -> None:
+    """After ``upgrade head`` the DB sits at the script head, and 020 is in
+    that head's ancestry. Not pinned to ``"020"``, so a later migration does
+    not require editing this test."""
     import asyncpg
     from alembic import command
 
@@ -289,7 +315,9 @@ def test_head_revision_applied_is_020() -> None:
         finally:
             await conn.close()
 
-    assert asyncio.run(_version()) == "020"
+    head, ancestry = _head_and_ancestry()
+    assert asyncio.run(_version()) == head
+    assert "020" in ancestry
 
 
 # ---------------------------------------------------------------------------

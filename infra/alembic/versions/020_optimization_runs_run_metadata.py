@@ -24,8 +24,8 @@ under (the optimize endpoint lets the caller choose any profile, U-2).
 
 ORM contract
 ------------
-This migration matches the ORM declaration owned by the
-python-backend-specialist exactly::
+This migration matches the ORM declaration on ``OptimizationRunORM``
+exactly::
 
     run_metadata: Mapped[dict[str, Any] | None] = mapped_column(
         JSONB, nullable=True
@@ -55,6 +55,10 @@ Downgrade path
 The column is dropped outright. Data loss on downgrade is limited to the
 persisted cost-profile / engine-semantics attribution of optimization
 runs; the rest of each row is untouched.
+
+Rollback caveat: an image older than 020 cannot start on a DB at 020
+(unknown revision); rollback = stop api -> downgrade to 019 with the new
+image -> deploy the older image.
 
 References
 ----------

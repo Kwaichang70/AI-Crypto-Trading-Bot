@@ -16,7 +16,7 @@ WP2.1b API coverage for the cost model of an OPTIMIZATION run (hermetic: a mocke
 from __future__ import annotations
 
 import uuid
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Generator
 from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -79,7 +79,7 @@ class _Db:
 
 
 @pytest.fixture()
-def db(app_dev_mode: Any) -> AsyncGenerator[_Db, None]:
+def db(app_dev_mode: Any) -> Generator[_Db, None, None]:
     from api.db.session import get_db
 
     holder = _Db()
@@ -88,7 +88,7 @@ def db(app_dev_mode: Any) -> AsyncGenerator[_Db, None]:
         yield holder.session
 
     app_dev_mode.dependency_overrides[get_db] = _override
-    yield holder  # type: ignore[misc]
+    yield holder
     app_dev_mode.dependency_overrides.pop(get_db, None)
 
 
