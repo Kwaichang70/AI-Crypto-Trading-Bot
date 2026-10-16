@@ -25,7 +25,7 @@ The breaker is evaluated **once per processed bar** from the portfolio's risk sn
 
 - Escalation takes one bar; de-escalation needs 3 consecutive bars (an in-band reading resets the count). In the HALT exit band (0.9 x limit up to the limit) the breaker still blocks although the WP1.5 gate would allow: it is deliberately stricter.
 - The WP1.5 risk gate (`pre_trade_check`) stays the per-order enforcement of record. A BUY the breaker lets through is still checked by it.
-- Backtests run **with** the breaker by default since WP2.1c (`BacktestRunner(enable_circuit_breaker=True)`); `enable_circuit_breaker=False` (scripts: `--no-circuit-breaker`) switches it off. Runs created by 2.1a / 2.1b ran without it (`engine_semantics.backtest_circuit_breaker=false`).
+- Backtests run **with** the breaker by default since WP2.1c (`BacktestRunner(enable_circuit_breaker=True)`); `enable_circuit_breaker=False` (scripts: `--no-circuit-breaker`) switches it off. Runs created by 2.1a / 2.1b ran without it (`engine_semantics.backtest_circuit_breaker=false`). Because of this, backtests (`run_id` `bt-…`) now emit the `trading_circuit_breaker_state` gauge and the critical `circuit_breaker.halt_entered` log; see the operator note in section 2b.
 - **Restart watch.** A breaker is built fresh on every start and resume (nothing is persisted), so it cannot know the level it had before. For its first 3 evaluations it enters HALT already at 0.9 x limit (live 18%), and for its first 6 evaluations it enters REDUCE already at 0.4 x limit (live 8%). Recovery counters start at 0; a level entered during the watch is then held by the normal 3-bar hysteresis. The API field `restart_watch` shows `halt`, `reduce` or `none`. Effects after a restart, all expected:
   - Never laxer than the WP1.5 gate.
   - From the 6th evaluation on, never laxer than a breaker that was never restarted.
@@ -42,7 +42,13 @@ The breaker is evaluated **once per processed bar** from the portfolio's risk sn
 A `CIRCUIT_BREAKER` message is sent when HALT is entered (`CRITICAL`: "entries blocked, exits active, run NOT stopped", the drawdown, the limit, N) and when HALT clears (`WARNING`). A HALT entered by the restart watch (section 1) reads "Drawdown X% is at or above 18.00% during the restart watch (limit 20.00%)" instead of "reached the limit". It carries percentages only (no amounts). REDUCE and DAILY_LIMIT do not send Telegram (logs and gauge only). If no notifier is configured there is **no push alert**; use the log/Grafana signals below. Never paste the bot token into tickets or logs.
 
 ### 2b. Grafana
-Rule `trading-cb-halt` fires on `max(trading_circuit_breaker_state) >= 3` (OK=0, REDUCE=1, DAILY_LIMIT=2, HALT=3). The gauge is zeroed when a run stops.
+Rule `trading-cb-halt` fires on `max(trading_circuit_breaker_state{run_id!~"bt-.*"}) >= 3` (OK=0, REDUCE=1, DAILY_LIMIT=2, HALT=3; the provisioned threshold is `> 2.5`). The gauge is zeroed when a run stops.
+
+**Operator note (since WP2.1c).** Backtests (`run_id` `bt-<12 hex>`) run with the circuit breaker. A backtest that runs inside the API process therefore emits the `trading_circuit_breaker_state` gauge (values 2 and 3 included) and logs `circuit_breaker.halt_entered` at critical, in the same metrics endpoint and log stream as paper and live runs. The Grafana rule excludes them with the matcher `run_id!~"bt-.*"`; `trading-kill-switch` and `trading-high-drawdown` carry the same matcher. Paper and live runs use `run_id` = the run UUID, which never starts with `bt-`, so the matcher cannot hide a live or paper HALT. When this alert fires, the series carries a UUID `run_id`: treat it as real.
+
+Logs are not filtered by Grafana. Filter by `run_id` before treating a `circuit_breaker.halt_entered` line as a live or paper HALT: a line whose `run_id` starts with `bt-` is a backtest and needs no action (for example, append `| grep -v 'bt-[0-9a-f]\{12\}'` to the command in section 2c).
+
+After deploying this change, restart the grafana container so it re-reads the alert provisioning and the rules pick up the matcher.
 
 ### 2c. Structured log
 ```bash

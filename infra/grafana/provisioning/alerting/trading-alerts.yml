@@ -11,6 +11,16 @@
 #   trading_drawdown_pct           fraction of peak equity (0.10 = 10%)
 #   up{job="trading-bot-api"}      prometheus scrape health
 #
+# The three per-run rules (trading-cb-halt, trading-kill-switch,
+# trading-high-drawdown) carry the matcher {run_id!~"bt-.*"}. Since WP2.1c
+# backtests run with the circuit breaker and emit these gauges under
+# run_id="bt-<12 hex>" (BacktestRunner); paper and live runs use
+# run_id=str(<run UUID>), which never starts with "bt-". Prometheus regex
+# matchers are fully anchored, so only ids beginning "bt-" are excluded and a
+# live run can never be hidden. If the prefix ever changed, the failure would
+# be a false positive, not a muted live alert. Pinned by
+# tests/unit/test_wp21c_alert_scope.py.
+#
 # Alerts fire in Grafana's alert list (and any configured contact points).
 # =============================================================================
 apiVersion: 1
@@ -41,7 +51,7 @@ groups:
             datasourceUid: prometheus
             model:
               refId: A
-              expr: max(trading_circuit_breaker_state)
+              expr: max(trading_circuit_breaker_state{run_id!~"bt-.*"})
               instant: true
           - refId: C
             relativeTimeRange: { from: 0, to: 0 }
@@ -71,7 +81,7 @@ groups:
             datasourceUid: prometheus
             model:
               refId: A
-              expr: max(trading_kill_switch_active)
+              expr: max(trading_kill_switch_active{run_id!~"bt-.*"})
               instant: true
           - refId: C
             relativeTimeRange: { from: 0, to: 0 }
@@ -101,7 +111,7 @@ groups:
             datasourceUid: prometheus
             model:
               refId: A
-              expr: max(trading_drawdown_pct)
+              expr: max(trading_drawdown_pct{run_id!~"bt-.*"})
               instant: true
           - refId: C
             relativeTimeRange: { from: 0, to: 0 }
