@@ -552,6 +552,7 @@ function NewRunInner() {
             <div className="h-10 animate-pulse rounded bg-slate-200 dark:bg-slate-800" />
           ) : (
             <select
+              aria-label="Strategy"
               value={selectedStrategy?.name ?? ""}
               onChange={(e) => void handleStrategyChange(e.target.value)}
               className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200"

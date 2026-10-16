@@ -155,12 +155,29 @@ describe("per-mode profile rules (SY-21-03)", () => {
     expect("costProfile" in costProfileField(undefined)).toBe(false);
   });
 
-  it("relaunchCostProfile carries a registry profile; legacy / inferred / custom fall back to the default", () => {
+  it("relaunchCostProfile carries every registry profile, including the default and explicit legacy_* ids", () => {
     expect(relaunchCostProfile({ costProfile: STRESS80, legacyCosts: false })).toBe("coinbase_stress_t80");
-    expect(relaunchCostProfile({ costProfile: LEGACY_BT, legacyCosts: true })).toBeUndefined();
+    // SEC-07: the default id is pinned, not omitted.
+    expect(relaunchCostProfile({ costProfile: ADV1, legacyCosts: false })).toBe(DEFAULT_COST_PROFILE_ID);
+    // CR-06: an explicit legacy registry id is carried (a backtest accepts it, SY-21-03).
+    expect(relaunchCostProfile({ costProfile: LEGACY_BT, legacyCosts: true })).toBe("legacy_backtest_v0");
+  });
+
+  it("relaunchCostProfile falls back to the default for missing / invalid / non-registry profiles", () => {
     expect(relaunchCostProfile({})).toBeUndefined();
+    expect(relaunchCostProfile({ costProfile: null })).toBeUndefined();
+    // legacy_inferred (source !== "registry"), even with a registry-looking id.
+    expect(relaunchCostProfile({ costProfile: LEGACY_RT, legacyCosts: true })).toBeUndefined();
     expect(
       relaunchCostProfile({ costProfile: { ...ADV1, id: "custom", source: "override" } }),
+    ).toBeUndefined();
+    // An invalid persisted profile is never carried, even if it is a registry id.
+    expect(
+      relaunchCostProfile({ costProfile: STRESS80, legacyCosts: true, costProfileInvalid: true }),
+    ).toBeUndefined();
+    // An id that is not in the registry is not offered for a backtest.
+    expect(
+      relaunchCostProfile({ costProfile: { ...ADV1, id: "no_such_id" }, legacyCosts: false }),
     ).toBeUndefined();
   });
 });

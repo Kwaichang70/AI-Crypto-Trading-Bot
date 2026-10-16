@@ -80,7 +80,8 @@ export default function OptimizationRunDetailPage() {
       backtestStart: null,
       backtestEnd: null,
       // WP2.1b: price the launched backtest like the optimization (registry
-      // profiles only; legacy / unknown fall back to the platform default).
+      // profiles, including the default id and explicit legacy_* ids, are
+      // pinned; inferred / invalid / unknown fall back to the platform default).
       ...costProfileField(relaunchCostProfile(phase.data)),
     };
 

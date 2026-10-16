@@ -586,7 +586,9 @@ export default function RunDetailPage() {
       initial_capital: initial_capital ?? "",
     });
     // WP2.1b: carry a registry cost profile over so the copy is priced alike
-    // (legacy / inferred / custom profiles fall back to the platform default).
+    // (pinned, including the default id; inferred / invalid / custom profiles
+    // fall back to the platform default). Never for a live source: live takes
+    // no profile.
     const costProfile = relaunchCostProfile(run);
     if (costProfile && run.runMode !== "live") params.set("cost_profile", costProfile);
     router.push(`/runs/new?${params.toString()}`);

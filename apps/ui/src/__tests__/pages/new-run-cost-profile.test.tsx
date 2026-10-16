@@ -2,6 +2,8 @@
  * WP21-T-35 (new run): the cost-profile selector follows SY-21-03 --
  *   backtest: any registry id   paper: live-equivalent ids only   live: none
  * and the request body omits `costProfile` for the platform default.
+ * WP21BD-UI-01 adds the live-confirm path: a stale backtest profile must not
+ * reach the live `createRun` body.
  */
 
 import React from "react";
@@ -160,5 +162,38 @@ describe("New run: costProfile in the request body", () => {
     mockSearchGet.mockImplementation((k: string) => (k === "cost_profile" ? "nope" : null));
     await renderForm();
     expect(costSelect().value).toBe("");
+  });
+});
+
+describe("New run: live submit never carries a stale costProfile (CR-04)", () => {
+  it("picks coinbase_stress_t80, switches to live, confirms -> createRun body has no costProfile key", async () => {
+    await renderForm();
+    fireEvent.change(costSelect(), { target: { value: "coinbase_stress_t80" } });
+    expect(costSelect().value).toBe("coinbase_stress_t80");
+
+    // The page keeps the picked id in state while the selector is hidden in
+    // live mode; only the body assembly stands between it and the wire.
+    chooseMode("live");
+    expect(screen.queryByLabelText("Cost profile")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /Start Run/ }));
+    // Live defers submission to LiveConfirmDialog; nothing is sent yet.
+    expect(mockCreateRun).not.toHaveBeenCalled();
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.change(within(dialog).getByLabelText(/Live trading confirmation token/i), {
+      target: { value: "typed-token" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Start Live Run" }));
+
+    await waitFor(() => expect(mockCreateRun).toHaveBeenCalledTimes(1));
+    const [body, options] = mockCreateRun.mock.calls[0] as [
+      Record<string, unknown>,
+      Record<string, unknown>,
+    ];
+    expect(body).toMatchObject({ mode: "live", allowPyramiding: false });
+    expect("costProfile" in body).toBe(false);
+    // The confirmation token travels in the options (header), never the body.
+    expect(options).toMatchObject({ liveConfirmToken: "typed-token" });
+    expect(JSON.stringify(body)).not.toContain("typed-token");
   });
 });

@@ -25,7 +25,7 @@ jest.mock("@/lib/api", () => ({
 
 import RunComparePage from "@/app/runs/compare/page";
 
-const BANNER = "These runs use different cost models; returns and Sharpe are not directly comparable.";
+const BANNER = "These runs use different or legacy cost models; returns and Sharpe are not directly comparable.";
 
 function load(a: Run, b: Run) {
   mockFetchRun.mockImplementation((id: string) =>

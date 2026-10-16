@@ -116,7 +116,7 @@ export function roundTripBps(c: CostCarrier): string | null {
 }
 
 export const COST_MODELS_DIFFER_MESSAGE =
-  "These runs use different cost models; returns and Sharpe are not directly comparable.";
+  "These runs use different or legacy cost models; returns and Sharpe are not directly comparable.";
 
 /**
  * Compare-page banner condition (quant-design 7): any run is legacy, or the
@@ -195,7 +195,20 @@ export function resolveCostProfileForMode(
     : undefined;
 }
 
-/** Spread into a request body: adds `costProfile` only when there is one (exactOptionalPropertyTypes-safe). */
+/**
+ * Spread into a request body: adds `costProfile` only when there is one
+ * (exactOptionalPropertyTypes-safe).
+ *
+ * Omit-vs-pin (WP2.1b, SEC-07): the two callers differ on purpose.
+ * - Form submit (new run, optimize): the id comes from
+ *   `resolveCostProfileForMode`, and the "Platform default" choice is the
+ *   empty value, so the key is OMITTED for the default (request fingerprint
+ *   unchanged, SY-21-17).
+ * - Relaunch (Launch Run, Duplicate Run): the id comes from
+ *   `relaunchCostProfile`, which PINS the source's registry profile, including
+ *   the default id. A relaunched run therefore keeps its source pricing even
+ *   if `DEFAULT_COST_PROFILE_ID` changes later.
+ */
 export function costProfileField(id: string | undefined): { costProfile?: string } {
   return id ? { costProfile: id } : {};
 }
@@ -210,12 +223,19 @@ export function describeCostProfileOption(o: CostProfileOption): string {
 
 /**
  * Registry id to carry over when re-launching a backtest from an existing
- * run / optimization (so the new run is priced like the original). Returns
- * `undefined` for legacy / inferred / custom profiles, which fall back to the
- * platform default.
+ * run / optimization (so the new run is priced like the original).
+ *
+ * Carries every profile the server reports as `source: "registry"`, including
+ * the default id (`coinbase_advanced_1`) and explicit `legacy_*` ids (a
+ * backtest accepts any registry id, SY-21-03). It is NOT omitted for the
+ * default: relaunch pins the source's profile (see `costProfileField`).
+ * Returns `undefined`, so the platform default applies, when there is no
+ * profile, the persisted profile is invalid, the profile is not from the
+ * registry (legacy-inferred / override / custom), or the id is not offered
+ * for a backtest.
  */
 export function relaunchCostProfile(c: CostCarrier): string | undefined {
   const p = c.costProfile;
-  if (p == null || isLegacyCosts(c) || p.source !== "registry") return undefined;
+  if (p == null || p.source !== "registry" || c.costProfileInvalid) return undefined;
   return resolveCostProfileForMode("backtest", p.id);
 }

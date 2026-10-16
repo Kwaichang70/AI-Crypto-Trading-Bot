@@ -8,7 +8,7 @@
 import React from "react";
 import { render, screen, waitFor, fireEvent, within } from "@testing-library/react";
 import type { Strategy, StrategyListResponse, OptimizeResponse } from "@/lib/types";
-import { ADV1, STRESS80, LEGACY_BT } from "../helpers/cost-profile-fixtures";
+import { ADV1, STRESS80, LEGACY_BT, LEGACY_RT } from "../helpers/cost-profile-fixtures";
 
 const mockPush = jest.fn();
 jest.mock("next/navigation", () => ({
@@ -200,13 +200,30 @@ describe("Optimize detail page", () => {
     expect(within(line).getByText("legacy costs")).toHaveClass("badge-warning");
   });
 
-  it("a legacy_* profile is also labelled legacy and is not carried into a launched run", async () => {
+  it("an explicit legacy_backtest_v0 registry profile is labelled legacy and IS carried into a launched run (WP21BD-UI-03)", async () => {
     mockFetchOptimizationRun.mockResolvedValue({
       ok: true,
       data: { ...BASE_RESULT, costProfile: LEGACY_BT },
     });
     render(<OptimizationRunDetailPage />);
-    await screen.findByTestId("optimize-cost-line");
+    const line = await screen.findByTestId("optimize-cost-line");
+    expect(within(line).getByText("legacy costs")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Launch Run" }));
+    await waitFor(() => expect(mockCreateRun).toHaveBeenCalledTimes(1));
+    expect((mockCreateRun.mock.calls[0] as [object])[0]).toMatchObject({
+      mode: "backtest",
+      costProfile: "legacy_backtest_v0",
+    });
+  });
+
+  it("a legacy_inferred profile is labelled legacy and is not carried into a launched run", async () => {
+    mockFetchOptimizationRun.mockResolvedValue({
+      ok: true,
+      data: { ...BASE_RESULT, costProfile: LEGACY_RT },
+    });
+    render(<OptimizationRunDetailPage />);
+    const line = await screen.findByTestId("optimize-cost-line");
+    expect(within(line).getByText("legacy costs")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Launch Run" }));
     await waitFor(() => expect(mockCreateRun).toHaveBeenCalledTimes(1));
     expect("costProfile" in (mockCreateRun.mock.calls[0] as [object])[0]).toBe(false);
