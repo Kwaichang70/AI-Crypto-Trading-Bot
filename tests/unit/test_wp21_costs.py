@@ -686,8 +686,9 @@ class TestT07AstPins:
                     kws = {kw.arg for kw in node.keywords}
                     assert "cost_profile" in kws, f"{path.relative_to(_REPO)}:{node.lineno}"
                     count += 1
-        # optimizer (BacktestRunner), create_run, ml gate, 2 scripts, optimize router
-        assert count == 6
+        # optimizer (BacktestRunner), create_run, ml gate, 2 scripts, optimize router,
+        # and (WP2.1c) the re-baseline script
+        assert count == 7
 
     def test_settings_has_no_cost_field(self) -> None:
         from api.config import Settings
