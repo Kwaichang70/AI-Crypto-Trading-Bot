@@ -10,7 +10,8 @@ WP2.1 glue between the pure ``trading.costs`` registry and the API layer.
   persisted next to ``config["cost_profile"]`` (closes CF-13b-16).
 * :func:`stamp_cost_config` -- write both keys into a NEW run's config
   (create / promote).  Resume, boot recovery and salvage never call it.
-* :func:`cost_response_fields` -- the four server-computed response fields.
+* :func:`cost_response_fields` -- the five server-computed response fields
+  (runs AND, since WP2.1b, optimization runs).
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ from trading.costs import (
     CostProfile,
     CostProfileError,
     FeeSource,
+    is_leaderboard_cost_eligible,
     is_legacy_cost_config,
     new_run_cost_profile,
     resolve_run_cost_profile,
@@ -97,7 +99,18 @@ def stamp_cost_config(
 
 def cost_response_fields(config: Mapping[str, object] | None, run_mode: str) -> dict[str, Any]:
     """``costProfile`` / ``legacyCosts`` / ``costProfileInvalid`` /
-    ``legacyExitSemantics`` for one run.  Never raises, never logs a value."""
+    ``legacyExitSemantics`` / ``liveEquivalentCosts`` for one run.
+
+    ``config`` is ``RunORM.config`` for a run and ``OptimizationRunORM.run_metadata``
+    for an optimization run (WP2.1b): both carry the same ``cost_profile`` /
+    ``engine_semantics`` keys.  ``None``, a non-mapping or a malformed value is
+    legacy.  Never raises, never logs a value.
+
+    ``live_equivalent_costs`` is the COST half of ``leaderboard_eligible`` (a valid
+    persisted live-equivalent REGISTRY profile that is not legacy), computed by the
+    same ``is_leaderboard_cost_eligible`` so the UI's "live-equivalent costs" filter
+    can never drift from the server rule.
+    """
     mode = run_mode if run_mode in ("backtest", "paper", "live") else "backtest"
     resolved = resolve_run_cost_profile(config, mode=mode, log_invalid=False)
     summary: CostProfileSummary = build_cost_profile_summary(
@@ -111,4 +124,5 @@ def cost_response_fields(config: Mapping[str, object] | None, run_mode: str) -> 
         "legacy_costs": is_legacy_cost_config(config),
         "cost_profile_invalid": resolved.invalid,
         "legacy_exit_semantics": not has_semantics,
+        "live_equivalent_costs": is_leaderboard_cost_eligible(config),
     }

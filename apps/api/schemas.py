@@ -454,8 +454,9 @@ class RunResponse(BaseModel):
 
     WP2.1 adds the cost-model transparency fields ``cost_profile`` (the
     inferred legacy profile for a legacy run), ``legacy_costs``,
-    ``cost_profile_invalid`` and ``legacy_exit_semantics``; they are computed
-    server-side in ``run_orm_to_response`` and never re-derived by the UI.
+    ``cost_profile_invalid``, ``legacy_exit_semantics`` and (WP2.1b)
+    ``live_equivalent_costs``; they are computed server-side in
+    ``run_orm_to_response`` and never re-derived by the UI.
     """
 
     model_config = _API_MODEL_CONFIG
@@ -524,6 +525,17 @@ class RunResponse(BaseModel):
     legacy_exit_semantics: bool = Field(
         default=False,
         description="True iff the run predates config['engine_semantics'] (CF-13b-16).",
+    )
+    live_equivalent_costs: bool = Field(
+        default=False,
+        description=(
+            "WP2.1b (SY-21-10): the cost half of leaderboard_eligible -- True iff the run "
+            "has a valid persisted live-equivalent REGISTRY cost profile that is not "
+            "legacy.  False for legacy, stress, diagnostic, override and invalid cost "
+            "models.  Independent of the trade-count / confidence thresholds, so the UI's "
+            "default 'live-equivalent costs' filter needs no client-side rule.  "
+            "leaderboard_eligible implies live_equivalent_costs."
+        ),
     )
 
     @model_validator(mode="after")

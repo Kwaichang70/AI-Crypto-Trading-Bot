@@ -1339,6 +1339,12 @@ class OptimizationRunORM(Base):
         server_default=func.now(),
         comment="UTC timestamp when the optimization run was persisted",
     )
+    # WP2.1b (SY-21-08): additive, nullable JSONB written by POST /api/v1/optimize as
+    # ``{"cost_profile": CostProfile.to_metadata(), "engine_semantics": {...}}`` (the same
+    # shape as ``RunORM.config``).  NULL, a missing key or a malformed value all mean
+    # "legacy costs"; there is no backfill.  Deliberately NO ``comment=``: migration 020
+    # adds the column without a DB comment, so the model and the DB stay identical.
+    run_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
 
     # Relationship  -- ordered by rank ascending so entry[0] is the best result
     entries: Mapped[list[OptimizationEntryORM]] = relationship(
