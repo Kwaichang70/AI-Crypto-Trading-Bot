@@ -44,6 +44,31 @@ export interface RunConfig {
   allow_pyramiding?: boolean;
 }
 
+/**
+ * WP2.1: the cost model a run was (or, for live, is estimated to be) priced
+ * with. Mirrors `CostProfileSummary` in apps/api/schemas.py. The bps fields are
+ * plain decimal strings (e.g. "120"), never floats.
+ */
+export interface CostProfileSummary {
+  /** Registry id, e.g. "coinbase_advanced_1"; "custom" for a library-only override. */
+  id: string;
+  exchange: string;
+  tier: string;
+  makerFeeBps: string;
+  takerFeeBps: string;
+  slippageBps: string;
+  /** 2 * (taker fee + slippage), in bps. */
+  roundTripBps: string;
+  source: "registry" | "override" | "legacy_inferred";
+  fingerprint: string;
+  /** "exchange_fills": the live ledger books the exchange's real fees; the profile is only an estimate. */
+  feeSource: "model" | "exchange_fills";
+  liveEquivalent: boolean;
+  diagnostic: boolean;
+  legacy: boolean;
+  stress: boolean;
+}
+
 export interface Run {
   id: string;
   runMode: RunMode;
@@ -83,6 +108,30 @@ export interface Run {
    * Added by M5 backend (Sprint 49).
    */
   leaderboardEligible?: boolean;
+  /**
+   * WP2.1 (SY-21-10): cost profile the run was priced with. For a legacy run
+   * the server returns the INFERRED legacy profile (`source: "legacy_inferred"`).
+   * Optional/nullable so an older API (or a malformed row) degrades to
+   * "legacy costs" in the UI -- see `isLegacyCosts` in `./cost-profile`.
+   */
+  costProfile?: CostProfileSummary | null;
+  /**
+   * WP2.1 (SY-21-10): SERVER-computed. True iff the run has no persisted cost
+   * profile, its profile is a `legacy_*` id, or the persisted value is invalid.
+   * The UI renders it and never re-derives it from `config`.
+   */
+  legacyCosts?: boolean;
+  /** WP2.1: a cost profile was persisted but is malformed (treated as legacy). */
+  costProfileInvalid?: boolean;
+  /**
+   * WP2.1b (SY-21-10): SERVER-computed cost half of `leaderboardEligible` --
+   * a valid persisted live-equivalent REGISTRY profile that is not legacy.
+   * Drives the leaderboard's default "Live-equivalent costs" filter. Optional:
+   * an API without it falls back to the profile flags (see `isLiveEquivalentCost`).
+   */
+  liveEquivalentCosts?: boolean;
+  /** WP2.1: the run predates `config.engine_semantics` (CF-13b-16). */
+  legacyExitSemantics?: boolean;
   /**
    * WP1.3a (SY-13a §5 API contract): warnings emitted by the exit-config /
    * pyramiding validator on a SUCCESSFUL 201 create. Absent/empty on every
@@ -240,6 +289,13 @@ export interface RunCreateRequest {
    *     `./exit-config`).
    */
   allowPyramiding?: boolean;
+  /**
+   * WP2.1 (SY-21-03): cost-profile registry id. OMIT for the platform default.
+   * backtest: any registry id; paper: live-equivalent ids only; live: never
+   * send it (422 `cost_profile_not_allowed_for_live`). See
+   * `resolveCostProfileForMode` in `./cost-profile`.
+   */
+  costProfile?: string;
   /**
    * WP1.7a/SY-10 (S13): deprecated body-field fallback only. The UI never
    * populates this — a live-mode confirmation is sent EXCLUSIVELY via the
@@ -836,6 +892,8 @@ export interface OptimizeRequest {
   rankBy?: string;
   topN?: number;
   maxCombinations?: number;
+  /** WP2.1: any registry id; omit for the platform default. Applied to every combination. */
+  costProfile?: string;
 }
 
 export interface OptimizeEntry {
@@ -867,6 +925,16 @@ export interface OptimizeResponse {
    * set after backend persistence is wired (Sprint 31)
    */
   optimizationRunId?: string;
+  /**
+   * WP2.1: the cost profile every combination was simulated with. `null` /
+   * absent means legacy (not persisted before WP2.1b) and is shown as
+   * "legacy costs".
+   */
+  costProfile?: CostProfileSummary | null;
+  /** WP2.1b: server flags, same meaning as on `Run`. */
+  legacyCosts?: boolean;
+  costProfileInvalid?: boolean;
+  liveEquivalentCosts?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -901,6 +969,12 @@ export interface OptimizationRunSummary {
   elapsedSeconds: number;
   /** ISO-8601 datetime when this optimization run was persisted. */
   createdAt: string;
+  /** WP2.1: cost profile of the run; `null` / absent means legacy costs. */
+  costProfile?: CostProfileSummary | null;
+  /** WP2.1b: server flags, same meaning as on `Run`. */
+  legacyCosts?: boolean;
+  costProfileInvalid?: boolean;
+  liveEquivalentCosts?: boolean;
 }
 
 /** Response envelope for GET /api/v1/optimize (paginated list). */

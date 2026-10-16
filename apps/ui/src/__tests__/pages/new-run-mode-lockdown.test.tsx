@@ -157,7 +157,9 @@ describe("NewRunPage — auto-correct mode", () => {
     expect(mode("paper")).toBeChecked();
 
     // Switch strategy to the demoted one via the dropdown.
-    const select = screen.getByRole("combobox") as HTMLSelectElement;
+    // WP2.1b: the form now also has a "Cost profile" <select>; the strategy
+    // dropdown is the FIRST combobox on the page.
+    const [select] = screen.getAllByRole("combobox") as HTMLSelectElement[];
     fireEvent.change(select, { target: { value: "ma_crossover" } });
 
     // The auto-correct effect must flip the mode back to backtest.

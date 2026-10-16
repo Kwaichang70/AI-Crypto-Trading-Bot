@@ -12,6 +12,8 @@ import type { CsvColumn } from "@/lib/csv-export";
 import { ExportCsvButton } from "@/components/ui/export-csv-button";
 import { DataTable, type Column } from "@/components/ui/data-table";
 import { RunStatusBadge } from "@/components/ui/status-badge";
+import { CostProfileBadge } from "@/components/ui/cost-profile-badge";
+import { costProfileLabel } from "@/lib/cost-profile";
 import { Header } from "@/components/layout/header";
 
 const MODE_OPTIONS: { value: RunMode | "all"; label: string }[] = [
@@ -134,6 +136,13 @@ function buildColumns(
       key: "status",
       header: "Status",
       render: (run) => <RunStatusBadge status={run.status} />,
+    },
+    {
+      // WP2.1b (SY-21-10): server flags only; hover for taker/maker/slip/RT bps.
+      key: "costProfile",
+      header: "Costs",
+      sortable: false,
+      render: (run) => <CostProfileBadge value={run} />,
     },
     {
       key: "returnPct",
@@ -260,6 +269,7 @@ const RUNS_CSV_COLUMNS: CsvColumn<Run>[] = [
   { header: "Mode", value: (r) => r.runMode },
   { header: "Strategy", value: (r) => r.config?.strategy_name ?? "" },
   { header: "Status", value: (r) => r.status },
+  { header: "Cost Profile", value: (r) => costProfileLabel(r).text },
   {
     header: "Return %",
     value: (r) =>

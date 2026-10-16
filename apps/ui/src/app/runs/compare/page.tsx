@@ -34,6 +34,12 @@ import type { Run, Portfolio, EquityPoint } from "@/lib/types";
 import { quoteCurrencyPrefix } from "@/lib/currency";
 import { Header } from "@/components/layout/header";
 import { RunStatusBadge } from "@/components/ui/status-badge";
+import {
+  COST_MODELS_DIFFER_MESSAGE,
+  costProfileLabel,
+  hasMixedCostProfiles,
+  roundTripBps,
+} from "@/lib/cost-profile";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -93,6 +99,23 @@ const METRIC_ROWS: MetricRow[] = [
     extract: () => null,
     display: (d) => d.run.status,
     higherIsBetter: true,
+  },
+  {
+    // WP2.1b (SY-21-10): server flags only. Live fees are the exchange's real
+    // fees, so the profile is labelled an estimate there.
+    label: "Cost profile",
+    extract: () => null,
+    display: (d) => {
+      const text = costProfileLabel(d.run).text;
+      return d.run.runMode === "live" ? `${text} (estimate)` : text;
+    },
+    higherIsBetter: true,
+  },
+  {
+    label: "Round-trip cost (bps)",
+    extract: () => null,
+    display: (d) => roundTripBps(d.run) ?? "—",
+    higherIsBetter: false,
   },
   {
     label: "Initial Capital",
@@ -494,6 +517,17 @@ function RunCompareInner() {
           </div>
         )}
       </div>
+
+      {/* WP2.1b: runs priced with different (or legacy) cost models */}
+      {hasMixedCostProfiles(items.map((d) => d.run)) && (
+        <div
+          role="alert"
+          data-testid="mixed-cost-banner"
+          className="rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-700 dark:border-amber-800 dark:bg-amber-900/20 dark:text-amber-400"
+        >
+          {COST_MODELS_DIFFER_MESSAGE}
+        </div>
+      )}
 
       {/* ------------------------------------------------------------------ */}
       {/* Metrics comparison table                                            */}
