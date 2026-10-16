@@ -25,7 +25,7 @@ The breaker is evaluated **once per processed bar** from the portfolio's risk sn
 
 - Escalation takes one bar; de-escalation needs 3 consecutive bars (an in-band reading resets the count). In the HALT exit band (0.9 x limit up to the limit) the breaker still blocks although the WP1.5 gate would allow: it is deliberately stricter.
 - The WP1.5 risk gate (`pre_trade_check`) stays the per-order enforcement of record. A BUY the breaker lets through is still checked by it.
-- Backtests run **without** the breaker unless `BacktestRunner(enable_circuit_breaker=True)` (WP2.1 turns it on by default).
+- Backtests run **with** the breaker by default since WP2.1c (`BacktestRunner(enable_circuit_breaker=True)`); `enable_circuit_breaker=False` (scripts: `--no-circuit-breaker`) switches it off. Runs created by 2.1a / 2.1b ran without it (`engine_semantics.backtest_circuit_breaker=false`).
 - **Restart watch.** A breaker is built fresh on every start and resume (nothing is persisted), so it cannot know the level it had before. For its first 3 evaluations it enters HALT already at 0.9 x limit (live 18%), and for its first 6 evaluations it enters REDUCE already at 0.4 x limit (live 8%). Recovery counters start at 0; a level entered during the watch is then held by the normal 3-bar hysteresis. The API field `restart_watch` shows `halt`, `reduce` or `none`. Effects after a restart, all expected:
   - Never laxer than the WP1.5 gate.
   - From the 6th evaluation on, never laxer than a breaker that was never restarted.

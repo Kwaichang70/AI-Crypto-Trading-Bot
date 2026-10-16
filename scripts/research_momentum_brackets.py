@@ -31,7 +31,14 @@ from common.models import MultiTimeframeContext, OHLCVBar
 from common.types import SignalDirection, TimeFrame
 from trading.backtest import BacktestRunner
 from trading.costs import DEFAULT_COST_PROFILE, CostProfile, CostProfileError
-from trading.costs_cli import add_cost_profile_args, cost_header, cost_profile_from_args
+from trading.costs_cli import (
+    add_circuit_breaker_arg,
+    add_cost_profile_args,
+    circuit_breaker_from_args,
+    circuit_breaker_header,
+    cost_header,
+    cost_profile_from_args,
+)
 from trading.models import Signal
 from trading.strategy import BaseStrategy, StrategyMetadata
 
@@ -42,6 +49,10 @@ _TF_ENUM = {"1h": TimeFrame.ONE_HOUR, "4h": TimeFrame.FOUR_HOURS, "1d": TimeFram
 # WP2.1: the cost model every backtest of this script runs under; set in main()
 # from --cost-profile / --taker-bps / --maker-bps / --slippage-bps.
 _COST_PROFILE: CostProfile = DEFAULT_COST_PROFILE
+
+# WP2.1c (SY-21-13): backtests build the circuit breaker by default; ``--no-circuit-breaker``
+# switches it off (the pre-2.1c numbers).  Set in main().
+_ENABLE_CB: bool = True
 
 SCAN = ["BTC/USDT", "ETH/USDT"]
 HELD_OUT = ["SOL/USDT", "BNB/USDT", "XRP/USDT"]
@@ -184,7 +195,7 @@ async def _run(bars: list[OHLCVBar], symbol: str, tf: TimeFrame, entry: dict[str
     strat = MomentumBracketStrategy(strategy_id=f"mom-{symbol}", params=entry)
     runner = BacktestRunner(strategies=[strat], symbols=[symbol], timeframe=tf,
                             initial_capital=Decimal("10000"), bracket_config=bracket, seed=42,
-                            cost_profile=_COST_PROFILE)
+                            cost_profile=_COST_PROFILE, enable_circuit_breaker=_ENABLE_CB)
     r = await runner.run({symbol: bars})
     pf = r.profit_factor
     return {
@@ -232,6 +243,7 @@ def parse_args(argv: Sequence[str] | None = None) -> tuple[argparse.Namespace, C
     ap.add_argument("--bars", type=int, default=1500)
     ap.add_argument("--folds", type=int, default=5)
     add_cost_profile_args(ap)
+    add_circuit_breaker_arg(ap)
     args = ap.parse_args(argv)
     try:
         profile = cost_profile_from_args(args)
@@ -241,9 +253,11 @@ def parse_args(argv: Sequence[str] | None = None) -> tuple[argparse.Namespace, C
 
 
 def main() -> None:
-    global _COST_PROFILE
+    global _COST_PROFILE, _ENABLE_CB
     args, _COST_PROFILE = parse_args()
+    _ENABLE_CB = circuit_breaker_from_args(args)
     print(cost_header(_COST_PROFILE), flush=True)
+    print(circuit_breaker_header(_ENABLE_CB), flush=True)
     tf = _TF_ENUM[args.timeframe]
 
     def load(syms: list[str]) -> dict[str, list[OHLCVBar]]:

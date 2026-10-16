@@ -32,6 +32,7 @@ from trading.costs import (
     resolve_run_cost_profile,
 )
 from trading.exit_config import EXIT_SEMANTICS_VERSION
+from trading.safety import BACKTEST_CIRCUIT_BREAKER_DEFAULT
 
 __all__ = [
     "COST_MODEL_VERSION",
@@ -64,11 +65,18 @@ def new_run_cost_profile_or_422(requested_id: str | None, *, mode: str) -> CostP
         raise cost_profile_http_error(exc) from exc
 
 
-def engine_semantics(mode: str) -> dict[str, object]:
+def engine_semantics(
+    mode: str, *, backtest_circuit_breaker: bool = BACKTEST_CIRCUIT_BREAKER_DEFAULT
+) -> dict[str, object]:
     """The semantics versions a run starts under.
 
-    ``backtest_circuit_breaker`` exists ONLY on backtest runs (the breaker is
-    always on in paper / live): ``False`` in WP2.1a, ``True`` from WP2.1c.
+    ``backtest_circuit_breaker`` exists ONLY on backtest runs and optimization
+    ``run_metadata`` (the breaker is always on in paper / live, SY-21-11): ``False``
+    in WP2.1a / 2.1b, ``True`` from WP2.1c.  The value is the one the engine will
+    run with (``BACKTEST_CIRCUIT_BREAKER_DEFAULT``, the same constant behind the
+    ``BacktestRunner`` / ``ParameterOptimizer`` defaults); a run row that already
+    persisted ``False`` keeps it -- nothing rewrites a stored config, and no reader
+    (legacy detection, leaderboard eligibility) looks at this key.
     """
     semantics: dict[str, object] = {
         "schema": 1,
@@ -77,7 +85,7 @@ def engine_semantics(mode: str) -> dict[str, object]:
         "daily_risk": _DAILY_RISK_VERSION,
     }
     if mode in ("backtest", "optimize"):
-        semantics["backtest_circuit_breaker"] = False
+        semantics["backtest_circuit_breaker"] = backtest_circuit_breaker
     return semantics
 
 
@@ -87,14 +95,18 @@ def stamp_cost_config(
     *,
     mode: str,
     fee_source: FeeSource = "model",
+    backtest_circuit_breaker: bool = BACKTEST_CIRCUIT_BREAKER_DEFAULT,
 ) -> None:
     """Write ``cost_profile`` + ``engine_semantics`` into a NEW run's config.
 
     OVERWRITES any inherited value (promote must never inherit the paper
-    run's profile).
+    run's profile).  ``backtest_circuit_breaker`` is only written for the
+    ``backtest`` / ``optimize`` modes.
     """
     config["cost_profile"] = profile.to_metadata(fee_source=fee_source)
-    config["engine_semantics"] = engine_semantics(mode)
+    config["engine_semantics"] = engine_semantics(
+        mode, backtest_circuit_breaker=backtest_circuit_breaker
+    )
 
 
 def cost_response_fields(config: Mapping[str, object] | None, run_mode: str) -> dict[str, Any]:

@@ -175,6 +175,10 @@ async def _run(
         seed=7,
         bracket_config=bracket,
         allow_pyramiding=pyramiding,
+        # WP2.1c: these scenarios pin the WP1.5 RISK GATE (daily-loss / drawdown at
+        # ``pre_trade_check``).  The default breaker would drop the BUY before the gate
+        # sees it (K-10) and hide exactly what is asserted, so it is pinned off.
+        enable_circuit_breaker=False,
     )
     bars = scripted_path(closes, first_open=first_open, symbol=SYMBOL, timeframe=timeframe)
     await runner.run({SYMBOL: bars})

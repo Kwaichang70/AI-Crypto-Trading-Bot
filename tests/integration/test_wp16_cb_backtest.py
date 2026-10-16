@@ -1,10 +1,12 @@
 """
 tests/integration/test_wp16_cb_backtest.py
 --------------------------------------------
-WP1.6 / U-2 -- the circuit breaker in backtests is OPT-IN (default off).
+WP1.6 / U-2 -- the circuit breaker in backtests: opt-in in WP1.6, ON BY DEFAULT since WP2.1c
+(SY-21-13); ``enable_circuit_breaker=False`` is the explicit pre-2.1c path.
 
-    WP16-T-32  the default ``BacktestRunner`` builds no breaker and a reference
-               backtest is byte-identical to pre-WP1.6 (golden digest taken at HEAD 206eb12;
+    WP16-T-32  the default ``BacktestRunner`` builds a breaker (WP2.1c flip); an explicit
+               ``enable_circuit_breaker=False`` builds none and a reference backtest is
+               byte-identical to pre-WP1.6 (golden digest taken at HEAD 206eb12;
                RE-PINNED once by WP2.1a-1 for the C25 fix, see GOLDEN_REFERENCE_DIGEST)
     WP16-T-33  ``enable_circuit_breaker=True`` through DAILY_LIMIT -> REDUCE -> OK
                and HALT -> REDUCE -> OK across 00:00 UTC: identical transitions, fills,
@@ -62,7 +64,10 @@ SCENARIOS: dict[str, tuple[list[int], dict[int, str], dict[int, str]]] = {
 }
 
 
-def _runner(scenario: str, *, enable: bool) -> tuple[BacktestRunner, dict[str, list[Any]]]:
+def _runner(
+    scenario: str, *, enable: bool | None
+) -> tuple[BacktestRunner, dict[str, list[Any]]]:
+    """``enable=None`` leaves ``enable_circuit_breaker`` OUT, i.e. the runner's default."""
     closes, script, targets = SCENARIOS[scenario]
     strategy = ScriptedSequenceStrategy(
         "wp16-bt", {"script": script, "target_notional": "3000", "targets": targets}
@@ -80,14 +85,14 @@ def _runner(scenario: str, *, enable: bool) -> tuple[BacktestRunner, dict[str, l
         # profile moved to coinbase_advanced_1.  Both T-32 scenarios and every T-33
         # assertion run under this one profile, so the C25 re-pin stays single-cause.
         cost_profile=get_cost_profile("legacy_backtest_v0"),
-        **({"enable_circuit_breaker": True} if enable else {}),
+        **({} if enable is None else {"enable_circuit_breaker": enable}),
     )
     bars = scripted_path(closes, first_open=FIRST_OPEN, symbol=SYMBOL, timeframe=TimeFrame.ONE_HOUR)
     return runner, {SYMBOL: bars}
 
 
 async def _run(
-    scenario: str, *, enable: bool, monkeypatch: pytest.MonkeyPatch
+    scenario: str, *, enable: bool | None, monkeypatch: pytest.MonkeyPatch
 ) -> dict[str, Any]:
     transitions: list[CircuitBreakerTransition] = []
     breakers: list[CircuitBreaker] = []
@@ -126,7 +131,7 @@ def _digest(payload: dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(stable, sort_keys=True).encode()).hexdigest()
 
 
-# Golden digest of the reference backtest (default: no breaker).
+# Golden digest of the reference backtest (``enable_circuit_breaker=False``, the pre-2.1c default).
 #
 # History: taken at HEAD 206eb12 (BEFORE any WP1.6 change) as
 # ``b130c79103652a460a093d4c28997de2ce2d56e3f1de5a434c7f8295b21f9eaa``.  RE-PINNED ONCE, with a
@@ -150,15 +155,21 @@ _HALT_FILLS_BREAKER_OFF = [
 ]
 
 
-async def test_wp16_t32_default_runner_builds_no_breaker(monkeypatch: pytest.MonkeyPatch) -> None:
-    runner, _bars = _runner("reduce_daily", enable=False)
-    engine, _pf, _rm, _ex = runner._build_engine("t32")
-    assert engine.circuit_breaker is None
+async def test_wp16_t32_default_runner_builds_a_breaker_and_explicit_false_builds_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """WP2.1c flip (SY-21-13): the DEFAULT runner has a breaker; only an explicit False has none."""
+    runner_default, _ = _runner("reduce_daily", enable=None)
+    engine_default, *_ = runner_default._build_engine("t32-default")
+    assert engine_default.circuit_breaker is not None
+    t = engine_default.circuit_breaker.thresholds
+    assert t is not None and t.halt_entry == Decimal("0.3")  # paper/backtest default limit
+    runner_off, _bars = _runner("reduce_daily", enable=False)
+    engine_off, _pf, _rm, _ex = runner_off._build_engine("t32-off")
+    assert engine_off.circuit_breaker is None
     runner_on, _ = _runner("reduce_daily", enable=True)
     engine_on, *_ = runner_on._build_engine("t32-on")
     assert engine_on.circuit_breaker is not None
-    t = engine_on.circuit_breaker.thresholds
-    assert t is not None and t.halt_entry == Decimal("0.3")  # paper/backtest default limit
 
 
 async def test_wp16_t32_reference_backtest_matches_the_c25_repinned_golden(

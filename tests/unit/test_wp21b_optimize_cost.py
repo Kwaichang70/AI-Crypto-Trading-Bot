@@ -89,8 +89,8 @@ class TestCostFieldsOfAnOptimizationRun:
         assert md["cost_profile"] == DEFAULT_COST_PROFILE.to_metadata()
         sem = md["engine_semantics"]
         assert sem == engine_semantics("optimize")
-        # SY-21-11: present on backtest / optimize metadata, false until WP2.1c
-        assert sem["backtest_circuit_breaker"] is False
+        # SY-21-11: present on backtest / optimize metadata; true from WP2.1c (false in 2.1a/2.1b)
+        assert sem["backtest_circuit_breaker"] is True
         assert {"schema", "cost_model", "exit_semantics", "daily_risk"} <= set(sem)
 
     def test_a_current_run_is_not_legacy(self) -> None:

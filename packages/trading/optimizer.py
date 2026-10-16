@@ -31,6 +31,7 @@ from trading.backtest import BacktestRunner
 from trading.costs import CostProfile, default_cost_profile
 from trading.exit_config import policy_cost_model, validate_param_grid_exit_config
 from trading.metrics import BacktestResult
+from trading.safety import BACKTEST_CIRCUIT_BREAKER_DEFAULT
 from trading.strategy import BaseStrategy
 from trading.walk_forward import (
     WalkForwardValidator,
@@ -131,6 +132,10 @@ class ParameterOptimizer:
         WP2.1: the ONE ``CostProfile`` handed to every combination's
         ``BacktestRunner`` (never a per-combination bps).  ``None`` -> the
         current default profile.
+    enable_circuit_breaker :
+        WP2.1c (SY-21-13, GAP-05): forwarded to every combination's
+        ``BacktestRunner``.  Default ``True``; ``False`` reproduces the pre-WP2.1c
+        (no breaker) optimizer exactly.
     """
 
     def __init__(
@@ -148,6 +153,7 @@ class ParameterOptimizer:
         walk_forward_folds: int = 4,
         walk_forward_train_fraction: float = 0.7,
         walk_forward_mode: str = "expanding",
+        enable_circuit_breaker: bool = BACKTEST_CIRCUIT_BREAKER_DEFAULT,
     ) -> None:
         if not param_grid:
             raise ValueError("param_grid must contain at least one parameter")
@@ -177,6 +183,7 @@ class ParameterOptimizer:
         self._cost_profile: CostProfile = (
             cost_profile if cost_profile is not None else default_cost_profile()
         )
+        self._enable_circuit_breaker: bool = enable_circuit_breaker
         self._walk_forward = walk_forward
         self._walk_forward_folds = walk_forward_folds
         self._walk_forward_train_fraction = walk_forward_train_fraction
@@ -208,6 +215,11 @@ class ParameterOptimizer:
             strategy=strategy_cls.__name__,
             total_combinations=len(self._combinations),
         )
+
+    @property
+    def circuit_breaker_enabled(self) -> bool:
+        """Whether every combination's runner builds a circuit breaker (WP2.1c)."""
+        return self._enable_circuit_breaker
 
     @property
     def total_combinations(self) -> int:
@@ -525,6 +537,7 @@ class ParameterOptimizer:
             trailing_stop_pct=trailing_stop_pct,
             bracket_config=bracket_config,
             allow_pyramiding=allow_pyramiding,
+            enable_circuit_breaker=self._enable_circuit_breaker,
             seed=42,
         )
         return await runner.run(bars_by_symbol)

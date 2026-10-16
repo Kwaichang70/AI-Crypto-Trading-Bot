@@ -119,6 +119,7 @@ from trading.exit_config import (
     validate_run_exit_config,
 )
 from trading.recovery import ResumeRejected, check_fill_integrity, replay_sort_key
+from trading.safety import BACKTEST_CIRCUIT_BREAKER_DEFAULT
 from trading.smoke_guard import SMOKE_STRATEGY_NAMES, SmokeGuardError, validate_smoke_run
 from trading.strategy_availability import get_availability, is_mode_allowed
 from trading.strategy_engine import FlattenResult, build_synthetic_flatten_result
@@ -1186,6 +1187,10 @@ async def create_run(
                     allow_pyramiding=_allow_pyramiding,
                     seed=body.seed,
                     cost_profile=_cost_profile,
+                    # WP2.1c (SY-21-13): the breaker the run executes with is the one
+                    # ``stamp_cost_config`` persisted as
+                    # ``engine_semantics.backtest_circuit_breaker``.  No API toggle.
+                    enable_circuit_breaker=BACKTEST_CIRCUIT_BREAKER_DEFAULT,
                 )
                 # M7 (Sprint 49 INF-9): persist the resolved seed (auto-generated or
                 # caller-supplied) into the config dict.  Seed mutation here is captured

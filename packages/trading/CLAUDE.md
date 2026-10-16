@@ -100,8 +100,8 @@ Core trading engine containing the heart of the system.
   `trip`, `reset`) are unreachable from production (AST-pinned, WP16-T-25);
   removal is CF-29. Never read `get_summary()` keys for a decision.
 - Build a breaker ONLY via `build_run_circuit_breaker(run_id, risk_manager.params)`
-  (orchestrator paper + live, the integration harness, the `BacktestRunner`
-  opt-in). Never construct `CircuitBreaker` / `CircuitBreakerConfig` directly in
+  (orchestrator paper + live, the integration harness, the `BacktestRunner`,
+  default on since WP2.1c). Never construct `CircuitBreaker` / `CircuitBreakerConfig` directly in
   `apps/` or `backtest.py`.
 - Every effect is BUY-only (C23): one filter site, `_drop_entry_signals`, first
   matching reason wins (`kill_switch`, `protective_mode`,
@@ -116,7 +116,14 @@ Core trading engine containing the heart of the system.
   exits below 0.4 x limit for 3 bars; DAILY_LIMIT clears on the `snapshot.day`
   roll. `evaluate` is transactional (state commits only after every computation
   succeeded). Bands are `Decimal` derived from the run's `RiskParameters`.
-- Backtests: opt-in (`BacktestRunner(enable_circuit_breaker=True)`), default off (U-2).
+- Backtests: ON by default since WP2.1c (SY-21-13, closes CF-26): `BacktestRunner` and
+  `ParameterOptimizer` default `enable_circuit_breaker=BACKTEST_CIRCUIT_BREAKER_DEFAULT`
+  (`True`, `trading.safety`); the API backtest, the optimizer, the ML gate and the research
+  scripts all use it (scripts: `--no-circuit-breaker`). There is NO API toggle. An explicit
+  `enable_circuit_breaker=False` is the pre-2.1c path and stays byte-identical to the 2.1a
+  goldens (pin it in any test calibrated to the no-breaker numbers). The value is persisted as
+  `engine_semantics.backtest_circuit_breaker` on backtest runs and optimization `run_metadata`
+  (absent on paper/live; `false` on 2.1a/2.1b rows, never rewritten, never read as legacy).
 - Restart watch (CF-35, user decision): every new breaker enters HALT at
   `halt_exit` (0.9 x limit) while `_evaluations < N` and REDUCE at `reduce_exit`
   (0.4 x limit) while `_evaluations < 2N`; streaks start at 0; nothing is

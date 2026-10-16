@@ -16,10 +16,11 @@ Usage::
 
     python scripts/validate_sl_tp_reversion.py --exchange binance \
         --symbols BTC/USDT,ETH/USDT --timeframe 1h --bars 4000 --folds 5 \
-        [--cost-profile coinbase_stress_t80] [--taker-bps 90]
+        [--cost-profile coinbase_stress_t80] [--taker-bps 90] [--no-circuit-breaker]
 
 The cost model defaults to the platform default profile (WP2.1); the profile
-id / fingerprint / source is printed in the first output line.
+id / fingerprint / source is printed in the first output line.  Backtests build the
+circuit breaker by default (WP2.1c); ``--no-circuit-breaker`` reproduces the earlier numbers.
 """
 from __future__ import annotations
 
@@ -35,12 +36,23 @@ from common.models import OHLCVBar
 from common.types import TimeFrame
 from trading.backtest import BacktestRunner
 from trading.costs import DEFAULT_COST_PROFILE, CostProfile, CostProfileError
-from trading.costs_cli import add_cost_profile_args, cost_header, cost_profile_from_args
+from trading.costs_cli import (
+    add_circuit_breaker_arg,
+    add_cost_profile_args,
+    circuit_breaker_from_args,
+    circuit_breaker_header,
+    cost_header,
+    cost_profile_from_args,
+)
 from trading.strategies.sl_tp_reversion import SLTPReversionStrategy
 
 # WP2.1: the cost model every backtest of this script runs under; set in main()
 # from --cost-profile / --taker-bps / --maker-bps / --slippage-bps.
 _COST_PROFILE: CostProfile = DEFAULT_COST_PROFILE
+
+# WP2.1c (SY-21-13): backtests build the circuit breaker by default; ``--no-circuit-breaker``
+# switches it off (the pre-2.1c numbers).  Set in main().
+_ENABLE_CB: bool = True
 
 _PAGE_LIMIT = 300
 _TF_DURATION_MS = {
@@ -109,6 +121,7 @@ async def _run_fold(
         strategies=[strat], symbols=[symbol], timeframe=tf,
         initial_capital=Decimal("10000"), bracket_config=bracket, seed=42,
         cost_profile=_COST_PROFILE,
+        enable_circuit_breaker=_ENABLE_CB,
     )
     result = await runner.run({symbol: bars})
     pf = result.profit_factor
@@ -172,6 +185,7 @@ def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, CostP
     ap.add_argument("--bars", type=int, default=4000)
     ap.add_argument("--folds", type=int, default=5)
     add_cost_profile_args(ap)
+    add_circuit_breaker_arg(ap)
     args = ap.parse_args(argv)
     try:
         profile = cost_profile_from_args(args)
@@ -181,9 +195,11 @@ def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, CostP
 
 
 def main() -> None:
-    global _COST_PROFILE
+    global _COST_PROFILE, _ENABLE_CB
     args, _COST_PROFILE = parse_args()
+    _ENABLE_CB = circuit_breaker_from_args(args)
     print(cost_header(_COST_PROFILE), flush=True)
+    print(circuit_breaker_header(_ENABLE_CB), flush=True)
 
     tf = _TF_ENUM[args.timeframe]
     symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]

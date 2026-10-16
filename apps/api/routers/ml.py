@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from api.db import get_db
 from api.schemas import ModelVersionListResponse, ModelVersionResponse
 from trading.costs import default_cost_profile
+from trading.safety import BACKTEST_CIRCUIT_BREAKER_DEFAULT
 
 __all__ = ["router"]
 
@@ -475,6 +476,8 @@ def _train_model_with_wf_sync(
                 # profile (WP2.1, X-13: stricter than the old 60/40 bps + 5 bps
                 # slippage; the profile is recorded in ModelVersionORM.extra),
                 # fixed-fractional sizing (A1 — no ATR risk_params), seed=42.
+                # WP2.1c (SY-21-13): with the circuit breaker, like every backtest (a
+                # model gated before 2.1c was gated without it; the gate is stricter now).
                 runner = BacktestRunner(
                     strategies=[strat],
                     symbols=[symbol],
@@ -482,6 +485,7 @@ def _train_model_with_wf_sync(
                     initial_capital=_Decimal("10000"),
                     seed=42,
                     cost_profile=default_cost_profile(),
+                    enable_circuit_breaker=BACKTEST_CIRCUIT_BREAKER_DEFAULT,
                 )
 
                 # OOS window starts where the test bars begin within bt_series.

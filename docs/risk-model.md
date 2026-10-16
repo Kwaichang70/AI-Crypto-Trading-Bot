@@ -270,8 +270,12 @@ drawdown starts at 0.
 
 ### Backtests
 
-Off by default (`BacktestRunner(enable_circuit_breaker=False)`); WP2.1 turns
-it on by default with a re-baseline.
+On by default since WP2.1c (`BacktestRunner` and `ParameterOptimizer`
+`enable_circuit_breaker=True`; closes CF-26): a backtest has the same entry guard as a paper
+run. `enable_circuit_breaker=False` (research scripts: `--no-circuit-breaker`) reproduces the
+earlier no-breaker numbers; there is no API toggle. The setting is stored as
+`engine_semantics.backtest_circuit_breaker` (`true` from 2.1c, `false` on runs created by
+2.1a / 2.1b, absent on paper and live).
 
 ### Observability
 

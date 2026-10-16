@@ -46,6 +46,7 @@ from trading.exit_config import (
     validate_param_grid_exit_config,
 )
 from trading.optimizer import SUPPORTED_METRICS, ParameterOptimizer
+from trading.safety import BACKTEST_CIRCUIT_BREAKER_DEFAULT
 
 __all__ = ["router"]
 
@@ -415,6 +416,9 @@ async def run_optimization(
             top_n=body.top_n,
             max_combinations=body.max_combinations,
             cost_profile=cost_profile,
+            # WP2.1c (SY-21-13, GAP-05): every combination runs with the breaker;
+            # persisted below as ``run_metadata.engine_semantics``.  No API toggle.
+            enable_circuit_breaker=BACKTEST_CIRCUIT_BREAKER_DEFAULT,
         )
     except ExitConfigError as exc:
         # Defence in depth: ParameterOptimizer.__init__ also validates.
@@ -452,7 +456,12 @@ async def run_optimization(
     # the same writer as a backtest run's ``config`` (``stamp_cost_config``).
     effective_profile = result.cost_profile if result.cost_profile is not None else cost_profile
     run_metadata: dict[str, Any] = {}
-    stamp_cost_config(run_metadata, effective_profile, mode="optimize")
+    stamp_cost_config(
+        run_metadata,
+        effective_profile,
+        mode="optimize",
+        backtest_circuit_breaker=optimizer.circuit_breaker_enabled,
+    )
 
     orm_run = OptimizationRunORM(
         id=uuid.uuid4(),

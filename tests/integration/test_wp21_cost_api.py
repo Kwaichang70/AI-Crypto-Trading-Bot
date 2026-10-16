@@ -4,8 +4,9 @@ tests/integration/test_wp21_cost_api.py
 WP2.1a API coverage (hermetic: no Postgres, no network, no exchange).
 
     WP21-T-20  create backtest / paper / live persist ``cost_profile`` + ``engine_semantics``
-               (``backtest_circuit_breaker`` only on backtest; live ``fee_source``
-               ``exchange_fills``); the ``run_*_engine`` spies receive the SAME fingerprint;
+               (``backtest_circuit_breaker`` only on backtest, true since WP2.1c;
+               live ``fee_source`` ``exchange_fills``); the ``run_*_engine`` spies receive the SAME
+               fingerprint;
                ``persist_backtest_results`` logs an error (no raise) on a fingerprint mismatch
     WP21-T-21  promote overwrites the inherited profile with the DEFAULT and validates at
                ``policy_cost_model(DEFAULT)``
@@ -32,12 +33,14 @@ from fastapi.testclient import TestClient
 from structlog.testing import capture_logs
 
 import api.routers.runs as runs_module
+import trading.backtest as backtest_module
 import trading.costs as costs_module
 from api.config import get_settings
 from api.services import kill_switch as _kill_switch
 from tests._wp15_logging import _structlog_unfiltered  # noqa: F401
 from tests.conftest import make_bars
 from tests.integration.fakes.idempotency_store import InMemoryIdempotencyStore
+from trading.backtest import BacktestRunner
 from trading.costs import DEFAULT_COST_PROFILE, get_cost_profile
 
 CONFIRM_TOKEN = "wp21-test-confirm-token"  # noqa: S105 -- test fixture, not a real secret
@@ -194,7 +197,7 @@ class TestT20CreatePersistsCostProfile:
             "cost_model": "wp21-1",
             "exit_semantics": "wp13b-1",
             "daily_risk": "wp15-1",
-            "backtest_circuit_breaker": False,
+            "backtest_circuit_breaker": True,  # WP2.1c (SY-21-13); false in 2.1a/2.1b
         }
         body = resp.json()
         assert body["costProfile"]["id"] == "coinbase_advanced_1"
@@ -206,6 +209,49 @@ class TestT20CreatePersistsCostProfile:
             False,
             False,
         )
+
+    def test_backtest_runs_with_the_breaker_it_persists_wp21_t36(self, c: _C) -> None:
+        """WP2.1c (SY-21-13): the persisted ``backtest_circuit_breaker`` is what the run used."""
+        seen: list[bool] = []
+        original_init = BacktestRunner.__init__
+
+        def _spy(self: BacktestRunner, *args: Any, **kw: Any) -> None:
+            seen.append(kw["enable_circuit_breaker"])
+            original_init(self, *args, **kw)
+
+        with (
+            patch.object(BacktestRunner, "__init__", _spy),
+            patch.object(
+                backtest_module,
+                "build_run_circuit_breaker",
+                wraps=backtest_module.build_run_circuit_breaker,
+            ) as build,
+        ):
+            resp = _post_backtest(c)
+        assert resp.status_code == 201, resp.text
+        cfg = c.created_run().config
+        assert cfg["engine_semantics"]["backtest_circuit_breaker"] is True
+        assert seen == [True]
+        assert build.call_count == 1  # the engine really built the breaker
+
+    def test_there_is_no_api_toggle_for_the_backtest_breaker_wp21_t36(self, c: _C) -> None:
+        seen: list[bool] = []
+        original_init = BacktestRunner.__init__
+
+        def _spy(self: BacktestRunner, *args: Any, **kw: Any) -> None:
+            seen.append(kw["enable_circuit_breaker"])
+            original_init(self, *args, **kw)
+
+        for field in ("enableCircuitBreaker", "enable_circuit_breaker", "backtestCircuitBreaker"):
+            seen.clear()
+            with patch.object(BacktestRunner, "__init__", _spy):
+                resp = _post_backtest(c, **{field: False})
+            # either the unknown field is rejected, or it is ignored: never honoured
+            assert resp.status_code in (201, 422), resp.text
+            assert seen in ([True], [])
+            if resp.status_code == 201:
+                cfg = c.created_run().config
+                assert cfg["engine_semantics"]["backtest_circuit_breaker"] is True
 
     def test_backtest_runs_under_the_persisted_profile(self, c: _C) -> None:
         resp = _post_backtest(c, costProfile="coinbase_advanced_d6")

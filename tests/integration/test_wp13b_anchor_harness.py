@@ -805,6 +805,9 @@ async def _backtest(
         trailing_stop_pct=trailing,
         allow_pyramiding=pyramiding,
         cost_profile=cost_profile,
+        # WP2.1c: the anchor / T-30 goldens were recorded without a breaker; the explicit
+        # pre-2.1c path stays byte-identical (AC-15).
+        enable_circuit_breaker=False,
     )
     bars = scripted_path(
         closes,

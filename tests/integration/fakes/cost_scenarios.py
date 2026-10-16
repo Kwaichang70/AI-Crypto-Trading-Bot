@@ -130,6 +130,9 @@ async def _run_smoke(**cost_kwargs: Any) -> dict[str, Any]:
         initial_capital=Decimal("65"),
         seed=42,
         bracket_config={"bracket_mode": "fixed", "bracket_stop_loss_pct": 0.05},
+        # WP2.1c: the 2.1a goldens were recorded without a breaker; explicit False keeps the
+        # explicit pre-2.1c path byte-identical (AC-15), whatever the default is.
+        enable_circuit_breaker=False,
         **cost_kwargs,
     )
     base = datetime(2026, 1, 1, tzinfo=UTC)
@@ -169,6 +172,8 @@ async def run_scenario(name: str, **cost_kwargs: Any) -> dict[str, Any]:
         bracket_config=sc.bracket,
         trailing_stop_pct=sc.trailing,
         allow_pyramiding=False,
+        # WP2.1c: see ``_run_smoke`` -- the goldens pin the no-breaker path explicitly.
+        enable_circuit_breaker=False,
         **cost_kwargs,
     )
     bars = scripted_path(

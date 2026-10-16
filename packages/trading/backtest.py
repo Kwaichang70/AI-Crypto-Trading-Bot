@@ -81,7 +81,7 @@ from trading.metrics import (
 from trading.portfolio import PortfolioAccounting
 from trading.risk import RiskParameters
 from trading.risk_manager import DefaultRiskManager
-from trading.safety import build_run_circuit_breaker
+from trading.safety import BACKTEST_CIRCUIT_BREAKER_DEFAULT, build_run_circuit_breaker
 from trading.strategy import BaseStrategy
 from trading.strategy_engine import StrategyEngine
 
@@ -192,10 +192,13 @@ class BacktestRunner:
         Random seed for deterministic backtests.  If provided, sets
         ``random.seed(seed)`` before execution.  Default None.
     enable_circuit_breaker : bool
-        WP1.6 / U-2: opt-in graduated circuit breaker (HALT / DAILY_LIMIT /
-        REDUCE from ``RiskSnapshot``, bar-close clock).  Default ``False`` --
-        a default backtest is byte-identical to pre-WP1.6.  WP2.1 turns it on
-        by default with a re-baseline (CF-26).
+        WP1.6 graduated circuit breaker (HALT / DAILY_LIMIT / REDUCE from
+        ``RiskSnapshot``, bar-close clock).  Default ``True`` since WP2.1c
+        (SY-21-13, closes CF-26): a backtest has the same entry guard as a paper
+        run.  ``False`` reproduces the pre-WP2.1c (WP1.6 opt-in, byte-identical to
+        pre-WP1.6) behaviour exactly -- the baseline-attribution path of the D13
+        re-baseline.  The value is NOT an API option; the API persists
+        ``engine_semantics.backtest_circuit_breaker`` next to it.
     """
 
     def __init__(
@@ -209,7 +212,7 @@ class BacktestRunner:
         trailing_stop_pct: float | None = None,
         bracket_config: dict[str, object] | None = None,
         allow_pyramiding: bool | None = None,
-        enable_circuit_breaker: bool = False,
+        enable_circuit_breaker: bool = BACKTEST_CIRCUIT_BREAKER_DEFAULT,
         cost_profile: CostProfile | None = None,
     ) -> None:
         if not strategies:
@@ -236,7 +239,7 @@ class BacktestRunner:
             seed = random.randint(0, 2**31 - 1)
         self._seed: int = seed
         self._trailing_stop_pct = trailing_stop_pct
-        # WP1.6 (U-2): the circuit breaker is opt-in in backtests (default off).
+        # WP1.6 (U-2) opt-in, default ON since WP2.1c (SY-21-13).
         self._enable_circuit_breaker: bool = enable_circuit_breaker
         # Engine-level fixed/ATR stop-loss + take-profit bracket config
         # (stop_loss_pct, take_profit_pct, bracket_mode, atr_*_multiplier,
@@ -296,6 +299,11 @@ class BacktestRunner:
     def cost_profile(self) -> CostProfile:
         """The cost profile this runner simulates with (WP2.1)."""
         return self._cost_profile
+
+    @property
+    def circuit_breaker_enabled(self) -> bool:
+        """Whether this runner builds a circuit breaker (WP2.1c, SY-21-13)."""
+        return self._enable_circuit_breaker
 
     @property
     def seed(self) -> int:

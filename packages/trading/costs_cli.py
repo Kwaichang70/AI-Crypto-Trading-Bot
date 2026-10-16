@@ -9,6 +9,10 @@ Numeric overrides are LIBRARY / SCRIPT ONLY (SY-21-03): they produce an
 ``id="custom"`` / ``source="override"`` profile that is printed in the script
 header but never persisted on a run row and never accepted by the API.
 
+WP2.1c (SY-21-13) adds ``--no-circuit-breaker``: backtests now build the WP1.6
+circuit breaker by default, and the flag switches it off so a script can
+reproduce the pre-2.1c numbers (attribution column E of the D13 re-baseline).
+
 Kept out of ``trading.costs`` so that module stays a pure, environment-free,
 argparse-free leaf.
 """
@@ -25,8 +29,16 @@ from trading.costs import (
     default_cost_profile,
     get_cost_profile,
 )
+from trading.safety import BACKTEST_CIRCUIT_BREAKER_DEFAULT
 
-__all__ = ["add_cost_profile_args", "cost_header", "cost_profile_from_args"]
+__all__ = [
+    "add_circuit_breaker_arg",
+    "add_cost_profile_args",
+    "circuit_breaker_from_args",
+    "circuit_breaker_header",
+    "cost_header",
+    "cost_profile_from_args",
+]
 
 
 def _bps_arg(raw: str) -> Decimal:
@@ -65,6 +77,29 @@ def add_cost_profile_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="override the slippage in bps (produces a 'custom' override profile)",
     )
+
+
+def add_circuit_breaker_arg(parser: argparse.ArgumentParser) -> None:
+    """Add ``--no-circuit-breaker`` (WP2.1c): backtests build the breaker by default."""
+    parser.add_argument(
+        "--no-circuit-breaker",
+        dest="no_circuit_breaker",
+        action="store_true",
+        default=False,
+        help="run the backtests WITHOUT the circuit breaker (the pre-WP2.1c behaviour)",
+    )
+
+
+def circuit_breaker_from_args(args: argparse.Namespace) -> bool:
+    """``enable_circuit_breaker`` for the runner: the default unless switched off."""
+    if getattr(args, "no_circuit_breaker", False):
+        return False
+    return BACKTEST_CIRCUIT_BREAKER_DEFAULT
+
+
+def circuit_breaker_header(enabled: bool) -> str:
+    """One-line header naming the breaker state of a script's backtests."""
+    return f"circuit_breaker={'on' if enabled else 'off'}"
 
 
 def cost_profile_from_args(args: argparse.Namespace) -> CostProfile:

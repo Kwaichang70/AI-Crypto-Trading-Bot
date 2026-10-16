@@ -28,6 +28,7 @@ from api.db.models import OptimizationEntryORM, OptimizationRunORM
 from api.services.cost_profiles import engine_semantics
 from common.types import TimeFrame
 from tests.conftest import make_bars
+from trading.backtest import BacktestRunner
 from trading.costs import DEFAULT_COST_PROFILE, get_cost_profile
 
 _URL = "/api/v1/optimize"
@@ -146,10 +147,46 @@ class TestPostWritesRunMetadata:
             "engine_semantics": engine_semantics("optimize"),
         }
         assert run.run_metadata["cost_profile"]["fee_source"] == "model"
-        # SY-21-11: optimization metadata carries the (still false) backtest breaker flag
-        assert run.run_metadata["engine_semantics"]["backtest_circuit_breaker"] is False
+        # SY-21-11 / WP2.1c: optimization metadata carries the backtest breaker flag, now true
+        assert run.run_metadata["engine_semantics"]["backtest_circuit_breaker"] is True
         assert str(run.id) == resp.json()["optimizationRunId"]
         db.session.commit.assert_awaited_once()
+
+    def test_every_combination_runs_with_the_breaker_it_persists_wp21_t36(
+        self, client_dev: TestClient, db: _Db
+    ) -> None:
+        """WP2.1c (SY-21-13, GAP-05): ``run_metadata`` says what the optimizer ran with."""
+        seen: list[bool] = []
+        original_init = BacktestRunner.__init__
+
+        def _spy(self: BacktestRunner, *args: Any, **kw: Any) -> None:
+            seen.append(kw["enable_circuit_breaker"])
+            original_init(self, *args, **kw)
+
+        with patch.object(BacktestRunner, "__init__", _spy):
+            resp = _post(client_dev)
+        assert resp.status_code == 200, resp.text
+        (run,) = db.added(OptimizationRunORM)
+        assert run.run_metadata["engine_semantics"]["backtest_circuit_breaker"] is True
+        assert seen == [True] * 4  # 2 x 2 combinations
+
+    def test_there_is_no_api_toggle_for_the_optimizer_breaker_wp21_t36(
+        self, client_dev: TestClient, db: _Db
+    ) -> None:
+        seen: list[bool] = []
+        original_init = BacktestRunner.__init__
+
+        def _spy(self: BacktestRunner, *args: Any, **kw: Any) -> None:
+            seen.append(kw["enable_circuit_breaker"])
+            original_init(self, *args, **kw)
+
+        with patch.object(BacktestRunner, "__init__", _spy):
+            resp = _post(client_dev, enableCircuitBreaker=False)
+        assert resp.status_code in (200, 422), resp.text
+        assert set(seen) <= {True}
+        if resp.status_code == 200:
+            (run,) = db.added(OptimizationRunORM)
+            assert run.run_metadata["engine_semantics"]["backtest_circuit_breaker"] is True
 
     @pytest.mark.parametrize(
         "profile_id",
