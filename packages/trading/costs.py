@@ -78,6 +78,9 @@ _CUSTOM_ID: Final = "custom"
 
 #: Modes accepted by :func:`new_run_cost_profile` / :func:`resolve_run_cost_profile`.
 _MODES: Final = frozenset({"backtest", "optimize", "paper", "live"})
+#: The modes that run against the exchange (or its paper twin): a stored profile read
+#: for one of these must be one a runtime writer can produce (WP2.1-H, CF-21-SEC-A).
+_RUNTIME_MODES: Final = frozenset({"paper", "live"})
 
 
 class CostProfileError(ValueError):
@@ -133,8 +136,8 @@ class CostProfile:
     def __post_init__(self) -> None:
         if not isinstance(self.id, str) or not _ID_RE.fullmatch(self.id):
             raise CostProfileError("id must match ^[a-z0-9_]{3,48}$")
-        if not isinstance(self.exchange, str) or not self.exchange:
-            raise CostProfileError("exchange must be a non-empty string")
+        if not isinstance(self.exchange, str) or not (0 < len(self.exchange) <= 48):
+            raise CostProfileError("exchange must be a string of 1..48 characters")
         if not isinstance(self.tier, str) or not (0 < len(self.tier) <= 48):
             raise CostProfileError("tier must be a string of 1..48 characters")
         zero = Decimal(0)
@@ -260,7 +263,12 @@ class CostProfile:
 
     @classmethod
     def from_metadata(cls, data: object) -> CostProfile:
-        """Strict inverse of :meth:`to_metadata`; raises :class:`CostProfileError`."""
+        """Strict inverse of :meth:`to_metadata`; raises :class:`CostProfileError`.
+
+        Schema-level only (an ``override`` profile round-trips).  Stored run rows
+        are NOT read through here: they go through :func:`_parse_persisted`, which
+        adds the source policy of WP2.1-H (CF-21-SEC-A).
+        """
         return _parse_metadata(data)[0]
 
 
@@ -358,6 +366,39 @@ def _parse_metadata(data: object) -> tuple[CostProfile, FeeSource]:
         if registered != profile:
             raise CostProfileError("registry cost_profile differs from the registry entry")
     return profile, fee_source
+
+
+def _parse_persisted(data: object, *, mode: str) -> tuple[CostProfile, FeeSource]:
+    """Read a profile STORED on a run row (``RunORM.config`` / ``run_metadata``).
+
+    WP2.1-H (CF-21-SEC-A, SEC-03, SEC-01).  On top of the schema checks of
+    :func:`_parse_metadata`, a stored profile is accepted only if it is
+
+    * ``source == "registry"`` (``_parse_metadata`` has already proven that the id
+      is in the registry and that every field equals the registry entry) AND, for
+      ``paper`` / ``live``, ``live_equivalent``.  Backtest / optimize accept any
+      registry id (stress, diagnostic and legacy profiles are legitimate inputs
+      there); paper and live accept none of those, because no writer stores one on
+      a runtime run (``new_run_cost_profile``), or
+    * ``source == "legacy_inferred"`` AND equal, field for field, to the legacy
+      profile of the mode family (``legacy_runtime_v0`` for paper / live,
+      ``legacy_backtest_v0`` for backtest / optimize) -- the one row the auto-retry
+      writer persists.
+
+    Anything else -- ``override``, another or hand-edited ``legacy_inferred`` row, a
+    registry row that is not live-equivalent on a paper / live run -- is a tampered
+    row.  A writer never produces one (``with_overrides`` is library / script only),
+    so rejecting it cannot affect a legitimate run.  The accepted set for a mode is
+    exactly the set its writers produce.  The error text carries no value (CF-36).
+    """
+    profile, fee_source = _parse_metadata(data)
+    if profile.source == "registry":
+        if mode in _RUNTIME_MODES and not profile.live_equivalent:
+            raise CostProfileError("persisted cost_profile source is not accepted")
+        return profile, fee_source
+    if profile.source == "legacy_inferred" and profile == _legacy_for(mode):
+        return profile, fee_source
+    raise CostProfileError("persisted cost_profile source is not accepted")
 
 
 # ---------------------------------------------------------------------------
@@ -509,6 +550,15 @@ def resolve_run_cost_profile(
     with ``invalid=True`` and ONE warning log (no value echoed -- CF-36;
     ``log_invalid=False`` for read-only response paths that resolve many rows).
     ``ValueError`` only for an invalid ``mode``.
+
+    WP2.1-H (CF-21-SEC-A): a persisted profile is valid only if it is a registry
+    profile or the mode family's own legacy profile (see :func:`_parse_persisted`);
+    a tampered row (``override``, a foreign or edited ``legacy_inferred``, and for
+    ``paper`` / ``live`` a registry row that is not ``live_equivalent``) reads as
+    malformed.  So the paper / live resume basis is a live-equivalent registry
+    profile or ``legacy_runtime_v0`` -- never below ``legacy_runtime_v0``.  It can
+    still be ANY live-equivalent registry profile (an accepted residual: the
+    stored id is not integrity-protected against a database writer).
     """
     _check_mode(mode)
     raw: object = None
@@ -519,7 +569,7 @@ def resolve_run_cost_profile(
     if not present or raw is None:
         return ResolvedCostProfile(_legacy_for(mode), persisted=False, invalid=False)
     try:
-        profile, fee_source = _parse_metadata(raw)
+        profile, fee_source = _parse_persisted(raw, mode=mode)
     except CostProfileError:
         if log_invalid:
             _log.warning("cost_profile.invalid mode=%s action=fallback_to_legacy", mode)
@@ -527,15 +577,19 @@ def resolve_run_cost_profile(
     return ResolvedCostProfile(profile, persisted=True, invalid=False, fee_source=fee_source)
 
 
-def is_legacy_cost_config(config: Mapping[str, object] | None) -> bool:
-    """SY-21-10: key absent, or a ``legacy`` profile, or invalid."""
-    if not isinstance(config, Mapping) or config.get("cost_profile") is None:
-        return True
-    try:
-        profile, _ = _parse_metadata(config["cost_profile"])
-    except CostProfileError:
-        return True
-    return profile.legacy
+def is_legacy_cost_config(config: Mapping[str, object] | None, *, mode: str = "backtest") -> bool:
+    """SY-21-10: key absent, or a ``legacy`` profile, or invalid.
+
+    The answer is the ``legacy`` flag of the profile :func:`resolve_run_cost_profile`
+    yields for ``mode``: a valid stored registry row gives its own flag, every other
+    outcome (absent key, invalid row, the family's ``legacy_inferred`` row) is legacy.
+    The default ``mode="backtest"`` accepts EVERY registry id (mode-agnostic callers);
+    a caller that knows the run's mode passes it, so that a row the run's own reader
+    rejects (WP2.1-H: a tampered ``override`` / foreign ``legacy_inferred`` row, or a
+    paper / live registry row that is not live-equivalent) reads as legacy -- in step
+    with ``cost_profile_invalid`` and the profile the response shows.
+    """
+    return resolve_run_cost_profile(config, mode=mode, log_invalid=False).profile.legacy
 
 
 def is_leaderboard_cost_eligible(config: Mapping[str, object] | None) -> bool:

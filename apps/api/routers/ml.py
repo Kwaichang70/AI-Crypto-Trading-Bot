@@ -19,7 +19,7 @@ import os
 import statistics as _statistics_stdlib  # avoid shadowing trading._statistics
 import tempfile
 import uuid
-from typing import Any
+from typing import Any, NamedTuple
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -27,13 +27,27 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.db import get_db
 from api.schemas import ModelVersionListResponse, ModelVersionResponse
-from trading.costs import default_cost_profile
+from trading.costs import CostProfile, default_cost_profile
 from trading.safety import BACKTEST_CIRCUIT_BREAKER_DEFAULT
 
 __all__ = ["router"]
 
 router = APIRouter(prefix="/ml", tags=["ml"])
 logger = structlog.get_logger(__name__)
+
+
+class _TrainedModel(NamedTuple):
+    """What ``_train_model_with_wf_sync`` hands back (WP2.1-H, CF-21a-02).
+
+    ``result`` is the JSON-able training / walk-forward dict that becomes the HTTP
+    response.  ``cost_profile`` is the :class:`CostProfile` object every fold
+    backtest ran under, kept OUT of that dict so the response shape cannot change;
+    ``train_model`` records it in ``ModelVersionORM.extra["cost_profile"]``.  Both
+    fields are required: a result without the profile cannot be constructed.
+    """
+
+    result: dict[str, Any]
+    cost_profile: CostProfile
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +126,7 @@ async def train_model(
     settings = get_settings()
 
     try:
-        result: dict[str, Any] = await asyncio.to_thread(
+        trained: _TrainedModel = await asyncio.to_thread(
             _train_model_with_wf_sync,
             symbol=symbol,
             exchange=exchange,
@@ -142,6 +156,10 @@ async def train_model(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Training failed: {exc}",
         ) from exc
+
+    # WP2.1-H (CF-21a-02): ``trained.cost_profile`` is the object the walk-forward gate
+    # ran under; it is not part of the response (not JSON), only ``trained.result`` is.
+    result: dict[str, Any] = trained.result
 
     # Persist model version to database
     from datetime import UTC, datetime as _dt
@@ -195,7 +213,10 @@ async def train_model(
     }
     # WP2.1: the cost model the walk-forward gate was run under (the platform
     # default); a model without this key was gated under the legacy 60/40 + 5 bps.
-    existing_extra["cost_profile"] = default_cost_profile().to_metadata()
+    # WP2.1-H (CF-21a-02): record the profile the gate ACTUALLY trained with (handed
+    # back by ``_train_model_with_wf_sync``), not a second ``default_cost_profile()``
+    # read.  It never enters ``result``, so the HTTP response keeps its shape.
+    existing_extra["cost_profile"] = trained.cost_profile.to_metadata()
     model_version.extra = existing_extra
     # The typed column now stores the MEDIAN REALIZED OOS trading Sharpe across
     # walk-forward folds (Cycle 6). Column name unchanged for backward compat.
@@ -284,7 +305,7 @@ def _train_model_with_wf_sync(
     threshold: float,
     num_wf_folds: int = 5,
     min_trades_per_fold: int = 20,
-) -> dict[str, Any]:
+) -> _TrainedModel:
     """Synchronous training pipeline with REAL walk-forward OOS Sharpe (Cycle 6).
 
     Extends ``_train_model_sync`` to additionally run ``WalkForwardValidator``
@@ -325,6 +346,13 @@ def _train_model_with_wf_sync(
         walk_forward_status="insufficient_samples".  WARNING: at
         prediction_threshold=0.60 over ~120-bar OOS folds this is likely
         unreachable — see reports/sprint50-cycle6-oos-backtest-producer.md §7.2.
+
+    Returns
+    -------
+    _TrainedModel
+        ``result``: the training / walk-forward dict (the HTTP response body).
+        ``cost_profile`` (WP2.1-H, CF-21a-02): the :class:`CostProfile` object every
+        fold backtest ran under (the platform default), for ``train_model`` to record.
     """
     import ccxt
     import pandas as pd
@@ -337,6 +365,10 @@ def _train_model_with_wf_sync(
     from trading.backtest import BacktestRunner
     from trading.strategies.model_strategy import ModelStrategy
     from trading.walk_forward import WalkForwardValidator
+
+    # WP2.1-H (CF-21a-02): read the platform default ONCE; every fold backtest below
+    # runs under this object and the same object is handed back for the caller to record.
+    trained_profile = default_cost_profile()
 
     # 1. Fetch candles via synchronous ccxt
     exchange_cls = getattr(ccxt, exchange, None)
@@ -485,7 +517,7 @@ def _train_model_with_wf_sync(
                     timeframe=tf_enum,
                     initial_capital=_Decimal("10000"),
                     seed=42,
-                    cost_profile=default_cost_profile(),
+                    cost_profile=trained_profile,
                     enable_circuit_breaker=BACKTEST_CIRCUIT_BREAKER_DEFAULT,
                 )
 
@@ -581,7 +613,7 @@ def _train_model_with_wf_sync(
         num_folds=len(fold_sharpes),
     )
 
-    return {
+    training_result: dict[str, Any] = {
         "status": "completed",
         "symbol": symbol,
         "exchange": exchange,
@@ -602,6 +634,7 @@ def _train_model_with_wf_sync(
         "walk_forward_status": "insufficient_samples" if insufficient_samples else "ok",
         "walk_forward_folds_below_threshold": folds_below_threshold,
     }
+    return _TrainedModel(result=training_result, cost_profile=trained_profile)
 
 
 # ---------------------------------------------------------------------------

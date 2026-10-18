@@ -159,7 +159,9 @@ class TestT18MlGate:
             "walk_forward_status": "ok",
             "walk_forward_oos_skill_score": 1.0,
         }
-        with patch.object(ml, "_train_model_with_wf_sync", return_value=result):
+        # WP2.1-H (CF-21a-02): the sync function hands back the profile it trained with.
+        trained = ml._TrainedModel(result=result, cost_profile=DEFAULT_COST_PROFILE)
+        with patch.object(ml, "_train_model_with_wf_sync", return_value=trained):
             await ml.train_model(
                 symbol="BTC/USDT",
                 exchange="binance",
@@ -319,7 +321,10 @@ class TestT15ResolutionParity:
     def test_the_ml_gate_source_passes_the_default(self) -> None:
         # (the behavioural proof is TestT18MlGate; this pins that no literal bps remain)
         src = (_REPO / "apps/api/routers/ml.py").read_text()
-        assert "cost_profile=default_cost_profile()" in src
+        # WP2.1-H (CF-21a-02): the default is read once and that object is both passed to the
+        # runner and handed back (the single-read behaviour is pinned in test_wp21h_ml_profile).
+        assert "trained_profile = default_cost_profile()" in src
+        assert "cost_profile=trained_profile" in src
         assert "taker_fee_bps" not in src and "maker_fee_bps" not in src
 
     def test_backtest_module_has_no_bps_kwargs_left(self) -> None:

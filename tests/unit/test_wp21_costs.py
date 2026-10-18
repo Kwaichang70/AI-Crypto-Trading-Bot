@@ -607,6 +607,58 @@ def _call_name(node: ast.Call) -> str | None:
     return None
 
 
+#: Files that construct a ``BacktestRunner`` / ``ParameterOptimizer`` (WP2.1-H, CF-21C-02).
+#: The optimizer builds the per-combination runners, the three routers are the API (create_run,
+#: optimize, the ML walk-forward gate), the rest are research / re-baseline scripts.
+_RUNNER_CONSTRUCTION_FILES = frozenset(
+    {
+        "apps/api/routers/ml.py",
+        "apps/api/routers/optimize.py",
+        "apps/api/routers/runs.py",
+        "packages/trading/optimizer.py",
+        "scripts/research_momentum_brackets.py",
+        "scripts/validate_sl_tp_reversion.py",
+        "scripts/wp21_rebaseline.py",
+    }
+)
+
+_DYNAMIC_IMPORTERS = frozenset({"import_module", "__import__", "spec_from_file_location"})
+
+
+def _is_forbidden_module(dotted: str) -> bool:
+    parts = dotted.replace(".py", "").replace("/", ".").split(".")
+    return (
+        "wp21_rebaseline" in parts
+        or dotted == "unittest.mock"
+        or dotted.startswith("unittest.mock.")
+    )
+
+
+def _forbidden_imports(tree: ast.AST) -> list[tuple[int, str]]:
+    """``(lineno, name)`` of every static or literal-dynamic import of ``wp21_rebaseline`` /
+    ``unittest.mock`` (``import a.b``, ``from a import b``, relative forms, and string
+    arguments of ``import_module`` / ``__import__`` / ``spec_from_file_location``)."""
+    found: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        lineno = 0
+        names: list[str] = []
+        if isinstance(node, ast.Import):
+            lineno, names = node.lineno, [a.name for a in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            base = node.module or ""
+            lineno = node.lineno
+            names = [base, *(f"{base}.{a.name}" if base else a.name for a in node.names)]
+        elif isinstance(node, ast.Call) and _call_name(node) in _DYNAMIC_IMPORTERS:
+            lineno = node.lineno
+            names = [
+                a.value
+                for a in (*node.args, *(k.value for k in node.keywords))
+                if isinstance(a, ast.Constant) and isinstance(a.value, str)
+            ]
+        found.extend((lineno, n) for n in names if _is_forbidden_module(n))
+    return found
+
+
 class TestT07AstPins:
     def test_costs_module_is_a_leaf_that_reads_no_environment(self) -> None:
         src = (_REPO / "packages/trading/costs.py").read_text()
@@ -675,7 +727,11 @@ class TestT07AstPins:
         assert seen == {"PaperExecutionEngine": 2, "StrategyEngine": 3, "LiveExecutionEngine": 1}
 
     def test_every_production_runner_and_optimizer_construction_passes_cost_profile(self) -> None:
-        count = 0
+        # WP2.1-H (CF-21C-02): structural, not a count.  EVERY construction site must pass
+        # ``cost_profile`` (checked per call below), and the set of files that construct a
+        # runner / optimizer is the expected one -- a new site in a NEW file fails here until
+        # it is reviewed and listed; a second call in a listed file is covered automatically.
+        sites: dict[str, int] = {}
         for path in _production_files():
             tree = ast.parse(path.read_text())
             for node in ast.walk(tree):
@@ -685,10 +741,63 @@ class TestT07AstPins:
                 }:
                     kws = {kw.arg for kw in node.keywords}
                     assert "cost_profile" in kws, f"{path.relative_to(_REPO)}:{node.lineno}"
-                    count += 1
-        # optimizer (BacktestRunner), create_run, ml gate, 2 scripts, optimize router,
-        # and (WP2.1c) the re-baseline script
-        assert count == 7
+                    rel = path.relative_to(_REPO).as_posix()
+                    sites[rel] = sites.get(rel, 0) + 1
+        assert set(sites) == _RUNNER_CONSTRUCTION_FILES, sorted(
+            set(sites) ^ _RUNNER_CONSTRUCTION_FILES
+        )
+
+    def test_no_production_module_imports_the_rebaseline_script_or_unittest_mock(self) -> None:
+        """WP2.1-H (CF-21C-02, SEC-06/CR-09): the re-baseline script monkeypatches the
+        engine and ``unittest.mock`` is test machinery; neither may be reachable from
+        ``apps/`` or ``packages/`` (the live path)."""
+        offenders: list[str] = []
+        for root in ("apps", "packages"):
+            for path in sorted((_REPO / root).rglob("*.py")):
+                if "node_modules" in path.parts or "__pycache__" in path.parts:
+                    continue
+                for lineno, name in _forbidden_imports(ast.parse(path.read_text())):
+                    offenders.append(f"{path.relative_to(_REPO)}:{lineno}:{name}")
+        assert offenders == []
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "import unittest.mock",
+            "import unittest.mock as m",
+            "from unittest import mock",
+            "from unittest import mock as m",
+            "from unittest.mock import MagicMock",
+            "from unittest.mock import *",
+            "import wp21_rebaseline",
+            "import scripts.wp21_rebaseline as r",
+            "from scripts import wp21_rebaseline",
+            "from scripts.wp21_rebaseline import run",
+            "from . import wp21_rebaseline",
+            "from .wp21_rebaseline import run",
+            "import importlib\nimportlib.import_module('unittest.mock')",
+            "import importlib\nimportlib.import_module('scripts.wp21_rebaseline')",
+            "__import__('unittest.mock')",
+            "import importlib.util\n"
+            "importlib.util.spec_from_file_location('x', 'scripts/wp21_rebaseline.py')",
+        ],
+    )
+    def test_the_import_pin_detects_every_import_form(self, source: str) -> None:
+        assert _forbidden_imports(ast.parse(source)), source
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "import unittest",
+            "import os, sys",
+            "from unittest import TestCase",
+            "from decimal import Decimal",
+            "import importlib\nimportlib.import_module('trading.costs')",
+            "x = 'wp21_rebaseline'",
+        ],
+    )
+    def test_the_import_pin_has_no_false_positives(self, source: str) -> None:
+        assert _forbidden_imports(ast.parse(source)) == [], source
 
     def test_settings_has_no_cost_field(self) -> None:
         from api.config import Settings

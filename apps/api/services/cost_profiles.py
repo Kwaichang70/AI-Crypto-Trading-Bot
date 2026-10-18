@@ -133,7 +133,9 @@ def cost_response_fields(config: Mapping[str, object] | None, run_mode: str) -> 
     )
     return {
         "cost_profile": summary,
-        "legacy_costs": is_legacy_cost_config(config),
+        # WP2.1-H (SEC-01): judged in the run's own mode, in step with ``cost_profile_invalid``
+        # and the profile shown above (a tampered paper / live row reads as invalid legacy).
+        "legacy_costs": is_legacy_cost_config(config, mode=mode),
         "cost_profile_invalid": resolved.invalid,
         "legacy_exit_semantics": not has_semantics,
         "live_equivalent_costs": is_leaderboard_cost_eligible(config),

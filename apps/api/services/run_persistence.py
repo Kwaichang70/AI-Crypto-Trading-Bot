@@ -29,10 +29,11 @@ internal callers inside the router module keep working unchanged.
 from __future__ import annotations
 
 import math
+import re
 import uuid
 from datetime import UTC, date, datetime, time
 from decimal import Decimal
-from typing import Any
+from typing import Any, Final
 
 import structlog
 from pydantic import ValidationError
@@ -70,6 +71,21 @@ __all__ = [
 ]
 
 logger = structlog.get_logger(__name__)
+
+#: Shape of ``CostProfile.fingerprint()``: a 16-hex digest of public economics.
+_FINGERPRINT_RE: Final = re.compile(r"[0-9a-f]{16}")
+
+
+def _loggable_fingerprint(value: object) -> str:
+    """A STORED fingerprint, safe to log (WP2.1-H, SEC-03 / CF-36).
+
+    The value was read from ``RunORM.config`` and is only trusted as far as its
+    shape: a full ``[0-9a-f]{16}`` match is logged as is, anything else (a longer
+    string, control characters, a non-string) as the fixed ``"<malformed>"``.
+    """
+    if isinstance(value, str) and _FINGERPRINT_RE.fullmatch(value):
+        return value
+    return "<malformed>"
 
 
 # ---------------------------------------------------------------------------
@@ -619,7 +635,7 @@ async def persist_backtest_results(
         log.error(
             "runs.cost_profile_fingerprint_mismatch",
             run_id=str(run_id),
-            config_fingerprint=str(_frozen.get("fingerprint"))[:32],
+            config_fingerprint=_loggable_fingerprint(_frozen.get("fingerprint")),
             result_fingerprint=_result_fp[:32],
         )
 
