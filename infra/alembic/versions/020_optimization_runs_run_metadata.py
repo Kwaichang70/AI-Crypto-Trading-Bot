@@ -47,8 +47,8 @@ Deployment order
 ----------------
 Apply this migration BEFORE the application code that reads or writes
 ``optimization_runs.run_metadata`` (mirrors 017/018/019). Old application
-code that does not know the column keeps working against the migrated
-schema.
+code that does not know the column keeps working at the SQL level (see the
+rollback caveat under Downgrade path).
 
 Downgrade path
 ---------------

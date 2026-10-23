@@ -208,6 +208,10 @@ export function resolveCostProfileForMode(
  *   `relaunchCostProfile`, which PINS the source's registry profile, including
  *   the default id. A relaunched run therefore keeps its source pricing even
  *   if `DEFAULT_COST_PROFILE_ID` changes later.
+ *
+ * A new-run form pre-filled by Duplicate Run holds the pinned id as its
+ * selected value, so submitting it sends that id (the default id included)
+ * like any explicit choice; only the empty "Platform default" choice omits it.
  */
 export function costProfileField(id: string | undefined): { costProfile?: string } {
   return id ? { costProfile: id } : {};

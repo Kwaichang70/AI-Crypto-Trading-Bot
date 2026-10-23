@@ -46,15 +46,36 @@ Rule `trading-cb-halt` fires on `max(trading_circuit_breaker_state{run_id!~"bt-.
 
 **Operator note (since WP2.1c).** Backtests (`run_id` `bt-<12 hex>`) run with the circuit breaker. A backtest that runs inside the API process therefore emits the `trading_circuit_breaker_state` gauge (values 2 and 3 included) and logs `circuit_breaker.halt_entered` at critical, in the same metrics endpoint and log stream as paper and live runs. The Grafana rule excludes them with the matcher `run_id!~"bt-.*"`; `trading-kill-switch` and `trading-high-drawdown` carry the same matcher. Paper and live runs use `run_id` = the run UUID, which never starts with `bt-`, so the matcher cannot hide a live or paper HALT. When this alert fires, the series carries a UUID `run_id`: treat it as real.
 
-Logs are not filtered by Grafana. Filter by `run_id` before treating a `circuit_breaker.halt_entered` line as a live or paper HALT: a line whose `run_id` starts with `bt-` is a backtest and needs no action (for example, append `| grep -v 'bt-[0-9a-f]\{12\}'` to the command in section 2c).
+The Grafana dashboard panels "Current Drawdown" and "Drawdown Over Time" (`infra/grafana/dashboards/trading-bot.json`) use the same matcher on `trading_drawdown_pct`, so they exclude backtest series. The other dashboard panels (equity, active positions, bar, signal, order and fill rates, bar latency) are not scoped: a backtest that runs inside the API process writes its `bt-<12 hex>` series into them too.
 
-After deploying this change, restart the grafana container so it re-reads the alert provisioning and the rules pick up the matcher.
+Logs are not filtered by Grafana. Filter on the `run_id` **field** before treating a `circuit_breaker.halt_entered` line as a live or paper HALT: a line whose `run_id` field starts with `bt-` is a backtest and needs no action. The API writes JSON logs (the `circuit_breaker.*` lines carry `"run_id": "<id>"`) unless `DEBUG` is set, and a deployed stack must not set it. To list the HALT entries of paper and live runs only (the command of section 2c, narrowed to that event, with the backtest lines dropped):
+
+```bash
+docker compose -f /opt/trading-bot/infra/docker-compose.yml logs api \
+    | grep -E 'circuit_breaker\.halt_entered' \
+    | grep -v '"run_id": "bt-'
+```
+
+The pattern contains the key and its opening quote, so it can match only the `run_id` field. Do not filter on the bare text `bt-<12 hex>`: a line for a paper or live run could contain that text in another field, and an unanchored filter would then hide a real HALT. The equivalent with `jq` needs `--no-log-prefix`, because the `api  |` prefix that compose adds makes a line invalid JSON:
+
+```bash
+docker compose -f /opt/trading-bot/infra/docker-compose.yml logs --no-log-prefix api \
+    | grep -E 'circuit_breaker\.halt_entered' \
+    | jq -cR '(fromjson? | objects) // {unparsed: .} | select((.run_id // "") | tostring | startswith("bt-") | not)'
+```
+
+For both commands: an error from `docker compose` means the command did not run, and empty output proves nothing in that case. A line printed as `{"unparsed": …}` is not JSON (for example, `DEBUG` is set): treat it as a possible live HALT.
+
+Alert rules are provisioned from a file, and a changed rule expression is not live until Grafana has re-read it. The deploy runbook does this by restarting the grafana container (`docs/runbooks/deploy-fase1-minimumset.md`, section 11, step D3-6). To check which expression is live, open the rules in Grafana (Alerting, then Alert rules, folder Trading) and confirm that its query for `trading-cb-halt` ("Circuit breaker HALT"), `trading-kill-switch` ("Kill switch active") and `trading-high-drawdown` ("Drawdown above 10 percent") shows `{run_id!~"bt-.*"}`; the Grafana rule list shows the titles. A rule without the matcher can fire on a backtest.
 
 ### 2c. Structured log
 ```bash
 docker compose -f /opt/trading-bot/infra/docker-compose.yml logs api 2>&1 \
     | grep -E "circuit_breaker\.(halt_entered|halt_cleared|transition|daily_limit_entered|reduce_entered)|engine\.circuit_breaker_(entries_blocked|eval_failed)|circuit_breaker\.listener_failed"
 ```
+
+This command also sends Compose's own error messages into `grep`, which drops them: empty output after a Compose error proves nothing (remove `2>&1` to see them).
+
 - `circuit_breaker.halt_entered` (critical, `alert="ENTRIES_BLOCKED"`) once per HALT entry; `circuit_breaker.halt_cleared` once per exit.
 - `engine.circuit_breaker_entries_blocked` once per bar that dropped at least one BUY (`skip_reason`).
 - `engine.circuit_breaker_eval_failed` (error): the breaker itself failed; that bar's BUYs were dropped (fail-closed for entries only). A loop of these means entries are blocked until fixed: open an incident.
@@ -191,3 +212,4 @@ positions and retry the flatten; do not sell by hand while a bot SELL is still o
 - **WP1.6** — Rewritten: HALT blocks entries only, auto-recovers (U-1), reset endpoint retired (410), Telegram alert on HALT, gauge zeroed on stop. Renamed from `circuit-breaker-halt-auto-stop.md`.
 - **WP1.3b-b** — Added section 7: the live intra-bar exit check (settings, semantics, logs, G-LIVE L-14..L-16).
 - **WP1.3b-b fix** — Section 7: asks and trade age on `engine.intrabar_exit_signal`, `intrabar_loop_died_total`, shutdown and flatten notes.
+- **WP2.1c / R3-DOCS** — Sections 1 and 2b: backtests run with the breaker and emit the gauge and the critical log under `bt-…`; the three per-run alert rules and the two drawdown dashboard panels exclude them with `{run_id!~"bt-.*"}`. R3-DOCS: the log filter is anchored to the `run_id` field, the Grafana restart sentence no longer refers to a past deploy, the `jq` filter passes non-JSON lines through as `unparsed`, and Compose errors are made visible (sections 2b and 2c).

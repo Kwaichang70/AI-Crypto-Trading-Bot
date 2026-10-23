@@ -258,12 +258,18 @@ export PYTHONPATH="$(pwd)/apps:$(pwd)/packages"
 # Run tests
 pytest tests/ -v --tb=short
 
+# Unit and integration suites in one process are supported, in either order:
+#   pytest tests/unit tests/integration
+#   pytest tests/integration tests/unit
+
 # Type checking
 mypy packages/ apps/ --ignore-missing-imports
 
 # Frontend
 cd apps/ui && npm install && npm run dev
 ```
+
+Test note: the root `tests/conftest.py` fixture `_global_logging_state_isolated` snapshots and restores the process-global logging state around every test and forces uncached structlog loggers (`cache_logger_on_first_use=False`) while tests run; this is what makes one combined `pytest tests/unit tests/integration` process safe. Production logging is unchanged and keeps `cache_logger_on_first_use=True`. The regression tests for it are `tests/integration/test_cf21a_sec_c_logging_isolation.py`.
 
 ---
 

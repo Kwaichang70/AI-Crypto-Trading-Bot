@@ -133,7 +133,7 @@ LIVE_CONFIRM_TOKEN=$(grep -E '^LIVE_TRADING_CONFIRM_TOKEN=' "$DEPLOY_DIR/.env" |
 
 ### 2b. Deploy conditions (D-0..D-6)
 
-- [ ] **D-0** The deploy runbook `docs/runbooks/deploy-fase1-minimumset.md` §5 passed and `alembic current` = `019 (head)` (deploy log, DEP §5.9).
+- [ ] **D-0** The deploy runbook `docs/runbooks/deploy-fase1-minimumset.md` §5 passed and `alembic current` = `020 (head)` on Release 3 (DEP §11.7), `019 (head)` on Release 2 (deploy log, DEP §5.9).
 - [ ] **D-1** The deployed code contains WP-SMOKE (commit `3db9148` or a descendant) and the acceptance suite is green (`reports/vp2-smoke/acceptance-report-smoke.md`).
 - [ ] **D-2** SMK-T-37 is green on real Postgres (recorded in the acceptance report).
 - [ ] **D-3** If D-2 is unmet, O-3 (§7) is the sole control for the create race. Record that in the evidence pack.
@@ -662,7 +662,7 @@ EVID=~/smoke-evidence/$(date +%F); install -d -m 700 "$EVID"
 **Setup**
 - [ ] Commit hash of the deployed tree (source machine: `git rev-parse HEAD`; must equal DEP §5.8) and the D-6 grep result (server).
 - [ ] Git blob hashes of the documents used (source machine): `git hash-object docs/runbooks/smoke-roundtrip-mechanics-test.md reports/vp2-smoke/synthesis-spec.md reports/vp2-smoke/final-synthesis-smoke.md reports/vp2-docs/final-synthesis-docs.md`.
-- [ ] D-0 (`alembic current` = `019 (head)`) and, if D-2 was unmet, the D-3 note.
+- [ ] D-0 (`alembic current` = `020 (head)` on Release 3, `019 (head)` on Release 2) and, if D-2 was unmet, the D-3 note.
 - [ ] O-1 and O-2 confirmations (date, chosen pair).
 - [ ] Output of the §2e pre-flight script: `limits.cost.min`, `limits.amount.min`, `precision.amount`, `taker`, `maker`, bid/ask/spread, EUR free/total, base `pre_total`.
 - [ ] Kill-switch status response and the empty "no live run" query output.
@@ -697,6 +697,7 @@ unset API_KEY ADMIN_KEY LIVE_CONFIRM_TOKEN; exit
 
 ## 10. Change log
 
+- **2026-10-20 (R3-DOCS)** — D-0 and its evidence line expect `020 (head)` on Release 3 (deploy runbook section 11).
 - **2026-10-14 (WP2.1a)** — §2e pointer to deploy-runbook Block L-21, §3 note on the stricter paper cost model (X-8, X-15), and the P3 corroboration note under §5 (`cost_profile.fill_fee_drift` / `tier_mismatch`).
 - **2026-10-12 (cf36b-fix)** — §4c step 0 re-runs the CF-36 log-hygiene self-check on the live config (G-LIVE L-19 gate run; `reports/vp2-cf36/final-synthesis-cf36b.md`, CF36B-SEC-03); §9 records its line.
 - **2026-09-28 (r3)** — Round-2 fixes per `reports/vp2-docs/final-synthesis-docs.md` Round 2 addendum (WR2-01..WR2-11).
