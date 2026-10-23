@@ -64,6 +64,7 @@ import pytest
 
 from api.routers.runs import _RUN_TASKS, _run_live_engine
 from common.types import RunMode, TimeFrame
+from trading.costs import DEFAULT_COST_PROFILE
 from trading.risk import RiskParameters
 
 # ---------------------------------------------------------------------------
@@ -314,6 +315,7 @@ class TestRunLiveEngine:
                 symbols=[_SYMBOL],
                 timeframe=TimeFrame.ONE_HOUR,
                 initial_capital=_INITIAL_CAPITAL,
+                cost_profile=DEFAULT_COST_PROFILE,
             )
 
         # Verify LiveExecutionEngine was constructed with enable_live_trading=True
@@ -360,6 +362,7 @@ class TestRunLiveEngine:
                 symbols=[_SYMBOL],
                 timeframe=TimeFrame.ONE_HOUR,
                 initial_capital=_INITIAL_CAPITAL,
+                cost_profile=DEFAULT_COST_PROFILE,
             )
 
         se_cls_mock.assert_called_once()
@@ -409,6 +412,7 @@ class TestRunLiveEngine:
                 symbols=[_SYMBOL],
                 timeframe=TimeFrame.ONE_HOUR,
                 initial_capital=_INITIAL_CAPITAL,
+                cost_profile=DEFAULT_COST_PROFILE,
             )
 
         flush_mock.assert_called_once()
@@ -468,6 +472,7 @@ class TestRunLiveEngine:
                 symbols=[_SYMBOL],
                 timeframe=TimeFrame.ONE_HOUR,
                 initial_capital=_INITIAL_CAPITAL,
+                cost_profile=DEFAULT_COST_PROFILE,
             )
 
         # The mock run's status must have been set to "error" by the finally block
@@ -515,6 +520,7 @@ class TestRunLiveEngine:
                 symbols=[_SYMBOL],
                 timeframe=TimeFrame.ONE_HOUR,
                 initial_capital=_INITIAL_CAPITAL,
+                cost_profile=DEFAULT_COST_PROFILE,
             )
 
         mock_exchange.close.assert_called_once(), (
@@ -565,6 +571,7 @@ class TestRunLiveEngine:
                 symbols=[_SYMBOL],
                 timeframe=TimeFrame.ONE_HOUR,
                 initial_capital=_INITIAL_CAPITAL,
+                cost_profile=DEFAULT_COST_PROFILE,
             )
 
         assert _RUN_ID not in _RUN_TASKS, (
@@ -614,6 +621,7 @@ class TestRunLiveEngine:
                 symbols=[_SYMBOL],
                 timeframe=TimeFrame.ONE_HOUR,
                 initial_capital=_INITIAL_CAPITAL,
+                cost_profile=DEFAULT_COST_PROFILE,
             )
 
         # The CCXT exchange class is called with a positional config dict.

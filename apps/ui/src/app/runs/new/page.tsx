@@ -14,6 +14,8 @@ import { useToast } from "@/components/ui/toast";
 import { LiveBanner } from "@/components/live-banner";
 import { LiveConfirmDialog } from "@/components/live-confirm-dialog";
 import { ExitConfigErrorPanel } from "@/components/exit-config-error-panel";
+import { CostProfileSelect } from "@/components/cost-profile-select";
+import { costProfileField, resolveCostProfileForMode } from "@/lib/cost-profile";
 import {
   describeConfigWarning,
   isPyramidingByDesignStrategy,
@@ -136,6 +138,9 @@ function NewRunInner() {
   const preSymbols = searchParams.get("symbols") ?? "";
   const preTimeframe = searchParams.get("timeframe") ?? "";
   const preCapital = searchParams.get("initial_capital") ?? "";
+  // WP2.1b: set by Duplicate Run; resolved against the offered ids below, so
+  // an unknown / not-offered value is silently dropped (platform default).
+  const preCostProfile = searchParams.get("cost_profile") ?? "";
 
   const [strategies, setStrategies] = useState<readonly Strategy[]>([]);
   const [selectedStrategy, setSelectedStrategy] = useState<Strategy | null>(null);
@@ -147,6 +152,10 @@ function NewRunInner() {
   const [timeframe, setTimeframe] = useState(preTimeframe || "1h");
   const [mode, setMode] = useState<RunMode>("backtest");
   const [initialCapital, setInitialCapital] = useState(preCapital || "10000");
+  // WP2.1b (SY-21-03): "" = platform default (key omitted from the request).
+  const [costProfile, setCostProfile] = useState(
+    resolveCostProfileForMode("backtest", preCostProfile) ?? "",
+  );
   const [backtestStart, setBacktestStart] = useState("2024-01-01T00:00");
   const [backtestEnd, setBacktestEnd] = useState("2024-12-31T23:59");
   const [enableLearning, setEnableLearning] = useState(false);
@@ -433,6 +442,12 @@ function NewRunInner() {
     // and backtest send the checkbox's current value explicitly.
     const resolvedAllowPyramiding = mode === "live" ? false : allowPyramiding;
 
+    // WP2.1b (SY-21-03): omit the key for the default and for live (live takes
+    // no profile: a non-null value would 422). An id that is not offered in
+    // the current mode (stress id left over after switching to paper) is
+    // dropped as well, so the body can never carry an ineligible profile.
+    const resolvedCostProfile = resolveCostProfileForMode(mode, costProfile);
+
     const body = {
       strategyName: selectedStrategy.name,
       strategyParams,
@@ -445,6 +460,7 @@ function NewRunInner() {
       enableAdaptiveLearning: mode !== "backtest" ? enableLearning : undefined,
       autoApplyLearning: mode === "paper" && enableLearning ? autoApplyLearning : undefined,
       allowPyramiding: resolvedAllowPyramiding,
+      ...costProfileField(resolvedCostProfile),
     };
 
     if (mode === "live") {
@@ -536,6 +552,7 @@ function NewRunInner() {
             <div className="h-10 animate-pulse rounded bg-slate-200 dark:bg-slate-800" />
           ) : (
             <select
+              aria-label="Strategy"
               value={selectedStrategy?.name ?? ""}
               onChange={(e) => void handleStrategyChange(e.target.value)}
               className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200"
@@ -640,6 +657,12 @@ function NewRunInner() {
               </p>
             </div>
           )}
+        </div>
+
+        {/* WP2.1b (SY-21-03): cost profile -- backtest any id, paper live-equivalent only, live none */}
+        <div className="card space-y-3">
+          <h2 className="text-sm font-semibold text-slate-800 dark:text-slate-200">Cost Model</h2>
+          <CostProfileSelect mode={mode} value={costProfile} onChange={setCostProfile} />
         </div>
 
         {/* Symbols */}

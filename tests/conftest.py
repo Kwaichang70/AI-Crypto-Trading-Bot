@@ -15,11 +15,13 @@ Pytest resolves them automatically from this module.
 from __future__ import annotations
 
 import random
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from decimal import Decimal
 from uuid import uuid4
 
 import pytest
+import structlog
 
 from api.services import kill_switch as _kill_switch
 from common.models import OHLCVBar
@@ -30,9 +32,11 @@ from common.types import (
     SignalDirection,
     TimeFrame,
 )
-from tests._cf36_logging import production_logging  # noqa: F401 -- CF-36 fixture, shared
+from tests._cf36_logging import (  # noqa: F401 -- production_logging: CF-36 fixture, shared
+    isolated_logging_state,
+    production_logging,
+)
 from trading.models import Fill, Order, Signal
-
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -58,6 +62,61 @@ def _cf36_redaction_registry_isolated() -> None:
     redaction._reset_registry_for_tests()
     yield
     redaction._reset_registry_for_tests()
+
+
+# ---------------------------------------------------------------------------
+# CF-21a-SEC-C / WP2.1-H: global logging state is process-global, and the API
+# lifespan (``configure_logging``) installs it and never removes it.  Every
+# ``TestClient`` lifespan in the suite therefore leaves behind, for the rest of
+# the process:
+#   * ``_AccessQueryFilter`` on ``uvicorn.access`` (and ``_WsQueryFilter``), the
+#     cleared uvicorn handlers + ``propagate=True``, the root handler / level,
+#     the ccxt / asyncio / urllib3 levels;
+#   * ``common.logging._LOGGING_CONFIGURED = True``, so the next lifespan skips
+#     configuration and structlog keeps whatever config is current;
+#   * ``cache_logger_on_first_use=True``: module-level loggers
+#     (``api.routers.runs.logger``, the idempotency store logger, ...) cache a
+#     bound logger that holds the processor LIST current at first use.
+# Separately, fixtures such as ``tests._wp15_logging._structlog_unfiltered``
+# restore the structlog config captured BEFORE the lifespan (a different list).
+# ``capture_logs`` mutates the *currently configured* list in place, so loggers
+# cached against the older list are invisible to it: ``capture_logs()`` yields
+# ``[]`` and "full key never logged" style assertions pass (or fail) vacuously.
+# That is why the unit and integration suites could not share one process.
+#
+# The fix is test-side and applies to EVERY test, because the offending
+# TestClients are built by many per-file fixtures (``app``, ``idem_app``,
+# ``_make_client``...), not only by ``client_dev`` / ``app_dev_mode``:
+#   1. the lifespan's structlog config is applied UNCACHED (the CF-36 harness
+#      rule RK-12; production keeps ``cache_logger_on_first_use=True``);
+#   2. all logging / structlog state is snapshotted before and restored after
+#      the test, including ``_LOGGING_CONFIGURED`` and the uvicorn filters.
+# Production code is unchanged.
+#
+# Both halves are pinned by ``tests/integration/test_cf21a_sec_c_logging_isolation.py``,
+# which replays the leaky-lifespan-then-check sequence in a fresh interpreter.
+#
+# Not needed (WP21H-TI2-02): a post-test sweep that un-caches module-level structlog
+# proxies.  With (1) in place no proxy is ever cached under test; measured over the whole
+# unit + integration run (5324 tests, 383 of them lifespan tests) the sweep found nothing
+# to undo.  A test that itself enables ``cache_logger_on_first_use=True`` owns that choice.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _global_logging_state_isolated(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    import common.logging as clog
+
+    real_configure_structlog = clog.configure_structlog
+
+    def _configure_structlog_uncached(*args: object, **kwargs: object) -> None:
+        real_configure_structlog(*args, **kwargs)  # type: ignore[arg-type]
+        structlog.configure(cache_logger_on_first_use=False)
+
+    monkeypatch.setattr(clog, "configure_structlog", _configure_structlog_uncached)
+
+    with isolated_logging_state(registry=False):
+        yield
 
 
 # ---------------------------------------------------------------------------

@@ -23,6 +23,13 @@ import { ParamGridEditor } from "./param-grid-editor";
 import type { ParamGridRow } from "./param-grid-editor";
 import { buildResultColumns } from "./result-columns";
 import { ExitConfigErrorPanel } from "@/components/exit-config-error-panel";
+import { CostProfileSelect } from "@/components/cost-profile-select";
+import { CostProfileBadge } from "@/components/ui/cost-profile-badge";
+import {
+  costProfileField,
+  relaunchCostProfile,
+  resolveCostProfileForMode,
+} from "@/lib/cost-profile";
 import {
   classifyIdempotencyError,
   getStructuredErrorCode,
@@ -141,6 +148,8 @@ function OptimizationHistory() {
                 <span className="text-xs text-slate-500">
                   ranked by <span className="text-slate-400">{run.rankBy}</span>
                 </span>
+                {/* WP2.1b: NULL / missing costProfile reads as legacy costs */}
+                <CostProfileBadge value={run} />
               </div>
               <div className="flex items-center gap-3 text-xs text-slate-500">
                 <span>{run.symbols.join(", ")}</span>
@@ -196,6 +205,8 @@ export default function OptimizePage() {
   const [rankBy, setRankBy] = useState("sharpe_ratio");
   const [topN, setTopN] = useState(10);
   const [maxCombinations, setMaxCombinations] = useState(500);
+  // WP2.1b (SY-21-03): any registry id; "" = platform default (key omitted).
+  const [costProfile, setCostProfile] = useState("");
 
   // --- Results / phase ---
   const [phase, setPhase] = useState<PagePhase>({ kind: "idle" });
@@ -336,6 +347,7 @@ export default function OptimizePage() {
       rankBy,
       topN,
       maxCombinations,
+      ...costProfileField(resolveCostProfileForMode("optimize", costProfile)),
     });
 
     if (result.ok) {
@@ -367,6 +379,10 @@ export default function OptimizePage() {
       initialCapital,
       backtestStart: startIso,
       backtestEnd: endIso,
+      // WP2.1b: price the launched backtest like the optimization (registry
+      // profiles, including the default id and explicit legacy_* ids, are
+      // pinned; inferred / invalid / unknown fall back to the platform default).
+      ...costProfileField(relaunchCostProfile(phase.data)),
     };
 
     try {
@@ -627,6 +643,17 @@ export default function OptimizePage() {
           </div>
         </div>
 
+        {/* WP2.1b: cost profile applied to every combination */}
+        <div className="card space-y-3 p-4">
+          <h2 className="text-sm font-semibold text-slate-700 dark:text-slate-300">Cost Model</h2>
+          <CostProfileSelect
+            mode="optimize"
+            value={costProfile}
+            onChange={setCostProfile}
+            id="optimize-cost-profile"
+          />
+        </div>
+
         {/* Error banner — WP1.3a (CF-13a-1 item 2): structured 422 first */}
         {phase.kind === "error" && (
           <ExitConfigErrorPanel
@@ -684,6 +711,10 @@ export default function OptimizePage() {
               <span className="text-slate-600">·</span>
               <span className="text-slate-400">
                 Elapsed: <span className="text-slate-800 dark:text-slate-200">{phase.data.elapsedSeconds}s</span>
+              </span>
+              <span className="text-slate-600">·</span>
+              <span className="text-slate-400">
+                Costs: <CostProfileBadge value={phase.data} />
               </span>
               {/* Link to saved detail page — only shown when the backend has persisted the run */}
               {phase.data.optimizationRunId && (

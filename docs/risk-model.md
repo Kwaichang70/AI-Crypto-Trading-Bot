@@ -30,10 +30,8 @@ class RiskParameters:
     max_drawdown_pct: float = 0.30           # block BUYs at drawdown >= 30% (paper/backtest);
                                              # LIVE runs use 0.20 via live_risk_parameters() (R-02)
 
-    # Fee / slippage model
-    taker_fee_pct: float = 0.001             # 0.10% taker fee
-    maker_fee_pct: float = 0.0005            # 0.05% maker fee
-    slippage_bps: int = 5                    # 5 basis points slippage
+    # Fees and slippage are NOT risk limits (WP2.1): they live in
+    # trading.costs.CostProfile, one per run -- see "Fee Model" below.
 
     # Cooldown
     cooldown_after_loss_streak: int = 3      # bars to pause after streak
@@ -272,8 +270,12 @@ drawdown starts at 0.
 
 ### Backtests
 
-Off by default (`BacktestRunner(enable_circuit_breaker=False)`); WP2.1 turns
-it on by default with a re-baseline.
+On by default since WP2.1c (`BacktestRunner` and `ParameterOptimizer`
+`enable_circuit_breaker=True`; closes CF-26): a backtest has the same circuit breaker as a
+paper run. `enable_circuit_breaker=False` (research scripts: `--no-circuit-breaker`) reproduces the
+earlier no-breaker numbers; there is no API toggle. The setting is stored as
+`engine_semantics.backtest_circuit_breaker` (`true` from 2.1c, `false` on runs created by
+2.1a / 2.1b, absent on paper and live).
 
 ### Observability
 
@@ -428,21 +430,49 @@ risk manager only read `risk_snapshot()` (pure).
 
 ## Fee Model
 
-### Fee Parameters
+### One cost model for every mode (WP2.1)
 
-| Parameter       | Default | Description                            |
-|-----------------|---------|----------------------------------------|
-| `taker_fee_pct` | 0.001   | Taker fee as fraction (0.1%)           |
-| `maker_fee_pct` | 0.0005  | Maker fee as fraction (0.05%)          |
-| `slippage_bps`  | 5       | Slippage in basis points (0.05%)       |
+Fees and slippage are described by ONE frozen, Decimal-only `CostProfile`
+(`packages/trading/costs.py`) per run. `RiskParameters` carries **no** cost
+field, so backtest, paper and live cannot disagree about costs.
+
+- **Default:** `DEFAULT_COST_PROFILE_ID` in `packages/trading/costs.py`. It is a
+  reviewed code constant. No environment variable selects it: a
+  `DEFAULT_COST_PROFILE` (or any `*COST_PROFILE*`) variable is ignored and the
+  API logs one `cost_profile.env_ignored` warning with the variable *name* only.
+  Switching the default, for instance after the operator's fee-tier check
+  (deploy runbook, G-LIVE L-21), is a one-line reviewed change.
+- **Registry (append-only; the numbers of an existing id never change):**
+
+| id | maker bps | taker bps | slippage bps | class |
+|---|---|---|---|---|
+| `coinbase_advanced_1` | 60 | 120 | 10 | live-equivalent |
+| `coinbase_advanced_d6` | 40 | 60 | 10 | live-equivalent |
+| `coinbase_stress_t80` / `coinbase_stress_t100` | 40 | 80 / 100 | 10 | stress (sensitivity only) |
+| `frictionless_diagnostic` | 0 | 0 | 0 | diagnostic (gross edge) |
+| `legacy_backtest_v0` | 10 | 15 | 5 | legacy (reproduces pre-WP2.1 backtests) |
+| `legacy_runtime_v0` | 40 | 60 | 5 | legacy (reproduces pre-WP2.1 paper runs) |
+
+- **Per mode:** a backtest or optimization run accepts any registry id
+  (`costProfile` in the request); a paper run only live-equivalent ids; a live
+  run accepts none. The profile is frozen in `RunORM.config["cost_profile"]`
+  (next to `config["engine_semantics"]`) when the run is created. Promote to
+  live overwrites it with the default; auto-retry copies it; resume and boot
+  recovery only read it. A run without the key is a *legacy-cost* run (it
+  resolves to a legacy profile and is hidden from the default leaderboard).
+- **Live:** the ledger always uses the exchange's real fees. The profile is an
+  estimate for the exit-cost floor, the stop-cost log and two log-only drift
+  warnings: `cost_profile.tier_mismatch` (market taker vs profile, at start)
+  and `cost_profile.fill_fee_drift` (a real fill's fee more than 5 bps off).
 
 ### Fee Calculation
 
-Fees are calculated per fill in the execution engine:
+Fees are calculated per fill in the execution engine from the profile
+(`fee_rate = bps / 10_000`, exact Decimal):
 
 ```
-MARKET orders: fee = quantity * fill_price * taker_fee_pct
-LIMIT orders:  fee = quantity * fill_price * maker_fee_pct
+MARKET orders: fee = quantity * fill_price * profile.fee_rate("taker")
+LIMIT orders:  fee = quantity * fill_price * profile.fee_rate("maker")
 ```
 
 ### Slippage Model
@@ -450,11 +480,25 @@ LIMIT orders:  fee = quantity * fill_price * maker_fee_pct
 Slippage is applied to MARKET orders only:
 
 ```
-BUY:  fill_price = last_price * (1 + slippage_bps / 10000)
-SELL: fill_price = last_price * (1 - slippage_bps / 10000)
+BUY:  fill_price = last_price * (1 + profile.slippage_bps / 10000)
+SELL: fill_price = last_price * (1 - profile.slippage_bps / 10000)
 ```
 
 This models the spread between the quoted price and the actual execution price.
+
+### Exit-cost floor and the all-in bracket basis
+
+The WP1.3a entry-cost floor (E6/E7) is `c_side = taker fee + slippage` of the
+profile (a fixed stop-loss or take-profit at or below it is rejected). The
+API validates at the stricter of the default profile and the run's own profile;
+the engines and a resume use the run's own profile, so no existing run becomes
+un-resumable.
+
+Bracket levels sit on the *all-in* (fee-inclusive) entry basis (WP1.3b), so a
+higher taker fee pulls every stop closer to the market: a stop at fraction `d`
+below the basis is only about `d - c_side` below the entry close. This is a
+cost mechanism, not a bug; a re-baseline therefore includes earlier stop-outs,
+not only fee drag.
 
 ### All-In Cost Basis
 

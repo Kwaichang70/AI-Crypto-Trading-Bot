@@ -19,7 +19,7 @@ import os
 import statistics as _statistics_stdlib  # avoid shadowing trading._statistics
 import tempfile
 import uuid
-from typing import Any
+from typing import Any, NamedTuple
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -27,11 +27,27 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.db import get_db
 from api.schemas import ModelVersionListResponse, ModelVersionResponse
+from trading.costs import CostProfile, default_cost_profile
+from trading.safety import BACKTEST_CIRCUIT_BREAKER_DEFAULT
 
 __all__ = ["router"]
 
 router = APIRouter(prefix="/ml", tags=["ml"])
 logger = structlog.get_logger(__name__)
+
+
+class _TrainedModel(NamedTuple):
+    """What ``_train_model_with_wf_sync`` hands back (WP2.1-H, CF-21a-02).
+
+    ``result`` is the JSON-able training / walk-forward dict that becomes the HTTP
+    response.  ``cost_profile`` is the :class:`CostProfile` object every fold
+    backtest ran under, kept OUT of that dict so the response shape cannot change;
+    ``train_model`` records it in ``ModelVersionORM.extra["cost_profile"]``.  Both
+    fields are required: a result without the profile cannot be constructed.
+    """
+
+    result: dict[str, Any]
+    cost_profile: CostProfile
 
 
 # ---------------------------------------------------------------------------
@@ -110,7 +126,7 @@ async def train_model(
     settings = get_settings()
 
     try:
-        result: dict[str, Any] = await asyncio.to_thread(
+        trained: _TrainedModel = await asyncio.to_thread(
             _train_model_with_wf_sync,
             symbol=symbol,
             exchange=exchange,
@@ -140,6 +156,10 @@ async def train_model(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Training failed: {exc}",
         ) from exc
+
+    # WP2.1-H (CF-21a-02): ``trained.cost_profile`` is the object the walk-forward gate
+    # ran under; it is not part of the response (not JSON), only ``trained.result`` is.
+    result: dict[str, Any] = trained.result
 
     # Persist model version to database
     from datetime import UTC, datetime as _dt
@@ -191,6 +211,12 @@ async def train_model(
         "fold_sharpes": result.get("walk_forward_fold_sharpes", []),
         "worst_fold_drawdown": result.get("walk_forward_worst_fold_drawdown"),
     }
+    # WP2.1: the cost model the walk-forward gate was run under (the platform
+    # default); a model without this key was gated under the legacy 60/40 + 5 bps.
+    # WP2.1-H (CF-21a-02): record the profile the gate ACTUALLY trained with (handed
+    # back by ``_train_model_with_wf_sync``), not a second ``default_cost_profile()``
+    # read.  It never enters ``result``, so the HTTP response keeps its shape.
+    existing_extra["cost_profile"] = trained.cost_profile.to_metadata()
     model_version.extra = existing_extra
     # The typed column now stores the MEDIAN REALIZED OOS trading Sharpe across
     # walk-forward folds (Cycle 6). Column name unchanged for backward compat.
@@ -279,7 +305,7 @@ def _train_model_with_wf_sync(
     threshold: float,
     num_wf_folds: int = 5,
     min_trades_per_fold: int = 20,
-) -> dict[str, Any]:
+) -> _TrainedModel:
     """Synchronous training pipeline with REAL walk-forward OOS Sharpe (Cycle 6).
 
     Extends ``_train_model_sync`` to additionally run ``WalkForwardValidator``
@@ -290,8 +316,8 @@ def _train_model_with_wf_sync(
     2. A ``ModelStrategy`` loads that fold model and is run through a real
        ``BacktestRunner`` mini-backtest over ``train_tail[-200:] + test_bars``.
     3. The backtest computes a REALIZED out-of-sample trading Sharpe over the
-       test (OOS) window only, net of Coinbase 60/40 bps fees + the Sprint-42
-       slippage default, with fixed-fractional sizing (A1 — no ATR plumb-through).
+       test (OOS) window only, net of the platform default CostProfile fees and
+       slippage (WP2.1), with fixed-fractional sizing (A1 — no ATR plumb-through).
 
     The MEDIAN realized OOS Sharpe across folds is the canonical gate value
     persisted to ``ModelVersionORM.walk_forward_oos_skill_score`` (column name
@@ -320,6 +346,13 @@ def _train_model_with_wf_sync(
         walk_forward_status="insufficient_samples".  WARNING: at
         prediction_threshold=0.60 over ~120-bar OOS folds this is likely
         unreachable — see reports/sprint50-cycle6-oos-backtest-producer.md §7.2.
+
+    Returns
+    -------
+    _TrainedModel
+        ``result``: the training / walk-forward dict (the HTTP response body).
+        ``cost_profile`` (WP2.1-H, CF-21a-02): the :class:`CostProfile` object every
+        fold backtest ran under (the platform default), for ``train_model`` to record.
     """
     import ccxt
     import pandas as pd
@@ -332,6 +365,10 @@ def _train_model_with_wf_sync(
     from trading.backtest import BacktestRunner
     from trading.strategies.model_strategy import ModelStrategy
     from trading.walk_forward import WalkForwardValidator
+
+    # WP2.1-H (CF-21a-02): read the platform default ONCE; every fold backtest below
+    # runs under this object and the same object is handed back for the caller to record.
+    trained_profile = default_cost_profile()
 
     # 1. Fetch candles via synchronous ccxt
     exchange_cls = getattr(ccxt, exchange, None)
@@ -467,17 +504,21 @@ def _train_model_with_wf_sync(
                     },
                 )
 
-                # 4d. Run the real mini-backtest. Coinbase taker/maker 60/40 bps,
-                # Sprint-42 default slippage (BacktestRunner default slippage_bps=5),
+                # 4d. Run the real mini-backtest under the platform DEFAULT cost
+                # profile (WP2.1, X-13: stricter than the old 60/40 bps + 5 bps
+                # slippage; the profile is recorded in ModelVersionORM.extra),
                 # fixed-fractional sizing (A1 — no ATR risk_params), seed=42.
+                # WP2.1c (SY-21-13): gated with the breaker, as paper/live run; not
+                # monotonically stricter (the breaker can lower worst-fold drawdown).
+                # A model gated before 2.1c was gated without it.
                 runner = BacktestRunner(
                     strategies=[strat],
                     symbols=[symbol],
                     timeframe=tf_enum,
                     initial_capital=_Decimal("10000"),
-                    taker_fee_bps=60,
-                    maker_fee_bps=40,
                     seed=42,
+                    cost_profile=trained_profile,
+                    enable_circuit_breaker=BACKTEST_CIRCUIT_BREAKER_DEFAULT,
                 )
 
                 # OOS window starts where the test bars begin within bt_series.
@@ -563,7 +604,7 @@ def _train_model_with_wf_sync(
         "ml.walk_forward_realized_oos_sharpe",
         msg=(
             "OOS gate now uses a REALIZED trading Sharpe over the OOS window "
-            "(net Coinbase 60/40 fees + Sprint-42 slippage), replacing the "
+            "(net of the default CostProfile fees + slippage, WP2.1), replacing the "
             "Cycle-5 directional z-score proxy."
         ),
         oos_sharpe_median=oos_sharpe_median,
@@ -572,7 +613,7 @@ def _train_model_with_wf_sync(
         num_folds=len(fold_sharpes),
     )
 
-    return {
+    training_result: dict[str, Any] = {
         "status": "completed",
         "symbol": symbol,
         "exchange": exchange,
@@ -593,6 +634,7 @@ def _train_model_with_wf_sync(
         "walk_forward_status": "insufficient_samples" if insufficient_samples else "ok",
         "walk_forward_folds_below_threshold": folds_below_threshold,
     }
+    return _TrainedModel(result=training_result, cost_profile=trained_profile)
 
 
 # ---------------------------------------------------------------------------
@@ -737,8 +779,8 @@ async def activate_model_version(
 
     Sprint 50 Cycle 6: checks the walk-forward REALIZED OOS Sharpe gate before
     activation.  The gate value is the MEDIAN realized out-of-sample trading
-    Sharpe across walk-forward folds (net Coinbase 60/40 fees + Sprint-42
-    slippage), with a worst-fold floor and a per-fold max-drawdown floor (B1).
+    Sharpe across walk-forward folds (net of the platform default CostProfile
+    fees and slippage, WP2.1), with a worst-fold floor and a per-fold max-drawdown floor (B1).
     If the model's OOS Sharpe is below ``min_oos_skill_score`` (or a fold's
     drawdown exceeds ``max_fold_drawdown``) the endpoint returns HTTP 422 with
     ``oos_gate_failed``.  Legacy models tagged ``metric_type=directional_zscore_proxy``

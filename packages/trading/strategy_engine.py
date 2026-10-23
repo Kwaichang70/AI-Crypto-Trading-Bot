@@ -72,10 +72,12 @@ from trading.bracket_exit import (
     open_lot_fills,
     window_is_contiguous,
 )
+from trading.costs import CostProfile, default_cost_profile
 from trading.execution import BaseExecutionEngine
 from trading.exit_config import (
     EXIT_CHECK_INTERVAL_MAX_S,
     EXIT_CHECK_INTERVAL_MIN_S,
+    EXIT_SEMANTICS_VERSION,
     ExitCostModel,
     parse_exit_config,
     require_exit_manager,
@@ -476,6 +478,7 @@ class StrategyEngine:
         config: dict[str, Any] | None = None,
         circuit_breaker: CircuitBreaker | None = None,
         protective_mode: bool = False,
+        cost_profile: CostProfile | None = None,
     ) -> None:
         if not strategies:
             raise ValueError("At least one strategy is required")
@@ -609,9 +612,19 @@ class StrategyEngine:
             )
             if k in self._config
         }
+        # WP2.1 (SY-21-05): the engine parses at the run's OWN cost profile
+        # (``None`` -> the current default; mock-safe, no risk_manager.params
+        # read), so a resumed legacy run is judged against its legacy costs.
+        self._cost_profile: CostProfile = (
+            cost_profile if cost_profile is not None else default_cost_profile()
+        )
+        self._exit_cost_model: ExitCostModel = ExitCostModel.from_cost_profile(
+            self._cost_profile
+        )
         _exit_cfg = parse_exit_config(
             bracket=_bracket_raw,
             trailing_stop_pct=self._config.get("trailing_stop_pct"),
+            cost=self._exit_cost_model,
         )
         if not exit_config_waived:
             require_exit_manager(self._strategies, _exit_cfg)
@@ -644,8 +657,8 @@ class StrategyEngine:
 
         # WP1.3b-a: lot / anchor bookkeeping (all in memory; rebuilt on resume).
         self._tf_s: int = _TIMEFRAME_SECONDS.get(timeframe, 60)
-        # Same default cost model the exit-config validator uses (SY-13a-01).
-        self._exit_cost_model: ExitCostModel = ExitCostModel.from_risk_parameters()
+        # ``self._exit_cost_model`` (stop-cost log basis) is built above from the
+        # run's cost profile, the same model the exit-config parse used.
         # symbol -> facts of the open lot (opening order, its fills, LotEntry).
         self._lots: dict[str, _EngineLot] = {}
         # BACKTEST only: opening-order id -> open time of the bar that was being
@@ -798,6 +811,11 @@ class StrategyEngine:
         return self._risk_manager
 
     @property
+    def cost_profile(self) -> CostProfile:
+        """The run's cost profile (exit-cost floor / stop-cost log basis)."""
+        return self._cost_profile
+
+    @property
     def circuit_breaker(self) -> CircuitBreaker | None:
         """The circuit breaker instance, or None if not configured."""
         return self._circuit_breaker
@@ -892,7 +910,13 @@ class StrategyEngine:
             # WP1.3b-a (SY-13b-16, D-13b-04): runs started from this commit on
             # use anchored exit semantics; older runs are "legacy" (their
             # baselines are re-run in WP2.8).
-            self._log.info("engine.exit_semantics", version="wp13b-1")
+            self._log.info("engine.exit_semantics", version=EXIT_SEMANTICS_VERSION)
+            # WP2.1: which cost profile this run is priced / floored with.
+            self._log.info(
+                "engine.cost_profile",
+                id=self._cost_profile.id,
+                fingerprint=self._cost_profile.fingerprint(),
+            )
 
         except Exception:
             self._state = EngineState.ERROR

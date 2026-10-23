@@ -2,9 +2,10 @@
 
 **Audience:** Operator merging and deploying the Phase-1 minimum-set branch to the Hetzner/Tailscale production stack (`/opt/trading-bot`).
 
-**Scope:** two releases of branch `claude-session-20260924-vp2-fase1-minimumset-xsoezy`.
+**Scope:** three releases of branch `claude-session-20260924-vp2-fase1-minimumset-xsoezy`.
 - **Release 1 (sections 1 to 9):** WP1.0, WP1.1, WP1.2, WP1.8a/b, WP1.4/1.4b, WP1.11a, WP1.7a/b, WP1.3a, WP7.0 and WP-SMOKE (16 commits, last commit `3db9148`). Merged to `origin/main` by pull request #2 (merge commit `ea0d41b`). These ship as **one deploy** (see section 1).
 - **Release 2 (section 10):** WP1.5a, WP1.5b, WP1.6, WP1.3b-a and WP1.3b-b (`6511af1`, `206eb12`, `bf2b27f`, `d7a9956`, `dc8cf83`) plus CF-36 log hygiene (cf36a `6047162`; cf36b with cf36b-fix, the commit that adds section 5.10 to this file), on top of `origin/main` `ea0d41b`. **No migration, no Caddy change, no UI change.** CF-36 is required for G-LIVE L-19. Release 2 is recommended, not minimum-set (`Documentation/Verbeterplan-v2-2026-09.md`, "Aanbevolen erbij: 1.3b, 1.5, 1.6").
+- **Release 3 (section 11):** WP2.1a, WP2.1b, WP2.1c and WP2.1-H (`60d7eaf` to `a7ae1bf`, fourteen commits), on top of `origin/main` `d36984e` (pull request #3). **One migration (020) and a ui image change; no compose, Caddy or environment change.** The WP2.1c re-baseline (CF-26) is still pending, and nothing in this file reports its result.
 
 **This runbook does not enable live trading.** `ENABLE_LIVE_TRADING` stays `false` throughout; the only exception is the rollback alternative RB-2 step 3 (section 6.2), on the new image only. The live restart (herstart-protocol) and the EUR mechanics test are separate procedures; section 8 defines the hand-off to `docs/runbooks/smoke-roundtrip-mechanics-test.md`. For Release 2, section 10.9 (G-LIVE) lists what must hold before any live restart.
 
@@ -76,7 +77,7 @@ hdrs() {  # usage: curl ... -H @<(hdrs api admin live)   (always inline; never s
 
 | Area | Change | Source of truth |
 |---|---|---|
-| Migrations | Release 1 adds **017** (`orphaned`/`resuming` run status, 4 audit event types), **018** (`kill_switch_state`, per-run `entries_latch_*`, 3 audit event types), **019** (`idempotency_keys`). Before pull request #2 the `origin/main` head was **016**; the head is now **019**, and Release 2 adds no migration (section 10.2). 018 to 019 is the WP7.0 migration. | `infra/alembic/versions/017_*.py`, `018_*.py`, `019_*.py` |
+| Migrations | Release 1 adds **017** (`orphaned`/`resuming` run status, 4 audit event types), **018** (`kill_switch_state`, per-run `entries_latch_*`, 3 audit event types), **019** (`idempotency_keys`). Before pull request #2 the `origin/main` head was **016**; the head was **019** after Release 1, and Release 2 adds no migration (section 10.2). Release 3 adds **020** (section 11.2); on the Release 3 tree read every `019 (head)` expectation below as `020 (head)`. 018 to 019 is the WP7.0 migration. | `infra/alembic/versions/017_*.py`, `018_*.py`, `019_*.py` |
 | Compose | `ADMIN_API_KEY` (api) and `INTERNAL_ADMIN_API_KEY` (ui) become **required** (`:?`). On `origin/main` neither reached its container. | `infra/docker-compose.yml` |
 | Caddy | New `handle /api/admin/*` to `ui:3000`, ordered before `handle /api/*`. `request_body { max_size 1MB }` on `/api/auth/*`, `/api/admin/*` and `/api/*`. The catch-all `handle` is not capped. | `infra/Caddyfile` |
 | API settings | New optional settings with defaults, not wired through compose: `MAX_REQUEST_BODY_BYTES` (1 MiB), `IDEMPOTENCY_KEY_TTL_HOURS` (24), `IDEMPOTENCY_STALE_AFTER_SECONDS` (240). No `.env` change needed. | `apps/api/config.py` |
@@ -102,7 +103,7 @@ Do not deploy if any of these is true:
 7. The `ENABLE_LIVE_TRADING` value that will be deployed is not `false`.
 8. A long-running transaction is open on the database at migration time (section 4.3). Never raise the migration `lock_timeout` (5 s) to get past it.
 
-Release 2 adds NO-GO 9 to 13 (section 10.4): the DS-1 precheck, the NaN equity-row check, the `LIVE_EXIT_CHECK_INTERVAL_S` value, the image content check and the schema revision.
+Release 2 adds NO-GO 9 to 13 (section 10.4): the DS-1 precheck, the NaN equity-row check, the `LIVE_EXIT_CHECK_INTERVAL_S` value, the image content check and the schema revision. Release 3 adds NO-GO 14 to 16 (section 11.4): the starting state, the image content and the rollback images.
 
 ---
 
@@ -603,6 +604,8 @@ Next procedure: `docs/runbooks/smoke-roundtrip-mechanics-test.md`.
 
 **Release 2 hand-off:** after Release 2 the same table applies (schema `019 (head)`, live off, no live run, kill switch unlatched). In addition, the G-LIVE checklist of section 10.9 stays open until the operator has recorded every row.
 
+**Release 3 hand-off:** after Release 3 the same table applies with schema `020 (head)` (live off, no live run, kill switch unlatched). The G-LIVE checklist stays open, and row L-21 (the fee-tier check, section 11.7 V3-7) gates the first live run on a WP2.1 image.
+
 **Still open before any live restart (outside both runbooks):** herstart-protocol steps in `Documentation/Verbeterplan-v2-2026-09.md` (integration gate on the merged commit, EUR mechanics test, two weeks of shadow paper, Phase-2 revalidation), the operator decision on residual risks in section 7, and the WP1.4b item "operator confirms Coinbase accepts the 49-character client order id".
 
 ---
@@ -617,7 +620,7 @@ Not verified (no Docker daemon, no exchange or server access in the authoring se
 
 - The `env_set` and `hdrs` helpers, the fail-closed window blocks, the §3.2 `if` block and RB-2 steps 3-4 have not been executed (CF-DOC-06); the first real use is the verification.
 
-Release 2 (section 10) has its own list of unverified items in section 10.11.
+Release 2 (section 10) has its own list of unverified items in section 10.11, and Release 3 (section 11) in section 11.11.
 
 Defects still open in existing documents (outside the scope of this file):
 - The catch-all Caddy `handle` has no `request_body` cap (carry-forward CF-13a-13/14).
@@ -648,7 +651,7 @@ This revision adds one section (this one), corrects six statements elsewhere tha
 | `.env.example` | `LIVE_EXIT_CHECK_INTERVAL_S=300` with a comment. | `.env.example:193` |
 | API setting | `live_exit_check_interval_s`, default `300`: `0` (off) or an integer `60..3600`. Anything else (`59`, `3601`, `-1`, `abc`, `1.5`, `true`, empty string) fails Settings validation, so the api would not start with such a value in its environment. Effective only for a **live** run whose timeframe is longer than the interval and that has a stop-loss or trailing stop; always off for paper, backtest and `smoke_roundtrip`. | `apps/api/config.py` (`Settings.live_exit_check_interval_s`, `validate_live_exit_check_interval`); `packages/trading/exit_config.py` (`resolve_exit_check_interval`) |
 | API surface | `GET /api/v1/runs/{id}/circuit-breaker` returns the typed breaker state (`level`, `evaluations`, `restart_watch`, `thresholds`, `inputs`, ...). `POST /api/v1/runs/{id}/circuit-breaker/reset` always returns `410`. The UI does not call either (no `circuit-breaker` string under `apps/ui`). | `apps/api/routers/circuit_breaker.py:60-79` |
-| Grafana | `trading-cb-halt` annotation text only; the rule expression (`max(trading_circuit_breaker_state)`, threshold 2.5) is unchanged. | `infra/grafana/provisioning/alerting/trading-alerts.yml` |
+| Grafana | `trading-cb-halt` annotation text only; the rule expression (`max(trading_circuit_breaker_state)`, threshold 2.5) is unchanged. **Current state (Release 3):** this row describes Release 2 as deployed. Since WP2.1c-delta (`b9bbfb8`) the expression is `max(trading_circuit_breaker_state{run_id!~"bt-.*"})`, and `trading-kill-switch` and `trading-high-drawdown` carry the same matcher; the threshold is still 2.5 (section 11.2, Grafana row; `circuit-breaker-halt.md` section 2b). | `infra/grafana/provisioning/alerting/trading-alerts.yml` |
 | Metrics | New counters appear on `/metrics` as `trading_<name>` (unmapped names get the `trading_` prefix), for example `trading_intrabar_exit_checks_total`. A counter series exists only after its first increment. **No Grafana rule exists for any of them** (the file has four rules: `trading-cb-halt`, `trading-kill-switch`, `trading-high-drawdown`, `trading-api-down`). | `apps/api/prometheus.py` (`_collect_counters`); `packages/common/metrics.py:193,236` |
 | Not changed | `infra/Dockerfile.api`, `infra/Dockerfile.ui`, `infra/docker-entrypoint.sh`, `infra/Caddyfile`, `apps/ui`, `scripts/`. `git diff --stat origin/main..HEAD -- infra apps/ui scripts` lists only `docker-compose.yml` and `trading-alerts.yml`. | `git diff` |
 | Docs | `circuit-breaker-halt-auto-stop.md` is replaced by `circuit-breaker-halt.md` (HALT no longer stops the run). After a rollback to Release 1 code, the old runbook is `git show origin/main:docs/runbooks/circuit-breaker-halt-auto-stop.md`. Section 5.10 (CF-36) is new, and `smoke-roundtrip-mechanics-test.md` §4c step 0 now re-runs the CF-36 self-check on the live config. | `git diff --name-status` |
@@ -860,6 +863,8 @@ Log events worth an alert in addition to those in section 7 (all present in the 
 
 Source: the consolidated list L-1 to L-20 in `reports/vp2-wp1.3b/final-synthesis-1.3b-b.md` section 12, which supersedes 1.5b F.3, WP1.6 R3-7 and 1.3b-a R2-5 for an image that contains WP1.3b. **All rows must hold, or be recorded where the table allows it, before the live restart.** Release 2 itself is deployed with live off; this checklist does not gate that deploy except for the rows in table A.
 
+**L-21 (WP2.1, Release 3 images only)** is the one-time fee-tier check: the default cost profile (`DEFAULT_COST_PROFILE_ID` in `packages/trading/costs.py`) assumes a Coinbase tier, and L-21 compares it with the account's real tier before the first live run on a WP2.1 image. Block L-21 is in 10.9.4; the 2.1 spec is `reports/vp2-wp2.1/synthesis-spec.md` section 8.
+
 Gate in words: `6511af1`, `206eb12`, `bf2b27f` and `d7a9956` are in the image, and so are `6047162` (cf36a) and cf36b with cf36b-fix (L-19); if intra-bar exits are wanted, `dc8cf83` is too (1.3b-b without 1.3b-a, or without its fix patch, is not allowed); the acceptance reports are green (1.5b F.5, WP1.6 R3-5, 1.3b-a ACCEPT 13/13, 1.3b-b ACCEPT 13/13); L-1 to L-20 below are satisfied. 1.3b is recommended, not minimum-set: an image without 1.3b-b runs bar-close-only exits, and W8 says so.
 
 Commands containing a pipe are in the numbered blocks of 10.9.4 (`Block L-n`), not in the table cells. Everything marked read-only changes nothing. Define `API_BASE="https://<FQDN>/api/v1"` and, for a live run, `RUN=<id>`.
@@ -885,6 +890,7 @@ Commands containing a pipe are in the numbered blocks of 10.9.4 (`Block L-n`), n
 | L-17 | Operator rules recorded: (a) D12, no backtest or optimizer on the live API process while live holds positions; (b) live stops are bid-touch with a 10 s confirm, the validated backtest is close-based; (c) TP is bar-close only; (d) flatten during an intra-bar exit can return `lock_timeout`: re-read positions, retry, do not sell by hand while a bot SELL is open; (e) a stop or shutdown can wait up to 15 s: keep `stop_grace_period: 30s` | `grep -n 'stop_grace_period' "$DEPLOY_DIR/infra/docker-compose.yml"` (read-only) | Rules (a) to (e) recorded in the deploy log; the first `stop_grace_period` (api) is `30s` | WP1.3b-a, WP1.3b-b |
 | L-18 | Trailing-gap seed: CF-13b-20 is in the image; record that a resume can take up to 40 s per held trailing symbol before the loop starts | Block L-1 (markers) plus a recorded note | 1.3b-b in the image, or acceptance of `seed_partial` for downtimes above 300 bars recorded | WP1.3b-b (CF-13b-20) |
 | L-19 | Log hygiene: CF-36 (a)+(b+)+(e) and CF-A are in the image and hold ((b+) includes `ccxt_retry.retrying`, `ccxt_retry.exhausted`, `live.ticker_fetch_failed`, `live.invalid_ticker_price`; (e) is `engine.warmup_fetch_failed`). With intra-bar enabled the four (b) sites are a prerequisite because ticks reach them every interval | Section 5.10 steps 1, 2 and 2b (R2-8); then the step-2 repeat on the live config when the flag is switched on (smoke §4c step 0, or the equivalent step of the live-restart procedure), before the first live order | Step 1 exit 0, commit and count recorded; `CF36 log hygiene: PASS` on the paper config and again on the live config; `CF36B_MARKERS_OK`; L-8 counters at 0 or each hit explained | CF-36 (cf36a `6047162`; cf36b with cf36b-fix; raised by WP1.6, 1.3b-a, 1.3b-b) |
+| L-21 | Coinbase fee tier (WP2.1, U-1): one read-only check that the account's real spot fee tier matches `DEFAULT_COST_PROFILE_ID` | Block L-21 (read-only, no order, no secret printed) | `FEE_TIER: DEFAULT CONFIRMED`; the four `market … taker=` values equal `fee_tier.taker_fee_rate`; `has_promo_fee: False`. Any other result: §8.4 | WP2.1 |
 
 #### 10.9.3 Table C: at and after the live restart (observed, not gating the Release 2 deploy)
 
@@ -1051,6 +1057,102 @@ Expected: `exchange=coinbase` (the compose default is `binance`; a different exc
 
 **Block L-19.** No separate block: section 5.10 is the procedure (steps 1, 2 and 2b, the L-8 counters), and smoke §4c step 0 runs the live-config repeat. The former informational grep (`error=str(exc)` / `ticker=ticker`) is retired: after cf36b it still lists `live.fill_parse_failed` and `live.reconciliation_transition_failed`, which stay on layer 1 by design and are not a failure.
 
+**Block L-21 (WP2.1, G-LIVE L-21; read-only; no order, no secret printed).** Prerequisite: the Coinbase API key is present in the api container's environment (smoke O-1). Without credentials, ccxt reports its hardcoded "Advanced 1" rate (taker 0.012) for every EUR market, so `markets[...]['taker']` alone proves nothing. (ccxt's stable pairs use 0.00001/0.) Do **not** use `fetch_trading_fees()`: ccxt 4.5.40 swaps maker and taker in its result. The script reads the raw `transaction_summary` response instead. The block refuses every non-GET request at ccxt's single HTTP choke point (`Exchange.fetch`), so it cannot place, cancel or transfer anything even with the trade-enabled container key.
+
+```bash
+$DC exec -T api python - <<'PY'
+from api.config import get_settings as _gs, register_settings_secrets as _rs
+from common.logging import configure_logging as _cl
+_cl(log_level="INFO", json_output=False, service_name="glive-l21")  # CF-36 layer 1 on
+_rs(_gs())
+import asyncio
+from api.services.run_orchestrator import build_live_ccxt_exchange
+
+SYMBOLS = ["XRP/EUR", "BTC/EUR", "ETH/EUR", "SOL/EUR"]   # edit: the live run's symbols
+
+
+async def main() -> None:
+    ex = None
+    try:
+        s = _gs()
+        print("exchange_id:", s.exchange_id)
+        ex = build_live_ccxt_exchange(s)
+        _orig_fetch = ex.fetch
+
+        async def _get_only(url, method="GET", headers=None, body=None):
+            # read-only guard: every ccxt REST call passes through Exchange.fetch;
+            # any non-GET (order, cancel, edit, transfer, withdraw) raises before any I/O
+            if str(method).upper() != "GET":
+                raise PermissionError("L-21 is read-only")
+            return await _orig_fetch(url, method, headers, body)
+
+        ex.fetch = _get_only
+        await ex.load_markets()
+        for sym in SYMBOLS:
+            m = ex.market(sym)
+            print(f"market {sym}: taker={m.get('taker')} maker={m.get('maker')}")
+        raw = await ex.v3PrivateGetBrokerageTransactionSummary({"product_type": "SPOT"})
+        tier = (raw or {}).get("fee_tier") or {}
+        promo = (raw or {}).get("has_promo_fee")
+        print("fee_tier.pricing_tier  :", tier.get("pricing_tier"))
+        print("fee_tier.taker_fee_rate:", tier.get("taker_fee_rate"))
+        print("fee_tier.maker_fee_rate:", tier.get("maker_fee_rate"))
+        print("fee_tier.usd_from/to   :", tier.get("usd_from"), "/", tier.get("usd_to"))
+        print("has_promo_fee:", promo)
+        try:
+            tier_taker = float(tier.get("taker_fee_rate"))
+        except (TypeError, ValueError):
+            tier_taker = None
+        if tier_taker is None or any(ex.market(sym).get("taker") != tier_taker for sym in SYMBOLS):
+            print("FEE_TIER: MARKETS DO NOT CARRY THE TIER -- stop")
+            return
+        if promo:
+            print("FEE_TIER: PROMO -- do not switch")
+            return
+        try:
+            from trading.costs import DEFAULT_COST_PROFILE_ID, match_fee_tier
+        except ImportError:
+            print("FEE_TIER: REGISTRY NOT IN IMAGE (pre-WP2.1) -- compare by hand with the WP2.1 registry table")
+            return
+        match = match_fee_tier(tier.get("taker_fee_rate"), tier.get("maker_fee_rate"))
+        print("default profile :", DEFAULT_COST_PROFILE_ID)
+        print("matching profile:", match)
+        if match == DEFAULT_COST_PROFILE_ID:
+            print("FEE_TIER: DEFAULT CONFIRMED")
+        elif match is not None:
+            print("FEE_TIER: DIFFERS -- reviewed one-line change of DEFAULT_COST_PROFILE_ID to", match)
+        else:
+            print("FEE_TIER: NOT IN REGISTRY -- reviewed change: add a registry id, then switch the default")
+    except Exception as exc:
+        print("L-21 check failed:", type(exc).__name__)   # type only (CF-36): never the message
+    finally:
+        if ex is not None:
+            await ex.close()
+
+
+asyncio.run(main())
+PY
+```
+
+**Expected result.**
+- `exchange_id: coinbase`.
+- `FEE_TIER: DEFAULT CONFIRMED`. The block prints it only when every listed market's taker equals `fee_tier.taker_fee_rate` and `has_promo_fee` is falsy.
+- Other results:
+  - `MARKETS DO NOT CARRY THE TIER`: stop and escalate.
+  - `PROMO`: §8.4 step 4.
+  - `DIFFERS` / `NOT IN REGISTRY`: §8.4.
+  - `L-21 check failed: PermissionError`: the script attempted a non-GET request. This is a defect; stop.
+- Save the output to `~/deploy-logs/<date>/glive-l21.txt` (`umask 077`). It contains rates only, no keys.
+
+**If the tier differs (exact rule).**
+1. **Never edit `.env`, and never set an environment variable, to change the default.** `DEFAULT_COST_PROFILE` in the environment is ignored and logged as `cost_profile.env_ignored` (SY-21-02).
+2. If `FEE_TIER: DIFFERS`, open a reviewed change. Its only production edit is the one line `DEFAULT_COST_PROFILE_ID: Final[str] = "<matching id>"` in `packages/trading/costs.py`. It passes the normal chain (producer → code-critic + security → executor → testing) and ships in the next release. The per-profile goldens (WP21-T-13) need no re-pin.
+3. If `FEE_TIER: NOT IN REGISTRY`, the reviewed change **adds** a `live_equivalent` registry id with the measured rates (and its fingerprint pin in WP21-T-02), and flips the same one line. Existing ids are never edited.
+4. If `has_promo_fee: True`, do **not** switch. Record the rates and re-run L-21 after the promotion ends.
+5. Until a switch ships, WP2.8's go/no-go is judged at **both** the current default and the measured tier.
+6. Already-persisted runs keep their own profiles (resume never re-resolves).
+7. Corroboration: the first real live fill logs `cost_profile.fill_fee_drift` if the fee is more than 5 bps off the profile, and smoke P3 records the effective rate.
+
 **Block L-6.**
 ```bash
 $DC logs --since 15m api 2>&1 | grep -E 'resume\.(risk_state_seeded|daily_seed_invalid|daily_state_unknown)'
@@ -1150,7 +1252,284 @@ Nothing in this section was executed against a server, a Docker daemon, a databa
 
 ---
 
-## 11. Change log
+## 11. Release 3 (WP2.1a/b/c and WP2.1-H): delta to sections 1 to 10
+
+Commits, on top of `origin/main` `d36984e` (pull request #3): `60d7eaf` (C25: `BacktestRunner` keeps all `RiskParameters` fields), `182cdf7` and `12616da` (WP2.1a: one cost model; a resume validates exits at the run's own cost profile), `926d7d2`, `0207a43`, `b8245a1`, `bbfbed1` and `4990974` (WP2.1b: optimization runs persist their cost model, UI cost labels, leaderboard filter and selectors, relaunch carry-over, migration test), `04c3d15`, `d13d454`, `83696c2` and `b9bbfb8` (WP2.1c: circuit breaker on by default in backtests, re-baseline harness, per-run alerts keep backtests out), `5e0a108` and `a7ae1bf` (WP2.1-H: hardened reads of the stored cost profile, test logging isolation). A squash merge changes these ids; the hash comparison in P3-5 then carries the proof, as in P-7.
+
+> [!IMPORTANT]
+> **The WP2.1c re-baseline (CF-26) has not run.** It needs network access to the exchange API, which is not available yet. This section reports no re-baseline numbers and does not treat CF-26 as closed. How far the new cost model and the breaker move backtest and paper results is therefore **not measured**.
+
+### 11.1 Form of this change: delta section, not integration
+
+Same form as section 10, for the same reasons: the smoke runbook and `circuit-breaker-halt.md` cite this file by section, and most Release 1 steps do not apply (no Caddy change, no compose change, no new environment variable, no new secret). The change log moves from section 11 to section 12; no document cites it (checked with `grep` over `docs/`, `infra/`, `scripts/` and `tests/`). Two differences from Release 2: Release 3 has **one migration (020)** and it changes the **ui image**.
+
+Sections 1 to 10 name `019 (head)` as the schema head. On the Release 3 tree the head is `020`: when a step of sections 4, 5, 8 or 10 is run after this deploy, read `019 (head)` as `020 (head)`.
+
+### 11.2 What changes in Release 3
+
+| Area | Change | Source of truth |
+|---|---|---|
+| Code: cost model (api image) | WP2.1a: one cost model. `trading/costs.py` holds an append-only registry of seven profiles and the default `DEFAULT_COST_PROFILE_ID` (`coinbase_advanced_1`). `RiskParameters` has no fee or slippage field. Backtest, optimizer, paper engine, ML gate, exit validation and the precheck read the run's profile. A run's profile is frozen in `runs.config["cost_profile"]` at create; promote overwrites it with the default; resume, boot and salvage resolve it and never write it. The live ledger, sizing and orders still use the exchange's real fees; the profile is an estimate there. | `packages/trading/costs.py`; `apps/api/services/cost_profiles.py`; `packages/trading/CLAUDE.md` (WP2.1a) |
+| Code: breaker default | WP2.1c: backtest, optimizer, ML gate and the research scripts run with the circuit breaker on (`BACKTEST_CIRCUIT_BREAKER_DEFAULT`, `True`). There is no API toggle (scripts: `--no-circuit-breaker`). New backtest runs and optimizations stamp `engine_semantics.backtest_circuit_breaker=true`. | `packages/trading/safety.py:539`; `packages/trading/backtest.py`; `packages/trading/optimizer.py`; `apps/api/services/cost_profiles.py` (`engine_semantics`) |
+| Code: stored-profile hardening | WP2.1-H: a stored cost profile on a paper or live run is accepted only in the cases listed in 11.9; anything else reads as invalid legacy. | `packages/trading/costs.py` (`resolve_run_cost_profile`, `_parse_persisted`); `apps/api/services/run_persistence.py` (`_loggable_fingerprint`) |
+| API surface | Run and optimization responses gain `costProfile`, `legacyCosts`, `costProfileInvalid` and `liveEquivalentCosts`; create and optimize requests accept `costProfile` (a registry id); the portfolio aggregate gains `legacyCostRunsExcluded`. | `apps/api/schemas.py`; `apps/api/routers/optimize.py`; `apps/api/routers/portfolio.py` |
+| Code: ui image | WP2.1b: cost-profile labels, the leaderboard default filter "Live-equivalent costs", per-mode profile selectors in the new-run and optimize forms, and relaunch (Launch Run, Duplicate Run) carrying the source run's registry profile. **The ui image is rebuilt and restarted** (Release 2 did not touch it). | `apps/ui/src/lib/cost-profile.ts`; `apps/ui/src/app/leaderboard/page.tsx` |
+| Migrations | **020** (`down_revision` `019`): one nullable JSONB column, `optimization_runs.run_metadata`, which holds the cost profile and `engine_semantics` of an optimization run. No default and no backfill: NULL means a legacy row. `SET LOCAL lock_timeout = '5s'`; `ADD COLUMN` takes a brief ACCESS EXCLUSIVE lock on `optimization_runs`. The api entrypoint runs `alembic upgrade head` at every start, so a new api container migrates by itself; D3-4 does it first, explicitly, so a failure is visible and the app never starts on a half-migrated schema. | `infra/alembic/versions/020_optimization_runs_run_metadata.py`; `infra/docker-entrypoint.sh` |
+| Compose, Caddy, environment | **None.** At `a7ae1bf`, `git diff --stat d36984e..HEAD` for `infra/docker-compose.yml`, `infra/Dockerfile.api`, `infra/Dockerfile.ui`, `infra/docker-entrypoint.sh`, `infra/Caddyfile` and `.env.example` is empty. There is no new variable. The default cost profile is a code constant: `DEFAULT_COST_PROFILE`, or any environment variable with `COST_PROFILE` in its name, is ignored and logged by name only as `cost_profile.env_ignored`. | `git diff --stat d36984e..HEAD -- infra .env.example`; `apps/api/config.py` (`warn_ignored_cost_profile_env`) |
+| Grafana | The three per-run alert rules `trading-cb-halt`, `trading-kill-switch` and `trading-high-drawdown` carry `{run_id!~"bt-.*"}` (thresholds, labels and `trading-api-down` are unchanged), so a backtest cannot fire them. The two `trading_drawdown_pct` dashboard panels carry the same matcher. The rule change needs D3-6. | `infra/grafana/provisioning/alerting/trading-alerts.yml`; `infra/grafana/dashboards/trading-bot.json`; `tests/unit/test_wp21c_alert_scope.py` |
+| Scripts | `scripts/wp13a_exit_config_precheck.py` gains `--cost-profile <id>` (P3-6) and validates each run at its own resolved profile. `scripts/wp21_rebaseline.py` is the CF-26 harness: it is not part of this deploy and nothing here runs it. | the script docstrings |
+| Docs | `docs/runbooks/circuit-breaker-halt.md` (sections 1 and 2b, the backtest and alert-scope notes). Block L-21 and the L-21 row in 10.9 were added by WP2.1a. | `git diff --name-status d36984e..HEAD -- docs` |
+
+### 11.3 Which path (decide first)
+
+This section is written for a server that runs **Release 2** (schema `019`).
+
+- [ ] Read the schema revision and check the running api image:
+  ```bash
+  $DC exec -T api sh -c 'cd /app/infra/alembic && python -m alembic -c alembic.ini current'
+  $DC exec -T api grep -c '_quote_context' /app/packages/trading/strategy_engine.py    # Release 2 and 3: 3 (verified at a7ae1bf)
+  $DC exec -T api ls /app/packages/trading/costs.py                                     # Release 3: the path; Release 2: "No such file or directory"
+  ```
+  - `019 (head)`, a `_quote_context` count of `3` and no `costs.py`: **Case A, Release 3 only.** Follow 11.4 to 11.7. Skip 3.5 and 3.6 (Caddy is not touched; the precheck is P3-6).
+  - `020 (head)`, or `costs.py` present: the server already runs Release 3, or a deploy stopped half-way. STOP and escalate. Do not run P3-3: it would tag a Release 3 image as the rollback image.
+  - Anything else (schema `016`, or `019` with a `_quote_context` count below `3`, so Release 2 is not deployed): STOP and escalate. Deploying the Release 3 tree on a server that does not run Release 2 is not described here (section 10.3 Case B covers `016` with the Release 2 content).
+
+### 11.4 NO-GO conditions added by Release 3
+
+NO-GO 1 to 4 and 7 to 12 apply to this deploy unchanged: it restarts the api, runs a migration, and uses the same key check, precheck, NaN query and `LIVE_EXIT_CHECK_INTERVAL_S` check as Release 2. Do not deploy if any of them holds, or if:
+
+14. The path is not Case A (11.3), or the schema is not `019` at D3-2.
+15. The built image does not hold the synced tree (P3-5), or does not contain migration 020 (`infra/alembic/versions/020_optimization_runs_run_metadata.py`).
+16. The Release 2 images were not tagged for rollback (P3-3). The rollback order of 11.10 needs the older image to exist; a rebuilt "older" image is not the image that was running.
+
+### 11.5 Pre-deploy additions (old stack still running)
+
+Do these in order. P3-3 must come before any build.
+
+- [ ] **P3-1 Path.** Section 11.3 done; Case A recorded in the deploy log.
+- [ ] **P3-2 Live runs and backup.** Run the section 3.1 live-run query (expected `(0 rows)`; NO-GO 1) and the section 3.2 backup. Change one line of the 3.2 block so the dump is named for this release: `DUMP="$BACKUP_DIR/pre-release3-$(date +%Y%m%d-%H%M%S).dump"`. Continue only after `BACKUP OK`. The dump predates column `run_metadata`, so it cannot restore optimization attribution created after this deploy (11.10).
+- [ ] **P3-3 Keep the running images for rollback, before building.** `crypto-trading-bot/api:local` and `crypto-trading-bot/ui:local` are overwritten by the build, and both images change in Release 3:
+  ```bash
+  $DC images api ui                                                    # note the IMAGE IDs of the running containers
+  docker image inspect --format '{{.Id}}' crypto-trading-bot/api:local   # must be the running api image; record the full id
+  docker image inspect --format '{{.Id}}' crypto-trading-bot/ui:local    # must be the running ui image; record the full id
+  STAMP=$(date +%Y%m%d-%H%M%S)
+  docker tag crypto-trading-bot/api:local "crypto-trading-bot/api:prerel3-$STAMP" \
+    && docker tag crypto-trading-bot/ui:local "crypto-trading-bot/ui:prerel3-$STAMP" \
+    && echo "rollback images tagged: prerel3-$STAMP"
+  ```
+  Continue only after `rollback images tagged:` (NO-GO 16). If an id differs from the running container's image, STOP: someone rebuilt `:local` since the last deploy, and the running image is no longer on a tag.
+- [ ] **P3-4 Stage, build, tag.** Stage the tree as in P-5 (sync, `bash $DEPLOY_DIR/infra/caddy-config.sh` with the `TAILSCALE_FQDN` count of `0`, `$DC config --quiet; echo "exit=$?"` giving `exit=0`, and the key-fingerprint check). The sync also replaces the Grafana provisioning files, which are bind-mounted read-only into the grafana container (D3-6 and V3-5 cover what that means). Then build both images that changed and tag the api for traceability:
+  ```bash
+  $DC build api ui
+  SHORT_COMMIT=REPLACE_ME    # edit: the short commit hash recorded in P-5 (7-12 hex characters)
+  if [[ "$SHORT_COMMIT" =~ ^[0-9a-f]{7,12}$ ]]; then
+    docker tag crypto-trading-bot/api:local "crypto-trading-bot/api:rel3-$SHORT_COMMIT" && echo "tagged rel3-$SHORT_COMMIT"
+  else
+    echo "STOP: set SHORT_COMMIT to the commit recorded in P-5 -- the Release 3 tag was NOT created"
+  fi
+  ```
+  Continue only after `tagged rel3-…` was printed, and note the tag in the deploy log: rollback step 3 (11.10) uses it.
+- [ ] **P3-5 Image content (NO-GO 15).** Prove the image holds the synced tree. This is the P-7 comparison with the Release 3 file list; nothing is started:
+  ```bash
+  cd "$DEPLOY_DIR"
+  FILES="apps/api/config.py apps/api/db/models.py apps/api/main.py apps/api/routers/ml.py \
+         apps/api/routers/optimize.py apps/api/routers/portfolio.py apps/api/routers/runs.py \
+         apps/api/schemas.py apps/api/services/cost_profiles.py apps/api/services/model_activation_gate.py \
+         apps/api/services/run_orchestrator.py apps/api/services/run_persistence.py \
+         packages/trading/backtest.py packages/trading/costs.py packages/trading/costs_cli.py \
+         packages/trading/engines/live.py packages/trading/engines/paper.py packages/trading/exit_config.py \
+         packages/trading/metrics.py packages/trading/optimizer.py packages/trading/risk.py \
+         packages/trading/safety.py packages/trading/strategy_engine.py \
+         infra/alembic/versions/020_optimization_runs_run_metadata.py"
+  diff <(sha256sum $FILES | awk '{print substr($1,1,16), $2}') \
+       <($DC run --rm --no-deps --entrypoint sha256sum api $(for f in $FILES; do echo "/app/${f#apps/}"; done) \
+          | awk '{p=$2; sub("^/app/","",p); if (p ~ /^api\//) p="apps/" p; print substr($1,1,16), p}') \
+    && echo "IMAGE MATCHES SYNCED TREE"
+  sha256sum $FILES | awk '{print substr($1,1,16), $2}'        # record
+  ```
+  On the **source machine**, in the merged tree, print the same list (`sha256sum $FILES | awk '{print substr($1,1,16), $2}'` with the same `FILES`) and compare it by eye with the recorded one; also confirm the fourteen commits are present (skip the loop if the merge was a squash or rebase; the hash comparison then carries the proof):
+  ```bash
+  for c in 60d7eaf 182cdf7 12616da 926d7d2 0207a43 b8245a1 bbfbed1 4990974 04c3d15 d13d454 83696c2 b9bbfb8 5e0a108 a7ae1bf; do
+    git merge-base --is-ancestor "$c" HEAD && echo "ok $c" || echo "MISSING $c"
+  done
+  ```
+  Expected: `IMAGE MATCHES SYNCED TREE` and identical lists on both machines. The `FILES` list is every non-test Python file that the Release 3 commits changed in `apps/api`, `packages/trading` and `infra/alembic`; the ui image and the scripts are not covered by it.
+- [ ] **P3-6 DS-1 precheck with the promote basis (NO-GO 9 and 10).** Run the WP1.3a precheck on the **Release 3 image** (the script is mounted from the synced tree; its `--cost-profile` option needs the Release 3 `trading.costs`). Read-only, as in P-8, plus `--cost-profile coinbase_advanced_1`:
+  ```bash
+  cd "$DEPLOY_DIR"
+  install -d -m 700 ~/deploy-logs/$(date +%F)
+  DS1R3=~/deploy-logs/$(date +%F)/precheck-r3-ds1.json
+  ( umask 077
+    $DC run --rm --no-deps --entrypoint python -v "$PWD/scripts:/app/scripts:ro" api \
+      /app/scripts/wp13a_exit_config_precheck.py --json --cost-profile coinbase_advanced_1 | tee "$DS1R3"; echo "exit=${PIPESTATUS[0]}" )
+  tail -n1 "$DS1R3" | grep -Eq '^wp13a-precheck: [0-9]+ run\(s\) checked, [0-9]+ invalid(, [0-9]+ would fail at promote)?\. No writes were made\.$' \
+    && echo "precheck ran" || echo "STOP: precheck did not complete -- NO-GO 9"
+  sed '$d' "$DS1R3" | jq -r '.[] | select(.valid != true) | "INVALID \(.mode) \(.status) \(.run_id) \(.codes|join(",")) \(.note // "")"'
+  sed '$d' "$DS1R3" | jq -r '.[] | select(.would_fail_at_promote == true) | "WOULD-FAIL-AT-PROMOTE \(.mode) \(.status) \(.run_id) \(.promote_codes|join(","))"'
+  ```
+  The script prints a summary line after the JSON, so `sed '$d'` drops it before `jq`. **The summary line differs from the one P-8 matches:** with `--cost-profile` and at least one affected run it reads `..., N invalid, M would fail at promote. No writes were made.`, and the P-8 pattern does not match it. Use the pattern above. Do not hand-build a `DATABASE_URL`, and check that the saved file contains no `input_value=` or DSN before attaching it to the deploy log (section 3.6).
+  - `exit=0`, `precheck ran`, nothing listed as `INVALID`: proceed.
+  - `exit=2`, an empty file or no `precheck ran`: NO-GO 9.
+  - An `INVALID` **live** run: NO-GO 10. An `INVALID` **paper** run: record it only; every invalid paper run is marked `error` at boot (as in P-8).
+  - A `WOULD-FAIL-AT-PROMOTE` line is **informational and does not change the exit code**. The script validates each run at its own cost profile (a run without a stored profile resolves to `legacy_runtime_v0`, side cost 0.0065), so these runs still resume. The line means the run has a fixed stop-loss or take-profit in (0.0065, 0.0130]: after this deploy the same exit config is refused with 422 `invalid_exit_config` when a run is created or promoted afresh (11.8). Record the run ids and tell their owners before the deploy.
+- [ ] **P3-7 NaN equity rows and `LIVE_EXIT_CHECK_INTERVAL_S` (NO-GO 11 and 12).** Run P-9 unchanged (expected `0`): the api restart resumes paper runs, and a NaN `peak_equity_hint` makes that resume raise. Run the validation block of P-4 unchanged (an invalid value stops the api at start, after the old api is already stopped); no new decision is needed, because Release 3 does not touch the setting.
+
+### 11.6 Deploy
+
+- [ ] **D3-1 Announce** the changes in section 11.8 (as in 4.1).
+- [ ] **D3-2 Re-check** immediately before stopping: the section 3.1 live-run query returns `(0 rows)`, `$DC exec -T api printenv ENABLE_LIVE_TRADING` prints `false` or nothing (4.1a), and the `.env` live-flag block of 10.6 D-2 prints `OK` (NO-GO 7). Record `curl -fsS -H @<(hdrs api) https://<FQDN>/api/v1/emergency/kill-switch` (expected `"latched": false`). Confirm once more that the schema is `019 (head)` with the first command of 11.3 (NO-GO 14).
+- [ ] **D3-3 Stop the api:** `$DC stop api` (graceful, up to 30 s). The old ui may show errors until D3-5.
+- [ ] **D3-4 Migrate to 020 with the new image.** Check first that no transaction is open longer than 5 s (the query in 4.3). Then:
+  ```bash
+  $DC run --rm --no-deps --entrypoint sh api -c \
+    'cd /app/infra/alembic && python -m alembic -c alembic.ini upgrade head && python -m alembic -c alembic.ini current'
+  ```
+  Expected: one `Running upgrade 019 -> 020` line, then `020 (head)`. Migration 020 sets `lock_timeout = '5s'`; if it fires, the transaction rolls back, the schema stays `019` and the command fails. Clear the blocker and repeat. Never raise the timeout. If the blocker cannot be cleared, or the output is anything else, stop here: the schema is still `019`, so no downgrade is needed. Before putting the older images back, apply gate G-RB (6.1 rule 5) and record it: (a) the section 3.1 live-run query returns `(0 rows)`; in place of (c), which needs a running api, the `.env` live-flag block of 10.6 D-2 prints `OK`; (b) is waived on this branch only, because the Release 3 code never started, so no position can exist that the Release 2 images did not already manage until D3-3. Then restore the two rollback images (11.10, step 4), confirm that `$DC exec -T api printenv ENABLE_LIVE_TRADING` prints `false` on the restored api, and escalate. Do not start the new api, because its entrypoint would run the same migration.
+- [ ] **D3-5 Start api and ui together:** `$DC up -d api ui`. Caddy is not recreated: its configuration did not change. Wait until `$DC ps` shows both `healthy` (api `start_period` 60 s). If the api exits right away, read `$DC logs --tail 50 api`.
+- [ ] **D3-6 Grafana (not optional since WP2.1c).** The per-run alert rules are provisioned from `infra/grafana/provisioning/alerting/trading-alerts.yml`. A changed expression is not live until Grafana has re-read the file; this runbook does it by restarting the container: `$DC restart grafana`. Until then the old, unscoped expressions stay live, and a backtest that reaches HALT in the API process can fire `trading-cb-halt` as a false alarm. V3-5 checks the result. Skipping D3-6 does not affect trading; it leaves the false-alarm risk.
+
+### 11.7 Post-deploy verification (Release 3)
+
+Repeat sections 5.1 (health; the schema is now `020 (head)`), 5.2 (single worker), 5.3 (`ENABLE_LIVE_TRADING` prints `false`; `DEBUG`) and 5.8 (lock-key constant, deployed commit recorded), and the last bullet of 5.4 (`/api/admin/*` is answered by the ui layer; the ui container was recreated). Then:
+
+- [ ] **V3-1 Column exists.** Read-only:
+  ```bash
+  $DC exec -T postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc \
+    "SELECT data_type FROM information_schema.columns WHERE table_name = '"'"'optimization_runs'"'"' AND column_name = '"'"'run_metadata'"'"';"'
+  ```
+  Expected: `jsonb`.
+- [ ] **V3-2 Boot log: cost profile events.** Expected: no lines. An error from `docker compose` means the check did not run; empty output proves nothing in that case.
+  ```bash
+  $DC logs --since 10m api | grep -E 'cost_profile\.(invalid|env_ignored)|runs\.cost_profile_fingerprint_mismatch'
+  ```
+  `cost_profile.invalid mode=... action=fallback_to_legacy` on a resume or at boot is a **database-tamper indicator**: follow 11.9 (invalid stored profile). `cost_profile.env_ignored` lists variable names that contain `COST_PROFILE` and reached the api environment: remove them; they never had an effect. `runs.cost_profile_fingerprint_mismatch` is an error log written when a backtest result does not carry the profile fingerprint the run froze at create; the numbers of that run were not produced under the frozen profile (11.9, fingerprint in the mismatch log).
+- [ ] **V3-3 Breaker stamp (optional, after the first backtest created on the new image).** Read-only:
+  ```bash
+  $DC exec -T postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c \
+    "SELECT config->'"'"'engine_semantics'"'"'->>'"'"'backtest_circuit_breaker'"'"' AS backtest_cb, count(*) FROM runs WHERE run_mode = '"'"'backtest'"'"' GROUP BY 1 ORDER BY 1;"'
+  ```
+  Expected: `true` for runs created after this deploy; `false` for runs created by WP2.1a or WP2.1b (never rewritten); an empty value (NULL) for older runs that have no `engine_semantics` block.
+- [ ] **V3-4 Registry default.** `$DC exec -T api grep -n 'DEFAULT_COST_PROFILE_ID: Final' /app/packages/trading/costs.py` prints the definition. Record the id: it is the default the L-21 check (V3-7) compares with the account's real fee tier.
+- [ ] **V3-5 Grafana picked up the change (after D3-6).**
+  ```bash
+  $DC exec -T grafana grep -c '^ *expr: .*run_id!~' /etc/grafana/provisioning/alerting/trading-alerts.yml        # expected: 3
+  $DC exec -T grafana grep -c 'trading_drawdown_pct{run_id!~' /var/lib/grafana/dashboards/trading-bot.json       # expected: 2
+  ```
+  The first count proves the container sees the new rule file, the second the new dashboard file. Then open the three rules (Alerting, Alert rules, folder Trading) and confirm that the query of `trading-cb-halt` ("Circuit breaker HALT"), `trading-kill-switch` ("Kill switch active") and `trading-high-drawdown` ("Drawdown above 10 percent") shows `{run_id!~"bt-.*"}`; the Grafana rule list shows the titles. The dashboard file provider polls its directory (`updateIntervalSeconds: 30` in `infra/grafana/provisioning/dashboards/dashboards.yml`), so the dashboard panels need no restart. If a rule still shows the old expression, repeat D3-6 once and record the result; do not edit the rule in the Grafana UI.
+- [ ] **V3-6 Log hygiene (CF-36).** The image was rebuilt from a new commit: run section 5.10 as in R2-8 (steps 1, 2 and 2b; `CF36 log hygiene: PASS` and `CF36B_MARKERS_OK`) and record the commit and counts of step 1.
+- [ ] **V3-7 G-LIVE L-21: fee tier.** After this deploy and **before the first live run on a WP2.1 image**, run the one-time fee-tier check: G-LIVE row L-21 (10.9.2, Table B) and Block L-21 (10.9.4). It compares the default cost profile (`DEFAULT_COST_PROFILE_ID`, V3-4) with the account's real Coinbase fee tier through a read-only call, and it needs the Coinbase API key in the api container's environment (the prerequisite stated in the block). It does not gate this deploy, because live stays off. If the result is not `FEE_TIER: DEFAULT CONFIRMED`, follow the list "If the tier differs (exact rule)" under Block L-21; the default is changed only by a reviewed code change, never through `.env`.
+- [ ] **V3-8 Evidence to keep** (adds to 5.9): Case A; the P3-3 rollback tags and image ids; the P3-4 tag; the P3-5 hash list; the P3-6 file `precheck-r3-ds1.json` and the run ids it listed as `WOULD-FAIL-AT-PROMOTE`; the P3-7 count; the D3-4 output (`Running upgrade 019 -> 020`, `020 (head)`); V3-1 to V3-6 results; UTC deploy time.
+
+Final step as in section 5.9: `unset API_KEY ADMIN_KEY LIVE_CONFIRM_TOKEN; exit`.
+
+### 11.8 Operator-visible behaviour changes (communicate before deploy)
+
+Cost model (WP2.1a/b):
+- **One cost model, default by id.** The default profile is `coinbase_advanced_1` (maker 60, taker 120, slippage 10 bps: 130 bps per side, 260 bps round trip). Name it by id; the number changes only through one reviewed code line (`DEFAULT_COST_PROFILE_ID`), never through `.env`.
+- **The exit floor doubles at create and promote: from 0.0065 to 0.0130 per side.** A new or promoted run is validated at the stricter of the default and its own profile. A fixed stop-loss of 0.0130 or less is refused with 422 `invalid_exit_config` and the issue `stop_inside_entry_cost` (field `bracket_stop_loss_pct`); a fixed take-profit of 0.0130 or less gets the issue `take_profit_inside_exit_cost` (field `bracket_take_profit_pct`). 0.0131 is accepted, with a warning. Before Release 3 the limit was 0.0065. Runs that already exist are not touched: resume, boot and salvage use the run's own stored profile, and a run without one resolves to `legacy_runtime_v0` (0.0065), so no existing run becomes un-resumable.
+- **Idempotent retries across the deploy (release note).** A client that retries a create or promote request with the same `Idempotency-Key` across this deploy, with a fixed stop-loss or take-profit in (0.0065, 0.0130], now gets a 422 instead of a replay of the original run. The exit validation runs before the replay check, so no duplicate run can be created; the client must pick a value above 0.0130 and use a new key. The operator note in the 2.1a security review (check the resume log for `runs.intrabar_exit_checks interval_s=None reason=no_protective_exit`) is obsolete: it applied only to a WP2.1a build without its resume fix, and Release 3 ships the fix together with WP2.1a.
+- **New paper costs.** A new paper run takes the default profile, or `coinbase_advanced_d6` (maker 40, taker 60, slippage 10 bps); paper accepts only these two live-equivalent profiles. Before, paper used 40/60 bps plus 5 bps slippage (`legacy_runtime_v0`, 65 bps per side). Paper results are lower in proportion to turnover, bracket levels sit on the all-in basis (a stop at distance d is only about d minus 0.0130 below the entry close), and the breaker and the daily and drawdown gates fire earlier, because the paper NAV falls faster. Backtest and optimize accept any registry id and default to the same profile; before, backtests used `legacy_backtest_v0` (10/15 bps plus 5 bps slippage). **How large these shifts are is not measured: the re-baseline (CF-26) is pending.**
+- **Live takes no profile.** A non-null `costProfile` on a live create is refused with 422 `cost_profile_not_allowed_for_live`. A live promote overwrites the inherited profile with the default. The live ledger books the exchange's real fees; the profile feeds only the log-only warnings `cost_profile.tier_mismatch` (at engine start) and `cost_profile.fill_fee_drift` (a real fill whose fee is more than 5 bps off the profile).
+- **Leaderboard default filter.** The leaderboard shows "Live-equivalent costs" by default: only runs whose server flag `liveEquivalentCosts` is true (a valid stored live-equivalent registry profile). Legacy-cost, stress and diagnostic runs, **including every run created before WP2.1**, are hidden until the user chooses "All cost models", where they carry labels (`legacy costs`, `stress`, `diagnostic`). The portfolio aggregate's best and worst return use the same eligibility; `legacyCostRunsExcluded` counts the runs that were left out only because of their cost model.
+- **Relaunch pins the source's profile.** Launch Run (from an optimization) and Duplicate Run (from a non-live run) carry the source's registry profile, including the default id and explicit `legacy_*` ids. A relaunched run keeps its source pricing even if the default changes later. A new-run form submitted by hand omits `costProfile` for the "Platform default" choice.
+
+Backtests, optimizations and breaker (WP2.1c):
+- **The circuit breaker is on by default** in backtests, optimizations, the ML gate and the research scripts (`BACKTEST_CIRCUIT_BREAKER_DEFAULT`). New rows record `engine_semantics.backtest_circuit_breaker=true` (`runs.config` for backtests, `optimization_runs.run_metadata` for optimizations). Rows created by WP2.1a or WP2.1b record `false` and are never rewritten; older rows have no block.
+- **Backtest numbers created by Release 3 differ from rows created by WP2.1a/2.1b (and from older rows).** The breaker drops or halves BUYs. Compare only rows with the same `engine_semantics` and the same cost profile. The size of the difference is not measured (CF-26 pending).
+- **Backtests emit breaker gauges and critical logs.** A backtest that runs inside the API process writes `trading_circuit_breaker_state` (2 and 3 included), `trading_kill_switch_active` and the other per-run gauges under `run_id` `bt-<12 hex>`, and logs `circuit_breaker.halt_entered` at critical. The alert rules and the two drawdown dashboard panels exclude `bt-` ids; the log filter that does the same is in `circuit-breaker-halt.md` section 2b. Paper and live ids are UUIDs, which never start with `bt-`.
+- **The Grafana alert change needs D3-6** (a restart of the grafana container).
+- **ML models gated before Release 3 ran without the breaker.** The walk-forward activation gate now runs its mini-backtests with the breaker and the default cost profile (the gate basis was 40/60 bps plus 5 bps slippage before). The breaker setting is **not** recorded on the model (carry-forward CF-21C-04, target Fase 6); the cost profile of a model gated on Release 3 is stored in `ModelVersionORM.extra["cost_profile"]`. Treat every model gated before this deploy as gated without the breaker and at the old cost basis, and do not compare its gate result with one produced on Release 3.
+
+Log events worth watching in addition to those in sections 7 and 10.8 (all present in the code): `cost_profile.invalid`, `cost_profile.env_ignored`, `cost_profile.tier_mismatch`, `cost_profile.fill_fee_drift` and `runs.cost_profile_fingerprint_mismatch`. None of them is wired to an automatic alert in `infra/`.
+
+### 11.9 Stored cost profile: operator notes and a known limitation (WP2.1-H)
+
+**Invalid stored profile.** A stored cost profile on a **paper or live** run is accepted only if it is a live-equivalent registry profile (`coinbase_advanced_1`, `coinbase_advanced_d6`) or the inferred `legacy_runtime_v0` profile (the one the paper auto-retry writes). Anything else is read as invalid legacy: the run response shows `costProfileInvalid` and `legacyCosts` both true, the exit-cost basis is `legacy_runtime_v0` (side cost 0.0065, never lower), and a resume or the boot recovery logs one warning, `cost_profile.invalid mode=<paper or live> action=fallback_to_legacy`, with no value in it. A run with no stored profile is plain legacy, with no warning.
+
+No legitimate writer produces an invalid row: create, promote and the paper auto-retry write only the profiles above; resume, boot recovery and backtest completion rewrite `runs.config` but copy the stored `cost_profile` block unchanged; and the request field accepts only registry ids. **Treat the warning as an indicator that the database was changed outside the application, and investigate it.** Keep the log line (it holds no secret). Find the run (read-only, not executed against a server; the list endpoint caps `limit` at 500, so page with `offset` if `.total` is larger):
+```bash
+for m in paper live; do
+  curl -fsS -H @<(hdrs api) "https://<FQDN>/api/v1/runs?mode=$m&limit=500" \
+    | jq -r '.items[] | select(.costProfileInvalid == true) | "\(.runMode) \(.status) \(.id)"'
+done
+```
+Then, before anything else changes:
+1. Preserve evidence: save the run's `config` (read-only `SELECT config FROM runs WHERE id = '<run id>'`, in the `exec` form of section 3.1) and `$DC logs postgres` to `~/deploy-logs/<date>/`, with `umask 077`.
+2. Check scope: whoever can write `runs.config` can also write `kill_switch_state`, the `entries_latch_*` columns, `idempotency_keys` and any run's exit config. Check the kill-switch state (`GET /api/v1/emergency/kill-switch`) and the exit config (`bracket_*`, `trailing_stop_pct`) of every live run for unexplained changes.
+3. If a live run is affected, press the kill switch (section 5.5) or stop the run until the cause is known.
+4. Establish who had write access to the database and when the row changed. If the write cannot be attributed, treat the database credentials as compromised: rotate them and escalate.
+
+Do not edit the row by hand to silence the warning, and do not restart repeatedly. The fallback is fail-safe for exit validation, so the cost profile itself is not an immediate trading fault; the database write behind it may be.
+
+**Fingerprint in the mismatch log.** In `runs.cost_profile_fingerprint_mismatch`, the field `config_fingerprint` now shows `"<malformed>"` for any stored value that is not exactly 16 lowercase hex characters; a well-formed value is shown as is. A `<malformed>` value is itself a sign of a changed row (see the paragraph above).
+
+**Known limitation.** The stored cost-profile id is **not integrity-protected** against someone who can write to the database. A tampered live row can swap between the live-equivalent tiers (`coinbase_advanced_1` and `coinbase_advanced_d6`) without any flag. The effect is bounded: the basis is always a real tier and never below the legacy floor, and the live ledger, sizing and orders do not use the profile at all. The log-only checks `cost_profile.tier_mismatch` and `cost_profile.fill_fee_drift` may show a swapped tier on a live run, but nothing guarantees it. Closing the gap would need an integrity check on the stored row (for example an HMAC), which is outside the current threat model. Keep database write access restricted.
+
+### 11.10 Rollback note for Release 3
+
+Release 3 has a migration, so unlike Release 2 the rollback has a database step. **An image older than 020 cannot start on a database at 020**: its entrypoint runs `alembic upgrade head` against a revision it does not know, which fails as in 6.1 rule 1 (reproduced for 019 in the WP7.0 acceptance; inferred for 020, not reproduced). So the order is fixed: **stop the api, downgrade to 019 with the new image, then deploy the older image.**
+
+Rules from section 6.1 that apply: stop the api first (rule 4); never raise `lock_timeout` (rule 6); `ENABLE_LIVE_TRADING=false` for the whole rollback (rule 7); and **gate G-RB in full** (rule 5), because the rule covers every downgrade, 020 included: (a) the section 3.1 live-run query returns `(0 rows)`, (b) no bot-held position above dust remains on Coinbase for any pair a live run traded, (c) `$DC exec -T api printenv ENABLE_LIVE_TRADING` prints `false` on the running new image. Release 2's note (10.10) needed only (a) and (c) because Release 2 had no downgrade. Add the `.env` live-flag block of 10.6 D-2 before `$DC stop api`.
+
+- [ ] **1. Record state** (Release 3 api still running): the kill switch, the running paper runs, and the optimization attribution you may want to keep (the downgrade drops it):
+  ```bash
+  $DC exec -T postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc \
+    "SELECT count(*) FROM optimization_runs WHERE run_metadata IS NOT NULL;"'
+  ```
+  If you want to keep the attribution, export it before step 3 (read-only; the data holds no secret). The line count of the file equals the count above:
+  ```bash
+  install -d -m 700 ~/deploy-logs/$(date +%F)
+  ( umask 077
+    $DC exec -T postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c \
+      "\copy (SELECT id, run_metadata FROM optimization_runs WHERE run_metadata IS NOT NULL) TO STDOUT"' \
+      > ~/deploy-logs/$(date +%F)/optimization-run-metadata-pre-019.tsv )
+  wc -l < ~/deploy-logs/$(date +%F)/optimization-run-metadata-pre-019.tsv
+  ```
+- [ ] **2. Gate G-RB** as above, recorded in the deploy log. Then `$DC stop api` (and `$DC stop ui`).
+- [ ] **3. Downgrade to 019 with the new image.** `crypto-trading-bot/api:local` must still be the Release 3 image; if it was overwritten, re-tag it first with `docker tag "crypto-trading-bot/api:rel3-$SHORT_COMMIT" crypto-trading-bot/api:local` (6.1 rule 2; set `SHORT_COMMIT` to the P3-4 value) and do not rebuild old code until after the downgrade:
+  ```bash
+  $DC run --rm --no-deps --entrypoint sh api -c \
+    "cd /app/infra/alembic && python -m alembic -c alembic.ini downgrade 019 && python -m alembic -c alembic.ini current"
+  ```
+  Expected: a `Running downgrade 020 -> 019` line and `019 (head)`. Effect: the column `optimization_runs.run_metadata` is dropped. Only the persisted cost-profile and `engine_semantics` attribution of optimization runs is lost; the rest of every row is untouched. Re-applying 020 later does not bring the attribution back, and the pre-deploy dump (P3-2) has no such column.
+- [ ] **4. Put the Release 2 images back** (the tags from P3-3; list them in a new shell with `docker image ls crypto-trading-bot/api` and `docker image ls crypto-trading-bot/ui`). Do not rebuild old code:
+  ```bash
+  ROLLBACK_TAG=REPLACE_ME      # edit: the suffix recorded in P3-3, for example prerel3-20261021-093000
+  if [[ "$ROLLBACK_TAG" =~ ^prerel3-[0-9]{8}-[0-9]{6}$ ]] \
+     && docker tag "crypto-trading-bot/api:$ROLLBACK_TAG" crypto-trading-bot/api:local \
+     && docker tag "crypto-trading-bot/ui:$ROLLBACK_TAG" crypto-trading-bot/ui:local; then
+    echo "restored $ROLLBACK_TAG"
+    $DC up -d api ui
+  else
+    echo "STOP: ROLLBACK_TAG not set to a prerel3-... suffix from P3-3 (or a tag does not exist) -- api and ui were NOT restarted"
+  fi
+  ```
+- [ ] **5. Grafana:** nothing to undo. The scoped rules and panels use the `run_id` label, which the older code also writes, so they work with it.
+- [ ] **6. Verify:** the api is `healthy`; `alembic current` prints `019 (head)` (the Release 2 entrypoint's `upgrade head` is a no-op); `docker image inspect --format '{{.Id}}' crypto-trading-bot/api:local` equals the api id recorded in P3-3; `$DC exec -T api ls /app/packages/trading/costs.py` fails with "No such file or directory"; `$DC exec -T api printenv ENABLE_LIVE_TRADING` prints `false`.
+- [ ] **7.** Record what was rolled back, why, and the G-RB results in the deploy log. G-LIVE rows that depend on Release 3 no longer hold, so a live restart is closed until Release 3 is deployed again.
+
+What a rollback gives up, so it is a decision and not a reflex:
+- The optimization attribution created since the deploy (step 3).
+- Backtests and optimizations return to the pre-2.1c semantics (no breaker) and the old cost numbers; the cost registry and its warnings disappear.
+- Paper runs created on Release 3 carry a `cost_profile` block in `runs.config`. The Release 2 code has no reference to `cost_profile` (checked with `git grep` at `d36984e`), so it should ignore the block, but what it does with such a run on the next restart is **not verified**. Record the paper runs that exist at step 1 and check them after step 6.
+
+### 11.11 Not verified in section 11
+
+Nothing in this section was executed against a server, a Docker daemon, a database, a Grafana or an exchange in the authoring session.
+- **Shell blocks:** syntax-checked with `bash -n`. The `grep -Eq` summary pattern and the `jq` filters of P3-6 were run against output that `scripts/wp13a_exit_config_precheck.py` produced from sample results (including a run that would fail at promote); the `FILES` comparison of P3-5 was run against a simulated image tree, with a negative control; the SQL quoting of V3-1 and V3-3 was run through `sh -c` with a stub `psql`. The `$DC`, `docker`, `psql` and `curl` calls themselves were not run. `$DC images api ui` (P3-3) and `docker compose logs --since` / `--no-log-prefix` depend on the installed Compose version.
+- **TTY and `\r`:** `$DC run` allocates a TTY when stdin is a terminal, and its output may then end lines with `\r`. That would make the P3-5 compare or the P3-6 summary pattern print a STOP (fail-closed, never a false pass). If either stops with no visible cause, re-run that block with `$DC run -T` before escalating. This was not reproduced (no Docker in the authoring session); the same applies to 3.6, P-7 and P-8.
+- **Grafana:** whether the alert provisioning file is re-read on `restart grafana` (D3-6), whether a contact point exists, and whether the dashboard provider reloads a changed file within its 30 s interval are not known. V3-5 is the check.
+- **Old image on a 020 database:** the exact error text is inferred from the 019 case (6.1 rule 1).
+- **Release 2 code on Release 3 data:** see 11.10 (paper runs with a `cost_profile` block).
+- **Caddy and the recreated ui container:** Caddy is not recreated in D3-5. That it keeps reaching the new ui container is expected from how Caddy resolves upstream names, not tested here; the `/api/admin/*` probe in the repeat of 5.4 above would show a failure.
+- **Invalid-profile query (11.9):** the `runs` list call and its `jq` filter follow the response schema (`costProfileInvalid`, `runMode`, `status`, `id`) and were not run.
+- **Pre-existing, not changed here:** the L-21 table row and Block L-21 refer to "§8.4", which is the numbering of the 2.1 specification, not of this file; the rule it points to is the list "If the tier differs (exact rule)" under Block L-21.
+- **CF-26:** the re-baseline has not run (see the start of this section), so no statement here depends on its result. Some code comments and `docs/risk-model.md` say "closes CF-26"; that refers to the code half only (the breaker default). The re-baseline, and with it the closure of CF-26, is pending.
+
+---
+
+## 12. Change log
 
 | Date | Change |
 |---|---|
@@ -1160,6 +1539,8 @@ Nothing in this section was executed against a server, a Docker daemon, a databa
 | 2026-10-12 (r4, Release 2) | Release 2 (WP1.5a/b, WP1.6, WP1.3b-a/b, HEAD `dc8cf83` plus CF-36 (`6047162`, cf36b)): new section 10 (delta, G-LIVE table, rollback note), Appendix B, six corrections of statements that the merge of Release 1 made stale (scope and Related line, section 1 migrations row, 3.2, 5.8, 7) and four pointers (sections 2, 3.3, 8, 9). The change log moved from section 10 to section 11. Producer draft `reports/vp2-docs-b/`; reconciled with CF-36 (sections 5.10, 10.2, 10.5 P-7, 10.7 R2-8, 10.8, 10.9 L-1/L-19 and Block L-8, Appendix B) per `reports/vp2-cf36/final-synthesis-cf36b.md` part B. Review fixes per its Round 2 addendum: Block L-12 unwraps the `SecretStr` token and stops when Telegram is not configured, Blocks L-12 and L-14 turn on CF-36 logging first, `.env` live-flag check in 10.6 D-2 and the 10.10 gate, fail-closed 10.10 restore, "already Release 2" branch in 10.3, symbol citations for the setting, `UVICORN_*` in the 5.10 operator rule. |
 | 2026-10-12 | cf36b: added section 5.10 (G-LIVE L-19 log-hygiene verification, operator rule, L-8 counters with the `trading_` prefix, access-log note) per `reports/vp2-cf36/synthesis-spec.md` section 9 and `final-synthesis-cf36a.md` section 6. |
 | 2026-10-12 (cf36b-fix) | Section 5.10 per `reports/vp2-cf36/final-synthesis-cf36b.md`: scoped to CF-36 images; step 1 hermetic (`env -i`, no `.env`, `--no-cov`, commit recorded); step 2 is the paper baseline and the L-19 gate run moves to the live config (smoke §4c step 0); new step 2b (cf36b markers in the image); CF-A note, uvicorn log-level operator rule, R-08 `http.request` note. |
+| 2026-10-14 (WP2.1a) | Added G-LIVE row L-21 (Table B) and Block L-21 (10.9.4): the one-time Coinbase fee-tier verification for the WP2.1 default cost profile, per `reports/vp2-wp2.1/synthesis-spec.md` section 8 as amended by SA-01 (`reports/vp2-wp2.1/final-synthesis-2.1a.md` section 8; GET-only guard at `Exchange.fetch`, enforced verdict line). Reads the raw `transaction_summary` `fee_tier` (ccxt 4.5.40 `fetch_trading_fees()` swaps maker and taker; unauthenticated `load_markets()` reports the hardcoded 0.012/0.006). Not run against a container in this change. |
+| 2026-10-20 (r5, Release 3) | Release 3 (WP2.1a/b/c and WP2.1-H, `60d7eaf` to `a7ae1bf`): new section 11 (delta, rollback note with the migration 020 order, operator-visible changes, stored-profile notes), Appendix C, and a Release 3 hand-off in section 8; pointers in the scope paragraph and sections 1, 2 and 9; a current-state note in the Grafana row of 10.2; the WP2.1a change-log row reworded (it now says "as amended by SA-01"); the change log moved from section 11 to section 12. R3-DOCS round per `reports/vp2-wp2.1h/final-synthesis.md` section 6.1; producer draft `reports/vp2-r3docs/`. The WP2.1c re-baseline (CF-26) is pending and not reported. Additions in this round: smoke runbook D-0 expects `020 (head)` on Release 3, Compose errors made visible in V3-2 and in the halt-runbook log filters, evidence-preservation and scope steps for an invalid stored profile (11.9), an optional attribution export (11.10 step 1), and gate G-RB on the D3-4 failure branch. |
 
 ---
 
@@ -1212,3 +1593,22 @@ Nothing in this section was executed against a server, a Docker daemon, a databa
 | `LIVE_EXIT_CHECK_INTERVAL_S`: default 300, 0 off, 60..3600 | `apps/api/config.py` (`Settings.live_exit_check_interval_s`); `infra/docker-compose.yml:197`; `.env.example:193`; `reports/vp2-wp1.3b/acceptance-report-1.3b-b.md` | 10.2, 10.5 P-4, 10.7 R2-1 |
 | Acceptance (PASS / ACCEPT) | `reports/vp2-wp1.5/acceptance-report-1.5a.md`, `-1.5b.md`; `reports/vp2-wp1.6/acceptance-report.md`; `reports/vp2-wp1.3b/acceptance-report-1.3b-a.md`, `-1.3b-b.md` | 10.9 (gate in words) |
 | No migration in WP1.5/1.6/1.3b | `reports/vp2-wp1.3b/final-synthesis-1.3b-b.md` section 10 row 10; `git diff origin/main..HEAD -- infra/alembic` | 10.2, 10.6 D-4, 10.10 |
+
+## Appendix C. Release 3 condition traceability
+
+| Condition / ID | Where | Section here |
+|---|---|---|
+| WP21B-CR-10 (2.1b C-05): Release 3 runbook section, migration 019 to 020, migrate-first via the entrypoint, the rollback order, 020 downgrade loses only optimization attribution | `reports/vp2-wp2.1b/final-synthesis.md` C-05 and section 5.6; `infra/alembic/versions/020_optimization_runs_run_metadata.py` (Deployment order, Downgrade path) | 11.2, 11.6 D3-4, 11.10 |
+| CF-21-13: operator-visible changes (floor 0.0065 to 0.0130, new paper costs, leaderboard default filter on `liveEquivalentCosts`, SA-21B-02) | `reports/vp2-wp2.1/synthesis-spec.md` sections 6.2 and 15 (CF-21-13); `reports/vp2-wp2.1b/final-synthesis.md` section 5.7 | 11.8 |
+| CF-21a-04 (WP21A-SEC-08): retry across the deploy gets a 422, not a replay; the SEC section 5.5 note is obsolete | `reports/vp2-wp2.1/final-synthesis-2.1a.md` (carry-forwards); `reports/vp2-wp2.1/security-report-2.1a.md` | 11.8 |
+| WP21A-CR-202: change-log wording "as amended by SA-01" | `reports/vp2-wp2.1/critic-report-2.1a-r2.md` | 12 (change log) |
+| X-7 (WP21-RK-09): DS-1 precheck with `--cost-profile coinbase_advanced_1`, informational "would fail at promote" | `reports/vp2-wp2.1/synthesis-spec.md` section 6.2; `scripts/wp13a_exit_config_precheck.py` | 11.5 P3-6 |
+| L-21 pointer: after the deploy, before the first live run on a WP2.1 image | `reports/vp2-wp2.1/synthesis-spec.md` section 8; 10.9.2 and 10.9.4 | 11.7 V3-7, 8 |
+| 2.1c breaker-on note (`BACKTEST_CIRCUIT_BREAKER_DEFAULT`, `engine_semantics.backtest_circuit_breaker=true`) | `reports/vp2-wp2.1c/final-synthesis.md`; `packages/trading/safety.py` | 11.2, 11.8, 11.7 V3-3 |
+| CF-21C-06 (1) to (4): alert reload, `bt-` gauges and logs, differing backtest numbers, ML models gated without the breaker (CF-21C-04 deferred, G-H-02) | `reports/vp2-wp2.1c/final-synthesis.md` section 5.5; `reports/vp2-wp2.1c/delta-signoff.md` section 8; `reports/vp2-wp2.1h/final-synthesis.md` G-H-02 | 11.6 D3-6, 11.7 V3-5, 11.8 |
+| WP21CD-SEC-04, WP21CD-CR-06, WP21CD-OPS-03, WP21CD-OPS-04 (2.1c-delta section 8) | same | `circuit-breaker-halt.md` section 2b (anchored log filter, timeless restart wording, dashboard note); 10.2 Grafana row (current-state note); `infra/grafana/dashboards/trading-bot.json` (two panel queries); R3-DOCS additions: smoke runbook D-0 expects `020 (head)` on Release 3, the `jq` filter passes non-JSON lines through as `unparsed`, Compose errors made visible (11.7 V3-2, `circuit-breaker-halt.md` sections 2b and 2c), tamper-evidence steps (11.9), attribution export (11.10 step 1), G-RB on the D3-4 failure branch (11.6) |
+| WP21BD-CR-01, WP21BD-CR-02 | `reports/vp2-wp2.1b/delta-signoff.md` section 3 | `apps/ui/src/lib/cost-profile.ts` (comment above `costProfileField`); `infra/alembic/versions/020_optimization_runs_run_metadata.py` (docstring) |
+| WP2.1-H, SA-21H-01 and SA-21H-03: invalid stored profile, `cost_profile.invalid`, tamper indicator | `reports/vp2-wp2.1h/final-synthesis.md` section 5.2 | 11.7 V3-2, 11.9 |
+| WP2.1-H, WP21H-SEC-03: `config_fingerprint="<malformed>"` | same, "Contract records" | 11.7 V3-2, 11.9 |
+| WP21H-SEC-04 (accepted residual): stored profile id not integrity-protected | same, section 5.3 | 11.9 |
+| SA-21H-05, WP21H-CR-04 (developer note: one-process test runs, uncached structlog in the harness) | same | `README.md`, Development |

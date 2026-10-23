@@ -74,6 +74,7 @@ __all__ = [
     "REDUCE_ENTRY_RATIO",
     "REDUCE_EXIT_RATIO",
     "REDUCE_MULTIPLIER",
+    "BACKTEST_CIRCUIT_BREAKER_DEFAULT",
     "build_run_circuit_breaker",
 ]
 
@@ -527,6 +528,15 @@ REDUCE_MULTIPLIER: Final[Decimal] = Decimal("0.5")
 #: Consecutive evaluations (processed bars) below the exit band before the
 #: HALT -> REDUCE and REDUCE -> OK de-escalations (U-3, K-02).
 DEESCALATION_EVALUATIONS: Final[int] = 3
+
+#: WP2.1c (SY-21-13, closes CF-26): whether a BACKTEST builds a circuit breaker
+#: when the caller does not say.  The ONE value behind ``BacktestRunner`` /
+#: ``ParameterOptimizer`` ``enable_circuit_breaker`` and behind the persisted
+#: ``engine_semantics.backtest_circuit_breaker`` (paper and live always have a
+#: breaker; this constant never touches them).  ``False`` was the WP1.6 / U-2
+#: opt-in default (byte-identical to pre-WP1.6); an explicit ``False`` still
+#: reproduces it.
+BACKTEST_CIRCUIT_BREAKER_DEFAULT: Final[bool] = True
 
 _LIMIT_CEILING: Final[Decimal] = Decimal("0.50")
 _ZERO: Final[Decimal] = Decimal(0)

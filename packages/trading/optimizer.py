@@ -28,8 +28,10 @@ import structlog
 from common.models import OHLCVBar
 from common.types import TimeFrame
 from trading.backtest import BacktestRunner
-from trading.exit_config import validate_param_grid_exit_config
+from trading.costs import CostProfile, default_cost_profile
+from trading.exit_config import policy_cost_model, validate_param_grid_exit_config
 from trading.metrics import BacktestResult
+from trading.safety import BACKTEST_CIRCUIT_BREAKER_DEFAULT
 from trading.strategy import BaseStrategy
 from trading.walk_forward import (
     WalkForwardValidator,
@@ -99,6 +101,8 @@ class OptimizationResult:
     walk_forward: bool = False
     num_folds: int = 0
     deflated_sharpe: float | None = None
+    #: WP2.1: the ONE cost profile every combination was simulated with.
+    cost_profile: CostProfile | None = None
 
 
 class ParameterOptimizer:
@@ -124,6 +128,14 @@ class ParameterOptimizer:
         Number of top results to return. Default 10.
     max_combinations :
         Hard cap on total combinations. Default 500.
+    cost_profile :
+        WP2.1: the ONE ``CostProfile`` handed to every combination's
+        ``BacktestRunner`` (never a per-combination bps).  ``None`` -> the
+        current default profile.
+    enable_circuit_breaker :
+        WP2.1c (SY-21-13, GAP-05): forwarded to every combination's
+        ``BacktestRunner``.  Default ``True``; ``False`` reproduces the pre-WP2.1c
+        (no breaker) optimizer exactly.
     """
 
     def __init__(
@@ -136,13 +148,12 @@ class ParameterOptimizer:
         rank_by: str = "sharpe_ratio",
         top_n: int = 10,
         max_combinations: int = DEFAULT_MAX_COMBINATIONS,
-        maker_fee_bps: int = 10,
-        taker_fee_bps: int = 15,
-        slippage_bps: int = 5,
+        cost_profile: CostProfile | None = None,
         walk_forward: bool = False,
         walk_forward_folds: int = 4,
         walk_forward_train_fraction: float = 0.7,
         walk_forward_mode: str = "expanding",
+        enable_circuit_breaker: bool = BACKTEST_CIRCUIT_BREAKER_DEFAULT,
     ) -> None:
         if not param_grid:
             raise ValueError("param_grid must contain at least one parameter")
@@ -169,9 +180,10 @@ class ParameterOptimizer:
         self._rank_by = rank_by
         self._top_n = top_n
         self._max_combinations = max_combinations
-        self._maker_fee_bps = maker_fee_bps
-        self._taker_fee_bps = taker_fee_bps
-        self._slippage_bps = slippage_bps
+        self._cost_profile: CostProfile = (
+            cost_profile if cost_profile is not None else default_cost_profile()
+        )
+        self._enable_circuit_breaker: bool = enable_circuit_breaker
         self._walk_forward = walk_forward
         self._walk_forward_folds = walk_forward_folds
         self._walk_forward_train_fraction = walk_forward_train_fraction
@@ -192,13 +204,22 @@ class ParameterOptimizer:
         # pre-validates the whole grid before the bar fetch; this covers any
         # caller that builds a ``ParameterOptimizer`` directly (a script,
         # or a future non-HTTP caller).
-        validate_param_grid_exit_config(self._strategy_cls, param_grid)
+        # WP2.1 (SY-21-06): validated at the policy basis of the run's profile,
+        # exactly like the router, so API pass => engine pass.
+        validate_param_grid_exit_config(
+            self._strategy_cls, param_grid, cost=policy_cost_model(self._cost_profile)
+        )
 
         self._log = structlog.get_logger(__name__).bind(
             component="parameter_optimizer",
             strategy=strategy_cls.__name__,
             total_combinations=len(self._combinations),
         )
+
+    @property
+    def circuit_breaker_enabled(self) -> bool:
+        """Whether every combination's runner builds a circuit breaker (WP2.1c)."""
+        return self._enable_circuit_breaker
 
     @property
     def total_combinations(self) -> int:
@@ -321,6 +342,7 @@ class ParameterOptimizer:
             walk_forward=False,
             num_folds=0,
             deflated_sharpe=None,
+            cost_profile=self._cost_profile,
         )
 
     # ------------------------------------------------------------------
@@ -460,6 +482,7 @@ class ParameterOptimizer:
             walk_forward=True,
             num_folds=len(folds),
             deflated_sharpe=dsr,
+            cost_profile=self._cost_profile,
         )
 
     # ------------------------------------------------------------------
@@ -510,12 +533,11 @@ class ParameterOptimizer:
             symbols=self._symbols,
             timeframe=self._timeframe,
             initial_capital=self._initial_capital,
-            maker_fee_bps=self._maker_fee_bps,
-            taker_fee_bps=self._taker_fee_bps,
-            slippage_bps=self._slippage_bps,
+            cost_profile=self._cost_profile,
             trailing_stop_pct=trailing_stop_pct,
             bracket_config=bracket_config,
             allow_pyramiding=allow_pyramiding,
+            enable_circuit_breaker=self._enable_circuit_breaker,
             seed=42,
         )
         return await runner.run(bars_by_symbol)

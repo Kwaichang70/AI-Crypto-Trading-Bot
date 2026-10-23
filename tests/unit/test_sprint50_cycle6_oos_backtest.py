@@ -461,6 +461,7 @@ class TestGateRealizedSharpeThreshold:
         assert result.eligible is False
         assert result.reason == "oos_skill_below_min"
         assert result.oos_skill_score == pytest.approx(0.8)
+        assert "CostProfile" in result.detail  # WP21A-CR-04: the API detail names the profile
 
     def test_median_at_or_above_threshold_eligible(self) -> None:
         """TEST-C6-051: realized row, median 1.5 >= 1.0 -> eligible."""
@@ -626,7 +627,12 @@ class TestTrainWfAggregation:
     median/worst/max-drawdown aggregation + status logic + result-dict keys.
     """
 
-    def _run(
+    def _run(self, **kwargs: Any) -> dict[str, Any]:
+        """The result dict of ``_train_model_with_wf_sync`` (see :meth:`_run_trained`)."""
+        result: dict[str, Any] = self._run_trained(**kwargs).result
+        return result
+
+    def _run_trained(
         self,
         *,
         fold_sharpes: list[float],
@@ -635,7 +641,9 @@ class TestTrainWfAggregation:
         min_trades_per_fold: int = 5,
         num_folds: int = 3,
         symbol: str = "BTC/USD",
-    ) -> dict[str, Any]:
+    ) -> Any:
+        """``_train_model_with_wf_sync`` itself: ``_TrainedModel(result, cost_profile)``
+        (WP2.1-H, CF-21a-02)."""
         from apps.api.routers import ml as ml_mod  # noqa: F401
         import importlib
 

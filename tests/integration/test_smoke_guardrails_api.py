@@ -66,6 +66,7 @@ from api.config import get_settings
 from api.db.models import RunORM
 from api.services import kill_switch as _kill_switch
 from tests.integration.fakes.idempotency_store import InMemoryIdempotencyStore
+from trading.costs import DEFAULT_COST_PROFILE
 
 CONFIRM_TOKEN = "wp-smoke-test-confirm-token"  # noqa: S105 -- test fixture, not a real secret
 ADMIN_KEY = "wp-smoke-test-admin-key-hex32-0123456789abcdef"
@@ -1153,6 +1154,7 @@ class TestSMKT31OrchestratorDefenceInDepth:
                 symbols=["XRP/EUR"],
                 timeframe=TimeFrame.FIVE_MINUTES,
                 initial_capital="65.00",
+                cost_profile=DEFAULT_COST_PROFILE,
                 bracket_config={},  # missing SL -> G-7 stop_loss_required
             )
 
@@ -1185,6 +1187,7 @@ class TestSMKT31OrchestratorDefenceInDepth:
                 symbols=["XRP/EUR"],
                 timeframe=TimeFrame.FIVE_MINUTES,
                 initial_capital="65.00",
+                cost_profile=DEFAULT_COST_PROFILE,
                 bracket_config={},  # would violate G-7, but the guard must be skipped
                 protective_mode=True,
             )
@@ -1225,6 +1228,7 @@ class TestSMKT31OrchestratorDefenceInDepth:
                 symbols=["XRP/EUR"],
                 timeframe=TimeFrame.FIVE_MINUTES,
                 initial_capital="10000.00",
+                cost_profile=DEFAULT_COST_PROFILE,
                 bracket_config={},  # missing SL -> G-7 stop_loss_required
             )
 
@@ -1269,6 +1273,7 @@ class TestF5NoSmokePaperAutoRetry:
                 symbols=["XRP/EUR"],
                 timeframe=TimeFrame.FIVE_MINUTES,
                 initial_capital="65.00",
+                cost_profile=DEFAULT_COST_PROFILE,
                 bracket_config={"bracket_mode": "fixed", "bracket_stop_loss_pct": 0.05},
             )
 
@@ -1298,6 +1303,7 @@ class TestF5NoSmokePaperAutoRetry:
                 symbols=["BTC/USDT"],
                 timeframe=TimeFrame.FIVE_MINUTES,
                 initial_capital="10000.00",
+                cost_profile=DEFAULT_COST_PROFILE,
                 bracket_config=None,
             )
 

@@ -186,7 +186,8 @@ def test_st30_upgrade_downgrade_upgrade_round_trip() -> None:
     assert asyncio.run(_table_exists(dsn, "idempotency_keys")) is True
     assert asyncio.run(_index_exists(dsn, "ix_idempotency_keys_updated_at")) is True
 
-    command.downgrade(cfg, "-1")
+    # Pinned to 018 (not "-1"): head moved to 020 in WP2.1b, so "-1" would only undo 020.
+    command.downgrade(cfg, "018")
     assert asyncio.run(_table_exists(dsn, "idempotency_keys")) is False
 
     command.upgrade(cfg, "head")

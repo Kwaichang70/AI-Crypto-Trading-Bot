@@ -221,7 +221,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "trading_drawdown_pct",
+          "expr": "trading_drawdown_pct{run_id!~\"bt-.*\"}",
           "instant": true,
           "legendFormat": "Drawdown",
           "refId": "A"
@@ -542,7 +542,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "trading_drawdown_pct",
+          "expr": "trading_drawdown_pct{run_id!~\"bt-.*\"}",
           "legendFormat": "Drawdown %",
           "refId": "A"
         }

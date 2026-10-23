@@ -323,6 +323,29 @@ class BacktestResult(BaseModel):
         description="Total fees paid in quote currency",
     )
 
+    # WP2.1 (SY-21-15): which cost model produced this result, and what the
+    # slippage alone cost (fees are ``total_fees_paid``) -- so fee drag and
+    # slippage drag are reported separately in the re-baseline.
+    cost_profile_id: str = Field(
+        default="",
+        description=(
+            "Id of the CostProfile the run was simulated with (``custom`` for a "
+            "library override).  Empty only for results constructed directly "
+            "(pre-WP2.1 fixtures)."
+        ),
+    )
+    cost_profile_fingerprint: str = Field(
+        default="",
+        description="CostProfile.fingerprint() of the profile above (economics only).",
+    )
+    total_slippage_cost: Decimal = Field(
+        default=Decimal("0"),
+        description=(
+            "Sum over all fills of |fill price - expected price| * quantity, in quote "
+            "currency.  0 under the frictionless_diagnostic profile."
+        ),
+    )
+
     # M6 (Sprint 49): quote currency detection + reporting currency label
     quote_currency: str | None = Field(
         default=None,
@@ -363,8 +386,8 @@ class BacktestResult(BaseModel):
         default=None,
         description=(
             "Annualised Sharpe ratio computed over the out-of-sample window only "
-            "(bars from oos_start_index onward). Net of Coinbase 60/40 bps fees + "
-            "Sprint-42 slippage. None when run() was called without oos_start_index. "
+            "(bars from oos_start_index onward). Net of the run's CostProfile fees + "
+            "slippage. None when run() was called without oos_start_index. "
             "0.0 when the OOS window has fewer than 2 per-period returns "
             "(compute_sharpe convention)."
         ),

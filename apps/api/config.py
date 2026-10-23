@@ -8,6 +8,7 @@ Environment variables always take priority over .env file values.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from functools import lru_cache
 from typing import Any, Literal
 from urllib.parse import quote
@@ -20,6 +21,7 @@ __all__ = [
     "get_settings",
     "iter_settings_secrets",
     "register_settings_secrets",
+    "warn_ignored_cost_profile_env",
 ]
 
 
@@ -531,16 +533,17 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     # Walk-Forward OOS Model Activation Gate (Sprint 50 Cycle 6)
     # The gate metric is now a REALIZED out-of-sample trading Sharpe computed by
-    # a per-fold BacktestRunner mini-backtest (net Coinbase 60/40 bps fees +
-    # Sprint-42 slippage). It REPLACES the Cycle-5 directional z-score proxy.
+    # a per-fold BacktestRunner mini-backtest (net of the platform default
+    # trading.costs.CostProfile fees + slippage, WP2.1). It REPLACES the Cycle-5
+    # directional z-score proxy.
     # ------------------------------------------------------------------
     min_oos_skill_score: float = Field(
         default=1.0,
         ge=0.0,
         le=5.0,
         description=(
-            "Minimum median realized OOS trading Sharpe (net Coinbase 60/40 bps "
-            "fees + Sprint-42 slippage) across walk-forward folds required to "
+            "Minimum median realized OOS trading Sharpe (net of the default "
+            "CostProfile fees + slippage, WP2.1) across walk-forward folds required to "
             "activate a model version via PUT /ml/models/{id}/activate.  "
             "Default 1.0 -- a realized annualised Sharpe of 1.0 on the "
             "out-of-sample window is a conventional floor for a deployable "
@@ -840,3 +843,31 @@ def register_settings_secrets(settings: Settings) -> int:
     for name, reason in sorted(skipped):
         log.warning("log_redaction.secret_not_registered", field=name, reason=reason)
     return total
+
+
+def warn_ignored_cost_profile_env(environ: Mapping[str, str] | None = None) -> list[str]:
+    """WP2.1 (SY-21-02): warn that a cost-profile environment variable is IGNORED.
+
+    The default cost profile is the reviewed code constant
+    ``trading.costs.DEFAULT_COST_PROFILE_ID``; no environment variable (not
+    ``DEFAULT_COST_PROFILE``, not any name containing ``COST_PROFILE``) can
+    change it, so an operator must not believe one does.  Logs ONE warning
+    ``cost_profile.env_ignored`` carrying the variable NAMES only (never a
+    value) and returns the names.  ``Settings`` deliberately has no cost field.
+    """
+    import os
+
+    import structlog
+
+    source: Mapping[str, str] = os.environ if environ is None else environ
+    names = sorted(name for name in source if "COST_PROFILE" in name.upper())
+    if names:
+        structlog.get_logger(__name__).warning(
+            "cost_profile.env_ignored",
+            names=names,
+            msg=(
+                "Cost-profile environment variables are ignored: the default is a "
+                "reviewed code constant (trading.costs.DEFAULT_COST_PROFILE_ID)."
+            ),
+        )
+    return names

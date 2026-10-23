@@ -21,8 +21,8 @@ Coverage groups
 Design notes
 ------------
 - _make_engine() factory returns (PaperExecutionEngine, MagicMock) tuple.
-  The mock has .params.taker_fee_pct = 0.001, .params.maker_fee_pct = 0.0005 to
-  match RiskParameters defaults and enable fee assertions.
+  WP2.1: fees and slippage come from the engine's ``CostProfile`` (see ``_profile``:
+  maker 40 / taker 60 bps), no longer from the risk manager's params.
 - All price/quantity/fee assertions use Decimal arithmetic to avoid float imprecision.
 - asyncio_mode = "auto" is set in pyproject.toml; @pytest.mark.asyncio is included
   for explicitness but not strictly required.
@@ -42,6 +42,7 @@ from uuid import uuid4
 import pytest
 
 from common.types import OrderSide, OrderStatus, OrderType, SignalDirection
+from trading.costs import CostProfile, CostProfileError
 from trading.engines.paper import PaperExecutionEngine
 from trading.execution import InvalidOrderTransitionError
 from trading.models import Order, RiskCheckResult, Signal
@@ -57,6 +58,19 @@ _LAST_PRICE = Decimal("50000")
 _SLIPPAGE_BPS = 5
 _TAKER_FEE_PCT = 0.006   # 0.60% (Coinbase Advanced Trade lowest tier)
 _MAKER_FEE_PCT = 0.004   # 0.40%
+
+
+def _profile(*, slippage_bps: int = _SLIPPAGE_BPS, impact_coefficient_bps: int = 0) -> CostProfile:
+    """WP2.1: the test cost model -- maker 40 / taker 60 bps (== _MAKER/_TAKER_FEE_PCT)."""
+    return CostProfile(
+        id="test_paper_profile",
+        exchange="generic",
+        tier="test_paper_tier",
+        maker_fee_bps=Decimal(40),
+        taker_fee_bps=Decimal(60),
+        slippage_bps=Decimal(slippage_bps),
+        impact_coefficient_bps=Decimal(impact_coefficient_bps),
+    )
 
 # Precision constant matching paper.py internal constant
 _PRICE_PRECISION = Decimal("0.00000001")
@@ -77,15 +91,10 @@ def _make_risk_manager_mock(
     Build a fully-configured MagicMock for BaseRiskManager.
 
     Configures:
-    - params.taker_fee_pct / maker_fee_pct matching RiskParameters defaults (0.60%/0.40%)
     - pre_trade_check() returning an approved RiskCheckResult by default
     - calculate_position_size() returning `position_size`
     """
     mock = MagicMock()
-
-    # Params used by _calculate_fee()
-    mock.params.taker_fee_pct = _TAKER_FEE_PCT
-    mock.params.maker_fee_pct = _MAKER_FEE_PCT
 
     # pre_trade_check default: approved, quantity unchanged
     qty = adjusted_quantity if adjusted_quantity is not None else position_size
@@ -125,7 +134,7 @@ def _make_engine(
         run_id=_RUN_ID,
         risk_manager=rm,
         fill_latency_ms=fill_latency_ms,
-        slippage_bps=slippage_bps,
+        cost_profile=_profile(slippage_bps=slippage_bps),
         initial_cash=initial_cash,
     )
     return engine, rm
@@ -248,7 +257,8 @@ class TestConstructorAndProperties:
     def test_slippage_bps_stored_correctly(self) -> None:
         """Custom slippage_bps is stored and influences fill price calculations."""
         engine, _ = _make_engine(slippage_bps=10)
-        assert engine._slippage_bps == 10
+        # WP2.1: slippage lives on the engine's CostProfile (no ``_slippage_bps`` attribute)
+        assert engine.cost_profile.slippage_bps == Decimal(10)
 
     def test_fill_latency_ms_stored_correctly(self) -> None:
         """Custom fill_latency_ms is stored on the engine instance."""
@@ -1176,8 +1186,7 @@ class TestQT001VolumeParticipationSlippage:
         engine = PaperExecutionEngine(
             run_id=_RUN_ID,
             risk_manager=_make_risk_manager_mock(),
-            slippage_bps=5,
-            impact_coefficient_bps=20,
+            cost_profile=_profile(impact_coefficient_bps=20),
         )
         # set_last_price (no volume) → impact term skipped
         engine.set_last_price(_SYMBOL, Decimal("100"))
@@ -1192,8 +1201,7 @@ class TestQT001VolumeParticipationSlippage:
         engine = PaperExecutionEngine(
             run_id=_RUN_ID,
             risk_manager=_make_risk_manager_mock(),
-            slippage_bps=5,
-            impact_coefficient_bps=100,
+            cost_profile=_profile(impact_coefficient_bps=100),
         )
         engine.set_last_bar(_SYMBOL, Decimal("100"), Decimal("100"))
 
@@ -1212,8 +1220,7 @@ class TestQT001VolumeParticipationSlippage:
         engine = PaperExecutionEngine(
             run_id=_RUN_ID,
             risk_manager=_make_risk_manager_mock(),
-            slippage_bps=5,
-            impact_coefficient_bps=100,
+            cost_profile=_profile(impact_coefficient_bps=100),
         )
         engine.set_last_bar(_SYMBOL, Decimal("100"), Decimal("100"))
 
@@ -1231,8 +1238,7 @@ class TestQT001VolumeParticipationSlippage:
         engine = PaperExecutionEngine(
             run_id=_RUN_ID,
             risk_manager=_make_risk_manager_mock(),
-            slippage_bps=5,
-            impact_coefficient_bps=100,
+            cost_profile=_profile(impact_coefficient_bps=100),
         )
         engine.set_last_bar(_SYMBOL, Decimal("100"), Decimal("100"))
 
@@ -1249,8 +1255,7 @@ class TestQT001VolumeParticipationSlippage:
         engine = PaperExecutionEngine(
             run_id=_RUN_ID,
             risk_manager=_make_risk_manager_mock(),
-            slippage_bps=5,
-            impact_coefficient_bps=100,
+            cost_profile=_profile(impact_coefficient_bps=100),
         )
 
         # Liquid bar
@@ -1267,12 +1272,9 @@ class TestQT001VolumeParticipationSlippage:
         assert quiet_fill > liquid_fill
 
     def test_negative_impact_coefficient_rejected(self) -> None:
-        with pytest.raises(ValueError, match="impact_coefficient_bps must be >= 0"):
-            PaperExecutionEngine(
-                run_id=_RUN_ID,
-                risk_manager=_make_risk_manager_mock(),
-                impact_coefficient_bps=-1,
-            )
+        # WP2.1: the >= 0 rule moved from the engine constructor to CostProfile.
+        with pytest.raises(CostProfileError, match="impact_coefficient_bps"):
+            _profile(impact_coefficient_bps=-1)
 
     def test_set_last_bar_rejects_negative_volume(self) -> None:
         engine, _ = _make_engine()

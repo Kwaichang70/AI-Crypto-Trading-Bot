@@ -53,11 +53,13 @@ from tests.integration.fakes.live_harness import IntrabarClock
 from tests.integration.fakes.scripted_strategy import ScriptedSequenceStrategy
 from trading import strategy_engine as se
 from trading.bracket_exit import BracketExitManager
+from trading.costs import DEFAULT_COST_PROFILE
 from trading.exit_config import (
     EXIT_CHECK_INTERVAL_MAX_S,
     EXIT_CHECK_INTERVAL_MIN_S,
     ExitCheckResolution,
     ExitConfigError,
+    ExitCostModel,
     resolve_exit_check_interval,
     resolve_run_exit_check,
     validate_run_exit_config,
@@ -69,6 +71,9 @@ from trading.strategy_engine import StrategyEngine
 from trading.trailing_stop import TrailingStopManager
 
 SYM = "BTC/EUR"
+# WP21A-CR-01: the resolver and its router helper take a REQUIRED cost basis.  These
+# pre-existing cases keep the basis they implicitly used (the module default).
+_DEFAULT_EXIT_COST = ExitCostModel.from_cost_profile(DEFAULT_COST_PROFILE)
 LOT = datetime(2026, 3, 1, 12, 0, tzinfo=UTC)
 
 
@@ -150,6 +155,7 @@ def test_t34_run_level_resolver_derives_the_run_facts() -> None:
             "strategy_name": "momentum_breakout",
             "bracket": sl,
             "trailing_stop_pct": None,
+            "cost": _DEFAULT_EXIT_COST,
         }
         args.update(kw)
         return resolve_run_exit_check(300, **args)
@@ -283,6 +289,7 @@ def test_cr02_router_w8_flag_follows_the_effective_check(
         strategy_name=strategy,
         bracket=_FIXED_SL,
         trailing_stop_pct=None,
+        cost=_DEFAULT_EXIT_COST,
     )
     assert got is expected
 
@@ -304,6 +311,7 @@ def test_cr02_router_w8_flag_is_false_when_the_settings_fail(
             strategy_name="wp13bb",
             bracket=_FIXED_SL,
             trailing_stop_pct=None,
+            cost=_DEFAULT_EXIT_COST,
         )
         is False
     )

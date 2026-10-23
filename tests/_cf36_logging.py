@@ -53,14 +53,42 @@ def fake_jwt(header: str, payload: str, signature: str) -> str:
     return ".".join((b64url(header), b64url(payload), b64url(signature)))
 
 
-_LOGGER_NAMES = ("uvicorn", "uvicorn.error", "uvicorn.access", "ccxt", "cf36", "stdlib")
+#: Loggers whose handlers / propagate / level / filters ``configure_logging`` touches
+#: (uvicorn x3, ccxt, and the "noisy third-party" set it raises to WARNING), plus the
+#: CF-36 test loggers.
+_LOGGER_NAMES = (
+    "uvicorn",
+    "uvicorn.error",
+    "uvicorn.access",
+    "ccxt",
+    "cf36",
+    "stdlib",
+    "asyncio",
+    "urllib3",
+    "httpcore",
+    "hpack",
+)
+
+
+def _is_pytest_handler(handler: logging.Handler) -> bool:
+    """True for pytest's own logging-plugin handlers (caplog, report sections, live log).
+
+    pytest attaches a fresh set to the root logger at the start of EVERY test phase
+    (setup / call / teardown) and detaches it at the end of the phase.  A fixture whose
+    snapshot spans phases must leave them alone, or it re-attaches a stale handler.
+    """
+    return type(handler).__module__.startswith("_pytest.")
 
 
 @contextmanager
-def isolated_logging_state() -> Iterator[None]:
-    """Snapshot and restore every piece of global logging / registry state."""
+def isolated_logging_state(*, registry: bool = True) -> Iterator[None]:
+    """Snapshot and restore every piece of global logging / registry state.
+
+    ``registry=False`` leaves the CF-36 secret registry alone (the suite-wide
+    ``_cf36_redaction_registry_isolated`` autouse fixture owns it).
+    """
     root = logging.getLogger()
-    saved_handlers = list(root.handlers)
+    saved_handlers = [h for h in root.handlers if not _is_pytest_handler(h)]
     saved_level = root.level
     saved_loggers = {
         n: (
@@ -74,11 +102,11 @@ def isolated_logging_state() -> Iterator[None]:
     saved_structlog = structlog.get_config()
     saved_ctx = dict(structlog.contextvars.get_contextvars())
     saved_configured = clog._LOGGING_CONFIGURED
-    saved_registry = redaction._get_registry()
+    saved_registry = redaction._get_registry() if registry else None
     try:
         yield
     finally:
-        root.handlers[:] = saved_handlers
+        root.handlers[:] = [*saved_handlers, *(h for h in root.handlers if _is_pytest_handler(h))]
         root.setLevel(saved_level)
         for n, (handlers, propagate, level, filters) in saved_loggers.items():
             lg = logging.getLogger(n)
@@ -90,7 +118,8 @@ def isolated_logging_state() -> Iterator[None]:
         structlog.contextvars.clear_contextvars()
         structlog.contextvars.bind_contextvars(**saved_ctx)
         clog._LOGGING_CONFIGURED = saved_configured
-        redaction._set_registry(saved_registry)
+        if registry:
+            redaction._set_registry(saved_registry)
 
 
 class Capture:

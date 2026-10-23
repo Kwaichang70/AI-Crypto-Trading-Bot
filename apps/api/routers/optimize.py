@@ -28,14 +28,25 @@ from sqlalchemy.orm import selectinload
 
 from api.db import get_db
 from api.db.models import OptimizationEntryORM, OptimizationRunORM
+from api.schemas import CostProfileSummary
+from api.services.cost_profiles import (
+    cost_response_fields,
+    new_run_cost_profile_or_422,
+    stamp_cost_config,
+)
 from common.types import TimeFrame
 # TODO(sprint-30): extract to api.services.market_data / api.services.strategy_registry
 from api.routers.runs import (
     _fetch_bars_for_backtest,
     _get_strategy_registry,
 )
-from trading.exit_config import ExitConfigError, validate_param_grid_exit_config
+from trading.exit_config import (
+    ExitConfigError,
+    policy_cost_model,
+    validate_param_grid_exit_config,
+)
 from trading.optimizer import SUPPORTED_METRICS, ParameterOptimizer
+from trading.safety import BACKTEST_CIRCUIT_BREAKER_DEFAULT
 
 __all__ = ["router"]
 
@@ -135,6 +146,15 @@ class OptimizeRequest(BaseModel):
         le=1000,
         description="Hard cap on total parameter combinations",
     )
+    cost_profile: str | None = Field(
+        default=None,
+        max_length=64,
+        description=(
+            "WP2.1: cost-profile registry id applied to EVERY combination "
+            "(any registry id, legacy / stress / diagnostic included).  None -> "
+            "the platform default profile.  Unknown ids give 422 'unknown_cost_profile'."
+        ),
+    )
 
 
 class OptimizeEntryResponse(BaseModel):
@@ -168,6 +188,39 @@ class OptimizationRunSummary(BaseModel):
     failed_combinations: int
     elapsed_seconds: float
     created_at: datetime
+    # WP2.1b (SY-21-08 / SY-21-10): cost-model transparency, server-computed from
+    # ``optimization_runs.run_metadata`` by the SAME helper the run endpoints use
+    # (``cost_response_fields``) -- identical field names and legacy semantics.
+    cost_profile: CostProfileSummary | None = Field(
+        default=None,
+        description=(
+            "Cost profile every combination was simulated with.  For a legacy run "
+            "(run_metadata NULL / no cost_profile key / malformed) this is the inferred "
+            "legacy profile (id 'legacy_backtest_v0', source 'legacy_inferred')."
+        ),
+    )
+    legacy_costs: bool = Field(
+        default=False,
+        description=(
+            "True iff run_metadata has no persisted cost profile, or its profile is a "
+            "legacy_* id, or the persisted value is invalid."
+        ),
+    )
+    cost_profile_invalid: bool = Field(
+        default=False,
+        description="True iff a cost profile was persisted but is malformed (treated as legacy).",
+    )
+    legacy_exit_semantics: bool = Field(
+        default=False,
+        description="True iff run_metadata carries no engine_semantics block.",
+    )
+    live_equivalent_costs: bool = Field(
+        default=False,
+        description=(
+            "True iff run_metadata holds a valid persisted live-equivalent REGISTRY cost "
+            "profile that is not legacy (same rule as RunResponse.live_equivalent_costs)."
+        ),
+    )
 
 
 class OptimizeResponse(BaseModel):
@@ -188,6 +241,38 @@ class OptimizeResponse(BaseModel):
     failed_combinations: int
     elapsed_seconds: float
     entries: list[OptimizeEntryResponse]
+    cost_profile: CostProfileSummary | None = Field(
+        default=None,
+        description=(
+            "WP2.1 / WP2.1b: the cost profile every combination was simulated with.  "
+            "POST returns the profile just persisted in run_metadata; GET returns the "
+            "persisted one.  For a legacy run (run_metadata NULL / no cost_profile key / "
+            "malformed) it is the inferred legacy profile (id 'legacy_backtest_v0', "
+            "source 'legacy_inferred') and legacy_costs is true."
+        ),
+    )
+    legacy_costs: bool = Field(
+        default=False,
+        description=(
+            "True iff run_metadata has no persisted cost profile, or its profile is a "
+            "legacy_* id, or the persisted value is invalid."
+        ),
+    )
+    cost_profile_invalid: bool = Field(
+        default=False,
+        description="True iff a cost profile was persisted but is malformed (treated as legacy).",
+    )
+    legacy_exit_semantics: bool = Field(
+        default=False,
+        description="True iff run_metadata carries no engine_semantics block.",
+    )
+    live_equivalent_costs: bool = Field(
+        default=False,
+        description=(
+            "True iff run_metadata holds a valid persisted live-equivalent REGISTRY cost "
+            "profile that is not legacy (same rule as RunResponse.live_equivalent_costs)."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -234,6 +319,10 @@ async def run_optimization(
         )
 
     strategy_cls = registry[strategy_name]
+
+    # WP2.1 (U-2, SY-21-03): optimize accepts ANY registry id (the same rule
+    # as backtest).  Resolved first: it is the exit-validation basis below.
+    cost_profile = new_run_cost_profile_or_422(body.cost_profile, mode="optimize")
 
     # Validate rank_by metric
     if body.rank_by not in SUPPORTED_METRICS:
@@ -289,7 +378,10 @@ async def run_optimization(
     # subclass, so it MUST be caught before the generic ``except
     # ValueError`` below (G-3) or it would silently map to 400.
     try:
-        validate_param_grid_exit_config(strategy_cls, body.param_grid)
+        # WP2.1 (SY-21-06): the stricter of the default and the run's profile.
+        validate_param_grid_exit_config(
+            strategy_cls, body.param_grid, cost=policy_cost_model(cost_profile)
+        )
     except ExitConfigError as exc:
         log.warning(
             "optimize.exit_config_invalid",
@@ -323,6 +415,10 @@ async def run_optimization(
             rank_by=body.rank_by,
             top_n=body.top_n,
             max_combinations=body.max_combinations,
+            cost_profile=cost_profile,
+            # WP2.1c (SY-21-13, GAP-05): every combination runs with the breaker;
+            # persisted below as ``run_metadata.engine_semantics``.  No API toggle.
+            enable_circuit_breaker=BACKTEST_CIRCUIT_BREAKER_DEFAULT,
         )
     except ExitConfigError as exc:
         # Defence in depth: ParameterOptimizer.__init__ also validates.
@@ -355,6 +451,18 @@ async def run_optimization(
     ]
 
     # Step 4: Persist optimization run + entries to DB
+    # WP2.1b (SY-21-08): freeze the cost model next to the ranking, so an optimizer
+    # result stays attributable to the profile that produced it.  Same two keys and
+    # the same writer as a backtest run's ``config`` (``stamp_cost_config``).
+    effective_profile = result.cost_profile if result.cost_profile is not None else cost_profile
+    run_metadata: dict[str, Any] = {}
+    stamp_cost_config(
+        run_metadata,
+        effective_profile,
+        mode="optimize",
+        backtest_circuit_breaker=optimizer.circuit_breaker_enabled,
+    )
+
     orm_run = OptimizationRunORM(
         id=uuid.uuid4(),
         strategy_name=result.strategy_name,
@@ -365,6 +473,7 @@ async def run_optimization(
         completed_combinations=result.completed_combinations,
         failed_combinations=result.failed_combinations,
         elapsed_seconds=float(result.elapsed_seconds),
+        run_metadata=run_metadata,
     )
     db.add(orm_run)
     await db.flush()  # Assign PK before inserting child rows
@@ -399,6 +508,9 @@ async def run_optimization(
         failed_combinations=result.failed_combinations,
         elapsed_seconds=result.elapsed_seconds,
         entries=entries,
+        # POST and GET share one code path: what is returned here is exactly what a
+        # later GET /optimize/{id} derives from the persisted ``run_metadata``.
+        **cost_response_fields(run_metadata, "optimize"),
     )
 
 
@@ -453,6 +565,8 @@ async def list_optimization_runs(
             failed_combinations=row.failed_combinations,
             elapsed_seconds=float(row.elapsed_seconds),
             created_at=row.created_at,
+            # WP2.1b: NULL / missing / malformed run_metadata is legacy, never a 500.
+            **cost_response_fields(row.run_metadata, "optimize"),
         )
         for row in rows
     ]
@@ -538,4 +652,6 @@ async def get_optimization_run(
         failed_combinations=row.failed_combinations,
         elapsed_seconds=float(row.elapsed_seconds),
         entries=entries,
+        # WP2.1b: NULL / missing / malformed run_metadata is legacy, never a 500.
+        **cost_response_fields(row.run_metadata, "optimize"),
     )

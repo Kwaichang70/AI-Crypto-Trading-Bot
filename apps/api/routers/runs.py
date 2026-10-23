@@ -79,6 +79,10 @@ from api.schemas import (
     RunStopResponse,
     UnprotectedPositionResponse,
 )
+from api.services.cost_profiles import (
+    new_run_cost_profile_or_422,
+    stamp_cost_config,
+)
 from api.services.run_orchestrator import (
     _IncrementalFlushState,
     _LEARNING_INSTANCES,
@@ -102,13 +106,20 @@ from api.services.run_persistence import (
 )
 from common.logging import exc_log_fields
 from common.types import OrderSide, RunMode, TimeFrame
+from trading.costs import (
+    default_cost_profile,
+    resolve_run_cost_profile,
+)
 from trading.exit_config import (
     ExitConfigError,
+    ExitCostModel,
+    policy_cost_model,
     resolve_run_exit_check,
     strategy_requires_exit_manager,
     validate_run_exit_config,
 )
 from trading.recovery import ResumeRejected, check_fill_integrity, replay_sort_key
+from trading.safety import BACKTEST_CIRCUIT_BREAKER_DEFAULT
 from trading.smoke_guard import SMOKE_STRATEGY_NAMES, SmokeGuardError, validate_smoke_run
 from trading.strategy_availability import get_availability, is_mode_allowed
 from trading.strategy_engine import FlattenResult, build_synthetic_flatten_result
@@ -132,12 +143,17 @@ def _intrabar_exit_checks_effective(
     strategy_name: str,
     bracket: dict[str, object] | None,
     trailing_stop_pct: object,
+    cost: ExitCostModel,
 ) -> bool:
     """WP1.3b-b: will the live intra-bar exit check be effective for this run?
 
     Feeds the W8 gate of ``validate_run_exit_config``.  Any failure (settings not
     loadable, a bad value) answers ``False``: the "bar close only" warning is then
     shown, which is the safe direction.
+
+    ``cost`` is REQUIRED (WP21A-CR-01): pass the SAME model as the neighbouring
+    ``validate_run_exit_config(..., cost=...)`` call.  Then "validation passed"
+    implies "this parse passes" and W8 is never spurious.
     """
     try:
         from api.config import get_settings
@@ -150,6 +166,7 @@ def _intrabar_exit_checks_effective(
                 strategy_name=strategy_name,
                 bracket=bracket,
                 trailing_stop_pct=trailing_stop_pct,
+                cost=cost,
             ).interval_s
             is not None
         )
@@ -645,10 +662,19 @@ async def create_run(
     # (bracket keys popped, trailing_stop_pct rewritten) before the claim
     # point, and a fingerprint taken after that mutation would not match a
     # byte-identical retry.
+    #
+    # WP2.1 (SY-21-17): the new optional ``cost_profile`` request field adds a
+    # ``"cost_profile": null`` key to the dump.  A body that does not send it is
+    # EXCLUDED from the fingerprint, so a byte-identical retry that straddles the
+    # deploy keeps its pre-2.1a fingerprint (and still replays); a body that
+    # carries one is fingerprinted with it.
+    _fingerprint_exclude = {"confirm_token"}
+    if body.cost_profile is None:
+        _fingerprint_exclude.add("cost_profile")
     _idempotency_fingerprint = compute_fingerprint(
         CREATE_ENDPOINT,
         {},
-        body.model_dump(mode="json", exclude={"confirm_token"}),
+        body.model_dump(mode="json", exclude=_fingerprint_exclude),
     )
 
     log = logger.bind(
@@ -707,6 +733,15 @@ async def create_run(
                 f"Allowed: {sorted_modes}. {demotion_reason}".strip()
             ),
         )
+
+    # ------------------------------------------------------------------
+    # WP2.1 (U-2, SY-21-03): resolve the run's cost profile BEFORE the exit
+    # validation (its basis).  Backtest: any registry id; paper: live-
+    # equivalent ids only; live: no id at all.  422 carries a stable code and
+    # never echoes the requested value.  A failure here leaves no RunORM row
+    # and touches no idempotency store.
+    # ------------------------------------------------------------------
+    _cost_profile = new_run_cost_profile_or_422(body.cost_profile, mode=str(body.mode))
 
     # Extract trailing_stop_pct from strategy params BEFORE schema validation.
     # The UI may submit trailing_stop_pct as an empty string when the field is
@@ -773,7 +808,11 @@ async def create_run(
                 strategy_name=strategy_name,
                 bracket=_bracket_config,
                 trailing_stop_pct=_raw_trailing_stop_pct,
+                cost=policy_cost_model(_cost_profile),
             ),
+            # WP2.1 (SY-21-06): the stricter of the default and the run's own
+            # profile, so create-pass => engine-pass => promote-pass.
+            cost=policy_cost_model(_cost_profile),
         )
     except ExitConfigError as exc:
         log.warning(
@@ -1037,6 +1076,17 @@ async def create_run(
     # WP1.3a (SY-13a-08/I8): the RESOLVED bool is always persisted so a
     # run's pyramiding behaviour is visible and stays fixed for its lifetime.
     config_snapshot["allow_pyramiding"] = _allow_pyramiding
+    # WP2.1 (AG-03/AG-06): freeze the run's cost profile + semantics versions.
+    # Live: the profile is only an estimate, the ledger uses exchange fills.
+    # WP2.1c (SEC-09): the stamp names the SAME constant the runner below receives (the
+    # stamp precedes the runner), instead of relying on the stamp's own default.
+    stamp_cost_config(
+        config_snapshot,
+        _cost_profile,
+        mode=str(body.mode),
+        fee_source="exchange_fills" if body.mode == "live" else "model",
+        backtest_circuit_breaker=BACKTEST_CIRCUIT_BREAKER_DEFAULT,
+    )
     if body.backtest_start is not None:
         config_snapshot["backtest_start"] = body.backtest_start.isoformat()
     if body.backtest_end is not None:
@@ -1139,6 +1189,11 @@ async def create_run(
                     bracket_config=_bracket_config,
                     allow_pyramiding=_allow_pyramiding,
                     seed=body.seed,
+                    cost_profile=_cost_profile,
+                    # WP2.1c (SY-21-13): the breaker the run executes with is the one
+                    # ``stamp_cost_config`` persisted as
+                    # ``engine_semantics.backtest_circuit_breaker``.  No API toggle.
+                    enable_circuit_breaker=BACKTEST_CIRCUIT_BREAKER_DEFAULT,
                 )
                 # M7 (Sprint 49 INF-9): persist the resolved seed (auto-generated or
                 # caller-supplied) into the config dict.  Seed mutation here is captured
@@ -1266,6 +1321,7 @@ async def create_run(
                     enable_adaptive_learning=body.enable_adaptive_learning,
                     auto_apply_learning=body.auto_apply_learning,
                     allow_pyramiding=_allow_pyramiding,
+                    cost_profile=_cost_profile,
                 ),
                 name=f"paper-engine-{run_id}",
             )
@@ -1303,6 +1359,7 @@ async def create_run(
                     bracket_config=_bracket_config,
                     enable_adaptive_learning=body.enable_adaptive_learning,
                     allow_pyramiding=_allow_pyramiding,
+                    cost_profile=_cost_profile,
                 ),
                 name=f"live-engine-{run_id}",
             )
@@ -2797,6 +2854,10 @@ async def promote_to_live(
             detail=f"Strategy {promotion_strategy_name!r} from source run is no longer registered.",
         )
     _source_strategy_params: dict[str, Any] = source_run.config.get("strategy_params", {}) or {}
+    # WP2.1 (AG-04): a promoted live run is ALWAYS priced (estimated) with the
+    # current default -- never the paper source's profile -- and validated at
+    # the policy basis of that default, which create can never be stricter than.
+    _promote_cost_profile = default_cost_profile()
     try:
         _promote_verdict = validate_run_exit_config(
             promotion_strategy_cls,
@@ -2811,7 +2872,9 @@ async def promote_to_live(
                 strategy_name=promotion_strategy_name,
                 bracket=source_run.config.get("bracket_config") or {},
                 trailing_stop_pct=_source_strategy_params.get("trailing_stop_pct"),
+                cost=policy_cost_model(_promote_cost_profile),
             ),
+            cost=policy_cost_model(_promote_cost_profile),
         )
     except ExitConfigError as exc:
         log.warning(
@@ -2965,6 +3028,11 @@ async def promote_to_live(
         else:
             promoted_config.pop("bracket_config", None)
         promoted_config["allow_pyramiding"] = _promote_verdict.allow_pyramiding
+        # WP2.1 (AG-04): OVERWRITE the inherited cost keys (the paper run's
+        # profile / engine semantics must not leak into the live run).
+        stamp_cost_config(
+            promoted_config, _promote_cost_profile, mode="live", fee_source="exchange_fills"
+        )
         # WP13a-S-07 (security round 2): mirror create_run -- persist the
         # NORMALISED trailing_stop_pct into strategy_params (or remove it when
         # unset), instead of leaving the raw source value in place while the
@@ -3025,6 +3093,7 @@ async def promote_to_live(
                 bracket_config=dict(_promote_verdict.config.bracket),
                 enable_adaptive_learning=False,
                 allow_pyramiding=_promote_verdict.allow_pyramiding,
+                cost_profile=_promote_cost_profile,
             ),
             name=f"live-engine-promoted-{new_run_id}",
         )
@@ -3354,6 +3423,11 @@ async def resume_run(
     # ------------------------------------------------------------------
     exit_config_waived_payload: dict[str, Any] | None = None
     exit_manager_missing: bool | None = None
+    # WP2.1 (AG-04, SY-21-05): resume resolves the run's OWN profile WITHOUT
+    # writing it (a legacy run -> legacy_runtime_v0), so no run becomes
+    # un-resumable and a later default switch never affects a resume.
+    _resume_cost_profile = resolve_run_cost_profile(orphan_config, mode="live").profile
+    _resume_cost_model = ExitCostModel.from_cost_profile(_resume_cost_profile)
     if mode == "normal":
         try:
             _resume_verdict = validate_run_exit_config(
@@ -3369,7 +3443,9 @@ async def resume_run(
                     strategy_name=strategy_name,
                     bracket=_bracket_config_raw,
                     trailing_stop_pct=_raw_trailing_for_validation,
+                    cost=_resume_cost_model,
                 ),
+                cost=_resume_cost_model,
             )
         except ExitConfigError as exc:
             log.warning(
@@ -3390,6 +3466,7 @@ async def resume_run(
         _salvaged_config, _salvage_issues = salvage_exit_config(
             bracket=_bracket_config_raw,
             trailing_stop_pct=_raw_trailing_for_validation,
+            cost=_resume_cost_model,
         )
         bracket_config = dict(_salvaged_config.bracket)
         trailing_pct = _salvaged_config.trailing_stop_pct
@@ -3771,6 +3848,7 @@ async def resume_run(
                 entries_latch_reason=run.entries_latch_reason,
                 allow_pyramiding=resolved_allow_pyramiding,
                 exit_config_waived=exit_config_waived_payload is not None,
+                cost_profile=_resume_cost_profile,
             ),
             name=f"live-engine-resumed-{run_id}",
         )
@@ -4210,6 +4288,10 @@ async def recover_orphaned_runs() -> int:
                             mode=RunMode.LIVE,
                             allow_pyramiding=run_config.get("allow_pyramiding"),
                             timeframe=str(run_config.get("timeframe", "1h")),
+                            # WP2.1: judged against the run's OWN (resolved) profile.
+                            cost=ExitCostModel.from_cost_profile(
+                                resolve_run_cost_profile(run_config, mode="live").profile
+                            ),
                         )
                 except ExitConfigError as exc:
                     log.error(
@@ -4307,6 +4389,11 @@ async def recover_orphaned_runs() -> int:
                 # was only logged by the outer except-block).  A failure
                 # here marks the run 'error' and moves on to the next
                 # candidate, never touching 'running'.
+                # WP2.1 (AG-04): boot recovery resolves the run's OWN profile and
+                # NEVER writes it (a legacy run -> legacy_runtime_v0).
+                recovery_cost_profile = resolve_run_cost_profile(
+                    run_config, mode="paper"
+                ).profile
                 try:
                     _recovery_verdict = validate_run_exit_config(
                         strategy_cls,
@@ -4315,6 +4402,7 @@ async def recover_orphaned_runs() -> int:
                         mode=RunMode.PAPER,
                         allow_pyramiding=run_config.get("allow_pyramiding"),
                         timeframe=timeframe_str,
+                        cost=ExitCostModel.from_cost_profile(recovery_cost_profile),
                     )
                 except ExitConfigError as exc:
                     log.warning(
@@ -4374,6 +4462,7 @@ async def recover_orphaned_runs() -> int:
                         elapsed_seconds=elapsed_seconds,
                         entries_latch_reason=entries_latch_reason,
                         allow_pyramiding=resolved_allow_pyramiding,
+                        cost_profile=recovery_cost_profile,
                     ),
                     name=f"recovery-paper-{run_id_str[:8]}",
                 )

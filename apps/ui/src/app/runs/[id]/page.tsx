@@ -23,6 +23,9 @@ import type { CsvColumn } from "@/lib/csv-export";
 import { ExportCsvButton } from "@/components/ui/export-csv-button";
 import { Header } from "@/components/layout/header";
 import { RunStatusBadge } from "@/components/ui/status-badge";
+import { CostProfileBadge } from "@/components/ui/cost-profile-badge";
+import { CostModelCard } from "@/components/cost-model-card";
+import { relaunchCostProfile } from "@/lib/cost-profile";
 import { SideBadge } from "@/components/ui/side-badge";
 import { StatCard } from "@/components/ui/stat-card";
 import { DataTable, type Column } from "@/components/ui/data-table";
@@ -582,6 +585,12 @@ export default function RunDetailPage() {
       timeframe: timeframe ?? "",
       initial_capital: initial_capital ?? "",
     });
+    // WP2.1b: carry a registry cost profile over so the copy is priced alike
+    // (pinned, including the default id; inferred / invalid / custom profiles
+    // fall back to the platform default). Never for a live source: live takes
+    // no profile.
+    const costProfile = relaunchCostProfile(run);
+    if (costProfile && run.runMode !== "live") params.set("cost_profile", costProfile);
     router.push(`/runs/new?${params.toString()}`);
   }
 
@@ -706,6 +715,7 @@ export default function RunDetailPage() {
       {/* Status + metadata row */}
       <div className="flex flex-wrap items-center gap-3 text-sm text-slate-500 dark:text-slate-400">
         <RunStatusBadge status={run.status} />
+        <CostProfileBadge value={run} />
         <span>Started {new Date(run.startedAt).toLocaleString()}</span>
         {run.stoppedAt && (
           <span>Stopped {new Date(run.stoppedAt).toLocaleString()}</span>
@@ -796,6 +806,9 @@ export default function RunDetailPage() {
           <>
             {activeTab === "overview" && (
               <div className="space-y-6">
+                {/* WP2.1b: cost model (live: fees are actual exchange fills) */}
+                <CostModelCard run={run} />
+
                 {/* Portfolio metric cards */}
                 <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
                   <StatCard

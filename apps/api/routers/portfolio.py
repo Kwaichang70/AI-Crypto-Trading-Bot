@@ -46,13 +46,13 @@ from api.schemas import (
     EquityCurveResponse,
     EquityPointResponse,
     ErrorResponse,
-    LEADERBOARD_ELIGIBLE_FLAGS,
-    LEADERBOARD_MIN_CLOSED_TRADES,
     PortfolioResponse,
     PositionListResponse,
     PositionResponse,
     TradeListResponse,
     TradeResponse,
+    leaderboard_eligible,
+    meets_trade_confidence_thresholds,
 )
 
 __all__ = ["router", "summary_router"]
@@ -685,6 +685,7 @@ async def get_aggregate_portfolio(
 
     total_initial_capital = Decimal("0")
     eligible_runs_count: int = 0
+    legacy_cost_runs_excluded: int = 0
     return_pcts_eligible: list[float] = []
 
     for cfg in config_rows:
@@ -707,11 +708,13 @@ async def get_aggregate_portfolio(
 
         n_trades = raw_metrics.get("total_trades")
         flag = raw_metrics.get("confidence_flag")
-        if not (
-            isinstance(n_trades, int)
-            and n_trades >= LEADERBOARD_MIN_CLOSED_TRADES
-            and flag in LEADERBOARD_ELIGIBLE_FLAGS
-        ):
+        # WP2.1 (U-5): the SAME helper RunResponse uses -- the trade-count and
+        # confidence thresholds AND a live-equivalent registry cost model.
+        if not leaderboard_eligible(n_trades, flag, cfg):
+            # Count the runs that pass on trades + confidence alone and are
+            # excluded purely by their cost model (legacy, stress, ...).
+            if meets_trade_confidence_thresholds(n_trades, flag):
+                legacy_cost_runs_excluded += 1
             continue
 
         eligible_runs_count += 1
@@ -746,4 +749,5 @@ async def get_aggregate_portfolio(
         worst_run_return_pct=worst_return,
         total_initial_capital=str(total_initial_capital),
         eligible_runs_count=eligible_runs_count,
+        legacy_cost_runs_excluded=legacy_cost_runs_excluded,
     )

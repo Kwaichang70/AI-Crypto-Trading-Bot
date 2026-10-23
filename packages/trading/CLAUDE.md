@@ -100,8 +100,8 @@ Core trading engine containing the heart of the system.
   `trip`, `reset`) are unreachable from production (AST-pinned, WP16-T-25);
   removal is CF-29. Never read `get_summary()` keys for a decision.
 - Build a breaker ONLY via `build_run_circuit_breaker(run_id, risk_manager.params)`
-  (orchestrator paper + live, the integration harness, the `BacktestRunner`
-  opt-in). Never construct `CircuitBreaker` / `CircuitBreakerConfig` directly in
+  (orchestrator paper + live, the integration harness, the `BacktestRunner`,
+  default on since WP2.1c). Never construct `CircuitBreaker` / `CircuitBreakerConfig` directly in
   `apps/` or `backtest.py`.
 - Every effect is BUY-only (C23): one filter site, `_drop_entry_signals`, first
   matching reason wins (`kill_switch`, `protective_mode`,
@@ -116,7 +116,14 @@ Core trading engine containing the heart of the system.
   exits below 0.4 x limit for 3 bars; DAILY_LIMIT clears on the `snapshot.day`
   roll. `evaluate` is transactional (state commits only after every computation
   succeeded). Bands are `Decimal` derived from the run's `RiskParameters`.
-- Backtests: opt-in (`BacktestRunner(enable_circuit_breaker=True)`), default off (U-2).
+- Backtests: ON by default since WP2.1c (SY-21-13, closes CF-26): `BacktestRunner` and
+  `ParameterOptimizer` default `enable_circuit_breaker=BACKTEST_CIRCUIT_BREAKER_DEFAULT`
+  (`True`, `trading.safety`); the API backtest, the optimizer, the ML gate and the research
+  scripts all use it (scripts: `--no-circuit-breaker`). There is NO API toggle. An explicit
+  `enable_circuit_breaker=False` is the pre-2.1c path and stays byte-identical to the 2.1a
+  goldens (pin it in any test calibrated to the no-breaker numbers). The value is persisted as
+  `engine_semantics.backtest_circuit_breaker` on backtest runs and optimization `run_metadata`
+  (absent on paper/live; `false` on 2.1a/2.1b rows, never rewritten, never read as legacy).
 - Restart watch (CF-35, user decision): every new breaker enters HALT at
   `halt_exit` (0.9 x limit) while `_evaluations < N` and REDUCE at `reduce_exit`
   (0.4 x limit) while `_evaluations < 2N`; streaks start at 0; nothing is
@@ -235,3 +242,27 @@ Core trading engine containing the heart of the system.
   and the `.exception` catch-alls (`engine.start_failed`, `runs.live_engine_error`).
 - See `reports/vp2-wp1.3b/synthesis-spec.md` section 5.3 and
   `docs/runbooks/circuit-breaker-halt.md`.
+
+### WP2.1a (one cost model: `trading/costs.py`)
+- `CostProfile` (frozen, Decimal-only, bps) is the ONLY cost source. `RiskParameters` has NO fee or
+  slippage field (do not add one: C25 was two cost sources). `costs.py` is a leaf: stdlib only,
+  reads no environment (AST-pinned, `tests/unit/test_wp21_costs.py`).
+- Registry `COST_PROFILES` is append-only; every fingerprint is pinned by a test. The default is the
+  code constant `DEFAULT_COST_PROFILE_ID` (one reviewed line; never env: a `*COST_PROFILE*` env var
+  is ignored and logged by name only as `cost_profile.env_ignored`). Docs name the default by id,
+  not by number.
+- Wiring: `BacktestRunner` / `ParameterOptimizer` / `PaperExecutionEngine` / `StrategyEngine` take
+  `cost_profile` (`None` -> the current default). `run_paper_engine` / `run_live_engine` take it as a
+  REQUIRED keyword. `LiveExecutionEngine(cost_profile=...)` is an ESTIMATE: the live ledger always
+  books the exchange's real fees; the profile only feeds the log-only `cost_profile.tier_mismatch`
+  (start) and `cost_profile.fill_fee_drift` (per real fill, 5 bps) checks.
+- The run's profile is frozen in `RunORM.config["cost_profile"]` (+ `engine_semantics`) at create;
+  promote overwrites it with the default; auto-retry copies it; resume / boot / salvage resolve it
+  WITHOUT writing (`resolve_run_cost_profile`; absent or invalid -> a legacy profile, never raises).
+- Exit-floor basis: the API validates at `policy_cost_model(run_profile)` = the stricter of the
+  default and the run's own profile; the engines and a resume use the run's own profile (API pass
+  implies engine pass).
+- Bracket levels sit on the all-in (fee-inclusive) basis (WP1.3b), so a higher taker moves every stop
+  closer to the market (X-15). Goldens calibrated on the old costs pin `legacy_backtest_v0`
+  explicitly; per-profile goldens are pinned per profile id with analytic per-fill checks.
+- See `reports/vp2-wp2.1/synthesis-spec.md`.

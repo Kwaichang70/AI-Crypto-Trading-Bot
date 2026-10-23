@@ -67,6 +67,15 @@ WP1.3b-b additions (live intra-bar exit check)
 - ``run_intrabar_loop(stack)``: run the REAL ``_intrabar_exit_loop``
   task body until the virtual clock reaches its ``horizon``.
 
+WP2.1 addition
+--------------
+- ``cost_profile: CostProfile | None = None`` on the three builders: forwarded to
+  the execution engine (paper: fee / slippage model; live: log-only drift
+  estimate) and to ``StrategyEngine`` (exit-cost floor), exactly as
+  ``run_orchestrator.run_paper_engine`` / ``run_live_engine`` now do.  ``None``
+  keeps every pre-WP2.1 caller on the engine defaults (paper/strategy: the
+  platform default profile; live: no drift checks).
+
 WP1.5a additions
 ----------------
 - ``clock``: an injectable risk-day clock (``ManualClock``) passed to
@@ -96,6 +105,7 @@ import pytest
 from common.types import RunMode, TimeFrame
 from data.services.ccxt_market_data import CCXTMarketDataService
 from tests.integration.fakes.fake_ccxt_exchange import FakeCCXTExchange
+from trading.costs import CostProfile, default_cost_profile
 from trading.engines.live import LiveExecutionEngine
 from trading.engines.paper import PaperExecutionEngine
 from trading.models import Fill, Order
@@ -202,6 +212,7 @@ async def build_live_stack(
     clock: Callable[[], datetime] | None = None,
     circuit_breaker: bool = True,
     symbols: Sequence[str] | None = None,
+    cost_profile: CostProfile | None = None,
 ) -> LiveStack:
     """Construct one real StrategyEngine(LIVE) stack against ``exchange``.
 
@@ -234,6 +245,7 @@ async def build_live_stack(
         risk_manager=risk_manager,
         exchange=live_exchange_handle,
         enable_live_trading=True,
+        cost_profile=cost_profile,
     )
 
     # Mirrors run_orchestrator.py:1126-1132, minus credentials (the fake
@@ -255,6 +267,7 @@ async def build_live_stack(
         # WP1.6 (C2 closed): production wires the breaker, so the harness does
         # too (same helper, same thresholds; no Telegram listener).
         circuit_breaker=cb,
+        cost_profile=cost_profile,
     )
 
     return LiveStack(
@@ -280,6 +293,7 @@ async def build_paper_stack(
     risk_params: RiskParameters | None = None,
     clock: Callable[[], datetime] | None = None,
     circuit_breaker: bool = True,
+    cost_profile: CostProfile | None = None,
 ) -> PaperStack:
     """Construct one real StrategyEngine(PAPER) stack against ``exchange``.
 
@@ -297,6 +311,7 @@ async def build_paper_stack(
     execution = PaperExecutionEngine(
         run_id=run_id,
         risk_manager=risk_manager,
+        cost_profile=cost_profile if cost_profile is not None else default_cost_profile(),
         initial_cash=initial_capital,
     )
     market_data = CCXTMarketDataService(exchange_id=EXCHANGE_ATTR, cache_ttl_seconds=0)
@@ -312,6 +327,7 @@ async def build_paper_stack(
         run_mode=RunMode.PAPER,
         config=engine_config,
         circuit_breaker=cb,
+        cost_profile=cost_profile,
     )
     return PaperStack(
         engine=engine,
@@ -341,6 +357,7 @@ async def build_resumed_live_stack(
     daily_seed: ResumeDailySeed | None = None,
     circuit_breaker: bool = True,
     orders: Sequence[Order] = (),
+    cost_profile: CostProfile | None = None,
 ) -> LiveStack:
     """Build a SECOND engine stack under the SAME ``run_id``, with its
     portfolio rebuilt from ``fills`` via the production
@@ -396,6 +413,7 @@ async def build_resumed_live_stack(
         risk_manager=risk_manager,
         exchange=live_exchange_handle,
         enable_live_trading=True,
+        cost_profile=cost_profile,
     )
 
     market_data = CCXTMarketDataService(exchange_id=EXCHANGE_ATTR, cache_ttl_seconds=0)
@@ -421,6 +439,7 @@ async def build_resumed_live_stack(
         config=engine_config,
         protective_mode=protective_mode,
         circuit_breaker=cb,
+        cost_profile=cost_profile,
     )
     engine.prime_resume_exit_state(fills, orders)
 
