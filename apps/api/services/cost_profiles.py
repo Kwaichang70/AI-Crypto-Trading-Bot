@@ -22,6 +22,7 @@ from typing import Any
 from fastapi import HTTPException, status
 
 from api.schemas import CostProfileSummary, build_cost_profile_summary
+from trading.clock import TIMESTAMP_CLOCK_VERSION
 from trading.costs import (
     CostProfile,
     CostProfileError,
@@ -36,17 +37,24 @@ from trading.safety import BACKTEST_CIRCUIT_BREAKER_DEFAULT
 
 __all__ = [
     "COST_MODEL_VERSION",
+    "KNOWN_TIMESTAMP_CLOCKS",
     "cost_profile_http_error",
     "cost_response_fields",
     "engine_semantics",
     "new_run_cost_profile_or_422",
     "stamp_cost_config",
+    "timestamp_response_fields",
 ]
 
 #: Version tag of the cost model wiring (``trading.costs``), persisted in
 #: ``engine_semantics.cost_model``.
 COST_MODEL_VERSION = "wp21-1"
 _DAILY_RISK_VERSION = "wp15-1"
+
+#: ``engine_semantics.timestamp_clock`` values that mean "persisted rows carry bar
+#: time" (WP2.2, SY-22-08).  A backtest whose stored value is outside this set is
+#: legacy (wall-clock stamps).  WP2.3 bumps the version and extends the set.
+KNOWN_TIMESTAMP_CLOCKS: frozenset[str] = frozenset({TIMESTAMP_CLOCK_VERSION})
 
 
 def cost_profile_http_error(exc: CostProfileError) -> HTTPException:
@@ -70,6 +78,11 @@ def engine_semantics(
 ) -> dict[str, object]:
     """The semantics versions a run starts under.
 
+    ``timestamp_clock`` (WP2.2, SY-22-08) is written on the same two modes and names
+    the clock the engine ran with (bar time); it is absent on paper / live, which
+    stamp wall time.  Unlike ``backtest_circuit_breaker`` it IS read, by
+    :func:`timestamp_response_fields`.
+
     ``backtest_circuit_breaker`` exists ONLY on backtest runs and optimization
     ``run_metadata`` (the breaker is always on in paper / live, SY-21-11): ``False``
     in WP2.1a / 2.1b, ``True`` from WP2.1c.  The value is the one the engine will
@@ -86,6 +99,7 @@ def engine_semantics(
     }
     if mode in ("backtest", "optimize"):
         semantics["backtest_circuit_breaker"] = backtest_circuit_breaker
+        semantics["timestamp_clock"] = TIMESTAMP_CLOCK_VERSION
     return semantics
 
 
@@ -140,3 +154,21 @@ def cost_response_fields(config: Mapping[str, object] | None, run_mode: str) -> 
         "legacy_exit_semantics": not has_semantics,
         "live_equivalent_costs": is_leaderboard_cost_eligible(config),
     }
+
+
+def timestamp_response_fields(config: Mapping[str, object] | None, run_mode: str) -> dict[str, Any]:
+    """``legacyTimestamps`` for one RUN (SY-22-08 / SY-22-09).
+
+    True iff the run is a backtest whose ``engine_semantics.timestamp_clock`` is not a
+    known version (missing, unknown, non-string, ``None`` or a malformed
+    ``engine_semantics``): its persisted rows carry wall-clock stamps.  Paper and live
+    runs always stamp wall time by design, so they are never flagged.  Never raises,
+    never logs a value.  Deliberately separate from :func:`cost_response_fields`,
+    which also feeds the optimization responses where the flag has no meaning.
+    """
+    legacy = False
+    if run_mode == "backtest":
+        semantics = config.get("engine_semantics") if isinstance(config, Mapping) else None
+        clock = semantics.get("timestamp_clock") if isinstance(semantics, Mapping) else None
+        legacy = not (isinstance(clock, str) and clock in KNOWN_TIMESTAMP_CLOCKS)
+    return {"legacy_timestamps": legacy}

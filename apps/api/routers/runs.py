@@ -3946,7 +3946,9 @@ async def get_diagnostics(
     eq_result = await db.execute(
         select(EquitySnapshotORM)
         .where(EquitySnapshotORM.run_id == run_id)
-        .order_by(EquitySnapshotORM.timestamp.desc())
+        # WP2.2 (SY-22-16): bar-time stamps repeat within a bar (mark + fill points), so
+        # ``bar_index`` (the point ordinal) breaks the tie deterministically.
+        .order_by(EquitySnapshotORM.timestamp.desc(), EquitySnapshotORM.bar_index.desc())
         .limit(1)
     )
     latest_equity: EquitySnapshotORM | None = eq_result.scalar_one_or_none()

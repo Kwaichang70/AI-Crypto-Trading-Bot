@@ -15,8 +15,9 @@ WP2.2 P2b: the bar-time clock, end to end (hermetic: no Postgres, no network).
     WP22-T-18  at most one Fill per Order (guards SY-22-06)
     WP22-T-19  runner edges (no-clock engine, :450, portfolio == BarClock after every bar)
 
-``snapshot_at`` of ``position_snapshots`` is NOT asserted here: it is stamped in
-``apps/api/services/run_persistence.py`` (SY-22-15), which belongs to commit P3.
+``snapshot_at`` of ``position_snapshots`` is stamped in ``run_persistence.py`` (SY-22-15,
+the last equity point) and is covered by every time-column check below, plus
+``tests/unit/test_wp22_api_semantics.py::TestT02SnapshotAt``.
 """
 
 from __future__ import annotations
@@ -240,12 +241,12 @@ _TIME_COLUMNS_EXCL_SNAPSHOT_AT = ("timestamp", "created_at", "updated_at", "exec
 
 
 def _time_values(rec: _Recorder) -> list[tuple[str, str, datetime]]:
-    """Every datetime in the persisted rows except ``snapshot_at`` (P3, SY-22-15)."""
+    """Every datetime in the persisted rows."""
     out: list[tuple[str, str, datetime]] = []
     for row in rec.rows:
         values = _row_values(row)
         for col, value in values.items():
-            if isinstance(value, datetime) and col != "snapshot_at":
+            if isinstance(value, datetime):
                 out.append((type(row).__name__, col, value))
     return out
 
@@ -616,7 +617,6 @@ def _normalised_rows(rec: _Recorder) -> list[tuple[str, tuple[Any, ...]]]:
     out = []
     for row in rec.rows:
         values = _row_values(row)
-        values.pop("snapshot_at", None)  # P3 (SY-22-15): still wall time until then
         out.append((type(row).__name__, tuple((k, norm(v, k)) for k, v in sorted(values.items()))))
     return out
 

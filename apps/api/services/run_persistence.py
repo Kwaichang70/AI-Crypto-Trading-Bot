@@ -31,6 +31,7 @@ from __future__ import annotations
 import math
 import re
 import uuid
+from collections.abc import Sequence
 from datetime import UTC, date, datetime, time
 from decimal import Decimal
 from typing import Any, Final
@@ -56,8 +57,9 @@ from api.schemas import (
     RunResponse,
     leaderboard_eligible,
 )
-from api.services.cost_profiles import cost_response_fields
+from api.services.cost_profiles import cost_response_fields, timestamp_response_fields
 from common.types import OrderSide, OrderStatus, OrderType
+from trading.metrics import EquityCurvePoint
 from trading.models import Fill, Order
 from trading.recovery import ResumeRejected, ResumeSnapshot
 
@@ -120,6 +122,8 @@ def run_orm_to_response(run: RunORM) -> RunResponse:
     # errored) still carries its cost profile and legacy flags.  A malformed
     # persisted value degrades to a legacy flag -- it never 500s a GET.
     response = response.model_copy(update=cost_response_fields(run.config, run.run_mode))
+    # WP2.2 (SY-22-09): server-computed legacy-timestamp flag (runs only).
+    response = response.model_copy(update=timestamp_response_fields(run.config, run.run_mode))
 
     # Step 2: extract JSONB-resident leaderboard fields (confidence_flag, psr).
     # These are NOT top-level SQL columns; they live in config["backtest_metrics"].
@@ -172,6 +176,7 @@ def run_orm_to_detail_response(run: RunORM) -> RunDetailResponse:
     base = RunDetailResponse.model_validate(run)
     # WP2.1: cost-model transparency fields (see run_orm_to_response).
     base = base.model_copy(update=cost_response_fields(run.config, run.run_mode))
+    base = base.model_copy(update=timestamp_response_fields(run.config, run.run_mode))
 
     # Attempt to populate backtest_metrics from the JSONB config blob
     raw_metrics: dict[str, Any] | None = (run.config or {}).get("backtest_metrics")
@@ -456,6 +461,19 @@ async def persist_paper_results(
 # ---------------------------------------------------------------------------
 
 
+def _final_bar_close(curve: Sequence[EquityCurvePoint]) -> datetime:
+    """End-of-run stamp for a backtest's position snapshots (WP2.2, SY-22-15).
+
+    The last equity point's stamp, i.e. the final bar close.  There is deliberately no
+    wall-time fallback: open positions without an equity curve is a broken result, and
+    a silent wall read would mix wall time into a bar-time table (T-06).
+    """
+    if not curve:
+        raise ValueError("cannot stamp position snapshots: the backtest result has no equity curve")
+    stamp: datetime = curve[-1].timestamp
+    return stamp
+
+
 async def persist_backtest_results(
     db: AsyncSession,
     run_id: uuid.UUID,
@@ -600,7 +618,7 @@ async def persist_backtest_results(
     # (CR-006 deferred cleanup; pre-existing before M3, not introduced here).
     position_orms: list[PositionSnapshotORM] = []
     if portfolio is not None and hasattr(portfolio, '_position_snapshots'):
-        now = datetime.now(tz=UTC)
+        # WP2.2 (SY-22-15): bar-time stamp, no wall-time fallback (see _final_bar_close).
         for pos in portfolio._position_snapshots.values():
             position_orms.append(
                 PositionSnapshotORM(
@@ -613,7 +631,7 @@ async def persist_backtest_results(
                     realised_pnl=pos.realised_pnl,
                     total_fees_paid=pos.total_fees_paid,
                     opened_at=pos.opened_at,
-                    snapshot_at=now,
+                    snapshot_at=_final_bar_close(result.equity_curve),
                 )
             )
 

@@ -198,6 +198,7 @@ class TestT20CreatePersistsCostProfile:
             "exit_semantics": "wp13b-1",
             "daily_risk": "wp15-1",
             "backtest_circuit_breaker": True,  # WP2.1c (SY-21-13); false in 2.1a/2.1b
+            "timestamp_clock": "wp22-1",
         }
         body = resp.json()
         assert body["costProfile"]["id"] == "coinbase_advanced_1"

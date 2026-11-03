@@ -526,6 +526,14 @@ class RunResponse(BaseModel):
         default=False,
         description="True iff the run predates config['engine_semantics'] (CF-13b-16).",
     )
+    legacy_timestamps: bool = Field(
+        default=False,
+        description=(
+            "WP2.2 (SY-22-09): True iff the run is a backtest persisted before bar-time "
+            "stamps (config['engine_semantics']['timestamp_clock'] missing or unknown), "
+            "so its row timestamps are wall-clock.  Always False for paper / live."
+        ),
+    )
     live_equivalent_costs: bool = Field(
         default=False,
         description=(

@@ -207,6 +207,7 @@ class TestEngineSemantics:
             "exit_semantics": "wp13b-1",
             "daily_risk": "wp15-1",
             "backtest_circuit_breaker": True,
+            "timestamp_clock": "wp22-1",
         }
 
 
