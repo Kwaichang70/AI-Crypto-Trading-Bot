@@ -444,8 +444,12 @@ class Settings(BaseSettings):
         default=90,
         ge=1,
         le=365,
-        description="Days to keep raw equity snapshots before pruning. "
-                    "Snapshots older than this are deleted daily at UTC midnight.",
+        description="Days to keep raw equity snapshots before pruning "
+                    "(checked daily). paper/live runs: snapshots whose timestamp "
+                    "is older than this are deleted. backtest runs: ALL of a "
+                    "run's snapshots are deleted once the run's created_at is "
+                    "older than this (simulated snapshot timestamps are ignored). "
+                    "Any other run mode is never pruned.",
     )
     idempotency_key_ttl_hours: int = Field(
         default=24,

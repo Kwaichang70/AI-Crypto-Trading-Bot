@@ -325,11 +325,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     async def _equity_prune_loop() -> None:
         """Delete equity snapshots older than retention period, once per day."""
-        from datetime import UTC as _UTC, datetime as _dt, timedelta as _td
-
-        from api.db.models import EquitySnapshotORM
         from api.db.session import get_session_factory as _get_sf
-        from sqlalchemy import delete as _sa_delete
+        from api.services.retention import prune_equity_snapshots
 
         _sf = _get_sf()
 
@@ -341,24 +338,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
         while True:
             try:
-                cutoff = _dt.now(_UTC) - _td(
-                    days=settings.equity_snapshot_retention_days
+                # SY-22-10: policy lives in api.services.retention
+                # (paper/live by snapshot timestamp, backtest by
+                # runs.created_at, other modes never). No inline DELETE
+                # here. The service emits the single ``equity_prune.completed``
+                # (per-mode counts, cutoff) or ``equity_prune.partial`` event;
+                # this loop deliberately logs nothing on success.
+                await prune_equity_snapshots(
+                    _sf,
+                    retention_days=settings.equity_snapshot_retention_days,
                 )
-                async with _sf() as session:
-                    del_result = await session.execute(
-                        _sa_delete(EquitySnapshotORM).where(
-                            EquitySnapshotORM.timestamp < cutoff
-                        )
-                    )
-                    deleted: int = del_result.rowcount  # type: ignore[attr-defined]
-                    await session.commit()
-                    if deleted > 0:
-                        log.info(
-                            "equity_prune.completed",
-                            deleted=deleted,
-                            cutoff=str(cutoff),
-                            retention_days=settings.equity_snapshot_retention_days,
-                        )
             except _asyncio.CancelledError:
                 break
             except Exception:
