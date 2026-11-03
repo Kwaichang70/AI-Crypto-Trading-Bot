@@ -25,7 +25,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal
 from typing import Any
 from uuid import UUID, uuid4
@@ -33,6 +33,7 @@ from uuid import UUID, uuid4
 import structlog
 
 from common.types import OrderSide, OrderStatus, OrderType, SignalDirection
+from trading.clock import Clock
 from trading.costs import DEFAULT_COST_PROFILE, CostProfile
 from trading.execution import BaseExecutionEngine
 from trading.models import Fill, Order, Position, Signal
@@ -91,6 +92,14 @@ class PaperExecutionEngine(BaseExecutionEngine):
     initial_cash:
         Starting cash balance in quote currency. Used for portfolio
         equity tracking. Default 10000.
+    clock:
+        WP2.2: unit-test convenience only.  ``None`` keeps the class default
+        (:data:`~trading.clock.WALL_CLOCK`).  ``BacktestRunner`` must NOT use
+        it: the ``StrategyEngine`` attaches the run's ``BarClock`` through
+        ``attach_clock`` in BACKTEST mode (SY-22-03 Amendment B), so there is
+        one injection path.  This engine is mode-agnostic (it is also the
+        backtest engine); the paper/live guarantee comes from the
+        ``StrategyEngine`` allowlist (SY-22-R2-02).
     """
 
     def __init__(
@@ -102,8 +111,11 @@ class PaperExecutionEngine(BaseExecutionEngine):
         cost_profile: CostProfile = DEFAULT_COST_PROFILE,
         initial_cash: Decimal = Decimal("10000"),
         config: dict[str, Any] | None = None,
+        clock: Clock | None = None,
     ) -> None:
         super().__init__(run_id=run_id, config=config)
+        if clock is not None:
+            self._clock = self._validated_clock(clock)
         self._risk_manager = risk_manager
         self._fill_latency_ms = fill_latency_ms
         # WP2.1: ONE cost source.  QT-001 (Sprint 42): when the profile's
@@ -363,7 +375,7 @@ class PaperExecutionEngine(BaseExecutionEngine):
             fee=fee,
             fee_currency=fee_currency,
             is_maker=is_maker,
-            executed_at=datetime.now(tz=UTC),
+            executed_at=self._clock.now(),
             expected_price=expected_price,
             slippage_bps_realized=slippage_bps_realized,
         )
@@ -444,8 +456,9 @@ class PaperExecutionEngine(BaseExecutionEngine):
             The fill event to process.
         at:
             Timestamp to stamp on the position's ``opened_at``/``updated_at``.
-            Defaults to ``datetime.now(tz=UTC)`` for a live fill during
-            normal processing; ``restore_from_fills`` (WP1.8a C-07) passes
+            Defaults to the engine clock (``self._clock``: wall time in
+            paper/live, bar close in a backtest) during normal processing;
+            ``restore_from_fills`` (WP1.8a C-07) passes
             ``fill.executed_at`` so a resumed run's own position cache is
             stamped with the real historical fill time, not the wall-clock
             time of the restart/rebuild.
@@ -454,7 +467,7 @@ class PaperExecutionEngine(BaseExecutionEngine):
         current_price = fill.price
 
         position = self._positions.get(symbol)
-        now = at if at is not None else datetime.now(tz=UTC)
+        now = at if at is not None else self._clock.now()
 
         if fill.side == OrderSide.BUY:
             # Decrease cash by (quantity * price + fee)
@@ -595,7 +608,7 @@ class PaperExecutionEngine(BaseExecutionEngine):
             order = order.model_copy(update={
                 "filled_quantity": order.quantity,
                 "average_fill_price": fill_price,
-                "updated_at": datetime.now(tz=UTC),
+                "updated_at": self._clock.now(),
             })
             self._orders[order.order_id] = order
 
@@ -633,7 +646,7 @@ class PaperExecutionEngine(BaseExecutionEngine):
                 order = order.model_copy(update={
                     "filled_quantity": order.quantity,
                     "average_fill_price": fill_price,
-                    "updated_at": datetime.now(tz=UTC),
+                    "updated_at": self._clock.now(),
                 })
                 self._orders[order.order_id] = order
 
@@ -798,6 +811,9 @@ class PaperExecutionEngine(BaseExecutionEngine):
         # ROUND_DOWN prevents overselling exchange-reported balances with >8dp
         # precision; BUY keeps ROUND_HALF_UP.
         rounding = ROUND_DOWN if side == OrderSide.SELL else ROUND_HALF_UP
+        # WP2.2 (SY-22-05 c): explicit stamp from ONE clock read (the ambient
+        # ``utc_now`` default is only a fallback), so created_at == updated_at.
+        order_stamp = self._clock.now()
         proposed_order = Order(
             client_order_id=client_order_id,
             run_id=self._run_id,
@@ -805,6 +821,8 @@ class PaperExecutionEngine(BaseExecutionEngine):
             side=side,
             order_type=OrderType.MARKET,
             quantity=quantity.quantize(_QTY_PRECISION, rounding=rounding),
+            created_at=order_stamp,
+            updated_at=order_stamp,
         )
 
         # Pre-trade risk check
@@ -938,7 +956,7 @@ class PaperExecutionEngine(BaseExecutionEngine):
                 order = order.model_copy(update={
                     "filled_quantity": order.quantity,
                     "average_fill_price": fill_price,
-                    "updated_at": datetime.now(tz=UTC),
+                    "updated_at": self._clock.now(),
                 })
                 self._orders[order.order_id] = order
                 order = self._transition(order, OrderStatus.FILLED)

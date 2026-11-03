@@ -97,6 +97,7 @@ from common.types import OrderSide, OrderStatus, OrderType, SignalDirection
 from trading.execution import BaseExecutionEngine, EquitySnapshot
 from trading.ccxt_errors import translate_ccxt_error
 from trading.ccxt_retry import ccxt_retry
+from trading.clock import WALL_CLOCK, Clock, ambient_clock
 from trading.costs import CostProfile
 from trading.models import Fill, Order, Position, Signal
 from trading.risk import BaseRiskManager
@@ -825,6 +826,19 @@ class LiveExecutionEngine(BaseExecutionEngine):
         """Per-symbol reconcile-required reason codes (I4). Blocks BUYs
         only; SELLs are never blocked. Empty when nothing is flagged."""
         return dict(self._reconcile_required)
+
+    def attach_clock(self, clock: Clock) -> None:
+        """WP2.2 (SY-22-R2-01): live accepts ONLY the wall-clock singleton.
+
+        Identity, never ``isinstance``: a duck-typed fake, a ``BarClock``, a
+        fresh ``WallClock()`` instance and ``None`` are all rejected
+        (``ValueError``, type name only).  Tests control live time by
+        monkeypatching ``trading.clock._wall_now``, never by injection.
+        """
+        if clock is not WALL_CLOCK:
+            raise ValueError(
+                f"LiveExecutionEngine accepts only the wall clock, got {type(clock).__name__}"
+            )
 
     # ------------------------------------------------------------------
     # WP1.1: position source wiring (WP11-A-02)
@@ -4049,6 +4063,16 @@ class LiveExecutionEngine(BaseExecutionEngine):
             If live trading is enabled and no position source is attached,
             or if ``load_markets`` fails.
         """
+        # WP2.2 R6 (SY-22-R2-01): fail-closed identity tripwire BEFORE any I/O.
+        # A live engine must stamp with the wall-clock singleton and must not
+        # run inside a simulated ambient clock.  Type names only (CF-36).
+        if self._clock is not WALL_CLOCK:
+            raise RuntimeError(
+                f"LiveExecutionEngine clock is not the wall clock ({type(self._clock).__name__})"
+            )
+        if ambient_clock() is not WALL_CLOCK:
+            raise RuntimeError("LiveExecutionEngine started under a non-wall ambient clock")
+
         await super().on_start()
 
         if not self._enable_live_trading:

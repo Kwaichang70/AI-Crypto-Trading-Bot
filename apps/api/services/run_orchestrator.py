@@ -50,6 +50,7 @@ from api.db.models import (
 )
 from api.services.audit_log import record_audit_event
 from common.types import TimeFrame
+from trading.clock import WALL_CLOCK, ambient_clock
 from trading.costs import CostProfile
 from trading.exit_config import ExitConfigError, ExitCostModel, resolve_run_exit_check
 from trading.recovery import ResumeSnapshot
@@ -1083,6 +1084,12 @@ async def run_paper_engine(
     auto_stop_task: asyncio.Task[None] | None = None
 
     try:
+        # WP2.2 R6 (SY-22-R2-05): fail-closed entry tripwire -- a paper/live
+        # run must never execute under a simulated ambient clock.  Inside the
+        # ``try`` so the existing teardown marks the run errored.
+        if ambient_clock() is not WALL_CLOCK:
+            raise RuntimeError("paper run started under a non-wall ambient clock")
+
         # WP-SMOKE (synthesis-spec.md section 7, G-13): defence in depth --
         # a no-op for every strategy except smoke_roundtrip. create_run
         # already rejects a violating config before this coroutine is ever
@@ -1554,6 +1561,12 @@ async def run_live_engine(
     auto_stop_task: asyncio.Task[None] | None = None
 
     try:
+        # WP2.2 R6 (SY-22-R2-05): fail-closed entry tripwire -- a paper/live
+        # run must never execute under a simulated ambient clock.  Inside the
+        # ``try`` so the existing teardown marks the run errored.
+        if ambient_clock() is not WALL_CLOCK:
+            raise RuntimeError("live run started under a non-wall ambient clock")
+
         if resume is not None:
             # WP1.8a-round2 (C-01/S-01 item 5): backstop against the
             # resume-vs-stop/kill-switch race.  This task is spawned right

@@ -43,7 +43,7 @@ from __future__ import annotations
 import math
 import random
 import uuid
-from datetime import UTC, datetime
+from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
@@ -53,6 +53,7 @@ import structlog
 from common.models import OHLCVBar
 from data.market_data import BaseMarketDataService
 from common.types import QuoteCurrency, RunMode, TimeFrame
+from trading.clock import BarClock
 from trading.costs import CostProfile, default_cost_profile
 from trading.engines.paper import PaperExecutionEngine
 from trading.exit_config import (
@@ -368,8 +369,15 @@ class BacktestRunner:
         # 2. Generate run ID
         run_id = f"bt-{uuid.uuid4().hex[:12]}"
 
+        # 2b. WP2.2 (SY-22-02/03): the run's simulated clock, created ONCE here
+        # (the only creation site for a production backtest).  ``t0`` is the
+        # bar-0 open under the same max rule as the WP1.5 risk clock, so the
+        # equity seed point sits exactly one timeframe before the first mark.
+        t0 = max(bars_by_symbol[symbol][0].timestamp for symbol in self._symbols)
+        bar_clock = BarClock(start=t0)
+
         # 3. Build engine components
-        engine, portfolio, risk_manager, exec_engine = self._build_engine(run_id)
+        engine, portfolio, risk_manager, exec_engine = self._build_engine(run_id, clock=bar_clock)
 
         self._log.info(
             "backtest.starting",
@@ -447,8 +455,9 @@ class BacktestRunner:
             start_date = min(b.timestamp for b in all_bars)
             end_date = max(b.timestamp for b in all_bars)
         else:
-            start_date = datetime.now(tz=UTC)
-            end_date = start_date
+            # WP2.2 (AD-17): unreachable (``_validate_bars`` guarantees bars);
+            # never fall back to the wall clock in a backtest.
+            raise ValueError("backtest has no bars to derive a date range from")
 
         duration_days = max(1, (end_date - start_date).days)
 
@@ -720,6 +729,8 @@ class BacktestRunner:
     def _build_engine(
         self,
         run_id: str,
+        *,
+        clock: BarClock | None = None,
     ) -> tuple[StrategyEngine, PortfolioAccounting, DefaultRiskManager, PaperExecutionEngine]:
         """
         Wire up all trading core components for a backtest run.
@@ -728,6 +739,15 @@ class BacktestRunner:
         ----------
         run_id : str
             Unique run identifier.
+        clock : BarClock | None
+            WP2.2: the run's simulated clock.  Injected into the portfolio
+            (``clock=clock.now``: the equity seed point and every stamp go
+            through its ``_now()`` seam) and into the ``StrategyEngine``, which
+            is the ONLY path to the execution engine (``attach_clock``;
+            Amendment B -- ``PaperExecutionEngine(clock=)`` is not used here).
+            ``None`` (tests calling ``_build_engine(run_id)`` directly): the
+            engine creates its own ``BarClock`` in ``run_backtest``; only the
+            portfolio's seed point then keeps a wall stamp.
 
         Returns
         -------
@@ -755,6 +775,7 @@ class BacktestRunner:
         portfolio = PortfolioAccounting(
             run_id=run_id,
             initial_cash=self._initial_capital,
+            clock=clock.now if clock is not None else None,
         )
 
         # The StrategyEngine requires a market data service for PAPER/LIVE
@@ -778,6 +799,7 @@ class BacktestRunner:
                 else None
             ),
             cost_profile=self._cost_profile,
+            clock=clock,
         )
 
         return engine, portfolio, risk_manager, execution_engine

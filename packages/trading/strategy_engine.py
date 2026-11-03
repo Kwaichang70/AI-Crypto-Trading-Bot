@@ -72,6 +72,7 @@ from trading.bracket_exit import (
     open_lot_fills,
     window_is_contiguous,
 )
+from trading.clock import WALL_CLOCK, BarClock, Clock, ambient_clock, use_clock
 from trading.costs import CostProfile, default_cost_profile
 from trading.execution import BaseExecutionEngine
 from trading.exit_config import (
@@ -463,6 +464,14 @@ class StrategyEngine:
           live/paper mode. Default 500.
         - ``poll_interval_seconds`` (float | None): override the default
           polling interval derived from ``timeframe``. Default None.
+    clock :
+        WP2.2 (SY-22-03/R1): the run's simulated clock.  BACKTEST accepts only
+        ``None`` or a :class:`~trading.clock.BarClock` (``None``: ``run_backtest``
+        creates one from the first bar); PAPER and LIVE accept only ``None`` or
+        the :data:`~trading.clock.WALL_CLOCK` singleton, checked by IDENTITY
+        (``ValueError``, type names only) -- outside a backtest the clock is
+        the wall clock, full stop.  The execution engine receives the clock
+        only through ``attach_clock``, duck-typed, in BACKTEST mode.
     """
 
     def __init__(
@@ -479,11 +488,29 @@ class StrategyEngine:
         circuit_breaker: CircuitBreaker | None = None,
         protective_mode: bool = False,
         cost_profile: CostProfile | None = None,
+        clock: Clock | None = None,
     ) -> None:
         if not strategies:
             raise ValueError("At least one strategy is required")
         if not symbols:
             raise ValueError("At least one symbol is required")
+
+        # WP2.2 R1 (SY-22-R2-01/02): mode-dependent clock allowlist.  BACKTEST:
+        # None or a BarClock (isinstance -- BarClock is final, and the guard
+        # never relies on that).  PAPER / LIVE: None or the WALL_CLOCK singleton
+        # by IDENTITY.  Messages carry type names only (CF-36).
+        if run_mode == RunMode.BACKTEST:
+            if clock is not None and not isinstance(clock, BarClock):
+                raise ValueError(
+                    f"BACKTEST StrategyEngine accepts only a BarClock, got {type(clock).__name__}"
+                )
+        elif clock is not None and clock is not WALL_CLOCK:
+            raise ValueError(
+                f"{run_mode.value} StrategyEngine accepts only the wall clock, "
+                f"got {type(clock).__name__}"
+            )
+        #: the clock exit-time stamps are read from: bar clock (BACKTEST) or wall.
+        self._clock: Clock = WALL_CLOCK if clock is None else clock
 
         self._strategies = list(strategies)
         self._circuit_breaker = circuit_breaker
@@ -523,6 +550,13 @@ class StrategyEngine:
         )
         if callable(_attach_risk_state_source):
             _attach_risk_state_source(self._portfolio)
+
+        # WP2.2 R3 (SY-22-03 Amendment B): the execution engine gets the clock
+        # ONLY here (duck-typed, like the hooks above), ONLY in BACKTEST mode
+        # and ONLY after the R1 guard passed.  In PAPER / LIVE the class default
+        # (WALL_CLOCK) stays: attach_clock is never called.
+        if run_mode == RunMode.BACKTEST and clock is not None:
+            self._attach_exec_clock(clock)
 
         # Derived configuration
         config_warmup = self._config.get("warmup_bars")
@@ -832,6 +866,42 @@ class StrategyEngine:
         return self._auto_stop_reason
 
     # ------------------------------------------------------------------
+    # WP2.2: clock wiring and the paper/live wall-clock tripwire
+    # ------------------------------------------------------------------
+
+    def _attach_exec_clock(self, clock: Clock) -> None:
+        """Hand the BACKTEST clock to the execution engine (duck-typed)."""
+        _attach_clock = getattr(self._execution_engine, "attach_clock", None)
+        if callable(_attach_clock):
+            _attach_clock(clock)
+
+    def _wall_clock_tripwire(self) -> None:
+        """WP2.2 R6: fail-closed identity tripwire for PAPER / LIVE.
+
+        Raises ``RuntimeError`` (type names only) if the ambient clock, this
+        engine's clock or a real execution engine's clock is not the
+        :data:`~trading.clock.WALL_CLOCK` singleton.  The ``isinstance`` type
+        gate keeps Mock execution engines (whose auto-created ``_clock`` is a
+        child Mock) out of the check.  Called from ``start`` and
+        ``run_live_loop``; never in BACKTEST.
+        """
+        if ambient_clock() is not WALL_CLOCK:
+            raise RuntimeError(
+                f"{self._run_mode.value} engine started under a non-wall ambient clock"
+            )
+        if self._clock is not WALL_CLOCK:
+            raise RuntimeError(
+                f"{self._run_mode.value} engine clock is not the wall clock "
+                f"({type(self._clock).__name__})"
+            )
+        execution = self._execution_engine
+        if isinstance(execution, BaseExecutionEngine) and execution._clock is not WALL_CLOCK:
+            raise RuntimeError(
+                f"{self._run_mode.value} execution engine clock is not the wall clock "
+                f"({type(execution._clock).__name__})"
+            )
+
+    # ------------------------------------------------------------------
     # Lifecycle: start
     # ------------------------------------------------------------------
 
@@ -858,6 +928,11 @@ class StrategyEngine:
                 f"Cannot start engine in state {self._state.value}; "
                 f"expected IDLE"
             )
+
+        # WP2.2 R6: PAPER / LIVE must run on the wall clock (fail closed, before
+        # any state change or I/O).  Never in BACKTEST.
+        if self._run_mode != RunMode.BACKTEST:
+            self._wall_clock_tripwire()
 
         self._state = EngineState.STARTING
         self._run_id = run_id
@@ -1130,87 +1205,111 @@ class StrategyEngine:
         # we read the LIVE len() at the boundary rather than computing an offset.
         oos_equity_curve_offset: int | None = None
 
+        # WP2.2: the run's simulated clock.  Injected by BacktestRunner (created
+        # at ``t0 = max(first bar open)``); a direct StrategyEngine user that
+        # passed none gets one here, attached to the execution engine (the
+        # portfolio's seed point then keeps a wall stamp -- test-only path).
+        bar_clock: Clock = self._clock
+        if bar_clock is WALL_CLOCK:
+            bar_clock = BarClock(
+                start=max(bars_by_symbol[symbol][0].timestamp for symbol in self._symbols)
+            )
+            self._clock = bar_clock
+            self._attach_exec_clock(bar_clock)
+
         self._log.info(
             "engine.backtest_starting",
             total_bars=num_bars,
             warmup_bars=self._warmup_bars,
         )
 
-        # Walk forward bar by bar
-        for bar_idx in range(num_bars):
-            if self._stop_event.is_set():
-                self._log.info(
-                    "engine.backtest_stopped_early",
-                    bar_index=bar_idx,
+        # WP2.2 R4: the ONLY ``use_clock`` entry in the code base.  Explicit
+        # raise (not ``assert``: ``python -O`` strips asserts) immediately
+        # before it; the ambient clock backs only model ``default_factory``
+        # fallbacks, every persisted stamp is explicit.  The token is reset in
+        # ``use_clock``'s ``finally``, also on an exception or cancellation.
+        if not isinstance(bar_clock, BarClock):
+            raise TypeError(f"run_backtest requires a BarClock, got {type(bar_clock).__name__}")
+        with use_clock(bar_clock):
+            # Walk forward bar by bar
+            for bar_idx in range(num_bars):
+                if self._stop_event.is_set():
+                    self._log.info(
+                        "engine.backtest_stopped_early",
+                        bar_index=bar_idx,
+                    )
+                    break
+
+                # Sprint 50 Cycle 6 (IMPL-C6-002): capture the equity-curve length
+                # the instant we reach the first OOS bar, BEFORE this bar appends any
+                # equity points. Everything appended from here on is the OOS window.
+                # Guard `is None` so a re-entry (impossible in a single loop, but
+                # defensive) cannot overwrite the boundary.
+                if (
+                    oos_start_index is not None
+                    and oos_equity_curve_offset is None
+                    and bar_idx >= oos_start_index
+                ):
+                    oos_equity_curve_offset = len(self._portfolio.get_equity_curve())
+
+                # Build the current bar snapshot and the growing history
+                current_bars: dict[str, OHLCVBar] = {}
+                history_by_symbol: dict[str, list[OHLCVBar]] = {}
+
+                for symbol in self._symbols:
+                    bar = bars_by_symbol[symbol][bar_idx]
+                    current_bars[symbol] = bar
+                    # Growing window: all bars up to and including current
+                    history_by_symbol[symbol] = bars_by_symbol[symbol][
+                        : bar_idx + 1
+                    ]
+
+                # WP1.5 (§5.2) + WP2.2 (SY-22-03 Amendment A): the BAR CLOSE time
+                # (latest bar timestamp + one timeframe) is computed ONCE and the
+                # SAME object drives both clocks -- the BarClock that stamps every
+                # fill / order / trade / curve point, and the portfolio's risk-day
+                # clock -- every bar, warmup included, BEFORE any mark or fill of
+                # this bar.  Close time matches paper/live, which only ever see a
+                # bar after its close; the wall clock is never read on this path, so
+                # a backtest is deterministic.  Forward-only: an earlier time (pre-
+                # WP2.3 multi-symbol misalignment) is a no-op in both clocks.
+                # Duck-typed so a portfolio test double without the method does not
+                # crash.
+                close_i = max(b.timestamp for b in current_bars.values()) + timedelta(
+                    seconds=_TIMEFRAME_SECONDS[self._timeframe]
                 )
-                break
+                bar_clock.advance(close_i)
+                _advance_clock = getattr(self._portfolio, "advance_clock", None)
+                if callable(_advance_clock):
+                    _advance_clock(close_i)
 
-            # Sprint 50 Cycle 6 (IMPL-C6-002): capture the equity-curve length
-            # the instant we reach the first OOS bar, BEFORE this bar appends any
-            # equity points. Everything appended from here on is the OOS window.
-            # Guard `is None` so a re-entry (impossible in a single loop, but
-            # defensive) cannot overwrite the boundary.
-            if (
-                oos_start_index is not None
-                and oos_equity_curve_offset is None
-                and bar_idx >= oos_start_index
-            ):
-                oos_equity_curve_offset = len(self._portfolio.get_equity_curve())
+                # Update last prices on the paper execution engine
+                self._update_engine_prices(current_bars)
 
-            # Build the current bar snapshot and the growing history
-            current_bars: dict[str, OHLCVBar] = {}
-            history_by_symbol: dict[str, list[OHLCVBar]] = {}
+                # Skip strategy calls during warmup, but still update prices
+                if bar_idx < self._warmup_bars:
+                    # Update market prices in portfolio during warmup
+                    prices = {
+                        s: bar.close for s, bar in current_bars.items()
+                    }
+                    self._portfolio.update_market_prices(prices)
+                    continue
 
-            for symbol in self._symbols:
-                bar = bars_by_symbol[symbol][bar_idx]
-                current_bars[symbol] = bar
-                # Growing window: all bars up to and including current
-                history_by_symbol[symbol] = bars_by_symbol[symbol][
-                    : bar_idx + 1
-                ]
+                # Process this bar
+                await self._process_bar(current_bars, history_by_symbol)
 
-            # WP1.5 (§5.2): push the BAR CLOSE time (latest bar timestamp +
-            # one timeframe) to the portfolio's risk-day clock -- every bar,
-            # warmup included, BEFORE any mark or fill of this bar.  Close
-            # time matches paper/live, which only ever see a bar after its
-            # close; the wall clock is never read on the risk path, so a
-            # backtest is deterministic.  Forward-only: an earlier time (pre-
-            # WP2.3 multi-symbol misalignment) is a no-op.  Duck-typed so a
-            # portfolio test double without the method does not crash.
-            _advance_clock = getattr(self._portfolio, "advance_clock", None)
-            if callable(_advance_clock):
-                _advance_clock(
-                    max(b.timestamp for b in current_bars.values())
-                    + timedelta(seconds=_TIMEFRAME_SECONDS[self._timeframe])
-                )
-
-            # Update last prices on the paper execution engine
-            self._update_engine_prices(current_bars)
-
-            # Skip strategy calls during warmup, but still update prices
-            if bar_idx < self._warmup_bars:
-                # Update market prices in portfolio during warmup
-                prices = {
-                    s: bar.close for s, bar in current_bars.items()
-                }
-                self._portfolio.update_market_prices(prices)
-                continue
-
-            # Process this bar
-            await self._process_bar(current_bars, history_by_symbol)
-
-            # M2 (Sprint 49): after _process_bar has applied fills, query live
-            # portfolio positions to count this bar authoritatively.
-            # Using get_position() per symbol is O(n_symbols) dict lookups — cheap
-            # compared to the O(bars × trades) post-hoc estimate it replaces.
-            _any_open = False
-            for _sym in self._symbols:
-                _pos = self._portfolio.get_position(_sym)
-                if _pos is not None and not _pos.is_flat:
-                    self._exposure_bars_per_symbol[_sym] += 1
-                    _any_open = True
-            if _any_open:
-                self._exposure_bars_total += 1
+                # M2 (Sprint 49): after _process_bar has applied fills, query live
+                # portfolio positions to count this bar authoritatively.
+                # Using get_position() per symbol is O(n_symbols) dict lookups — cheap
+                # compared to the O(bars × trades) post-hoc estimate it replaces.
+                _any_open = False
+                for _sym in self._symbols:
+                    _pos = self._portfolio.get_position(_sym)
+                    if _pos is not None and not _pos.is_flat:
+                        self._exposure_bars_per_symbol[_sym] += 1
+                        _any_open = True
+                if _any_open:
+                    self._exposure_bars_total += 1
 
         self._log.info(
             "engine.backtest_complete",
@@ -1257,6 +1356,8 @@ class StrategyEngine:
                 f"run_live_loop() requires engine state RUNNING "
                 f"(call start() first), got {self._state.value}"
             )
+
+        self._wall_clock_tripwire()  # WP2.2 R6
 
         self._log.info(
             "engine.live_loop_starting",
@@ -2242,7 +2343,8 @@ class StrategyEngine:
             self._log.error("engine.trade_record_no_run_id", symbol=fill.symbol)
             return
 
-        now = datetime.now(tz=UTC)
+        # WP2.2: the engine clock (bar close in a backtest, wall time otherwise).
+        now = self._clock.now()
 
         # Enrich the trade record with excursion (MAE/MFE) and exit
         # classification so post-run analytics can slice by exit reason.

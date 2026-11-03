@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import abc
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Protocol
 from uuid import UUID
@@ -23,6 +22,7 @@ from uuid import UUID
 import structlog
 
 from common.types import OrderSide, OrderStatus
+from trading.clock import WALL_CLOCK, Clock
 from trading.models import Fill, Order, Signal
 from trading.risk import BaseRiskManager
 
@@ -211,6 +211,14 @@ class BaseExecutionEngine(abc.ABC):
     # mypy --strict without each call-site needing a cast.
     _risk_manager: BaseRiskManager
 
+    # WP2.2 (SY-22-03 Amendment C): the clock every order / fill stamp is read
+    # from.  A CLASS-level default so a subclass or test double that skips
+    # ``super().__init__`` still stamps wall time.  There is deliberately NO
+    # ``clock`` constructor parameter on this class (nor on LiveExecutionEngine):
+    # the only way to change it is ``attach_clock``, which the StrategyEngine
+    # calls in BACKTEST mode only (SY-22-R2-01).
+    _clock: Clock = WALL_CLOCK
+
     def __init__(self, run_id: str, config: dict[str, Any] | None = None) -> None:
         self._run_id = run_id
         self._config: dict[str, Any] = config or {}
@@ -241,6 +249,28 @@ class BaseExecutionEngine(abc.ABC):
             return
         self._risk_state_source = source
         self._log.info("execution_engine.risk_state_source_attached")
+
+    def attach_clock(self, clock: Clock) -> None:
+        """WP2.2: set the clock order / fill stamps are read from.
+
+        Called by ``StrategyEngine`` in BACKTEST mode only (SY-22-R2-01 / R3);
+        in PAPER / LIVE the class default :data:`~trading.clock.WALL_CLOCK`
+        stays.  Raises ``TypeError`` (type name only) for a non-``Clock``.
+        ``LiveExecutionEngine`` overrides this and accepts nothing but the
+        wall-clock singleton.
+        """
+        self._clock = self._validated_clock(clock)
+
+    @staticmethod
+    def _validated_clock(clock: Clock) -> Clock:
+        """``clock`` if it is a ``Clock`` instance, else ``TypeError`` (type name only).
+
+        A class object passes the runtime protocol check (it has a ``now``
+        attribute), so it is rejected explicitly, like ``use_clock`` does.
+        """
+        if isinstance(clock, type) or not isinstance(clock, Clock):
+            raise TypeError(f"attach_clock requires a Clock, got {type(clock).__name__}")
+        return clock
 
     # ------------------------------------------------------------------
     # Abstract interface
@@ -377,7 +407,7 @@ class BaseExecutionEngine(abc.ABC):
         """
         validate_transition(order, to_status)
         updated = order.model_copy(
-            update={"status": to_status, "updated_at": datetime.now(tz=UTC)}
+            update={"status": to_status, "updated_at": self._clock.now()}
         )
         self._orders[updated.order_id] = updated
         self._log.debug(

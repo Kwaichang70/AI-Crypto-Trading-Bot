@@ -88,7 +88,7 @@ class WallClock:
     __slots__ = ()
 
     def __init_subclass__(cls, **kwargs: object) -> None:
-        raise TypeError(f"{cls.__mro__[1].__name__} is final and cannot be subclassed")
+        raise TypeError("WallClock is final and cannot be subclassed")
 
     def now(self) -> datetime:
         # Resolved through the module globals at call time (not bound at
@@ -131,7 +131,7 @@ class BarClock:
     __slots__ = ("_now",)
 
     def __init_subclass__(cls, **kwargs: object) -> None:
-        raise TypeError(f"{cls.__mro__[1].__name__} is final and cannot be subclassed")
+        raise TypeError("BarClock is final and cannot be subclassed")
 
     def __init__(self, start: datetime) -> None:
         self._now: datetime = _require_aware_utc(start, "BarClock start")

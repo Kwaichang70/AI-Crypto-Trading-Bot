@@ -258,7 +258,12 @@ class PortfolioAccounting:
     clock:
         Risk-day clock (UTC).  Defaults to the wall clock (:func:`_utc_now`);
         injectable for paper/live tests.  A backtest overrides it by pushing
-        bar time through :meth:`advance_clock`.
+        bar time through :meth:`advance_clock`.  WP2.2: the same seam stamps
+        the equity-curve seed point and every position / curve stamp;
+        ``BacktestRunner`` passes ``BarClock.now`` so the seed is the first
+        bar's open.  This stays an unguarded callable (SY-22-R2-03): the
+        control that keeps a bar clock out of paper/live is that no code in
+        ``apps/`` passes ``clock=`` (AST-pinned, R7).
     """
 
     def __init__(
@@ -305,8 +310,11 @@ class PortfolioAccounting:
         self._losing_trades = 0
 
         # Equity curve: list of (datetime, equity_value) tuples
+        # WP2.2: the seed point is stamped through the single ``_now()`` seam
+        # (a backtest injects ``clock=BarClock.now``, so this is the first bar's
+        # open ``t0``; paper/live resolve to the wall clock via ``_utc_now``).
         self._equity_curve: list[tuple[datetime, Decimal]] = [
-            (datetime.now(tz=UTC), initial_cash),
+            (self._now(), initial_cash),
         ]
 
         # Completed trade history
@@ -439,11 +447,11 @@ class PortfolioAccounting:
         current_price:
             Current market price of the asset (for unrealised PnL).
         """
-        # ``at`` (position/curve stamps) stays wall time until WP2.2; the risk
-        # day is resolved through the single ``_now()`` seam (WP1.5 C-06).
-        self._apply_fill(
-            fill, current_price, at=datetime.now(tz=UTC), day_at=self._now()
-        )
+        # WP2.2: position / curve stamps AND the risk day come from ONE read of
+        # the single ``_now()`` seam (WP1.5 C-06): bar close in a backtest, the
+        # wall clock in paper/live.
+        now = self._now()
+        self._apply_fill(fill, current_price, at=now, day_at=now)
 
     def _apply_fill(
         self,
@@ -745,8 +753,10 @@ class PortfolioAccounting:
         prices:
             Mapping of symbol -> current market price.
         """
-        self._ensure_daily_pnl_date(self._now())
-        now = datetime.now(tz=UTC)  # curve / position stamps stay wall time (WP2.2)
+        # WP2.2: one read of the ``_now()`` seam for the risk day AND the
+        # curve / position stamps.
+        now = self._now()
+        self._ensure_daily_pnl_date(now)
         for symbol, price in prices.items():
             position = self._position_snapshots.get(symbol)
             if position is not None and not position.is_flat:
@@ -981,8 +991,9 @@ class PortfolioAccounting:
     def _now(self) -> datetime:
         """The risk clock: simulated time if one was pushed, else the clock.
 
-        The single seam every risk-day decision goes through (WP2.2 reuses it
-        for curve / trade stamps).
+        The single seam every risk-day decision goes through; since WP2.2 it is
+        also the source of every curve / position stamp (bar close in a
+        backtest, the wall clock in paper/live).
         """
         if self._sim_now is not None:
             return self._sim_now

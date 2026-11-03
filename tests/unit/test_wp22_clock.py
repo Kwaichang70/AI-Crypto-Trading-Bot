@@ -402,3 +402,32 @@ class TestImportHygiene:
                     ):
                         offenders.append((fn.name, node.lineno))
         assert {name for name, _ in offenders} == {"_wall_now"}, offenders
+
+
+class TestFinalityMessageNamesTheClass:
+    """WP2.2 P2b / R15 (SEC-03b): the finality ``TypeError`` names the class literally.
+
+    It used to print ``cls.__mro__[1].__name__``: with a mixin first in the bases
+    that was the mixin ("Mixin is final"), pointing the reader at the wrong class.
+    """
+
+    class _Mixin:
+        pass
+
+    def test_bar_clock_message_is_literal(self) -> None:
+        with pytest.raises(TypeError) as direct:
+            type("EvilBar", (BarClock,), {})
+        with pytest.raises(TypeError) as mixed:
+            type("EvilMixedBar", (self._Mixin, BarClock), {})
+        for err in (direct, mixed):
+            assert str(err.value) == "BarClock is final and cannot be subclassed"
+        assert "_Mixin" not in str(mixed.value)
+
+    def test_wall_clock_message_is_literal(self) -> None:
+        with pytest.raises(TypeError) as direct:
+            type("EvilWall", (WallClock,), {})
+        with pytest.raises(TypeError) as mixed:
+            type("EvilMixedWall", (self._Mixin, WallClock), {})
+        for err in (direct, mixed):
+            assert str(err.value) == "WallClock is final and cannot be subclassed"
+        assert "_Mixin" not in str(mixed.value)

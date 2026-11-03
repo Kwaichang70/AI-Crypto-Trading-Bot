@@ -266,3 +266,36 @@ Core trading engine containing the heart of the system.
   closer to the market (X-15). Goldens calibrated on the old costs pin `legacy_backtest_v0`
   explicitly; per-profile goldens are pinned per profile id with analytic per-fill checks.
 - See `reports/vp2-wp2.1/synthesis-spec.md`.
+
+### WP2.2 (bar-time clock: `trading/clock.py`)
+- A backtest stamps every fill, order, trade and equity point with BAR CLOSE time
+  (`close_i = max(ts) + timeframe`, the same value as the WP1.5 risk clock); the seed equity point is
+  `t0 = max(first bar open)`. Paper and live keep the wall clock (`datetime.now(tz=UTC)` through
+  `trading.clock._wall_now`). `runs.*` audit columns, logs, uuid4 ids and monotonic telemetry stay wall.
+- `clock.py` is a leaf (stdlib + structlog). `BacktestRunner.run` creates ONE `BarClock(t0)` and hands it
+  to `PortfolioAccounting(clock=bar_clock.now)` and `StrategyEngine(clock=bar_clock)`. The execution
+  engine gets it ONLY through `StrategyEngine.__init__ -> attach_clock` (BACKTEST only; never use
+  `PaperExecutionEngine(clock=)` in the runner). `run_backtest` computes `close_i` once and passes the
+  SAME object to `bar_clock.advance` and `portfolio.advance_clock`.
+- Guards (identity, never `isinstance(x, WallClock)` / `type(x) is`): BACKTEST `StrategyEngine` accepts
+  `None` or a `BarClock`; PAPER and LIVE accept `None` or `WALL_CLOCK`; `LiveExecutionEngine.attach_clock`
+  accepts only `WALL_CLOCK`; neither `BaseExecutionEngine` nor `LiveExecutionEngine` has a `clock=`
+  constructor parameter. Messages carry type names only. Fail-closed tripwires (`RuntimeError`):
+  `StrategyEngine.start` (not BACKTEST), `run_live_loop`, `LiveExecutionEngine.on_start`,
+  `run_paper_engine` / `run_live_engine`.
+- Ambient `ContextVar`: `use_clock` is entered ONLY in `StrategyEngine.run_backtest` (after an explicit
+  `isinstance(.., BarClock)` raise, never an `assert`), `utc_now` is used ONLY as a pydantic
+  `default_factory`, and every persisted field is still stamped explicitly. `ambient_clock()` is read only
+  at the tripwire sites, as an operand of `is` / `is not`. Do not wrap a `yield` in `use_clock`, spawn
+  tasks/threads inside `run_backtest`, or adopt Python 3.14 (`thread_inherit_context`) without
+  re-reviewing this (a test fails under that flag).
+- Test seam for paper/live time (S18 / WP4.8): monkeypatch `trading.clock._wall_now` and nothing else.
+  Never patch `WALL_CLOCK` or `WallClock.now`, never inject a fake clock into a paper/live engine
+  (the guards reject it by design), and wrap a `BarClock` instead of patching an instance (`__slots__`).
+- Same-bar events share a stamp; `(timestamp, bar_index)` totally orders equity points. At most one
+  `Fill` per `Order` (pinned): reopen the sequence-key decision (SY-22-06) if partial fills are added.
+- Lots are dropped on a full-flatten SELL (`close_lot` in both managers), so an equal bar-time `lot_key`
+  on a same-bar reopen can never revive the closed lot.
+- Known limit (WP2.3 / WP2.4): on misaligned multi-symbol bars a lagging symbol carries the leading
+  symbol's close; the MTF context (C10) still reads wall time in API backtests.
+- See `reports/vp2-wp2.2/synthesis-spec.md` and `reports/vp2-wp2.2/synthesis-r2-guards.md`.
