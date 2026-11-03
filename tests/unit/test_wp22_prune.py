@@ -311,7 +311,23 @@ def test_only_allow_listed_modes_are_ever_targeted() -> None:
 # main.py has no inline DELETE / SQL (AST guard, WP22-P0V2-01 / CR-01)
 # ---------------------------------------------------------------------------
 _FORBIDDEN_CONST = re.compile(r"(?i)delete\s+from|equity_snapshots")
-_FORBIDDEN_CALL_ATTRS = frozenset({"execute", "commit"})
+# WP22-P0-R2-CR-01: this guard is a TRIPWIRE against someone re-inlining the policy
+# in main.py, not a security boundary (a determined author can always defeat an AST
+# check). Each rule below has at least one synthetic mutant in ``_MUTANTS``.
+_FORBIDDEN_CALL_ATTRS = frozenset(
+    {
+        "execute",
+        "commit",
+        "run_sync",
+        "scalars",
+        "scalar",
+        "stream",
+        "exec_driver_sql",
+        "begin",
+    }
+)
+#: Allow-list of what the loop may import from ``api.db``: the session-factory getter.
+_ALLOWED_API_DB_IMPORTS = {"api.db.session": frozenset({"get_session_factory"})}
 _FORBIDDEN_NAMES = frozenset({"EquitySnapshotORM", "_sa_delete", "delete", "text"})
 
 
@@ -335,6 +351,13 @@ def _violations(loop: ast.AsyncFunctionDef) -> list[str]:
             "sqlalchemy"
         ):
             out.append(f"import from {node.module}")
+        if isinstance(node, ast.ImportFrom):
+            mod = node.module or ""
+            if mod == "api.db" or mod.startswith("api.db."):
+                allowed = _ALLOWED_API_DB_IMPORTS.get(mod, frozenset())
+                bad = [a.name for a in node.names if a.name not in allowed]
+                if bad:
+                    out.append(f"import from {mod}: {bad}")
         if isinstance(node, ast.Import):
             out.extend(
                 f"import {a.name}"
@@ -353,6 +376,8 @@ def _violations(loop: ast.AsyncFunctionDef) -> list[str]:
             fn = node.func
             if isinstance(fn, ast.Name) and fn.id == "_sf":
                 out.append("session factory called inline")
+            if isinstance(fn, ast.Name) and fn.id == "getattr":
+                out.append("getattr call (dynamic attribute access)")
     return out
 
 
@@ -375,9 +400,14 @@ _CLEAN = '''
 async def _equity_prune_loop():
     from api.db.session import get_session_factory as _get_sf
     from api.services.retention import prune_equity_snapshots
+    from common.logging import exc_log_fields
     _sf = _get_sf()
     while True:
-        await prune_equity_snapshots(_sf, retention_days=1)
+        try:
+            await prune_equity_snapshots(_sf, retention_days=1)
+        except Exception as exc:
+            log.warning("equity_prune.error", **exc_log_fields(exc))
+            log.debug("equity_prune.error.trace", exc_info=exc)
 '''
 
 _MUTANTS = {
@@ -428,6 +458,48 @@ async def _equity_prune_loop():
 async def _equity_prune_loop():
     s = _sf()
 ''',
+    # WP22-P0-R2-CR-01: one mutant per new rule / forbidden attribute
+    "R2a_run_sync": '''
+async def _equity_prune_loop():
+    await session.run_sync(Model.__table__.delete)
+''',
+    "R2b_scalars": '''
+async def _equity_prune_loop():
+    rows = await session.scalars(q)
+''',
+    "R2c_scalar": '''
+async def _equity_prune_loop():
+    n = await session.scalar(q)
+''',
+    "R2d_stream": '''
+async def _equity_prune_loop():
+    r = await session.stream(q)
+''',
+    "R2e_exec_driver_sql": '''
+async def _equity_prune_loop():
+    await conn.exec_driver_sql("select 1")
+''',
+    "R2f_begin": '''
+async def _equity_prune_loop():
+    async with engine.begin() as conn:
+        pass
+''',
+    "R2g_getattr_concatenated_name": '''
+async def _equity_prune_loop():
+    await getattr(s, "exe" + "cute")(q)
+''',
+    "R2h_import_from_api_db_models_as_alias": '''
+async def _equity_prune_loop():
+    from api.db.models import EquitySnapshotORM as E
+''',
+    "R2i_import_api_db_package_member": '''
+async def _equity_prune_loop():
+    from api.db import models
+''',
+    "R2j_import_other_name_from_api_db_session": '''
+async def _equity_prune_loop():
+    from api.db.session import get_engine as ge
+''',
 }
 
 
@@ -443,3 +515,31 @@ def test_ast_guard_kills_each_mutant(name: str) -> None:
 def test_ast_guard_mutant_a5_removing_the_service_call_is_detected() -> None:
     no_call = _CLEAN.replace("await prune_equity_snapshots(_sf, retention_days=1)", "pass")
     assert "prune_equity_snapshots" not in _calls(_find_loop(ast.parse(no_call)))
+
+
+def test_main_loop_error_path_follows_cf36_wp22_p0_r2_sec_03() -> None:
+    """The loop logs type + location at WARNING and the traceback only at DEBUG."""
+    src = (Path(__file__).resolve().parents[2] / "apps" / "api" / "main.py").read_text()
+    loop = _find_loop(ast.parse(src))
+    handler = next(
+        h
+        for n in ast.walk(loop)
+        if isinstance(n, ast.Try)
+        for h in n.handlers
+        if isinstance(h.type, ast.Name) and h.type.id == "Exception"
+    )
+    assert handler.name == "exc"
+    calls = [n for n in ast.walk(handler) if isinstance(n, ast.Call)]
+    by_event = {
+        c.args[0].value: c
+        for c in calls
+        if c.args and isinstance(c.args[0], ast.Constant) and isinstance(c.args[0].value, str)
+    }
+    warn = by_event["equity_prune.error"]
+    assert isinstance(warn.func, ast.Attribute) and warn.func.attr == "warning"
+    assert any(k.arg is None for k in warn.keywords)  # **exc_log_fields(exc)
+    assert {k.arg for k in warn.keywords} == {None}, "no exc_info / str(exc) at WARNING"
+    trace = by_event["equity_prune.error.trace"]
+    assert isinstance(trace.func, ast.Attribute) and trace.func.attr == "debug"
+    assert [k.arg for k in trace.keywords] == ["exc_info"]
+    assert "exc_log_fields" in {n.id for n in ast.walk(warn) if isinstance(n, ast.Name)}

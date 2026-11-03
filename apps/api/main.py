@@ -327,6 +327,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         """Delete equity snapshots older than retention period, once per day."""
         from api.db.session import get_session_factory as _get_sf
         from api.services.retention import prune_equity_snapshots
+        from common.logging import exc_log_fields
 
         _sf = _get_sf()
 
@@ -350,8 +351,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 )
             except _asyncio.CancelledError:
                 break
-            except Exception:
-                log.warning("equity_prune.error", exc_info=True)
+            except Exception as exc:
+                # CF-36: type + code location at WARNING, traceback behind DEBUG.
+                log.warning("equity_prune.error", **exc_log_fields(exc))
+                log.debug("equity_prune.error.trace", exc_info=exc)
 
             try:
                 await _asyncio.sleep(86400)

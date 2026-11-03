@@ -12,7 +12,10 @@ retention policy implemented by ``api.services.retention``:
   (the backtest rule must never reach paper / live runs);
 - the return value equals the number of rows deleted, and the single
   ``equity_prune.completed`` event carries the per-mode counts;
-- concurrent pruners neither deadlock nor double count.
+- concurrent pruners neither deadlock nor double count;
+- the per-batch ``SET LOCAL enable_bitmapscan = off`` never leaks: on a
+  ``pool_size=1`` engine ``SHOW enable_bitmapscan`` is ``on`` on the reused
+  connection after a prune, on both the commit and the rollback path.
 
 Gated exactly like ``test_wp70_idempotency_races.py``: reads
 ``MIGRATION_TEST_DATABASE_URL`` and SKIPS when unset. The shared
@@ -28,6 +31,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 from structlog.testing import capture_logs
@@ -347,3 +351,71 @@ def test_concurrent_pruners_do_not_deadlock_or_double_count() -> None:
             await conn.close()
 
     asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------------------
+# WP22-P0-R2-CR-02: SET LOCAL must not leak through the connection pool
+# ---------------------------------------------------------------------------
+async def _pooled_scenario(*, fail_in_backtest_pass: bool) -> tuple[int, str, str, int, int]:
+    """Prune on a ``pool_size=1`` engine, so the next session MUST reuse the same
+    backend connection.
+
+    Returns ``(pid_before, setting_before, setting_after, pid_after, deleted)``;
+    ``deleted`` is -1 on the failing (rollback) path.
+    """
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+    from api.services import retention
+
+    assert _MIGRATION_URL is not None
+    now = datetime.now(UTC)
+    conn = await _connect()
+    engine = create_async_engine(_MIGRATION_URL, pool_size=1, max_overflow=0)
+    try:
+        rid = await _insert_run(conn, "paper", now - timedelta(days=200))
+        await _insert_snaps(conn, rid, [now - timedelta(days=100 + i) for i in range(4)])
+        factory = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
+
+        async def probe() -> tuple[int, str]:
+            async with factory() as s:
+                pid = (await s.execute(text("SELECT pg_backend_pid()"))).scalar_one()
+                setting = (await s.execute(text("SHOW enable_bitmapscan"))).scalar_one()
+                return int(pid), str(setting)
+
+        pid_before, before = await probe()
+        deleted = -1
+        if fail_in_backtest_pass:
+            # The paper/live batches commit; the backtest batch then dies INSIDE its
+            # transaction, after the SET LOCAL pin: the rollback path.
+            with patch.object(
+                retention, "build_backtest_prune_stmt", lambda *_a, **_k: text("SELECT 1/0")
+            ):
+                with pytest.raises(Exception, match="division by zero"):
+                    await retention.prune_equity_snapshots(factory, retention_days=90, now=now)
+        else:
+            deleted = await retention.prune_equity_snapshots(factory, retention_days=90, now=now)
+        pid_after, after = await probe()
+        return pid_before, before, after, pid_after, deleted
+    finally:
+        await engine.dispose()
+        await conn.close()
+
+
+def test_set_local_pin_does_not_leak_to_the_reused_pooled_connection_commit_path() -> None:
+    pid_before, before, after, pid_after, deleted = asyncio.run(
+        _pooled_scenario(fail_in_backtest_pass=False)
+    )
+    assert deleted == 4  # the prune really ran (and pinned) before the probe
+    assert pid_before == pid_after, "pool_size=1 must hand back the same backend"
+    assert before == "on"
+    assert after == "on", "SET LOCAL leaked: use SET LOCAL, never plain SET"
+
+
+def test_set_local_pin_does_not_leak_to_the_reused_pooled_connection_rollback_path() -> None:
+    pid_before, before, after, pid_after, _ = asyncio.run(
+        _pooled_scenario(fail_in_backtest_pass=True)
+    )
+    assert pid_before == pid_after
+    assert before == "on"
+    assert after == "on"

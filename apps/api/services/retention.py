@@ -42,9 +42,13 @@ Victim selection is driven per run through an index, never by a scan of
   ``id IN (subquery)`` lets the planner flip to ``Hash Semi Join`` + ``Seq Scan``
   over the whole table once VACUUM has shrunk ``reltuples`` (measured 196-260 ms
   per batch at ~1 M rows); the planner cannot know the length of an
-  ``ARRAY(subquery)``, so it always probes the primary key. The array is also
-  de-duplicated and sorted by the btree scan, so concurrent pruners lock rows in
-  ascending ``id`` order.
+  ``ARRAY(subquery)``, so at production table sizes (measured from ~300 k rows)
+  the planner probes the primary key. On a small table it may still choose a
+  ``Seq Scan``; the victim set is the same either way. The lock order is
+  deterministic per plan: the ``ScalarArrayOp`` index scan sorts and
+  de-duplicates the array, so concurrent pruners on the pkey plan lock rows in
+  ascending ``id`` order (a ``Seq Scan`` plan locks in physical order, and
+  pruners with the same statistics choose the same plan).
 - ``runs`` is tiny relative to ``equity_snapshots``; its mode / created_at
   filter is a scan of ``runs`` only.
 
@@ -57,9 +61,13 @@ precedent as ``api.services.idempotency``). ``enable_seqscan = off`` is NOT
 used: its inflated cost estimate trips JIT compilation on every tiny batch.
 
 Logging (CF-36): one ``equity_prune.completed`` event on success, or one
-``equity_prune.partial`` event (totals so far) if a batch raises. Only
-integers, mode names and an ISO timestamp are logged; never exception text,
-run ids, or the DSN.
+``equity_prune.partial`` event (totals so far) if a batch raises. The counts in
+``partial`` are a lower bound ("at least" this many rows were removed): a batch
+is added only after ``commit()`` returns, so a failure or cancellation that
+lands after the server committed but before the client saw the reply leaves
+that batch uncounted (off by at most one batch, ``DEFAULT_PRUNE_BATCH`` rows).
+Nothing deletes extra rows. Only integers, mode names and an ISO timestamp are
+logged; never exception text, run ids, or the DSN.
 """
 
 from __future__ import annotations
@@ -170,7 +178,9 @@ async def _run_batched(
     """Delete in batches until a short batch; add each committed batch to ``counts[key]``.
 
     ``counts`` is updated after every commit so a later failure can still
-    report exactly what was removed (``equity_prune.partial``).
+    report what was removed (``equity_prune.partial``). The figure is a lower
+    bound: a batch committed server-side whose reply was lost is not counted
+    (off by at most one batch).
     """
     while True:
         async with session_factory() as session:
@@ -198,7 +208,8 @@ async def prune_equity_snapshots(
 
     Emits ``equity_prune.completed`` (per-mode counts) when anything was
     deleted. If a batch raises, emits ``equity_prune.partial`` with the
-    totals committed so far and re-raises.
+    totals committed so far (at least that many rows were removed; off by at
+    most one batch) and re-raises.
     """
     if retention_days < 1:
         raise ValueError("retention_days must be >= 1")

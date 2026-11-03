@@ -64,6 +64,7 @@ from trading.models import Fill, Order
 from trading.recovery import ResumeRejected, ResumeSnapshot
 
 __all__ = [
+    "EmptyEquityCurveError",
     "build_backtest_metrics",
     "load_resume_snapshot",
     "persist_backtest_results",
@@ -461,15 +462,28 @@ async def persist_paper_results(
 # ---------------------------------------------------------------------------
 
 
+class EmptyEquityCurveError(RuntimeError):
+    """A backtest produced open positions but no equity curve (internal invariant breach).
+
+    Deliberately a ``RuntimeError``, NOT a ``ValueError``: ``routers/runs.py`` maps
+    ``ValueError`` to HTTP 400 "data quality" (a caller-fixable date-range problem),
+    whereas this is a server-side defect and must take the generic HTTP 500 branch
+    (WP22-P3-R2-CR-01).  The message is a static string with no run data in it.
+    """
+
+
 def _final_bar_close(curve: Sequence[EquityCurvePoint]) -> datetime:
     """End-of-run stamp for a backtest's position snapshots (WP2.2, SY-22-15).
 
     The last equity point's stamp, i.e. the final bar close.  There is deliberately no
     wall-time fallback: open positions without an equity curve is a broken result, and
-    a silent wall read would mix wall time into a bar-time table (T-06).
+    a silent wall read would mix wall time into a bar-time table (T-06).  Raises
+    :class:`EmptyEquityCurveError` (a ``RuntimeError``) in that case.
     """
     if not curve:
-        raise ValueError("cannot stamp position snapshots: the backtest result has no equity curve")
+        raise EmptyEquityCurveError(
+            "cannot stamp position snapshots: the backtest result has no equity curve"
+        )
     stamp: datetime = curve[-1].timestamp
     return stamp
 

@@ -15,12 +15,13 @@ from __future__ import annotations
 import ast
 import inspect
 import uuid
+from collections.abc import Generator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from sqlalchemy import create_engine
@@ -39,8 +40,20 @@ from api.services.cost_profiles import (
     stamp_cost_config,
     timestamp_response_fields,
 )
-from api.services.run_persistence import run_orm_to_detail_response, run_orm_to_response
+from api.services.run_persistence import (
+    EmptyEquityCurveError,
+    _final_bar_close,
+    run_orm_to_detail_response,
+    run_orm_to_response,
+)
+from tests.integration.test_wp21_cost_api import (  # noqa: F401  (fixtures + HTTP harness)
+    _C,
+    _clean_run_tasks,
+    _post_backtest,
+    app,  # fixture: requested by name in ``http`` below
+)
 from tests.integration.test_wp22_bar_clock import _by_type, _dod_run, _persist
+from trading.backtest import BacktestRunner
 from trading.clock import TIMESTAMP_CLOCK_VERSION
 from trading.costs import DEFAULT_COST_PROFILE
 
@@ -310,7 +323,7 @@ class TestT02SnapshotAt:
         run = await _dod_run()
         broken = SimpleNamespace(**{**vars(run.result), "equity_curve": []})
         run.result = broken
-        with pytest.raises(ValueError, match="no equity curve"):
+        with pytest.raises(EmptyEquityCurveError, match="no equity curve"):
             await _persist(run)
 
     async def test_no_open_positions_and_an_empty_curve_do_not_raise(self) -> None:
@@ -347,3 +360,81 @@ class TestT02SnapshotAt:
         )
         text = ast.unparse(fn)
         assert "snapshot_at=now" in text and "datetime.now" in text
+
+
+# ---------------------------------------------------------------------------
+# WP22-P3-R2-CR-01  the empty-curve invariant breach is a 500, not a 400
+# ---------------------------------------------------------------------------
+
+_GENERIC_500 = "Backtest execution failed. See server logs for details."
+
+
+def _open_position() -> SimpleNamespace:
+    return SimpleNamespace(
+        symbol="BTC/USD",
+        quantity=Decimal("1"),
+        average_entry_price=Decimal("100"),
+        current_price=Decimal("101"),
+        unrealised_pnl=Decimal("1"),
+        realised_pnl=Decimal("0"),
+        total_fees_paid=Decimal("0"),
+        opened_at=datetime(2024, 1, 1, tzinfo=UTC),
+    )
+
+
+@pytest.fixture()
+def http(request: pytest.FixtureRequest) -> Generator[_C, None, None]:
+    """The hermetic create-run harness of ``test_wp21_cost_api`` (mocked DB, no network)."""
+    client = _C(request.getfixturevalue("app"))
+    yield client
+    client.close()
+
+
+class TestP3R2Cr01EmptyCurveIs500:
+    def test_it_is_a_runtime_error_and_not_a_value_error(self) -> None:
+        assert issubclass(EmptyEquityCurveError, RuntimeError)
+        assert not issubclass(EmptyEquityCurveError, ValueError)
+
+    def test_the_helper_raises_the_dedicated_error(self) -> None:
+        with pytest.raises(EmptyEquityCurveError, match="no equity curve"):
+            _final_bar_close([])
+
+    def test_the_endpoint_maps_it_to_500_with_a_generic_detail_and_a_rollback(
+        self, http: _C
+    ) -> None:
+        """Real ``persist_backtest_results`` + real dispatch: open lot, emptied curve."""
+        original_run = BacktestRunner.run
+
+        async def _run_then_break(self: BacktestRunner, *a: Any, **kw: Any) -> Any:
+            result = await original_run(self, *a, **kw)
+            assert self.last_portfolio is not None
+            self.last_portfolio._position_snapshots["BTC/USD"] = _open_position()
+            return SimpleNamespace(**{**vars(result), "equity_curve": []})
+
+        with patch.object(BacktestRunner, "run", _run_then_break):
+            resp = _post_backtest(http)
+        assert resp.status_code == 500, resp.text
+        assert resp.json()["detail"] == _GENERIC_500
+        assert "equity curve" not in resp.text and "data quality" not in resp.text
+        http.db.rollback.assert_awaited()  # the run row and everything added are discarded
+        http.db.commit.assert_not_awaited()
+        assert http.created_run().status == "error"
+
+    def test_control_a_value_error_from_the_same_site_is_still_a_400(self, http: _C) -> None:
+        """Proves the test above discriminates: ``ValueError`` takes the 400 branch."""
+        with patch(
+            "api.services.run_persistence._final_bar_close",
+            side_effect=ValueError("boom"),
+        ):
+            original_run = BacktestRunner.run
+
+            async def _run_with_lot(self: BacktestRunner, *a: Any, **kw: Any) -> Any:
+                result = await original_run(self, *a, **kw)
+                assert self.last_portfolio is not None
+                self.last_portfolio._position_snapshots["BTC/USD"] = _open_position()
+                return result
+
+            with patch.object(BacktestRunner, "run", _run_with_lot):
+                resp = _post_backtest(http)
+        assert resp.status_code == 400, resp.text
+        http.db.rollback.assert_awaited()
