@@ -21,6 +21,8 @@ from decimal import Decimal
 from typing import Any
 from uuid import UUID, uuid4
 
+import pytest
+
 from common.types import OrderSide, TimeFrame
 from tests.integration.fakes.scripted_strategy import ScriptedSequenceStrategy
 from trading.backtest import BacktestRunner
@@ -323,3 +325,104 @@ def test_partial_sell_keeps_both_lots() -> None:
     assert engine._trailing_stop.peak_prices[SYM] == Decimal("100")
     assert SYM in engine._trailing_stop._lots
     assert engine._bracket_exit.get_anchor(SYM) is not None
+
+
+# ---------------------------------------------------------------------------
+# P2a.1 (SY-22-R2-04, SEC-06 a-d): regression pins for the engine hook
+# ---------------------------------------------------------------------------
+
+
+def _pend_both(engine: Any) -> None:
+    """Populate the pending-exit guards of both managers (qty 1, age 0)."""
+    trailing, bracket = engine._trailing_stop, engine._bracket_exit
+    assert trailing.check(SYM, Decimal("110"), _pos(), bar_ts=_ts(1)) is None
+    assert trailing.check(SYM, Decimal("100"), _pos(), bar_ts=_ts(2)) is not None
+    assert bracket.check(SYM, Decimal("97"), _pos()) is not None
+    assert SYM in trailing._pending_stop_symbols
+    assert SYM in bracket._pending_exit_symbols
+
+
+def test_sec06a_flatten_clears_pending_guard_so_a_reopened_lot_is_protected() -> None:
+    """SEC-03 / SEC-06 (a): a pending SL at quantity 1 must not shadow lot B.
+
+    Lot A's SL is pending at quantity 1 and fills in full; lot B reopens at the
+    SAME quantity (and, with bar-time stamps, the same lot_key) with its open
+    hook skipped.  HEAD kept the stale guard: ``has_unchanged_pending`` stayed
+    True and lot B's stop was suppressed for the pending TTL.
+    """
+    engine = _engine()
+    _seed_both(engine)
+    bracket = engine._bracket_exit
+    assert bracket.check(SYM, Decimal("97"), _pos()) is not None  # pending SL, qty 1
+    assert bracket.has_unchanged_pending(SYM, _pos())
+
+    engine._on_fill_routed(None, _sell("1"), _pos(qty="1"))  # full flatten
+
+    lot_b = _pos(qty="1", entry="100")  # same quantity, same key; open hook skipped
+    assert not bracket.has_unchanged_pending(SYM, lot_b)
+    signal = bracket.check(SYM, Decimal("95"), lot_b)
+    assert signal is not None
+    assert signal.direction.name == "SELL"
+    assert signal.target_position == 0
+
+
+def test_sec06a_control_without_the_flatten_hook_the_guard_is_stale() -> None:
+    """Control: the same sequence without the engine hook keeps the stale guard."""
+    engine = _engine()
+    _seed_both(engine)
+    bracket = engine._bracket_exit
+    assert bracket.check(SYM, Decimal("97"), _pos()) is not None
+    lot_b = _pos(qty="1", entry="100")
+    assert bracket.has_unchanged_pending(SYM, lot_b)  # stale: HEAD behaviour
+    assert bracket.check(SYM, Decimal("95"), lot_b) is None  # suppressed
+
+
+_CLEARED_TRAILING = (None, None, False, None, None)
+_CLEARED_BRACKET = (None, False, None, None, False, False)
+
+
+@pytest.mark.parametrize(
+    ("sell_qty", "flattens"),
+    [("0.4", False), ("1", True), ("1.5", True)],
+    ids=["partial-0.4", "exact-1", "oversized-1.5"],
+)
+def test_sec06bd_wiring_by_sell_quantity_with_populated_pending_guards(
+    sell_qty: str, flattens: bool
+) -> None:
+    """SEC-06 (b) oversized and (d) partial with a populated guard.
+
+    A partial SELL (0.4 of 1) leaves every byte of manager and engine state
+    untouched; an exact or oversized SELL clears both managers.
+    """
+    engine = _engine()
+    _seed_both(engine)
+    _pend_both(engine)
+    trailing_before = _trailing_state(engine._trailing_stop, SYM)
+    bracket_before = _bracket_state(engine._bracket_exit, SYM)
+    lots_before = dict(engine._lots)
+    assert trailing_before != _CLEARED_TRAILING
+    assert bracket_before != _CLEARED_BRACKET
+
+    engine._on_fill_routed(None, _sell(sell_qty), _pos(qty="1"))
+
+    if flattens:
+        assert _trailing_state(engine._trailing_stop, SYM) == _CLEARED_TRAILING
+        assert _bracket_state(engine._bracket_exit, SYM) == _CLEARED_BRACKET
+    else:
+        assert _trailing_state(engine._trailing_stop, SYM) == trailing_before
+        assert _bracket_state(engine._bracket_exit, SYM) == bracket_before
+    assert engine._lots == lots_before  # nothing seeded in the engine ledger of lots
+
+
+@pytest.mark.parametrize("sell_qty", ["0.4", "1", "1.5"])
+def test_sec06c_flat_not_none_pre_fill_position_counts_as_flatten(sell_qty: str) -> None:
+    """SEC-06 (c): a flat (not ``None``) ``pre_fill_pos`` has quantity 0, so any
+    SELL satisfies ``fill.quantity >= pre_fill_pos.quantity`` and clears the lot."""
+    engine = _engine()
+    _seed_both(engine)
+    _pend_both(engine)
+
+    engine._on_fill_routed(None, _sell(sell_qty), _flat())
+
+    assert _trailing_state(engine._trailing_stop, SYM) == _CLEARED_TRAILING
+    assert _bracket_state(engine._bracket_exit, SYM) == _CLEARED_BRACKET

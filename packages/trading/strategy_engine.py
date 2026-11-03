@@ -2660,6 +2660,8 @@ class StrategyEngine:
                 # WP2.2 SY-22-07: drop the managers' per-lot state exactly as
                 # their own check() flat branch does, so an equal lot_key on a
                 # reopen (or a skipped open hook) cannot revive the closed lot.
+                # close_lot must stay non-raising (pure dict/set ops); engine cleanup
+                # below depends on it.
                 if self._bracket_exit is not None:
                     self._bracket_exit.close_lot(symbol)
                 if self._trailing_stop is not None:
