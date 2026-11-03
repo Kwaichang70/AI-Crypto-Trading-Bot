@@ -82,7 +82,7 @@ from trading.engines.paper import PaperExecutionEngine
 from trading.models import Order, Signal
 from trading.portfolio import PortfolioAccounting, _utc_day
 from trading.risk_manager import DefaultRiskManager
-from trading.strategy_engine import StrategyEngine
+from trading.strategy_engine import EngineState, StrategyEngine
 
 LEGACY = get_cost_profile(
     "legacy_backtest_v0"
@@ -792,8 +792,71 @@ class TestT19RunnerEdges:
         assert before <= curve[0][0] <= datetime.now(tz=UTC)  # documented: the seed is wall
         assert {stamp for stamp, _eq in curve[1:]} == closes
         assert {f.executed_at for f in exec_engine.get_all_fills()} <= closes
-        assert isinstance(engine._clock, BarClock) and exec_engine._clock is engine._clock
+        # WP22-P2B-CR-01: the run-scoped fallback BarClock is restored afterwards
+        assert engine._clock is WALL_CLOCK and exec_engine._clock is WALL_CLOCK
         assert ambient_clock() is WALL_CLOCK
+
+    async def _direct_engine(
+        self, tag: str, script: dict[int, str] | None = None
+    ) -> tuple[Any, Any, Any]:
+        runner = BacktestRunner(
+            strategies=[_strategy(script or {0: "buy", 6: "sell"})],
+            symbols=[SYM],
+            timeframe=TimeFrame.ONE_HOUR,
+            seed=7,
+            enable_circuit_breaker=False,
+            cost_profile=LEGACY,
+        )
+        engine, portfolio, _rm, exec_engine = runner._build_engine(tag)
+        return engine, portfolio, exec_engine
+
+    async def test_fallback_clock_is_restored_after_the_run_and_after_a_raise(self) -> None:
+        """WP22-P2B-CR-01: the run-scoped fallback BarClock never outlives ``run_backtest``."""
+        engine, _portfolio, exec_engine = await self._direct_engine("restore")
+        bars = {SYM: scripted_path(_FLAT_72, first_open=POST_WARMUP_OPEN, symbol=SYM)}
+        await engine.start("restore")
+        try:
+            await engine.run_backtest(bars)
+        finally:
+            await engine.stop()
+        assert engine._clock is WALL_CLOCK and exec_engine._clock is WALL_CLOCK
+        assert ambient_clock() is WALL_CLOCK
+
+        engine2, _p2, exec2 = await self._direct_engine("restore-raise")
+        await engine2.start("restore-raise")
+        try:
+            with patch.object(engine2, "_process_bar", side_effect=RuntimeError("boom")):
+                with pytest.raises(RuntimeError, match="boom"):
+                    await engine2.run_backtest(bars)
+        finally:
+            await engine2.stop()
+        assert engine2._clock is WALL_CLOCK and exec2._clock is WALL_CLOCK
+        assert ambient_clock() is WALL_CLOCK
+
+    async def test_two_backtests_on_one_engine_with_an_earlier_second_start_stamp_correctly(
+        self,
+    ) -> None:
+        """WP22-P2B-CR-01: the second run does not inherit the first run's forward-only clock."""
+        # the scripted strategy counts on_bar calls across runs: the second run is 72..143
+        script = {0: "buy", 6: "sell", 72: "buy", 78: "sell"}
+        engine, _portfolio, exec_engine = await self._direct_engine("twice", script)
+        late = scripted_path(_FLAT_72, first_open=POST_WARMUP_OPEN + 200 * H, symbol=SYM)
+        early = scripted_path(_FLAT_72, first_open=POST_WARMUP_OPEN, symbol=SYM)
+        await engine.start("twice")
+        try:
+            await engine.run_backtest({SYM: late})
+            first = list(exec_engine.get_all_fills())
+            await engine.run_backtest({SYM: early})
+        finally:
+            await engine.stop()
+        first_ids = {f.fill_id for f in first}
+        second = [f for f in exec_engine.get_all_fills() if f.fill_id not in first_ids]
+        first_closes = {b.timestamp + H for b in late}
+        second_closes = {b.timestamp + H for b in early}
+        assert first and second
+        assert {f.executed_at for f in first} <= first_closes
+        assert {f.executed_at for f in second} <= second_closes
+        assert min(f.executed_at for f in second) < min(f.executed_at for f in first)
 
     def test_the_empty_bars_branch_raises_and_never_reads_the_wall_clock(self) -> None:
         src = Path(pyinspect.getsourcefile(backtest_mod) or "").read_text()
@@ -1005,6 +1068,39 @@ class TestT09Tripwires:
         with pytest.raises(RuntimeError, match="execution engine clock is not the wall clock"):
             await engine.start("run")
 
+    async def test_start_fails_closed_for_a_non_wall_engine_clock_and_stays_idle(self) -> None:
+        """WP22-P2B-SEC-07 (a) + (c): the own-clock branch trips, and before any state change."""
+        engine = _paper_engine(RunMode.PAPER)
+        engine._clock = BarClock(_T)  # what the R1 constructor guard makes unreachable
+        with pytest.raises(RuntimeError, match=r"engine clock is not the wall clock \(BarClock\)"):
+            await engine.start("run")
+        assert engine.state is EngineState.IDLE
+
+    async def test_ambient_and_exec_clock_trips_leave_the_engine_idle(self) -> None:
+        """WP22-P2B-SEC-07 (c): the trip precedes ``STARTING`` for every branch."""
+        ambient = _paper_engine(RunMode.PAPER)
+        with use_clock(BarClock(_T)), pytest.raises(RuntimeError):
+            await ambient.start("run")
+        assert ambient.state is EngineState.IDLE
+        paper = PaperExecutionEngine("r", DefaultRiskManager("r"))
+        paper.attach_clock(BarClock(_T))
+        real = _paper_engine(RunMode.PAPER)
+        real._execution_engine = paper
+        with pytest.raises(RuntimeError, match="execution engine clock"):
+            await real.start("run")
+        assert real.state is EngineState.IDLE
+
+    async def test_exec_clock_tripwire_message_never_leaks_the_clock_repr(self) -> None:
+        """WP22-P2B-SEC-07 (b) / R11: type name only, never ``repr(clock)``."""
+        paper = PaperExecutionEngine("r", DefaultRiskManager("r"))
+        paper.attach_clock(_SecretRepr())  # a Clock by protocol; the tripwire must refuse it
+        engine = _paper_engine(RunMode.PAPER)
+        engine._execution_engine = paper
+        with pytest.raises(RuntimeError, match="execution engine clock") as err:
+            await engine.start("run")
+        assert "SECRET" not in str(err.value)
+        assert "_SecretRepr" in str(err.value)
+
     async def test_mock_exec_engines_stay_green_the_type_gate(self) -> None:
         engine = _paper_engine(RunMode.PAPER)  # AsyncMock exec: _clock is a child Mock
         await engine.start("run")
@@ -1076,6 +1172,49 @@ class TestT09Tripwires:
         assert _CapturingEngine.instances == []  # the engine was never built
         engine_cls.assert_not_called()
 
+    @pytest.mark.parametrize("trip", [True, False], ids=["tripwire", "control-other-error"])
+    async def test_paper_tripwire_does_not_schedule_an_auto_retry(self, trip: bool) -> None:
+        """WP22-P2B-SEC-06: a retry would inherit the poisoned ambient clock.
+
+        The control (an unrelated error) proves the harness does schedule a retry.
+        """
+        import contextlib
+
+        from api.services import run_orchestrator as orch
+
+        _CapturingEngine.instances.clear()
+        retry_mock = AsyncMock()
+        patches = [
+            patch("api.db.session.get_session_factory", _session_factory()),
+            patch("api.config.get_settings", return_value=_settings()),
+            patch("data.services.ccxt_market_data.CCXTMarketDataService", MagicMock()),
+            patch("trading.portfolio.PortfolioAccounting", MagicMock()),
+            patch("trading.strategy_engine.StrategyEngine", _CapturingEngine),
+            patch.object(orch, "make_circuit_breaker_alert_listener", MagicMock()),
+            patch.object(orch, "record_audit_event", AsyncMock()),
+            patch.object(orch, "_auto_retry_paper_run", retry_mock),
+            patch("trading.engines.paper.PaperExecutionEngine", MagicMock()),
+        ]
+        if not trip:
+            patches.append(patch.object(orch, "validate_smoke_run", side_effect=RuntimeError("x")))
+        with contextlib.ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            with use_clock(BarClock(_T)) if trip else contextlib.nullcontext():
+                await orch.run_paper_engine(
+                    run_id_str=str(uuid.uuid4()),
+                    strategy_cls=MagicMock,
+                    strategy_name="grid_trading",
+                    strategy_params={},
+                    symbols=[_ORCH_SYM],
+                    timeframe=TimeFrame.ONE_HOUR,
+                    initial_capital="10000",
+                    cost_profile=LEGACY,
+                    resume=None,
+                )
+            await asyncio.sleep(0)  # let a fire-and-forget retry task start
+        assert retry_mock.call_count == (0 if trip else 1)
+
 
 class TestT09StampsAndIsolation:
     async def test_paper_stamps_are_wall_time_through_the_one_seam(
@@ -1122,6 +1261,15 @@ class TestT09StampsAndIsolation:
         )
         assert sell.created_at == frozen and sell.updated_at == frozen
         assert engine.get_all_fills()[-1].executed_at == frozen
+        # WP22-P2B1-03: the portfolio's seed, position and curve stamps follow the
+        # SAME seam (``portfolio._utc_now`` delegates to ``clock._wall_now``).
+        fresh = PortfolioAccounting("r2")
+        assert fresh.get_equity_curve()[0][0] == frozen  # seed point
+        fresh.update_position(engine.get_all_fills()[0], Decimal("100"))
+        position = fresh.get_position(SYM)
+        assert position is not None and position.opened_at == frozen
+        fresh.update_market_prices({SYM: Decimal("102")})
+        assert {ts for ts, _eq in fresh.get_equity_curve()} == {frozen}
 
     async def test_explicit_stamps_do_not_rely_on_the_ambient_fallback(self) -> None:
         """SY-22-05 (c): every persisted field is stamped from the ENGINE clock.

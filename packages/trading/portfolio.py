@@ -42,6 +42,7 @@ from typing import Callable, Literal, TypedDict
 import structlog
 
 from common.types import OrderSide
+from trading import clock as _clock_module
 from trading.models import Fill, Position, TradeResult
 from trading.recovery import ResumeDailySeed, replay_sort_key
 
@@ -90,12 +91,15 @@ DayStartSource = Literal["run_start", "roll", "snapshot", "replay_estimate", "un
 
 
 def _utc_now() -> datetime:
-    """Default risk-day clock (wall clock, UTC).
+    """Default risk-day / stamp clock (wall clock, UTC).
 
-    Module-level on purpose: it is the one monkeypatch seam the determinism
-    tests (WP15-T-23) use to prove a backtest never reads the wall clock.
+    Module-level on purpose: it is the monkeypatch seam the determinism tests
+    (WP15-T-23) use to prove a backtest never reads the wall clock.  It
+    delegates to :func:`trading.clock._wall_now` (WP22-P2B-SEC-08), the one
+    ``datetime.now(tz=UTC)`` read, resolved at call time so patching either
+    name takes effect.
     """
-    return datetime.now(tz=UTC)
+    return _clock_module._wall_now()
 
 
 def _utc_day(at: datetime) -> date:

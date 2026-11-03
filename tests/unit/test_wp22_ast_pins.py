@@ -153,8 +153,8 @@ def _wall_reads(tree: ast.Module) -> list[tuple[str, str, int]]:
 # (module, function path, call): the ONLY direct wall reads left in the stamp modules.
 _WALL_ALLOWLIST: frozenset[tuple[str, str, str]] = frozenset(
     {
-        # the risk-day default clock seam (WP15-T-18 / T-23 monkeypatch target)
-        ("portfolio.py", "_utc_now", "datetime.now"),
+        # (portfolio.py's ``_utc_now`` seam delegates to ``trading.clock._wall_now``
+        # since WP22-P2B1-03, so it is no longer a direct wall read)
         # live-only quote-age log field (never on the backtest path)
         ("strategy_engine.py", "StrategyEngine._quote_context", "datetime.now"),
     }

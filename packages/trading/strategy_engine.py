@@ -46,7 +46,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -875,6 +875,25 @@ class StrategyEngine:
         if callable(_attach_clock):
             _attach_clock(clock)
 
+    @contextlib.contextmanager
+    def _restore_fallback_clock(
+        self, applied: bool, prior_clock: Clock, prior_exec_clock: Clock | None
+    ) -> Iterator[None]:
+        """Undo the ``run_backtest`` fallback ``BarClock`` on every exit path.
+
+        A no-op unless ``run_backtest`` created the clock itself (``applied``);
+        an injected clock (``BacktestRunner``) is never touched.  Writes the
+        attributes directly (no ``attach_clock``) so the attach-site pins hold.
+        """
+        try:
+            yield
+        finally:
+            if applied:
+                self._clock = prior_clock
+                execution = self._execution_engine
+                if prior_exec_clock is not None and isinstance(execution, BaseExecutionEngine):
+                    execution._clock = prior_exec_clock
+
     def _wall_clock_tripwire(self) -> None:
         """WP2.2 R6: fail-closed identity tripwire for PAPER / LIVE.
 
@@ -1209,8 +1228,17 @@ class StrategyEngine:
         # at ``t0 = max(first bar open)``); a direct StrategyEngine user that
         # passed none gets one here, attached to the execution engine (the
         # portfolio's seed point then keeps a wall stamp -- test-only path).
+        # The fallback is scoped to this call (WP22-P2B-CR-01): the engine's and
+        # the execution engine's clocks are restored when the run ends, so a
+        # second ``run_backtest`` on the same engine starts a fresh BarClock.
         bar_clock: Clock = self._clock
-        if bar_clock is WALL_CLOCK:
+        prior_clock: Clock = self._clock
+        execution = self._execution_engine
+        prior_exec_clock: Clock | None = (
+            execution._clock if isinstance(execution, BaseExecutionEngine) else None
+        )
+        fallback_applied = bar_clock is WALL_CLOCK
+        if fallback_applied:
             bar_clock = BarClock(
                 start=max(bars_by_symbol[symbol][0].timestamp for symbol in self._symbols)
             )
@@ -1230,7 +1258,10 @@ class StrategyEngine:
         # ``use_clock``'s ``finally``, also on an exception or cancellation.
         if not isinstance(bar_clock, BarClock):
             raise TypeError(f"run_backtest requires a BarClock, got {type(bar_clock).__name__}")
-        with use_clock(bar_clock):
+        with (
+            use_clock(bar_clock),
+            self._restore_fallback_clock(fallback_applied, prior_clock, prior_exec_clock),
+        ):
             # Walk forward bar by bar
             for bar_idx in range(num_bars):
                 if self._stop_event.is_set():

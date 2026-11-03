@@ -1088,6 +1088,9 @@ async def run_paper_engine(
         # run must never execute under a simulated ambient clock.  Inside the
         # ``try`` so the existing teardown marks the run errored.
         if ambient_clock() is not WALL_CLOCK:
+            # WP22-P2B-SEC-06: deterministic, so the auto-retry (which would
+            # inherit the same ambient context) must not respawn the run.
+            _skip_auto_retry = True
             raise RuntimeError("paper run started under a non-wall ambient clock")
 
         # WP-SMOKE (synthesis-spec.md section 7, G-13): defence in depth --
