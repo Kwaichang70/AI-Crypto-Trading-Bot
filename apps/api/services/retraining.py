@@ -52,6 +52,11 @@ logger = structlog.get_logger(__name__)
 # Sentinel: beginning of time — all trades qualify on first run
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
+# Allow-list of run modes whose trades may become training labels.  Backtest
+# (and optimize) trades are in-sample replays of the model's own history, so
+# they must never feed retraining (WP2.2 SY-22-11).
+TRAINING_RUN_MODES: tuple[str, ...] = ("paper", "live")
+
 
 class RetrainingService:
     """Background asyncio.Task that monitors trade counts and triggers retraining."""
@@ -189,7 +194,7 @@ class RetrainingService:
         """Count trades since last retrain; trigger retraining if threshold met."""
         from sqlalchemy import func, select
 
-        from api.db.models import TradeORM
+        from api.db.models import RunORM, TradeORM
 
         key = f"{symbol}::{timeframe}"
         last_at = self._last_retrain_at.get(key, _EPOCH)
@@ -198,10 +203,12 @@ class RetrainingService:
             count_result = await session.execute(
                 select(func.count())
                 .select_from(TradeORM)
+                .join(RunORM, RunORM.id == TradeORM.run_id)
                 .where(
                     TradeORM.strategy_id == "model_strategy",
                     TradeORM.symbol == symbol,
                     TradeORM.exit_at > last_at,
+                    RunORM.run_mode.in_(TRAINING_RUN_MODES),
                 )
             )
             trade_count = count_result.scalar_one()
@@ -509,10 +516,10 @@ class RetrainingService:
     # ------------------------------------------------------------------ #
 
     async def _fetch_trade_dicts(self, symbol: str) -> list[dict[str, Any]]:
-        """Query all closed model_strategy trades for the symbol and return as dicts."""
+        """Query closed paper/live model_strategy trades for the symbol as dicts."""
         from sqlalchemy import select
 
-        from api.db.models import TradeORM
+        from api.db.models import RunORM, TradeORM
 
         async with self._db_session_factory() as session:
             result = await session.execute(
@@ -523,9 +530,11 @@ class RetrainingService:
                     TradeORM.quantity,
                     TradeORM.entry_at,
                 )
+                .join(RunORM, RunORM.id == TradeORM.run_id)
                 .where(
                     TradeORM.strategy_id == "model_strategy",
                     TradeORM.symbol == symbol,
+                    RunORM.run_mode.in_(TRAINING_RUN_MODES),
                 )
                 .order_by(TradeORM.entry_at)
             )
