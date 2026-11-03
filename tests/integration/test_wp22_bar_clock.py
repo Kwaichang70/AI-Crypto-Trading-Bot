@@ -237,9 +237,6 @@ def _by_type(rec: _Recorder, cls: type) -> list[dict[str, Any]]:
     return [_row_values(r) for r in rec.rows if isinstance(r, cls)]
 
 
-_TIME_COLUMNS_EXCL_SNAPSHOT_AT = ("timestamp", "created_at", "updated_at", "executed_at")
-
-
 def _time_values(rec: _Recorder) -> list[tuple[str, str, datetime]]:
     """Every datetime in the persisted rows."""
     out: list[tuple[str, str, datetime]] = []

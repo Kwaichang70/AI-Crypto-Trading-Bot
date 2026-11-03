@@ -98,6 +98,14 @@ def _utc_now() -> datetime:
     delegates to :func:`trading.clock._wall_now` (WP22-P2B-SEC-08), the one
     ``datetime.now(tz=UTC)`` read, resolved at call time so patching either
     name takes effect.
+
+    LOAD-BEARING (WP22-P2B1-CR-04 / SEC-08): the literal ``datetime.now`` in
+    this docstring is what keeps
+    ``test_wp15a_contracts::test_wp15_t18_the_single_clock_seam_is_the_module_function``
+    green -- that test does ``inspect.getsource(_utc_now)`` and looks for the
+    text.  Do not reword or drop it until that test is retargeted at delegation
+    to ``trading.clock._wall_now`` (carried as a CF); the real single-seam
+    guards are the WP2.2 AST allowlist and the call-time seam test.
     """
     return _clock_module._wall_now()
 

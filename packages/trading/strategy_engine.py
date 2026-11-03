@@ -511,6 +511,8 @@ class StrategyEngine:
             )
         #: the clock exit-time stamps are read from: bar clock (BACKTEST) or wall.
         self._clock: Clock = WALL_CLOCK if clock is None else clock
+        #: WP22-P2B2 (SEC-07): True while a ``run_backtest`` call owns this engine.
+        self._backtest_running: bool = False
 
         self._strategies = list(strategies)
         self._circuit_breaker = circuit_breaker
@@ -877,21 +879,39 @@ class StrategyEngine:
 
     @contextlib.contextmanager
     def _restore_fallback_clock(
-        self, applied: bool, prior_clock: Clock, prior_exec_clock: Clock | None
+        self,
+        applied: bool,
+        bar_clock: Clock,
+        prior_clock: Clock,
+        execution: object,
+        prior_exec_clock: Clock | None,
     ) -> Iterator[None]:
-        """Undo the ``run_backtest`` fallback ``BarClock`` on every exit path.
+        """Scope one ``run_backtest`` call: re-entrancy flag and fallback clock.
 
-        A no-op unless ``run_backtest`` created the clock itself (``applied``);
-        an injected clock (``BacktestRunner``) is never touched.  Writes the
-        attributes directly (no ``attach_clock``) so the attach-site pins hold.
+        Entered immediately after ``use_clock`` and before any clock is
+        installed, so nothing the call installs can outlive it.  ``execution``
+        is the execution engine captured at entry (never re-read from ``self``)
+        and is restored only ``if execution._clock is bar_clock``: the scope
+        undoes exactly what it installed and never writes into another object.
+        A no-op for the clocks unless ``run_backtest`` created the clock itself
+        (``applied``); an injected clock (``BacktestRunner``) is never touched.
+        Writes the attributes directly (no ``attach_clock``) so the attach-site
+        pins hold.  The flag is set here, with no ``await`` between
+        ``run_backtest``'s check and this entry, so the check-and-set is atomic.
         """
+        self._backtest_running = True
         try:
             yield
         finally:
+            self._backtest_running = False
             if applied:
-                self._clock = prior_clock
-                execution = self._execution_engine
-                if prior_exec_clock is not None and isinstance(execution, BaseExecutionEngine):
+                if self._clock is bar_clock:
+                    self._clock = prior_clock
+                if (
+                    prior_exec_clock is not None
+                    and isinstance(execution, BaseExecutionEngine)
+                    and execution._clock is bar_clock
+                ):
                     execution._clock = prior_exec_clock
 
     def _wall_clock_tripwire(self) -> None:
@@ -1200,6 +1220,12 @@ class StrategyEngine:
                 f"(call start() first), got {self._state.value}"
             )
 
+        # WP22-P2B2 (SEC-07): one run per engine at a time.  Type name only (R11).
+        if self._backtest_running:
+            raise RuntimeError(
+                f"run_backtest() is already running on this {type(self).__name__}"
+            )
+
         # Validate that bars exist for all symbols
         for symbol in self._symbols:
             if symbol not in bars_by_symbol or not bars_by_symbol[symbol]:
@@ -1228,9 +1254,11 @@ class StrategyEngine:
         # at ``t0 = max(first bar open)``); a direct StrategyEngine user that
         # passed none gets one here, attached to the execution engine (the
         # portfolio's seed point then keeps a wall stamp -- test-only path).
-        # The fallback is scoped to this call (WP22-P2B-CR-01): the engine's and
-        # the execution engine's clocks are restored when the run ends, so a
-        # second ``run_backtest`` on the same engine starts a fresh BarClock.
+        # The fallback is scoped to this call (WP22-P2B-CR-01): it is installed
+        # INSIDE the ``with`` below (WP22-P2B2, P2B1-CR-01), so a raise while
+        # installing -- or anywhere before the ``with`` -- leaves no clock behind;
+        # on exit each clock is restored only if it is still the one installed.
+        # A second ``run_backtest`` on the same engine starts a fresh BarClock.
         bar_clock: Clock = self._clock
         prior_clock: Clock = self._clock
         execution = self._execution_engine
@@ -1242,8 +1270,6 @@ class StrategyEngine:
             bar_clock = BarClock(
                 start=max(bars_by_symbol[symbol][0].timestamp for symbol in self._symbols)
             )
-            self._clock = bar_clock
-            self._attach_exec_clock(bar_clock)
 
         self._log.info(
             "engine.backtest_starting",
@@ -1260,8 +1286,15 @@ class StrategyEngine:
             raise TypeError(f"run_backtest requires a BarClock, got {type(bar_clock).__name__}")
         with (
             use_clock(bar_clock),
-            self._restore_fallback_clock(fallback_applied, prior_clock, prior_exec_clock),
+            self._restore_fallback_clock(
+                fallback_applied, bar_clock, prior_clock, execution, prior_exec_clock
+            ),
         ):
+            if fallback_applied:
+                # Attach first: a rejecting execution engine (LiveExecutionEngine)
+                # raises here and the engine's own clock is never replaced.
+                self._attach_exec_clock(bar_clock)
+                self._clock = bar_clock
             # Walk forward bar by bar
             for bar_idx in range(num_bars):
                 if self._stop_event.is_set():

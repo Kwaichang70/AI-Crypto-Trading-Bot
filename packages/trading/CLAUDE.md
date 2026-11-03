@@ -277,8 +277,11 @@ Core trading engine containing the heart of the system.
   engine gets it ONLY through `StrategyEngine.__init__ -> attach_clock` (BACKTEST only; never use
   `PaperExecutionEngine(clock=)` in the runner). `run_backtest` computes `close_i` once and passes the
   SAME object to `bar_clock.advance` and `portfolio.advance_clock`.
-  A direct `StrategyEngine` built without a clock gets a run-scoped fallback `BarClock`, restored (engine and
-  execution engine) when `run_backtest` exits, so one engine can run several backtests.
+  A direct `StrategyEngine` built without a clock gets a run-scoped fallback `BarClock`, installed INSIDE the
+  `run_backtest` `with` (attach to the execution engine first, then the engine's own clock) so a rejected attach
+  leaves nothing behind. On exit the scope undoes only what it installed: onto the execution engine captured at
+  entry, and only `if clock is bar_clock` (never a re-read or swapped engine). So one engine can run several
+  backtests; a concurrent second `run_backtest` on the same engine raises `RuntimeError` (type name only).
 - Guards (identity, never `isinstance(x, WallClock)` / `type(x) is`): BACKTEST `StrategyEngine` accepts
   `None` or a `BarClock`; PAPER and LIVE accept `None` or `WALL_CLOCK`; `LiveExecutionEngine.attach_clock`
   accepts only `WALL_CLOCK`; neither `BaseExecutionEngine` nor `LiveExecutionEngine` has a `clock=`
@@ -293,7 +296,9 @@ Core trading engine containing the heart of the system.
   re-reviewing this (a test fails under that flag).
 - Test seam for paper/live time (S18 / WP4.8): monkeypatch `trading.clock._wall_now` and nothing else.
   `trading.portfolio._utc_now` (the WP1.5 seam, kept by name so its monkeypatches still work) delegates to it
-  at call time, so the portfolio's seed / curve / position stamps follow the same patch.
+  at call time, so the portfolio's seed / curve / position stamps follow the same patch. The `datetime.now`
+  literal in its docstring is load-bearing for `test_wp15a_contracts::test_wp15_t18` until that test is
+  retargeted at delegation (CF); do not reword it.
   Never patch `WALL_CLOCK` or `WallClock.now`, never inject a fake clock into a paper/live engine
   (the guards reject it by design), and wrap a `BarClock` instead of patching an instance (`__slots__`).
 - Same-bar events share a stamp; `(timestamp, bar_index)` totally orders equity points. At most one
