@@ -2657,6 +2657,13 @@ class StrategyEngine:
                         self._order_signal_bar_ts.pop(closed.opening_order_id, None)
                     for add_id in closed.add_order_ids:
                         self._order_signal_bar_ts.pop(add_id, None)
+                # WP2.2 SY-22-07: drop the managers' per-lot state exactly as
+                # their own check() flat branch does, so an equal lot_key on a
+                # reopen (or a skipped open hook) cannot revive the closed lot.
+                if self._bracket_exit is not None:
+                    self._bracket_exit.close_lot(symbol)
+                if self._trailing_stop is not None:
+                    self._trailing_stop.close_lot(symbol)
                 self._clear_anchor_pending(symbol)
                 self._forget_exit_check_state(symbol)
             return
