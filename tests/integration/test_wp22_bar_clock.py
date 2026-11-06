@@ -489,7 +489,10 @@ class TestT04DayAttribution:
 
 
 # ---------------------------------------------------------------------------
-# T-05  multi-symbol, misaligned
+# T-05  multi-symbol: WP2.3 rewrite (WP23-T-14a).  The phase-offset fixture of WP2.2 (symbols
+#       30 minutes apart, paired by index, stamped by the max rule) is now a hard
+#       ``bar_alignment_off_grid`` rejection.  The max rule itself is unchanged; under
+#       alignment it is a no-op, which the on-grid missing-bar tests below pin.
 # ---------------------------------------------------------------------------
 
 
@@ -510,22 +513,37 @@ def _offset_bars(symbol: str, first_open: datetime, n: int) -> list[OHLCVBar]:
 
 
 class TestT05MisalignedMultiSymbol:
-    async def test_stamps_follow_the_max_rule_and_increase_strictly(self) -> None:
+    async def test_the_phase_offset_fixture_is_rejected_as_off_grid(self) -> None:
+        from data.bar_alignment import BarAlignmentError
+
         other = "ETH/USDT"
         lead = _offset_bars(SYM, F1_FIRST_OPEN + timedelta(minutes=30), 70)
         lag = _offset_bars(other, F1_FIRST_OPEN, 70)  # opens 30 min EARLIER than SYM
+        with pytest.raises(BarAlignmentError) as ei:
+            await _run([], {}, symbols=(SYM, other), bars={SYM: lead, other: lag})
+        assert ei.value.code == "bar_alignment_off_grid"
+        assert str(ei.value) == "bar alignment check failed (bar_alignment_off_grid)"
+        assert [v.symbol for v in ei.value.violations] == [SYM]
+
+    async def test_stamps_of_an_on_grid_missing_bar_follow_the_union_timeline(self) -> None:
+        other = "ETH/USDT"
+        lead = _offset_bars(SYM, F1_FIRST_OPEN, 70)
+        # ETH misses two bars INSIDE the trading region; its first and last bars are present
+        lag = [b for k, b in enumerate(_offset_bars(other, F1_FIRST_OPEN, 70)) if k not in (55, 56)]
+        assert len(lag) == 68
         run = await _run([], {}, symbols=(SYM, other), bars={SYM: lead, other: lag})
-        assert run.t0 == lead[0].timestamp  # max of the first opens
-        expected = [lead[i].timestamp + H for i in range(70)]
+        assert run.t0 == lead[0].timestamp == F1_FIRST_OPEN
+        # one curve point per timeline step (70, not min(len) = 68), stamped step + tf
+        expected = [b.timestamp + H for b in lead]
         assert [p.timestamp for p in run.curve[1:]] == expected
         assert run.curve[0].timestamp == run.t0
         stamps = [p.timestamp for p in run.curve]
         assert all(a < b for a, b in pairwise(stamps))
 
-    async def test_the_lagging_symbol_orders_carry_the_leading_close(self) -> None:
+    async def test_orders_are_stamped_with_the_close_of_the_step_that_filled_them(self) -> None:
         other = "ETH/USDT"
-        lead = _offset_bars(SYM, F1_FIRST_OPEN + timedelta(minutes=30), 60)
-        lag = _offset_bars(other, F1_FIRST_OPEN, 60)
+        lead = _offset_bars(SYM, F1_FIRST_OPEN, 60)
+        lag = [b for k, b in enumerate(_offset_bars(other, F1_FIRST_OPEN, 60)) if k != 52]
         runner = BacktestRunner(
             strategies=[_strategy({0: "buy"})],
             symbols=[SYM, other],
@@ -537,7 +555,8 @@ class TestT05MisalignedMultiSymbol:
         result = await runner.run({SYM: lead, other: lag})
         run = Run(runner, result, {SYM: lead, other: lag}, H)
         assert run.fills, "the scripted BUY must fill"
-        assert all(f.executed_at in set(run.closes) for f in run.fills)
+        timeline_closes = {b.timestamp + H for b in lead}
+        assert all(f.executed_at in timeline_closes for f in run.fills)
 
 
 # ---------------------------------------------------------------------------

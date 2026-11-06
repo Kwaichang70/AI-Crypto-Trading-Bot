@@ -60,6 +60,7 @@ import structlog
 from common.logging import exc_log_fields
 from common.models import MultiTimeframeContext, OHLCVBar
 from common.types import OrderSide, OrderStatus, RunMode, SignalDirection, TimeFrame
+from data.bar_alignment import Step, build_timeline
 from data.indicators import atr as _atr_series
 from data.market_data import BaseMarketDataService, MarketDataError, RateLimitError
 from trading.bracket_exit import (
@@ -139,8 +140,9 @@ _UNPROTECTED_LOG_EVERY: int = 10
 #: high-water mark after a resume (beyond that: ``trailing_stop.seed_partial``).
 _TRAILING_GAP_FETCH_LIMIT: int = 1000
 #: WP1.3b-a (CF-13b-20, SEC-04(a)): the trailing gap is fetched through
-#: ``fetch_ohlcv_range`` -- at most this many 300-bar pages (1000 bars = 4 pages),
-#: each bounded by ``_EXIT_FETCH_TIMEOUT_S``, the whole call by their product.
+#: ``fetch_ohlcv_range`` -- 4 pages dense; up to 2*ceil(gap/300)+2 requests on
+#: windowed exchanges with holes; one overall bound of 40 s (each page is bounded by
+#: ``_EXIT_FETCH_TIMEOUT_S``, the whole call by ``_TRAILING_GAP_MAX_PAGES`` times that).
 _TRAILING_GAP_MAX_PAGES: int = 4
 #: WP1.3b-b (SY-13b-06): the confirming ticker reading is taken this long after the
 #: first one (the second reading *is* the retry).  Instance attribute
@@ -1181,13 +1183,18 @@ class StrategyEngine:
         ----------
         bars_by_symbol :
             Pre-fetched OHLCV bars keyed by symbol. Each list must be
-            sorted by timestamp ascending.
+            sorted by timestamp ascending. WP2.3: several symbols are walked
+            on the UNION timeline of their bar-open times, with a per-step
+            present mask (an absent symbol is skipped at that step); the
+            input must start and end on a full row (``BacktestRunner``
+            trims to that). One symbol: a plain index walk, no validation.
         htf_bars :
             Optional higher-timeframe bar data keyed by timeframe string,
             then by symbol. Passed to strategies via MultiTimeframeContext.
         oos_start_index :
-            Sprint 50 Cycle 6 (IMPL-C6-002): bar ordinal (0-based into the
-            shortest symbol series) marking the first out-of-sample bar. When
+            Sprint 50 Cycle 6 (IMPL-C6-002): step ordinal (0-based into the
+            aligned timeline, WP2.3; the symbol's own series when there is one
+            symbol) marking the first out-of-sample bar. When
             set, the engine records the live equity-curve length at the exact
             moment processing crosses into that bar and returns it in the
             summary dict under "oos_equity_curve_offset". This lets
@@ -1207,6 +1214,11 @@ class StrategyEngine:
             If run mode is not BACKTEST.
         ValueError
             If no bars are provided for any configured symbol.
+        BarAlignmentError
+            (a ``ValueError``) With several symbols: ``bar_alignment_off_grid``
+            (off-grid, duplicate or non-increasing bars, or a phase mismatch) or
+            ``bar_alignment_not_trimmed`` (the first or last step is not a full
+            row).  Raised before any engine state is touched.
         """
         if self._run_mode != RunMode.BACKTEST:
             raise RuntimeError(
@@ -1233,8 +1245,24 @@ class StrategyEngine:
                     f"No bars provided for symbol {symbol}"
                 )
 
-        # Determine the number of bars to process (shortest series)
-        num_bars = min(len(bars_by_symbol[s]) for s in self._symbols)
+        # WP2.3 (SY-23-10): the steps to walk.  One symbol: the plain index walk
+        # (``timeline is None``; NO validation -- a direct caller may feed an
+        # unsorted series, test_wp13b_fix).  Several symbols: the union timeline
+        # of bar-open times with a per-step present mask; a symbol with no bar at
+        # a step is skipped there (no history step, no mark, no exit check, no
+        # fill) and keeps its last mark.  ``build_timeline`` is pure and sync
+        # (WP2.2 R4/R5) and raises ``BarAlignmentError`` for off-grid input or a
+        # first/last step that is not a full row, so the fallback seed below
+        # (``max`` of the first opens) equals ``timeline[0]``.  The clock keeps
+        # reading the bars' own timestamps (``close_i`` below).
+        timeline: tuple[Step, ...] | None = None
+        if len(self._symbols) == 1:
+            num_bars = len(bars_by_symbol[self._symbols[0]])
+        else:
+            timeline = build_timeline(
+                bars_by_symbol, self._symbols, _TIMEFRAME_SECONDS[self._timeframe]
+            )
+            num_bars = len(timeline)
 
         # Store HTF bars for multi-timeframe context building
         self._htf_bars = htf_bars
@@ -1320,13 +1348,17 @@ class StrategyEngine:
                 current_bars: dict[str, OHLCVBar] = {}
                 history_by_symbol: dict[str, list[OHLCVBar]] = {}
 
-                for symbol in self._symbols:
-                    bar = bars_by_symbol[symbol][bar_idx]
-                    current_bars[symbol] = bar
-                    # Growing window: all bars up to and including current
-                    history_by_symbol[symbol] = bars_by_symbol[symbol][
-                        : bar_idx + 1
-                    ]
+                present = (
+                    ((self._symbols[0], bar_idx),)
+                    if timeline is None
+                    else timeline[bar_idx].present
+                )
+                for symbol, series_idx in present:
+                    series = bars_by_symbol[symbol]
+                    current_bars[symbol] = series[series_idx]
+                    # Growing window: all of the symbol's own bars up to and
+                    # including current (input bar objects only, never filled)
+                    history_by_symbol[symbol] = series[: series_idx + 1]
 
                 # WP1.5 (§5.2) + WP2.2 (SY-22-03 Amendment A): the BAR CLOSE time
                 # (latest bar timestamp + one timeframe) is computed ONCE and the
@@ -1335,8 +1367,9 @@ class StrategyEngine:
                 # clock -- every bar, warmup included, BEFORE any mark or fill of
                 # this bar.  Close time matches paper/live, which only ever see a
                 # bar after its close; the wall clock is never read on this path, so
-                # a backtest is deterministic.  Forward-only: an earlier time (pre-
-                # WP2.3 multi-symbol misalignment) is a no-op in both clocks.
+                # a backtest is deterministic.  Forward-only: an earlier time is a
+                # no-op in both clocks.  Under WP2.3 alignment every present bar of a
+                # step shares one timestamp, so the ``max`` is that timestamp.
                 # Duck-typed so a portfolio test double without the method does not
                 # crash.
                 close_i = max(b.timestamp for b in current_bars.values()) + timedelta(
@@ -3423,7 +3456,9 @@ class StrategyEngine:
 
         When the warmup window starts after ``anchor bar + 1`` the gap is
         fetched through the paginated ``fetch_ohlcv_range`` (from
-        ``anchor_bar_ts + tf``, at most 1000 bars = 4 pages, CF-13b-20); on failure
+        ``anchor_bar_ts + tf``, at most 1000 bars; 4 pages dense, up to
+        2*ceil(gap/300)+2 requests on windowed exchanges with holes, one overall
+        bound of 40 s, CF-13b-20); on failure
         the available closes are used and ``trailing_stop.seed_partial`` is logged.
         """
         peak = entry.entry_gross_vwap
@@ -3445,10 +3480,10 @@ class StrategyEngine:
             gap: list[OHLCVBar] | None = None
             if missing <= _TRAILING_GAP_FETCH_LIMIT:
                 try:
-                    # CF-13b-20: paginated -- at most ``_TRAILING_GAP_MAX_PAGES`` pages of
-                    # the service's page limit (1000 bars = 4 x 300), 10 s per page, the
-                    # whole call under one overall timeout; each page may retry inside
-                    # the service (WP13BB-CR-08).
+                    # CF-13b-20: paginated -- 4 pages dense (1000 bars = 4 x 300); up to
+                    # 2*ceil(gap/300)+2 requests on windowed exchanges with holes; one
+                    # overall bound of 40 s; each page may retry inside the service
+                    # (WP13BB-CR-08).
                     fetched = await asyncio.wait_for(
                         self._market_data.fetch_ohlcv_range(
                             symbol=symbol,
