@@ -80,7 +80,10 @@ from api.schemas import (
     UnprotectedPositionResponse,
 )
 from api.services.cost_profiles import (
+    bar_alignment_http_error,
+    check_backtest_request_bounds,
     new_run_cost_profile_or_422,
+    requested_bar_window,
     stamp_cost_config,
 )
 from api.services.run_orchestrator import (
@@ -98,6 +101,8 @@ from api.services.run_orchestrator import (
     run_paper_engine as _run_paper_engine,
 )
 from api.services.run_persistence import (
+    DUPLICATE_SYMBOLS_REASON,
+    has_duplicate_symbols,
     load_resume_snapshot as _load_resume_snapshot,
     persist_backtest_results as _persist_backtest_results,
     persist_paper_results as _persist_paper_results,
@@ -106,6 +111,7 @@ from api.services.run_persistence import (
 )
 from common.logging import exc_log_fields
 from common.types import OrderSide, RunMode, TimeFrame
+from data.bar_alignment import BarAlignmentError
 from trading.costs import (
     default_cost_profile,
     resolve_run_cost_profile,
@@ -422,6 +428,20 @@ def _build_promoted_strategy_params(
 # ``_normalize_exchange_secret`` lives in ``api.services.run_orchestrator``
 # since Sprint 40 Stap 2b; the top-level import block re-exports it under
 # the original underscore-prefixed name for backwards compatibility.
+
+
+# ---------------------------------------------------------------------------
+# WP2.3 (SY-23-14): the ONE wall-clock read of the bar-alignment window
+# ---------------------------------------------------------------------------
+
+
+def _window_now() -> datetime:
+    """``now`` for :func:`~api.services.cost_profiles.requested_bar_window`.
+
+    The ROUTER reads the clock, never the runner, optimizer or engine (WP22-T-06); this
+    module-level seam is what tests patch.  ``optimize.py`` calls it through this module.
+    """
+    return datetime.now(tz=UTC)
 
 
 # ---------------------------------------------------------------------------
@@ -870,6 +890,14 @@ async def create_run(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="backtest_start must be before backtest_end",
             )
+        # WP2.3 P0 SEC-02: fixed 422 codes for an oversized / pre-genesis / too-wide
+        # history request, BEFORE the idempotency claim and any bar fetch.
+        check_backtest_request_bounds(
+            start=body.backtest_start,
+            end=body.backtest_end,
+            timeframe=TimeFrame(str(body.timeframe)),
+            n_symbols=len(body.symbols),
+        )
 
     # ------------------------------------------------------------------
     # 3-Layer Live Trading Safety Gate (SEC-003)
@@ -1162,6 +1190,11 @@ async def create_run(
         # ------------------------------------------------------------------
         if is_backtest:
             try:
+                # WP2.3 (SY-23-14, SEC-01): read ``now`` ONCE, BEFORE the fetch.  The pager
+                # stops at ``floor(its own now) + tf`` (later than this value), so every bar
+                # opening before ``floor(now)`` is already closed and the tail is covered;
+                # reading it after a slow fetch would admit the still-forming bar.
+                _bar_window_now = _window_now()
                 # Step 1: Fetch historical OHLCV bars
                 bars_by_symbol = await _fetch_bars_for_backtest(
                     symbols=body.symbols,
@@ -1203,7 +1236,21 @@ async def create_run(
                 config_snapshot["seed"] = runner.seed
 
                 log.info("runs.backtest_execution_starting", run_id=str(run_id))
-                result = await runner.run(bars_by_symbol)
+                # WP2.3 (SY-23-14): the requested window, with the still-forming bar
+                # clamped off.  ``now`` is read HERE (router), nowhere deeper.
+                result = await runner.run(
+                    bars_by_symbol,
+                    requested_window=requested_bar_window(
+                        body.backtest_start,  # type: ignore[arg-type]
+                        body.backtest_end,  # type: ignore[arg-type]
+                        timeframe,
+                        _bar_window_now,
+                    ),
+                )
+                # WP2.3 (SY-23-16): ints / strings / bools only; carried through
+                # ``_persist_backtest_results`` (it rebuilds config from ``run_orm.config``).
+                if runner.last_alignment is not None:
+                    config_snapshot["bar_alignment"] = runner.last_alignment.to_metadata()
 
                 # Step 4: Persist results (trades + equity curve + metrics in config)
                 await _persist_backtest_results(
@@ -1240,6 +1287,28 @@ async def create_run(
                 run_orm.updated_at = error_time
                 await db.flush()
                 raise
+
+            except BarAlignmentError as exc:
+                # WP2.3 (SY-23-08): MUST precede ``except ValueError`` (BarAlignmentError
+                # is a ValueError subclass; after it this would be a 400 that echoes
+                # ``str(exc)``).  422 with the closed code only; CF-36: the log carries
+                # the code and the type, never the exception text.  The row's ``error``
+                # status is in-flight only: the outer ``except BaseException`` rolls the
+                # session back like every other 4xx/5xx here, so nothing is persisted and
+                # the durable record of a rejection is the log line and the metric.
+                error_time = datetime.now(tz=UTC)
+                run_orm.status = "error"
+                run_orm.stopped_at = error_time
+                run_orm.updated_at = error_time
+                await db.flush()
+
+                log.warning(
+                    "runs.backtest_bar_alignment_rejected",
+                    run_id=str(run_id),
+                    code=exc.code,
+                    error_type="BarAlignmentError",
+                )
+                raise bar_alignment_http_error(exc) from exc
 
             except ValueError as exc:
                 # BacktestRunner._validate_bars raised a data-quality error
@@ -2853,6 +2922,14 @@ async def promote_to_live(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Strategy {promotion_strategy_name!r} from source run is no longer registered.",
         )
+    # WP2.3 (CF-23-20): a legacy paper config with a duplicated symbol must not become a
+    # live run (the engine would reject it after the audit row and the claim exist).
+    if has_duplicate_symbols(source_run.config.get("symbols")):
+        log.warning("runs.promote_duplicate_symbols", source_run_id=str(run_id))
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": DUPLICATE_SYMBOLS_REASON},
+        )
     _source_strategy_params: dict[str, Any] = source_run.config.get("strategy_params", {}) or {}
     # WP2.1 (AG-04): a promoted live run is ALWAYS priced (estimated) with the
     # current default -- never the paper source's profile -- and validated at
@@ -3386,6 +3463,15 @@ async def resume_run(
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"Run {run_id} has no configured symbols; cannot resume.",
+        )
+    # WP2.3 (CF-23-20): a legacy config that lists a symbol twice cannot resume (the engine
+    # rejects duplicates).  Fail closed BEFORE the CAS with a distinct 422 reason; the run
+    # stays orphaned and untouched, and nothing is deduped.
+    if has_duplicate_symbols(symbols):
+        log.warning("runs.resume_duplicate_symbols", run_id=str(run_id))
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": DUPLICATE_SYMBOLS_REASON},
         )
 
     try:
@@ -4329,6 +4415,11 @@ async def recover_orphaned_runs() -> int:
 
                 if not symbols:
                     await _mark_run_error(factory, run_id, log, reason="empty_symbols")
+                    continue
+
+                # WP2.3 (CF-23-20): fail closed with a distinct reason; no silent dedupe.
+                if has_duplicate_symbols(symbols):
+                    await _mark_run_error(factory, run_id, log, reason=DUPLICATE_SYMBOLS_REASON)
                     continue
 
                 try:

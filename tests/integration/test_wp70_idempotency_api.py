@@ -81,7 +81,7 @@ _BACKTEST_PAYLOAD: dict[str, Any] = {
     "mode": "backtest",
     "initialCapital": "10000.00",
     "backtestStart": "2024-01-01T00:00:00Z",
-    "backtestEnd": "2024-01-10T00:00:00Z",
+    "backtestEnd": "2024-01-06T00:00:00Z",
 }
 
 

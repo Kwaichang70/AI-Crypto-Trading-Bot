@@ -146,7 +146,7 @@ _BACKTEST: dict[str, Any] = {
     "mode": "backtest",
     "initialCapital": "10000.00",
     "backtestStart": "2024-01-01T00:00:00Z",
-    "backtestEnd": "2024-06-01T00:00:00Z",
+    "backtestEnd": "2024-01-06T00:00:00Z",
 }
 _PAPER: dict[str, Any] = {
     "strategyName": "grid_trading",
@@ -199,6 +199,7 @@ class TestT20CreatePersistsCostProfile:
             "daily_risk": "wp15-1",
             "backtest_circuit_breaker": True,  # WP2.1c (SY-21-13); false in 2.1a/2.1b
             "timestamp_clock": "wp22-1",
+            "bar_alignment": "wp23-1",  # WP2.3 (SY-23-16)
         }
         body = resp.json()
         assert body["costProfile"]["id"] == "coinbase_advanced_1"
@@ -862,7 +863,7 @@ _OPT_BODY: dict[str, Any] = {
     "symbols": [_SYMBOL],
     "timeframe": "1h",
     "backtestStart": "2024-01-01T00:00:00Z",
-    "backtestEnd": "2024-06-01T00:00:00Z",
+    "backtestEnd": "2024-01-13T12:00:00Z",
     "topN": 3,
     "maxCombinations": 10,
 }

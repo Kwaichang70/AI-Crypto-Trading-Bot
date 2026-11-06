@@ -208,6 +208,7 @@ class TestEngineSemantics:
             "daily_risk": "wp15-1",
             "backtest_circuit_breaker": True,
             "timestamp_clock": "wp22-1",
+            "bar_alignment": "wp23-1",  # WP2.3 (SY-23-16)
         }
 
 

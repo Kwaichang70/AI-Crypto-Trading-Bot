@@ -57,15 +57,21 @@ from api.schemas import (
     RunResponse,
     leaderboard_eligible,
 )
-from api.services.cost_profiles import cost_response_fields, timestamp_response_fields
+from api.services.cost_profiles import (
+    bar_alignment_response_fields,
+    cost_response_fields,
+    timestamp_response_fields,
+)
 from common.types import OrderSide, OrderStatus, OrderType
 from trading.metrics import EquityCurvePoint
 from trading.models import Fill, Order
 from trading.recovery import ResumeRejected, ResumeSnapshot
 
 __all__ = [
+    "DUPLICATE_SYMBOLS_REASON",
     "EmptyEquityCurveError",
     "build_backtest_metrics",
+    "has_duplicate_symbols",
     "load_resume_snapshot",
     "persist_backtest_results",
     "persist_paper_results",
@@ -125,6 +131,8 @@ def run_orm_to_response(run: RunORM) -> RunResponse:
     response = response.model_copy(update=cost_response_fields(run.config, run.run_mode))
     # WP2.2 (SY-22-09): server-computed legacy-timestamp flag (runs only).
     response = response.model_copy(update=timestamp_response_fields(run.config, run.run_mode))
+    # WP2.3 (SY-23-16): server-computed legacy bar-alignment flag (multi-symbol backtests).
+    response = response.model_copy(update=bar_alignment_response_fields(run.config, run.run_mode))
 
     # Step 2: extract JSONB-resident leaderboard fields (confidence_flag, psr).
     # These are NOT top-level SQL columns; they live in config["backtest_metrics"].
@@ -159,6 +167,33 @@ def run_orm_to_response(run: RunORM) -> RunResponse:
     return response.model_copy(update=updates)
 
 
+#: Distinct, closed reason for a legacy persisted paper / live config that lists a
+#: symbol twice (WP2.3 CF-23-20).  The engine rejects duplicates, so such a run can
+#: neither resume nor be rebuilt; it fails closed with this reason (never a silent
+#: dedupe, which would change the sizing the run was opened with).
+DUPLICATE_SYMBOLS_REASON = "duplicate_symbols_in_config"
+
+
+def has_duplicate_symbols(symbols: object) -> bool:
+    """True iff ``symbols`` is a list that names the same string symbol twice.
+
+    Never raises.  A non-string element is skipped, not a reason to stop scanning, so
+    ``["A", 1, "A"]`` is still flagged (fail closed on a corrupt mixed list); a value that
+    is not a list at all (missing, malformed) is ``False`` here and left to the caller's
+    existing empty / shape checks.
+    """
+    if not isinstance(symbols, list):
+        return False
+    seen: set[str] = set()
+    for symbol in symbols:
+        if not isinstance(symbol, str):
+            continue
+        if symbol in seen:
+            return True
+        seen.add(symbol)
+    return False
+
+
 def run_orm_to_detail_response(run: RunORM) -> RunDetailResponse:
     """Convert a ``RunORM`` instance to a ``RunDetailResponse`` Pydantic model.
 
@@ -178,6 +213,7 @@ def run_orm_to_detail_response(run: RunORM) -> RunDetailResponse:
     # WP2.1: cost-model transparency fields (see run_orm_to_response).
     base = base.model_copy(update=cost_response_fields(run.config, run.run_mode))
     base = base.model_copy(update=timestamp_response_fields(run.config, run.run_mode))
+    base = base.model_copy(update=bar_alignment_response_fields(run.config, run.run_mode))
 
     # Attempt to populate backtest_metrics from the JSONB config blob
     raw_metrics: dict[str, Any] | None = (run.config or {}).get("backtest_metrics")
@@ -236,6 +272,8 @@ def build_backtest_metrics(result: Any) -> BacktestMetricsResponse:
         average_loss=str(result.average_loss),
         largest_win=str(result.largest_win),
         largest_loss=str(result.largest_loss),
+        # WP2.3 (SY-23-11): ``result.total_bars`` is the number of aligned TIMELINE steps
+        # minus the warm-up window (steps - W), not a per-symbol bar count.
         total_bars=result.total_bars,
         bars_in_market=result.bars_in_market,
         exposure_pct=result.exposure_pct,
@@ -503,6 +541,13 @@ async def persist_backtest_results(
     - ``TradeORM`` rows for every completed round-trip trade.
     - ``EquitySnapshotORM`` rows for every equity curve point.
     - Backtest metrics summary into ``run_orm.config["backtest_metrics"]``.
+
+    ``run_orm.config["bar_alignment"]`` (WP2.3, ``AlignmentReport.to_metadata()``) is set
+    by the caller before this runs and is carried through the config rebuild below.
+    Two runs on the same bars are compared by its ``presence_digest``, NOT by
+    ``fingerprint``: the optimizer aligns with warm-up 0 (a combination-independent
+    split), so ``fingerprint`` (which covers the ``holes_in_*`` diagnostics) differs
+    between a runner report and an optimizer report on identical data.
 
     Parameters
     ----------

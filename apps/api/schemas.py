@@ -334,6 +334,11 @@ class RunCreateRequest(BaseModel):
                     f"Symbol {symbol!r} must follow CCXT format 'BASE/QUOTE' "
                     f"(e.g. 'BTC/USDT')"
                 )
+        # WP2.3 (CF-23-20, P3 critic ruling 3): a duplicate symbol double-counts exposure
+        # and the engine rejects it; fail at the API edge with a 422 instead.  Order is
+        # preserved (nothing is deduped); the message never echoes a request value.
+        if len(set(v)) != len(v):
+            raise ValueError("symbols must be unique")
         return v
 
 
@@ -534,6 +539,17 @@ class RunResponse(BaseModel):
             "so its row timestamps are wall-clock.  Always False for paper / live."
         ),
     )
+    legacy_bar_alignment: bool = Field(
+        default=False,
+        description=(
+            "WP2.3 (SY-23-16): True iff the run is a MULTI-symbol backtest persisted before "
+            "timestamp-based bar alignment (config['engine_semantics']['bar_alignment'] "
+            "missing or unknown), so its symbols were paired by list index and silently "
+            "truncated to the shortest series.  A missing or malformed symbol list counts "
+            "as not-single (fails closed).  Single-symbol runs are identical and are never "
+            "flagged; always False for paper / live."
+        ),
+    )
     live_equivalent_costs: bool = Field(
         default=False,
         description=(
@@ -633,7 +649,14 @@ class BacktestMetricsResponse(BaseModel):
     largest_loss: str
 
     # Exposure
-    total_bars: int
+    total_bars: int = Field(
+        description=(
+            "Trading steps after warm-up: aligned timeline steps minus the warm-up window "
+            "(WP2.3, SY-23-11).  A multi-symbol run counts one step per timestamp on which "
+            "at least one symbol has a bar, so it can differ from any single symbol's bar "
+            "count.  Single-symbol runs are unchanged."
+        ),
+    )
     bars_in_market: int
     exposure_pct: float
     exposure_pct_per_symbol: dict[str, float] = Field(

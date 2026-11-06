@@ -46,7 +46,7 @@ def _base_payload(**overrides: object) -> dict:
         "mode": "backtest",
         "initialCapital": "10000.00",
         "backtestStart": "2024-01-01T00:00:00Z",
-        "backtestEnd": "2024-06-01T00:00:00Z",
+        "backtestEnd": "2024-01-06T00:00:00Z",
     }
     body.update(overrides)
     return body
@@ -320,7 +320,7 @@ class TestZeroMeansUnsetAtApi:
             "mode": "backtest",
             "initialCapital": "10000.00",
             "backtestStart": "2024-01-01T00:00:00Z",
-            "backtestEnd": "2024-06-01T00:00:00Z",
+            "backtestEnd": "2024-01-06T00:00:00Z",
         }
         resp = _post(client_dev_with_db, payload)
         assert resp.status_code == 201, resp.text
@@ -368,7 +368,7 @@ class TestAllowPyramiding:
             "mode": "backtest",
             "initialCapital": "10000.00",
             "backtestStart": "2024-01-01T00:00:00Z",
-            "backtestEnd": "2024-06-01T00:00:00Z",
+            "backtestEnd": "2024-01-06T00:00:00Z",
         }
         resp = _post(client_dev_with_db, payload)
         assert resp.status_code == 201, resp.text

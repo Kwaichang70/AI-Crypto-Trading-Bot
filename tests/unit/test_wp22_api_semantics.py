@@ -109,8 +109,18 @@ class TestT13Marker:
         assert "timestamp_clock" not in engine_semantics(mode)
 
     def test_the_pinned_backtest_dict_differs_by_exactly_the_one_key(self) -> None:
-        assert engine_semantics("backtest") == {**_PRE_P3_BACKTEST, "timestamp_clock": "wp22-1"}
-        assert engine_semantics("optimize") == {**_PRE_P3_BACKTEST, "timestamp_clock": "wp22-1"}
+        # WP2.3 (SY-23-16): ``bar_alignment`` is the one added key; ``timestamp_clock`` is
+        # NOT bumped.
+        assert engine_semantics("backtest") == {
+            **_PRE_P3_BACKTEST,
+            "timestamp_clock": "wp22-1",
+            "bar_alignment": "wp23-1",
+        }
+        assert engine_semantics("optimize") == {
+            **_PRE_P3_BACKTEST,
+            "timestamp_clock": "wp22-1",
+            "bar_alignment": "wp23-1",
+        }
         assert engine_semantics("paper") == {
             k: v for k, v in _PRE_P3_BACKTEST.items() if k != "backtest_circuit_breaker"
         }

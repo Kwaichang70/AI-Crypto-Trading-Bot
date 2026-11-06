@@ -20,7 +20,7 @@ from typing import Annotated, Any
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic.alias_generators import to_camel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -30,11 +30,16 @@ from api.db import get_db
 from api.db.models import OptimizationEntryORM, OptimizationRunORM
 from api.schemas import CostProfileSummary
 from api.services.cost_profiles import (
+    bar_alignment_http_error,
+    check_backtest_request_bounds,
     cost_response_fields,
     new_run_cost_profile_or_422,
+    requested_bar_window,
     stamp_cost_config,
 )
 from common.types import TimeFrame
+from data.bar_alignment import BarAlignmentError
+from api.routers import runs as _runs_router  # module import: tests patch ``runs._window_now``
 # TODO(sprint-30): extract to api.services.market_data / api.services.strategy_registry
 from api.routers.runs import (
     _fetch_bars_for_backtest,
@@ -155,6 +160,18 @@ class OptimizeRequest(BaseModel):
             "the platform default profile.  Unknown ids give 422 'unknown_cost_profile'."
         ),
     )
+
+    @field_validator("symbols")
+    @classmethod
+    def _symbols_are_unique(cls, v: list[str]) -> list[str]:
+        """WP2.3 (CF-23-20): order-preserving uniqueness; a duplicate is a 422.
+
+        The engine rejects a duplicate symbol (it double-counts exposure); fail at the
+        API edge instead of as a 500.  Nothing is deduped and no value is echoed.
+        """
+        if len(set(v)) != len(v):
+            raise ValueError("symbols must be unique")
+        return v
 
 
 class OptimizeEntryResponse(BaseModel):
@@ -395,6 +412,18 @@ async def run_optimization(
 
     timeframe = TimeFrame(body.timeframe)
 
+    # WP2.3 P0 SEC-02: fixed 422 codes for an oversized / pre-genesis / too-wide history
+    # request, before the (real) exchange round trips of the fetch below.
+    check_backtest_request_bounds(
+        start=body.backtest_start,
+        end=body.backtest_end,
+        timeframe=timeframe,
+        n_symbols=len(body.symbols),
+    )
+
+    # WP2.3 (SY-23-14, SEC-01): read ``now`` ONCE, BEFORE the fetch (see create_run).
+    bar_window_now = _runs_router._window_now()
+
     # Step 1: Fetch OHLCV data ONCE
     bars_by_symbol = await _fetch_bars_for_backtest(
         symbols=body.symbols,
@@ -438,7 +467,27 @@ async def run_optimization(
         rank_by=body.rank_by,
     )
 
-    result = await optimizer.run(bars_by_symbol)
+    # WP2.3 (SY-23-08/14/18): the requested window (``now`` read here, in the router,
+    # through the same seam as backtest) and a 422 for a rejected alignment.  The
+    # ``BarAlignmentError`` branch is the only one: the optimizer never swallows it into
+    # ``failed_combinations``, and no ``str(exc)`` reaches the log or the response.
+    try:
+        result = await optimizer.run(
+            bars_by_symbol,
+            requested_window=requested_bar_window(
+                body.backtest_start,
+                body.backtest_end,
+                timeframe,
+                bar_window_now,
+            ),
+        )
+    except BarAlignmentError as exc:
+        log.warning(
+            "optimize.bar_alignment_rejected",
+            code=exc.code,
+            error_type="BarAlignmentError",
+        )
+        raise bar_alignment_http_error(exc) from exc
 
     # Step 3: Build response entry list
     entries = [
@@ -462,6 +511,10 @@ async def run_optimization(
         mode="optimize",
         backtest_circuit_breaker=optimizer.circuit_breaker_enabled,
     )
+    # WP2.3 (SY-23-16): the alignment report of the whole run (aligned once, SY-23-18).
+    # Compare runs by ``presence_digest``, not ``fingerprint`` (warm-up 0 in the optimizer).
+    if optimizer.last_alignment is not None:
+        run_metadata["bar_alignment"] = optimizer.last_alignment.to_metadata()
 
     orm_run = OptimizationRunORM(
         id=uuid.uuid4(),

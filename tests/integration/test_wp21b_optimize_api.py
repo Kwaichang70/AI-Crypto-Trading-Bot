@@ -40,7 +40,7 @@ _BODY: dict[str, Any] = {
     "symbols": [_SYMBOL],
     "timeframe": "1h",
     "backtestStart": "2024-01-01T00:00:00Z",
-    "backtestEnd": "2024-06-01T00:00:00Z",
+    "backtestEnd": "2024-01-13T12:00:00Z",
     "topN": 3,
     "maxCombinations": 10,
 }
@@ -142,7 +142,11 @@ class TestPostWritesRunMetadata:
         resp = _post(client_dev)
         assert resp.status_code == 200, resp.text
         (run,) = db.added(OptimizationRunORM)
-        assert run.run_metadata == {
+        # WP2.3 (SY-23-16): ``run_metadata`` also carries the alignment report; the other
+        # two keys stay exactly as before.
+        metadata = dict(run.run_metadata)
+        assert metadata.pop("bar_alignment")["version"] == "wp23-1"
+        assert metadata == {
             "cost_profile": DEFAULT_COST_PROFILE.to_metadata(),
             "engine_semantics": engine_semantics("optimize"),
         }
