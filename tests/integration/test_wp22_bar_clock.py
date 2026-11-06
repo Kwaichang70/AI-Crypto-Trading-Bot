@@ -6,7 +6,7 @@ WP2.2 P2b: the bar-time clock, end to end (hermetic: no Postgres, no network).
     WP22-T-02  DoD: every persisted time column of a backtest is in {t0} U {close_i}
     WP22-T-03  quant expected values (F1 123 points, AT-2 holding 24 h, AT-3 stop-loss exit)
     WP22-T-04  day attribution: stamp day == the WP1.5 risk day for every mark
-    WP22-T-05  multi-symbol, misaligned bars: the max rule
+    WP22-T-05  multi-symbol (WP2.3): phase offset -> off_grid; on-grid holes -> union timeline
     WP22-T-06  no wall-clock read in the backtest path (raising tripwires)
     WP22-T-08  determinism under two poisoned wall clocks (uuid-normalised rows)
     WP22-T-09  paper / live unchanged, guards (R1/R2/R8), tripwires (R6), isolation (R8), R10

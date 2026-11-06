@@ -162,8 +162,12 @@ Core trading engine containing the heart of the system.
   `resume_fallback_current_atr` (interim, non-final until the attempts are spent; error log
   `bracket_exit.resume_fallback_final` + `bracket_anchor_source_total{source,final}`) or
   `entry_deferred`. The trailing gap (bars missing between the anchor bar and the warmup window,
-  up to 1000) is fetched through the paginated `fetch_ohlcv_range` (at most 4 pages of 300);
-  a gap that cannot be fetched, or is longer, logs `trailing_stop.seed_partial`.
+  up to 1000) is fetched through the paginated `fetch_ohlcv_range`: 4 pages of 300 when dense;
+  with holes (since WP2.3 P0 a short page never ends the fetch) up to about 2·ceil(gap/page)+2
+  requests, all inside the same 40 s `wait_for` bound (WP23-P0-RISK-04). A timeout discards
+  every page already gathered, so on a slow exchange the seed can be looser than a partial
+  fetch would give (WP23-P0-RISK-03 / SEC-01, carry-forward: pager deadline). A gap that cannot
+  be fetched, or is longer, logs `trailing_stop.seed_partial`.
 - Trailing: HWM_0 = gross opening VWAP; ratchets only at bar closes with `bar_ts >
   anchor_bar_ts`; KEPT on a trigger and on a quantity change (no re-seed from the current price).
 - R-04: an exit that was not submitted (`[]`, every order terminal+unfilled, or
@@ -305,6 +309,81 @@ Core trading engine containing the heart of the system.
   `Fill` per `Order` (pinned): reopen the sequence-key decision (SY-22-06) if partial fills are added.
 - Lots are dropped on a full-flatten SELL (`close_lot` in both managers), so an equal bar-time `lot_key`
   on a same-bar reopen can never revive the closed lot.
-- Known limit (WP2.3 / WP2.4): on misaligned multi-symbol bars a lagging symbol carries the leading
-  symbol's close; the MTF context (C10) still reads wall time in API backtests.
+- Known limit (WP2.4): the MTF context (C10) still reads wall time in API backtests. (The
+  multi-symbol index pairing, where a lagging symbol carried the leading symbol's close, is gone
+  since WP2.3; see below.)
 - See `reports/vp2-wp2.2/synthesis-spec.md` and `reports/vp2-wp2.2/synthesis-r2-guards.md`.
+
+### WP2.3 (multi-symbol bar alignment: `data/bar_alignment.py`)
+- BACKTEST only; paper/live are untouched (CF-23-01..03). Policy `union_present_mask`: multi-symbol
+  `run_backtest` walks the sorted union of observed bar timestamps (`build_timeline`, at the old
+  `min(len)` site). Per step only PRESENT symbols get `on_bar`, a mark, a bracket/trailing check, a
+  fill and a history step; an absent symbol keeps its last mark and, if held, still counts as
+  exposed. No synthetic bar, ever (no ffill).
+- Single symbol (`len(self._symbols) == 1`, a pinned literal): index walk, no `build_timeline`, no
+  validation, byte-identical to before. Multi-symbol full-row guard: `build_timeline` raises
+  `bar_alignment_off_grid` (phase mismatch, duplicate or non-increasing bar) or
+  `bar_alignment_not_trimmed` (first or last step not a full row) before any state change, so
+  `t0 = max(first opens) == timeline[0]`. The WP2.2 clock lines are textually unchanged and
+  `test_wp22_ast_pins.py` is unedited; the clock never reads `Step.ts`.
+- `BacktestRunner.run` order: `_validate_bars` -> `align_bars(window=requested_window)` ->
+  telemetry -> `check_alignment` -> warmup check on `len(timeline)` -> rebind `bars_by_symbol` to
+  the aligned dict -> the unchanged `t0` line -> `run_id` + engine. A rejection happens before
+  `run_id` and engine construction. Everything after the rebind sees the execution window: terminal
+  MTM, start/end/duration, `total_bars = len(timeline) - W`, exposure denominators, the OOS range
+  (`oos_start_index` is an ordinal into the timeline). Enforced for more than one distinct symbol
+  or whenever `requested_window` is given; a single symbol without a window (goldens, scripts, ML
+  gate) is report-only.
+- Tolerances are code constants (the `_TOL_*` block in the leaf, U-01 (a)); never env, never an
+  API field (`alignment_tolerance=` on the runner/optimizer is for tests and scripts). Abort when
+  missing > 1% of the grid (warn > 0.1%; zero-volume counts as missing); `max_gap_bars` > 4 (warn >= 2),
+  counted over absent OR zero-volume slots (QA-04); head > 0; tail > 1; any off-grid bar; per
+  walk-forward test fold missing > max(1, floor(2% * n)) or a run > 4.
+- `BarAlignmentError(ValueError)`: a closed set of 8 codes (`bar_alignment_` + `off_grid`,
+  `no_common_row`, `head_coverage`, `tail_coverage`, `missing_bars`, `gap_too_long`,
+  `fold_tolerance`, `not_trimmed`), fixed message `bar alignment check failed (<code>)`; precedence
+  is code order, then `self._symbols` order. Log from `.code` / `.violations`, never `str(exc)`. The
+  API maps it to 422 `{"code": <code>, "error_type": "BarAlignmentError"}`
+  (`bar_alignment_http_error`), before `except ValueError` in runs and around `optimizer.run`.
+- Optimizer: `ParameterOptimizer.run` aligns and checks ONCE (`_align_once`), including every
+  walk-forward test fold (`fold_check`), before any combination. Inner runners get
+  `record_alignment=False` (they trim and build the timeline: no tolerance check, no telemetry; only the
+  structural `off_grid` / `no_common_row` check still runs on an empty multi-symbol timeline), and
+  `except BarAlignmentError: raise` precedes every per-combination `except Exception`.
+- Walk-forward: `WalkForwardValidator.split` splits by TIME: fold boundaries are ordinals on the
+  union timeline, snapped to full rows at both edges (rolling `train_start` too), each symbol sliced
+  by `bisect`. Unequal bar counts are legal; a window without a full row raises `ValueError`. A single
+  symbol keeps the old index slices.
+- Duplicate symbols: `StrategyEngine.__init__` raises `ValueError("duplicate symbols are not
+  allowed")` in every mode. The API rejects them at the request edge (run create and optimize, 422)
+  and fails closed with `duplicate_symbols_in_config` at resume, paper boot recovery and promote
+  (CF-23-20). Never dedupe silently.
+- BACKTEST drops a signal whose symbol is absent at the step (`_drop_absent_symbol_signals`, log
+  `engine.signal_dropped_symbol_absent`), before the entry filter and the signal count; paper/live
+  keep it (test-pinned).
+- Report: `runner.last_alignment` / `optimizer.last_alignment` (reset at every `run`);
+  `BacktestResult` has NO alignment field. Persisted as `config["bar_alignment"] =
+  report.to_metadata()` (ints, strings, bools) on backtest config and optimize `run_metadata`.
+  Compare runs by `presence_digest` (sha256 over sorted `symbol|ts_ms` lines of the bars handed to
+  the engine), never by `fingerprint`: the optimizer computes `holes_*` with warmup 0, so its
+  fingerprint differs on identical data. The digest covers the execution window, so it depends on
+  the whole basket and the window, not on one symbol's data alone (QA-08).
+- Marker `engine_semantics.bar_alignment = "wp23-1"` on backtest and optimize only;
+  `timestamp_clock` stays `"wp22-1"`. `legacy_bar_alignment` (run responses,
+  `bar_alignment_response_fields`) is True iff backtest AND the symbol count is not exactly one AND
+  the marker is not in `KNOWN_BAR_ALIGNMENTS`; it never raises. Single-symbol legacy runs are not
+  flagged.
+- Telemetry: `bar_alignment_runs_total{outcome}`, `bar_alignment_missing_bars_total{symbol,timeframe}`,
+  `bar_alignment_rejected_total{reason}` via `common.metrics` directly (no `run_id` label); logs
+  `backtest.bar_alignment` / `_gaps` / `_rejected` carry numbers, symbols, ISO times and codes only.
+- Window: the API passes `requested_window = (start, min(end, floor_tf(now)))` and reads `now` once,
+  BEFORE the fetch (`runs._window_now`); runner and engine never read the wall clock. 1w caveat:
+  `floor_tf` is epoch-anchored (Thursday 00:00 UTC), so from Thursday to Sunday the forming weekly
+  bar is not trimmed (WP23-P4-CR-03, carry-forward).
+- API request bounds (WP23-P0-SEC-02, backtest create and optimize only; 422 `{"code": ...}` before any
+  idempotency claim or fetch, never an echo of the request): more than `MAX_BACKTEST_SYMBOLS` (20) symbols
+  `too_many_symbols`; a start before `MIN_BACKTEST_START` (2009-01-03) or an overflowing UTC conversion of
+  it `start_too_early`; `ceil((end - start) / tf) * symbols` above `MAX_BACKTEST_BARS` (500 000) or an
+  overflowing end `range_too_large` (`check_backtest_request_bounds`, `api/services/cost_profiles.py`).
+  Paper/live carry no symbol cap (WP23-P4-SEC-06, carry-forward).
+- See `reports/vp2-wp2.3/synthesis-spec.md` and `Documentation/WP2.3-register.md`.
