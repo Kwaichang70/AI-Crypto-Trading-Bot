@@ -79,17 +79,15 @@ from trading.metrics import (
     EquityCurvePoint,
     OpenPositionMTM,
     _derive_confidence_flag,  # noqa: PLC2701 - private helper, same-package call
-    compute_psr,
-    TIMEFRAME_PERIODS_PER_YEAR,
     compute_cagr,
     compute_calmar,
     compute_exposure,
     compute_max_drawdown,
     compute_max_drawdown_duration,
+    compute_return_metrics,
     compute_returns_from_equity,
-    compute_sharpe,
-    compute_sortino,
     compute_trade_statistics,
+    periods_per_year as _periods_per_year,
 )
 from trading.portfolio import PortfolioAccounting
 from trading.risk import RiskParameters
@@ -688,13 +686,14 @@ class BacktestRunner:
         max_dd = compute_max_drawdown(equity_curve)
         max_dd_duration = compute_max_drawdown_duration(equity_curve)
 
-        periods_per_year = TIMEFRAME_PERIODS_PER_YEAR.get(
-            self._timeframe, 365.25
-        )
+        # WP2.5 P1: strict annualisation (an unknown timeframe raises; no silent
+        # daily fallback).  SR, Sortino, PSR and n come from ONE call below.
+        ann_factor = _periods_per_year(self._timeframe)
         per_period_returns = compute_returns_from_equity(equity_curve)
 
-        sharpe = compute_sharpe(per_period_returns, periods_per_year)
-        sortino = compute_sortino(per_period_returns, periods_per_year)
+        full_metrics = compute_return_metrics(per_period_returns, ann_factor)
+        sharpe = full_metrics.sharpe
+        sortino = full_metrics.sortino
         calmar = compute_calmar(cagr, max_dd)
 
         # Sprint 50 Cycle 6 (IMPL-C6-003): realized OOS Sharpe over the OOS window.
@@ -739,7 +738,7 @@ class BacktestRunner:
                 oos_curve = equity_curve[slice_start:]
                 oos_returns = compute_returns_from_equity(oos_curve)
                 oos_n_returns = len(oos_returns)
-                oos_sharpe = compute_sharpe(oos_returns, periods_per_year)
+                oos_sharpe = compute_return_metrics(oos_returns, ann_factor).sharpe
                 self._log.info(
                     "backtest.oos_sharpe_computed",
                     oos_start_index=oos_start_index,
@@ -749,35 +748,10 @@ class BacktestRunner:
                     full_curve_len=len(equity_curve),
                 )
 
-        # M4 (Sprint 49): PSR + statistical confidence fields
-        n_obs = len(per_period_returns)
-        # De-annualise Sharpe for PSR — Bailey's formula uses per-period Sharpe.
-        # per_period_sharpe = annual_sharpe / sqrt(periods_per_year)
-        per_period_sharpe = (
-            sharpe / math.sqrt(periods_per_year)
-            if periods_per_year > 0
-            else sharpe
-        )
-        # Compute population skewness and kurtosis from per-period returns
-        psr_skew = 0.0
-        psr_kurtosis = 3.0  # normal distribution default
-        if n_obs >= 4:
-            _mean = sum(per_period_returns) / n_obs
-            _var = sum((r - _mean) ** 2 for r in per_period_returns) / n_obs  # population
-            _std = math.sqrt(_var)
-            if _std > 0.0:
-                psr_skew = sum(
-                    (r - _mean) ** 3 for r in per_period_returns
-                ) / (n_obs * _std ** 3)
-                psr_kurtosis = sum(
-                    (r - _mean) ** 4 for r in per_period_returns
-                ) / (n_obs * _std ** 4)
-        psr = compute_psr(
-            per_period_sharpe,
-            n_obs,
-            skew=psr_skew,
-            kurtosis=psr_kurtosis,
-        )
+        # M4 (Sprint 49): PSR + statistical confidence fields, from the same
+        # return series as the Sharpe above (``compute_return_metrics``).
+        n_obs = full_metrics.n
+        psr = full_metrics.psr
 
         # 15. Compute trade statistics
         trade_stats = compute_trade_statistics(trade_history)

@@ -9,13 +9,20 @@ testable without standing up backtest infrastructure.
 
 Financial formulae
 ------------------
-- CAGR: ``(final / initial) ^ (365 / days) - 1``
+- CAGR: ``(final / initial) ^ (365.25 / days) - 1``
 - Sharpe (annualised): ``mean(returns) / std(returns) * sqrt(periods_per_year)``
 - Sortino: ``mean(returns) / downside_deviation * sqrt(periods_per_year)``
 - Calmar: ``CAGR / |max_drawdown|``
 - Profit Factor: ``sum(winning_pnl) / |sum(losing_pnl)|``
 - Exposure: ``bars_in_market / total_bars``
 - Max Drawdown Duration: longest contiguous peak-to-recovery span in bars
+
+Version marker
+--------------
+``METRICS_VERSION`` identifies the curve-derived metric semantics (formulas, the
+annualisation year of 365.25 days, the zero-std guard, the CAGR span).  Any later
+change to a persisted curve-derived number must bump it and extend
+``KNOWN_METRICS_VERSIONS``.
 
 All monetary values use ``Decimal`` for precision.  Ratios and percentages
 use ``float`` because they are derived statistical quantities where Decimal
@@ -25,9 +32,10 @@ precision offers no practical benefit and numpy interop is simpler.
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
-from typing import Literal, Sequence
+from typing import Final, Literal, Sequence
 
 import structlog
 from pydantic import BaseModel, Field
@@ -35,12 +43,16 @@ from pydantic import BaseModel, Field
 from common.types import TimeFrame
 from trading.models import TradeResult
 from trading._statistics import _norm_cdf  # noqa: PLC2701 — shared statistics helper
+from trading.equity_sampling import simple_returns
 from trading.walk_forward import deflated_sharpe_ratio  # noqa: F401 — thin re-export for consumers
 
 __all__ = [
     "BacktestResult",
     "EquityCurvePoint",
+    "KNOWN_METRICS_VERSIONS",
+    "METRICS_VERSION",
     "OpenPositionMTM",
+    "ReturnMetrics",
     "compute_psr",
     "deflated_sharpe_ratio",
     "compute_cagr",
@@ -52,12 +64,28 @@ __all__ = [
     "compute_max_drawdown",
     "compute_max_drawdown_duration",
     "compute_exposure",
+    "compute_return_metrics",
     "compute_returns_from_equity",
     "compute_trade_statistics",
+    "periods_per_year",
+    "return_moments",
     "TIMEFRAME_PERIODS_PER_YEAR",
 ]
 
 logger = structlog.get_logger(__name__)
+
+# ---------------------------------------------------------------------------
+# Metrics version marker (WP2.5, SY-25-02)
+# ---------------------------------------------------------------------------
+# Owned here (the formula owner), not by the sampling leaf: the version also
+# covers the CAGR span, the duration unit and the zero-std guard.
+
+METRICS_VERSION: Final = "wp25-1"
+KNOWN_METRICS_VERSIONS: Final[frozenset[str]] = frozenset({METRICS_VERSION})
+
+# Relative tolerance below which a standard deviation is float noise around a
+# constant series (std / |mean| <= 1e-9 means a per-period Sharpe >= 1e9).
+_ZERO_STD_REL_TOL: Final = 1e-9
 
 # ---------------------------------------------------------------------------
 # Annualisation factors
@@ -75,6 +103,19 @@ TIMEFRAME_PERIODS_PER_YEAR: dict[TimeFrame, float] = {
     TimeFrame.ONE_DAY: 365.25,                        #     365.25
     TimeFrame.ONE_WEEK: 365.25 / 7,                   #      52.18
 }
+
+
+def periods_per_year(timeframe: TimeFrame) -> float:
+    """Return the annualisation factor (periods per 365.25-day year) for ``timeframe``.
+
+    Strict: a timeframe missing from ``TIMEFRAME_PERIODS_PER_YEAR`` raises
+    ``ValueError`` (fixed text) instead of silently falling back to daily
+    annualisation.
+    """
+    try:
+        return TIMEFRAME_PERIODS_PER_YEAR[timeframe]
+    except KeyError:
+        raise ValueError("unknown timeframe for annualisation") from None
 
 
 # ---------------------------------------------------------------------------
@@ -412,7 +453,7 @@ class BacktestResult(BaseModel):
 def compute_cagr(
     initial: Decimal,
     final: Decimal,
-    days: int,
+    days: float,
 ) -> float:
     """
     Compute Compound Annual Growth Rate.
@@ -421,20 +462,24 @@ def compute_cagr(
     -------
     CAGR = (final / initial) ^ (365.25 / days) - 1
 
+    The year is 365.25 days, the same year as ``TIMEFRAME_PERIODS_PER_YEAR``.
+
     Parameters
     ----------
     initial : Decimal
         Starting portfolio value. Must be > 0.
     final : Decimal
         Ending portfolio value.
-    days : int
-        Number of calendar days in the evaluation period.
+    days : float
+        Length of the evaluation period in calendar days (fractional days are
+        allowed; integer callers get byte-identical results).
 
     Returns
     -------
     float
         CAGR as a decimal fraction.  Returns 0.0 when inputs are
-        degenerate (zero capital, zero days, negative final value).
+        degenerate (zero capital, zero days), -1.0 for a non-positive final
+        value, and ``inf`` when the power overflows a float (never raises).
 
     Examples
     --------
@@ -450,7 +495,10 @@ def compute_cagr(
         return -1.0
 
     exponent = 365.25 / days
-    return float(ratio ** exponent) - 1.0
+    try:
+        return float(ratio ** exponent) - 1.0
+    except OverflowError:
+        return math.inf
 
 
 def compute_sharpe(
@@ -477,7 +525,8 @@ def compute_sharpe(
     -------
     float
         Annualised Sharpe ratio.  Returns 0.0 if fewer than 2
-        observations or if standard deviation is zero.
+        observations or if the standard deviation is zero or float noise
+        (``std <= 1e-9 * |mean|``, i.e. a constant series).
 
     Notes
     -----
@@ -495,7 +544,7 @@ def compute_sharpe(
     variance = sum((r - mean_r) ** 2 for r in returns) / (n - 1)
     std_r = math.sqrt(variance)
 
-    if std_r == 0.0:
+    if std_r == 0.0 or std_r <= _ZERO_STD_REL_TOL * abs(mean_r):
         return 0.0
 
     return (mean_r / std_r) * math.sqrt(periods_per_year)
@@ -528,18 +577,21 @@ def compute_sortino(
     -------
     float
         Annualised Sortino ratio.  Returns 0.0 if fewer than 2
-        observations or if downside deviation is zero.
+        observations, and ``+inf`` when the downside deviation is zero
+        (no return below target) and the mean is at or above target.
 
     Notes
     -----
     Downside deviation is computed using **all** observations in the
-    denominator (not just the negative ones), consistent with the
-    original Sortino & Price (1994) definition.  Specifically::
+    denominator (not just the negative ones), so non-negative periods are
+    not excluded from the count.  Specifically::
 
         DD = sqrt( sum(min(r - target, 0)^2) / (N - 1) )
 
-    This avoids inflating the ratio by excluding non-negative periods
-    from the count.
+    The Sortino & Price (1994) lower partial moment divides by N; this
+    implementation deliberately uses N - 1 (sample statistic, consistent
+    with ``compute_sharpe``), which scales every Sortino by
+    ``sqrt((N - 1) / N)`` relative to the LPM-over-N form.
     """
     n = len(returns)
     if n < 2 or periods_per_year <= 0:
@@ -709,39 +761,25 @@ def compute_max_drawdown(
     return float(max_dd)
 
 
-def compute_max_drawdown_duration(
-    equity_curve: Sequence[EquityCurvePoint],
-) -> int:
+def _max_dd_duration(equities: Sequence[Decimal]) -> int:
+    """Longest drawdown run, in observations, over a plain equity series.
+
+    A drawdown starts when equity drops below the running peak and ends when it
+    recovers to or exceeds that peak.  Fewer than 2 values, or no drawdown,
+    give 0.  Shared by the per-point and the per-bar callers so the rule has
+    one implementation.
     """
-    Compute the longest drawdown duration in bars.
-
-    A drawdown period starts when equity drops below the current peak
-    and ends when equity recovers to or exceeds that peak.  The
-    duration is measured in number of bars (equity curve points).
-
-    Parameters
-    ----------
-    equity_curve : Sequence[EquityCurvePoint]
-        Equity curve points ordered by timestamp ascending.
-
-    Returns
-    -------
-    int
-        Longest peak-to-recovery span in bars.
-        Returns 0 if there are fewer than 2 points or no drawdown
-        occurred.
-    """
-    if len(equity_curve) < 2:
+    if len(equities) < 2:
         return 0
 
     peak = Decimal("0")
     current_dd_duration = 0
     max_dd_duration = 0
 
-    for point in equity_curve:
-        if point.equity >= peak:
+    for equity in equities:
+        if equity >= peak:
             # New peak or recovery to previous peak
-            peak = point.equity
+            peak = equity
             if current_dd_duration > max_dd_duration:
                 max_dd_duration = current_dd_duration
             current_dd_duration = 0
@@ -754,6 +792,32 @@ def compute_max_drawdown_duration(
         max_dd_duration = current_dd_duration
 
     return max_dd_duration
+
+
+def compute_max_drawdown_duration(
+    equity_curve: Sequence[EquityCurvePoint],
+) -> int:
+    """
+    Compute the longest drawdown duration over the curve points.
+
+    A drawdown period starts when equity drops below the current peak
+    and ends when equity recovers to or exceeds that peak.  The
+    duration is measured in number of equity curve POINTS (every fill adds a
+    point); for a per-bar duration feed ``_max_dd_duration`` a per-bar sample.
+
+    Parameters
+    ----------
+    equity_curve : Sequence[EquityCurvePoint]
+        Equity curve points ordered by timestamp ascending.
+
+    Returns
+    -------
+    int
+        Longest peak-to-recovery span in points.
+        Returns 0 if there are fewer than 2 points or no drawdown
+        occurred.
+    """
+    return _max_dd_duration([point.equity for point in equity_curve])
 
 
 def compute_exposure(
@@ -808,21 +872,13 @@ def compute_returns_from_equity(
     Returns are computed using simple (arithmetic) returns, not
     log returns.  For the sub-daily periods typical of crypto
     backtests, the difference is negligible.
+
+    The formula lives in ``trading.equity_sampling.simple_returns`` (one source
+    of truth); this wrapper only extracts the equity column.  It returns one
+    value per curve POINT pair, not per bar: use the per-bar sampler for
+    metrics.
     """
-    if len(equity_curve) < 2:
-        return []
-
-    returns: list[float] = []
-    for i in range(1, len(equity_curve)):
-        prev_eq = equity_curve[i - 1].equity
-        curr_eq = equity_curve[i].equity
-        if prev_eq > Decimal("0"):
-            ret = float((curr_eq - prev_eq) / prev_eq)
-        else:
-            ret = 0.0
-        returns.append(ret)
-
-    return returns
+    return simple_returns([point.equity for point in equity_curve])
 
 
 def compute_trade_statistics(
@@ -945,8 +1001,8 @@ def compute_psr(
         Per-period (NOT annualised) Sharpe ratio.  Callers must de-annualise
         before passing: ``per_period_sharpe = annual_sharpe / sqrt(periods_per_year)``.
     n_observations:
-        Number of per-period return observations (``len(equity_curve) - 1``).
-        Must be >= _PSR_MIN_OBSERVATIONS for the asymptotic CDF approximation
+        Number of per-period return observations.  Must be
+        >= _PSR_MIN_OBSERVATIONS for the asymptotic CDF approximation
         to be reliable.
     sr_benchmark:
         Benchmark Sharpe to test against.  Default 0 — tests if the strategy
@@ -1044,6 +1100,77 @@ def _derive_confidence_flag(
     if psr >= _PSR_MEDIUM_THRESHOLD and n_closed_trades >= _N_TRADES_MEDIUM_THRESHOLD:
         return "medium"
     return "low"
+
+
+# ===================================================================
+# WP2.5: one place for Sharpe / Sortino / PSR / n
+# ===================================================================
+
+
+def return_moments(returns: Sequence[float]) -> tuple[float, float]:
+    """Population skewness and NON-excess kurtosis of ``returns``.
+
+    Returns ``(0.0, 3.0)`` (the normal-distribution values) when there are fewer
+    than 4 observations, or when the standard deviation is zero or float noise
+    (``std <= 1e-9 * |mean|``, the same tolerance as ``compute_sharpe``).
+    """
+    n = len(returns)
+    if n < 4:
+        return 0.0, 3.0
+    mean = sum(returns) / n
+    var = sum((r - mean) ** 2 for r in returns) / n  # population
+    std = math.sqrt(var)
+    if std <= 0.0 or std <= _ZERO_STD_REL_TOL * abs(mean):
+        return 0.0, 3.0
+    skew = sum((r - mean) ** 3 for r in returns) / (n * std**3)
+    kurtosis = sum((r - mean) ** 4 for r in returns) / (n * std**4)
+    return skew, kurtosis
+
+
+@dataclass(frozen=True, slots=True)
+class ReturnMetrics:
+    """Return-series statistics computed together from ONE series.
+
+    ``n`` is the number of returns the other fields were computed from, so SR,
+    PSR and n can never come from different samplings.
+    """
+
+    n: int
+    sharpe: float
+    sortino: float
+    psr: float | None
+    skew: float
+    kurtosis: float
+
+
+def compute_return_metrics(
+    returns: Sequence[float],
+    periods_per_year: float,
+) -> ReturnMetrics:
+    """Compute annualised Sharpe and Sortino, PSR, n and the PSR moments.
+
+    The only place where SR, Sortino, PSR and n are derived together.  PSR uses
+    the de-annualised Sharpe, ``n = len(returns)`` and the population moments of
+    the same ``returns`` (``compute_psr`` returns ``None`` below
+    ``_PSR_MIN_OBSERVATIONS``).
+    """
+    n = len(returns)
+    sharpe = compute_sharpe(returns, periods_per_year)
+    sortino = compute_sortino(returns, periods_per_year)
+    # De-annualise: Bailey's formula uses the per-period Sharpe.
+    per_period_sharpe = (
+        sharpe / math.sqrt(periods_per_year) if periods_per_year > 0 else sharpe
+    )
+    skew, kurtosis = return_moments(returns)
+    psr = compute_psr(per_period_sharpe, n, skew=skew, kurtosis=kurtosis)
+    return ReturnMetrics(
+        n=n,
+        sharpe=sharpe,
+        sortino=sortino,
+        psr=psr,
+        skew=skew,
+        kurtosis=kurtosis,
+    )
 
 
 # ===================================================================
@@ -1197,6 +1324,10 @@ def compute_buy_and_hold_return(
     Computed as ``(end_price - start_price) / start_price`` so it can be
     compared directly against ``BacktestResult.total_return_pct``.
     Returns ``0.0`` for empty / single-price inputs.
+
+    Time-stamp convention (QA-06): grid stamps of a per-bar sample are bar CLOSE
+    times.  Join benchmark series on the bar close; a vendor series labelled by
+    bar OPEN is shifted by +1 timeframe.
     """
     if len(benchmark_prices) < 2:
         return 0.0
@@ -1222,6 +1353,10 @@ def compute_alpha_beta(
     Both series must be the same length; mismatched input returns
     ``(0.0, 0.0)``.  ``Var(R_b) = 0`` returns ``(mean(R_s), 0.0)`` —
     a flat benchmark yields zero beta by construction.
+
+    Time-stamp convention (QA-06): grid stamps of a per-bar sample are bar CLOSE
+    times.  Join benchmark series on the bar close; a vendor series labelled by
+    bar OPEN is shifted by +1 timeframe.
     """
     n = len(strategy_returns)
     if n == 0 or n != len(benchmark_returns):
@@ -1253,6 +1388,10 @@ def compute_information_ratio(
     Where ``active_return_t = R_strategy_t - R_benchmark_t``.  Measures
     consistency of out-performance per unit of tracking-error risk.
     Returns ``0.0`` on mismatched lengths or zero tracking error.
+
+    Time-stamp convention (QA-06): grid stamps of a per-bar sample are bar CLOSE
+    times.  Join benchmark series on the bar close; a vendor series labelled by
+    bar OPEN is shifted by +1 timeframe.
     """
     n = len(strategy_returns)
     if n == 0 or n != len(benchmark_returns):
