@@ -387,3 +387,96 @@ Core trading engine containing the heart of the system.
   overflowing end `range_too_large` (`check_backtest_request_bounds`, `api/services/cost_profiles.py`).
   Paper/live carry no symbol cap (WP23-P4-SEC-06, carry-forward).
 - See `reports/vp2-wp2.3/synthesis-spec.md` and `Documentation/WP2.3-register.md`.
+
+### WP2.5 (metric sampling: `trading/equity_sampling.py`, `trading/metrics.py`)
+- A backtest computes its return metrics from ONE equity value per bar, not from every curve point.
+  Before WP2.5 `n` counted warmup points, one point per bar and one extra point per fill (C13). The
+  sample is built AFTER the run from `result.equity_curve`; `strategy_engine.py`, `portfolio.py`, `engines/`
+  and `test_wp22_ast_pins.py` are untouched since 01d393d, and the curve, fills, trades, `EquitySnapshot`
+  rows and every golden digest are byte-identical.
+- `trading.equity_sampling` is a stdlib-only leaf (AST-pinned, `tests/unit/test_wp25_ast_pins.py`): no
+  `trading.*`/`common.*`/`data.*` import, no logging, env or wall clock. Points are duck-typed
+  (`.timestamp`, `.equity`). API: `sample_equity_per_bar(points, *, start_at, timeframe_s, mode=...) ->
+  BarSample`, `last_per_stamp`, `simple_returns`, `EquitySamplingError(ValueError)` with the closed codes
+  `equity_sampling_unordered` and `equity_sampling_no_base_point` (message `equity sampling failed (<code>)`).
+- Semantics: collapse to the last point per stamp (a decreasing stamp raises); keep stamps `>= start_at`
+  (none left = empty sample, n 0); the first kept stamp MUST equal `start_at` (the base point), else
+  `equity_sampling_no_base_point`. All kept stamps on `start_at + k*tf` = mode `calendar_asof`: slots
+  `k = 0..K` each take the equity of the last stamp `<=` the slot, and `carried_slots` /
+  `carried_stamps` list the slots `k >= 1` without an own point (a multi-symbol all-absent slot carries
+  the previous value). Otherwise mode `present_steps` (distinct stamps, `carried_slots = 0`).
+  `BarSample` (frozen) has `stamps`, `equity` (`n_returns + 1` values, or none when empty), `n_returns`,
+  `returns()` and `from_stamp(at)` (base = as-of value at `at`; in calendar mode `at` must be a grid stamp;
+  before the first stamp it fails closed; after the last it gives an empty sample). Grid stamps are bar
+  CLOSE times; an open-labelled benchmark series shifts +1 timeframe before a join.
+- `BacktestRunner.run`: `_step_close(timeline, k, t0, tf_s)` is `t0` for `k == 0`, else `timeline[k-1].ts + tf`.
+  `trading_start_at = _step_close(timeline, warmup_bars, ...)` (= `curve[W].timestamp`, also for W = 0);
+  `trading_end_at = equity_curve[-1].timestamp`, or `None` only when the sample is empty (the run
+  stopped before the base point). Production code NEVER passes `mode=` to the sampler (AST-pinned,
+  `**kwargs` counts); the automatic off-grid fallback to `present_steps` (single-symbol library runs only)
+  logs `backtest.metric_sampling_fallback` with `metric_sampling` and `n_returns` only.
+- `trading.metrics.compute_return_metrics(returns, periods_per_year) -> ReturnMetrics(n, sharpe, sortino, psr,
+  skew, kurtosis)` is the ONLY place where Sharpe, Sortino, PSR and n are derived (the full run and the OOS
+  window both call it, so SR and n cannot come from different samplings; AST-pinned: no inline moments in
+  `backtest.py`). `return_moments` = population skewness and NON-excess kurtosis, `(0.0, 3.0)` below 4
+  observations. PSR uses `n = len(returns)`; `_PSR_MIN_OBSERVATIONS = 30` now counts BARS, so fewer than
+  30 post-warmup returns give `psr = None` and `confidence_flag = None`. DSR is unchanged (no n input); the
+  real DSR is WP2.7.
+- `compute_sharpe` and `return_moments` treat `std == 0` or `std <= _ZERO_STD_REL_TOL * |mean|`
+  (`_ZERO_STD_REL_TOL = 1e-9`) as zero std (Sharpe 0.0). `compute_cagr(initial, final, days: float)` keeps
+  the HEAD arithmetic `ratio ** (365.25 / days) - 1`, returns `inf` on `OverflowError` and never raises.
+- `periods_per_year(tf)` (`metrics.py`) is strict: an unknown timeframe raises `ValueError("unknown timeframe
+  for annualisation")`. There is no fallback in the runner (AST-pinned: `backtest.py` does not use
+  `TIMEFRAME_PERIODS_PER_YEAR`), and the factor is resolved once, before the simulation. The table equals
+  `365.25 * 86400 / tf_seconds` for every `TimeFrame`. The legacy path of `scripts/backfill_metrics_v2.py`
+  still has its own `.get(tf, 8_766.0)` on purpose (rows without a marker must reproduce).
+- What reads the sample: Sharpe, Sortino, PSR, skew/kurtosis, `n_observations`, `confidence_flag`,
+  `max_drawdown_duration_bars` (`_max_dd_duration(sample.equity)`, in bars), `cagr` and `oos_sharpe` /
+  `oos_n_returns`. `cagr = compute_cagr(sample.equity[0], final_equity, span_days)` with
+  `span_days = max(1.0, (trading_end_at - trading_start_at) / 86400)` (an empty sample gives 0.0);
+  `calmar_ratio = compute_calmar(cagr, max_dd)`. `max_drawdown_pct` STAYS over all curve points (so it
+  agrees with every point's `drawdown_pct` and with the portfolio router). `start_date`, `end_date` and
+  `duration_days` are unchanged (bar-open based).
+- OOS is cut BY TIME: `oos_start_at = _step_close(timeline, oos_start_index, ...)`, then
+  `compute_return_metrics(sample.from_stamp(oos_start_at).returns(), P)`; `oos_sharpe` and `oos_n_returns`
+  come from that one result (gap-free: `oos_n_returns == N - oos_start_index`). The engine's
+  `oos_equity_curve_offset` stays in the summary, but the runner reads it only for the `is None` check and
+  the info log (AST-pinned).
+- 7 new `BacktestResult` fields, all defaulted: `metrics_version: str = ""` (the runner writes
+  `METRICS_VERSION`), `trading_start_at`, `trading_end_at` (`datetime | None`), `periods_per_year`
+  (`float | None`), `metric_sampling` (`"calendar_asof" | "present_steps" | None`), `carried_slots: int = 0`,
+  `oos_start_at` (`datetime | None`). In calendar mode `n_observations == total_bars + carried_slots`.
+- `METRICS_VERSION = "wp25-1"` and `KNOWN_METRICS_VERSIONS` live in `trading.metrics` (not in the leaf,
+  which `metrics.py` cannot be: it imports pydantic and structlog). Any later change to a persisted
+  curve-derived number bumps `METRICS_VERSION`; add the new value to `KNOWN_METRICS_VERSIONS` together with it
+  (the `scripts/backfill_metrics_v2.py` guard skips only KNOWN markers).
+- All-points returns (`compute_returns_from_equity`) may be called only at the allow-list
+  `scripts/wp21_rebaseline.py::_pre_wp25_sharpe` and `scripts/backfill_metrics_v2.py::_recompute_psr_from_snapshots`
+  (AST-pinned); never in `backtest.py`, `optimizer.py`, `walk_forward.py` or `apps/`. Future metrics
+  (ulcer, omega, CVaR, benchmark joins) must take `BarSample` returns.
+- CF-26 freeze (UD-4 (a)): `scripts/wp21_rebaseline.py` computes its `sharpe_pre_wp25` and `cagr` keys
+  with `_pre_wp25_sharpe` and `_pre_wp25_cagr` (the 117236f formulas: all points, bar-open `duration_days`),
+  so a CF-26 run on any later commit still reproduces the baseline PR #4 waits for.
+  `tests/integration/test_wp22_bar_clock.py::TestT16RebaselineUnaffected` (the 117236f digest) and
+  `test_wp21c_rebaseline.py` are unedited; feeding the new Sharpe or CAGR into the record makes T-16 fail.
+  Do not relabel the record to wp25-1.
+- API (`apps/api`): `engine_semantics.metrics = METRICS_VERSION` is stamped on backtest and optimize only
+  (`cost_profiles.engine_semantics`; `promote_to_live` re-stamps mode `live`, so it cannot leak);
+  `timestamp_clock` and `bar_alignment` keep their own versions. `metrics_response_fields(config, run_mode)`
+  returns `{"legacy_metrics": bool}`: True iff the mode is backtest or optimize AND the marker is not a `str`
+  in `KNOWN_METRICS_VERSIONS` (missing, unknown, non-string, a malformed `engine_semantics`, `config=None`).
+  There is NO single-symbol exemption (unlike `legacy_bar_alignment`), paper/live/unknown modes are never
+  flagged, and it neither raises nor logs. It is wired on run list and detail and on optimize POST,
+  GET-one and GET-list (wire name `legacyMetrics`).
+- Response fields on `BacktestMetricsResponse`: `trading_start_at`, `trading_end_at`, `periods_per_year`,
+  `metric_sampling`, `carried_slots`. NOT `oos_start_at` (engine-level; WP2.7) and NOT `metrics_version`.
+  Leaderboard: `leaderboard_eligible` adds `is_leaderboard_metrics_eligible` (known marker), and
+  `/portfolio/summary` counts the runs it excludes in `legacy_metrics_runs_excluded`. ML: `train_model` writes
+  `extra["walk_forward"]["metrics"]`; the activation gate warns (does not reject) when that label is not
+  known. Optimize persists and returns non-finite entry metrics as `None` (`_scrub_non_finite`; ranking
+  unchanged). Old rows are labelled, never recomputed. Paper/live are unchanged and carry no marker.
+- Carry-forwards: the "known marker" rule exists in four places (`schemas.py`, `cost_profiles.py`,
+  `backfill_metrics_v2.py`, `model_activation_gate.py`); keep them in step with `KNOWN_METRICS_VERSIONS`.
+  CAGR/Calmar over short windows are extrapolations, and the optimizer's `cagr`/`calmar` ranking now depends on
+  each trial's span (WP2.7).
+- See `reports/vp2-wp2.5/synthesis-spec.md` and `Documentation/WP2.5-register.md`.
