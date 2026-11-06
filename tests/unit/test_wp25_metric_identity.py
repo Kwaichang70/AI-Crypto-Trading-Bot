@@ -1,8 +1,17 @@
-"""WP2.5 / P1: metric-identity harness (WP25-T-09).
+"""WP2.5 / P1 + P2: metric-identity harness (WP25-T-09, WP25-T-17).
 
-Binding spec: ``reports/vp2-wp2.5/synthesis-spec.md`` (SY-25-26, section 5 row P1, WP25-T-09).
+Binding spec: ``reports/vp2-wp2.5/synthesis-spec.md`` (SY-25-26, section 5 rows P1/P2,
+WP25-T-09, WP25-T-17).
 
-P1 is behaviour-neutral: the runner lifts its metric block into
+P2 (the behaviour switch) turns this harness from "identical" into "identical except the
+allow-list": ``head_capture.json`` is NOT re-captured and NOT re-pinned.  Every field outside
+``ALLOW_LISTED`` + ``NEW_FIELDS`` (equity curve, drawdown, fills, trades, final equity,
+exposure, total_bars, dates, duration_days, ``max_drawdown_pct`` ...) must still equal the
+01d393d capture; the allow-listed curve-derived metrics must differ in the documented direction
+(per-bar n); the 7 new fields must be present.  The new metric VALUES are verified against an
+independent oracle in ``tests/integration/test_wp25_runner.py``.
+
+P1 was behaviour-neutral: the runner lifts its metric block into
 ``trading.metrics.compute_return_metrics`` but still feeds it the equity-curve POINT series, so
 every number must equal the one the unmodified tree (``01d393d``) produced.  This module holds
 
@@ -18,7 +27,7 @@ The capture also holds the fields WP25-T-17 (P2) compares: ``equity_curve`` (tim
 the metric fields it deliberately changes.
 
 Regenerating the capture on a later tree is a bug: the file is the HEAD reference.  The only
-allowed difference to it in P1 is the zero-std edge (``compute_sharpe`` with std / |mean| <= 1e-9),
+allowed difference to it in P1 was the zero-std edge (``compute_sharpe`` with std / |mean| <= 1e-9),
 which none of these scenarios reaches.
 
 Fills carry random UUIDs (``fill_id``, ``order_id``) and trades carry the random run id and a
@@ -66,6 +75,15 @@ _BRACKETS: dict[str, object] = {
     "bracket_stop_loss_pct": 0.03,
     "bracket_take_profit_pct": 0.06,
 }
+# WP25-T-17 (P2): the only fields the switch may change, and the 7 it adds.
+ALLOW_LISTED: tuple[str, ...] = (
+    "sharpe_ratio", "sortino_ratio", "calmar_ratio", "cagr", "psr", "n_observations",
+    "confidence_flag", "max_drawdown_duration_bars", "oos_sharpe", "oos_n_returns",
+)  # fmt: skip
+NEW_FIELDS: tuple[str, ...] = (
+    "metrics_version", "trading_start_at", "trading_end_at", "periods_per_year",
+    "metric_sampling", "carried_slots", "oos_start_at",
+)  # fmt: skip
 _DROPPED_FILL_KEYS = ("fill_id", "order_id")
 _DROPPED_TRADE_KEYS = ("run_id", "trade_id")
 
@@ -255,17 +273,57 @@ def test_capture_holds_the_fields_p2_compares() -> None:
     assert any(e["result"]["oos_sharpe"] is not None for e in capture.values())
 
 
+def _strip(result: dict[str, Any]) -> dict[str, Any]:
+    drop = set(ALLOW_LISTED) | set(NEW_FIELDS)
+    return {k: v for k, v in result.items() if k not in drop}
+
+
 @pytest.mark.parametrize("sc", SCENARIOS, ids=[sc.name for sc in SCENARIOS])
 async def test_metric_identity_vs_head_capture(sc: Scenario) -> None:
-    """WP25-T-09: ``model_dump`` minus ``run_id`` and the fills equal the 01d393d capture."""
+    """WP25-T-17: everything but the allow-list equals the 01d393d capture; the fills too.
+
+    Strict on the invariant fields (full ``model_dump`` minus ``run_id``, floats compared
+    exactly through the sorted-key JSON string).  Only ``ALLOW_LISTED`` may change and only
+    ``NEW_FIELDS`` may be added.
+    """
     expected = _load_capture()[sc.name]
     actual = _roundtrip(await run_scenario(sc))
-    if canonical(actual) != canonical(expected):
-        bad = _diff_keys(actual["result"], expected["result"])
+    a, e = actual["result"], expected["result"]
+    assert set(a) - set(e) == set(NEW_FIELDS), sorted(set(a) ^ set(e))
+    assert set(e) <= set(a)
+    if canonical(_strip(a)) != canonical(_strip(e)):
+        bad = _diff_keys(_strip(a), _strip(e))
         pytest.fail(
-            f"{sc.name}: differs from the HEAD capture; result keys {bad}; "
+            f"{sc.name}: invariant fields differ from the HEAD capture; keys {bad}; "
             f"fills equal: {actual['fills'] == expected['fills']}"
         )
+    assert canonical(actual["fills"]) == canonical(expected["fills"])
+
+
+@pytest.mark.parametrize("sc", SCENARIOS, ids=[sc.name for sc in SCENARIOS])
+async def test_allow_listed_fields_moved_as_designed(sc: Scenario) -> None:
+    """The switch is real: n is per bar after warm-up and the markers are filled in.
+
+    Guards the harness against going vacuous (an allow-list that never changes would pass
+    the strict test above while P2 did nothing).
+    """
+    e = _load_capture()[sc.name]["result"]
+    a = _roundtrip(await run_scenario(sc))["result"]
+    assert a["n_observations"] == a["total_bars"] + a["carried_slots"]
+    assert a["n_observations"] < e["n_observations"]  # warm-up and fill points are gone
+    assert 0 < a["max_drawdown_duration_bars"] <= a["n_observations"] + 1  # bars, not points
+    assert a["metrics_version"] == "wp25-1"
+    assert a["metric_sampling"] == "calendar_asof"
+    assert a["periods_per_year"] == {"1h": 8766.0, "1d": 365.25}[sc.timeframe.value]
+    assert a["trading_start_at"] is not None and a["trading_end_at"] is not None
+    assert (a["oos_start_at"] is not None) == (sc.oos_start_index is not None)
+    if sc.oos_start_index is not None:
+        assert a["oos_n_returns"] == a["total_bars"] + (_warmup(sc)) - sc.oos_start_index
+    assert a["cagr"] != e["cagr"] and a["sharpe_ratio"] != e["sharpe_ratio"]
+
+
+def _warmup(sc: Scenario) -> int:
+    return 50 if sc.warmup_override is None else sc.warmup_override
 
 
 def test_scenarios_cover_the_required_axes() -> None:

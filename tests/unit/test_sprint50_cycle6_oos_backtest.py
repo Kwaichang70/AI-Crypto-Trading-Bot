@@ -201,6 +201,8 @@ class TestOOSWindowSlicing:
         """TEST-C6-010: with a no-fill strategy the equity curve is 1:1 with bars,
         so the OOS boundary is exactly oos_start_index. Recompute the OOS Sharpe
         independently from result.equity_curve[oos_start_index:] and assert match.
+        WP2.5: the runner slices BY TIME (from the close before the first OOS bar), which
+        is the same slice here because there are no fill points; the values are unchanged.
 
         This is the load-bearing proof that warmup bars are excluded: the OOS
         Sharpe is built ONLY from the equity points at/after oos_start_index.
@@ -238,7 +240,8 @@ class TestOOSWindowSlicing:
     @pytest.mark.asyncio
     async def test_oos_excludes_warmup_returns(self) -> None:
         """TEST-C6-011: OOS return count == (n - oos_start), i.e. warmup +
-        in-sample returns are EXCLUDED from the OOS window (no-fill case)."""
+        in-sample returns are EXCLUDED from the OOS window (no-fill case).
+        WP2.5: still n - oos_start, now by time (one return per bar, fills or not)."""
         n = 300
         oos_start = 220
         bars = make_bars(n, seed=11, symbol="BTC/USDT")
@@ -340,9 +343,10 @@ class TestOOSUnderInSampleFills:
         """TEST-C6-030: a strategy that fills once in-sample (fire_on=5, bar ~54)
         adds an extra equity point. The naive bar-ordinal slice
         curve[oos_start:] would then be OFF BY ONE relative to the correct
-        live-len() boundary. Prove the implementation does NOT use the naive
-        slice by showing its OOS Sharpe matches the boundary-shifted slice and
-        NOT the naive one.
+        boundary. Prove the implementation does NOT use the naive slice by
+        showing its OOS Sharpe matches the boundary-shifted slice (the same slice
+        the WP2.5 by-time cut gives: the close before the first OOS bar) and NOT
+        the naive one.
         """
         n = 300
         oos_start = 200
@@ -383,6 +387,43 @@ class TestOOSUnderInSampleFills:
         # is not discriminating). The fill is in-sample so the slices differ by
         # one return observation.
         assert len(naive_returns) == len(correct_returns) + 1
+
+    @pytest.mark.asyncio
+    async def test_oos_fill_inside_the_window_adds_no_return(self) -> None:
+        """TEST-C6-031 (WP2.5, SY-25-10): a fill INSIDE the OOS window adds a curve point
+        but no return: OOS n is exactly n - oos_start and the Sharpe is the per-bar
+        (last point per stamp) series from the close before the first OOS bar.
+        """
+        n = 300
+        oos_start = 200
+        bars = make_bars(n, seed=5, symbol="BTC/USDT")
+        # on_bar call #160 is bar 50 + 159 = 209, inside the OOS window (>= 200)
+        runner = BacktestRunner(
+            strategies=[_BuyAtBarStrategy(strategy_id="c6-oos-fill", params={"fire_on": 160})],
+            symbols=["BTC/USDT"],
+            timeframe=TimeFrame.ONE_HOUR,
+            seed=5,
+        )
+        result = await runner.run({"BTC/USDT": bars}, oos_start_index=oos_start)
+        curve = result.equity_curve
+        assert len(curve) == n + 2  # seed + one point per bar + the OOS fill point
+        assert result.oos_n_returns == n - oos_start  # gap-free: no extra return for the fill
+
+        # independent per-bar series: last point per stamp, from close_{oos_start - 1}
+        start = bars[oos_start - 1].timestamp + (bars[1].timestamp - bars[0].timestamp)
+        assert result.oos_start_at == start
+        last: dict[datetime, Decimal] = {}
+        for point in curve:
+            last[point.timestamp] = point.equity
+        per_bar = [SimpleNamespace(equity=last[ts]) for ts in sorted(last) if ts >= start]
+        returns = compute_returns_from_equity(per_bar)  # type: ignore[arg-type]
+        assert result.oos_n_returns == len(returns)
+        expected_sharpe = compute_sharpe(returns, _PPY_1H)
+        assert result.oos_sharpe == pytest.approx(expected_sharpe, rel=1e-9, abs=1e-12)
+
+        # HEAD sliced the point series at the engine offset: the OOS fill added a return
+        naive = compute_returns_from_equity(curve[oos_start:])
+        assert len(naive) == n - oos_start + 1
 
 
 # ===========================================================================

@@ -39,7 +39,9 @@ Attribution matrix (spec section 11; the parts are NOT claimed to be additive)
 
 Columns B-E run with ``enable_circuit_breaker=False`` (the ``--no-circuit-breaker`` path of
 the research scripts); only F builds the breaker.  Every backtest uses ``seed=42`` and a
-single symbol.  Sharpe is labelled "pre-WP2.5" (the WP2.5 Sharpe fix is not in).
+single symbol.  Sharpe is labelled "pre-WP2.5" (the WP2.5 Sharpe fix is not in); Sharpe
+and CAGR are computed on purpose with the pre-WP2.5 all-points formula so the record stays
+the PR #4 (117236f) baseline.
 
 Breakeven taker: for each baseline x symbol a bisection over the taker fee of
 ``coinbase_advanced_1`` (``CostProfile.with_overrides(taker_fee_bps=...)``, slippage kept at
@@ -90,6 +92,13 @@ from common.types import TimeFrame
 from trading.backtest import BacktestRunner
 from trading.costs import CostProfile, CostProfileError, get_cost_profile
 from trading.exit_config import ExitConfigError
+from trading.metrics import (
+    TIMEFRAME_PERIODS_PER_YEAR,
+    BacktestResult,
+    compute_cagr,
+    compute_returns_from_equity,
+    compute_sharpe,
+)
 from trading.models import RiskCheckResult, SkippedTrade
 from trading.portfolio import RiskSnapshot
 from trading.risk_manager import DefaultRiskManager
@@ -841,6 +850,24 @@ def _num(value: float) -> float:
     return round(value, 10)
 
 
+# Frozen pre-WP2.5 formula (UD-4a); guarded by the T-16 117236f digest.
+def _pre_wp25_sharpe(result: BacktestResult) -> float:
+    """Pre-WP2.5 Sharpe: ALL equity-curve points (CF-26 freeze, SY-25-17).
+
+    The ONE sanctioned all-points call site: it keeps the record the PR #4 (117236f)
+    baseline.  Do not use it for anything else.
+    """
+    return compute_sharpe(
+        compute_returns_from_equity(result.equity_curve),
+        TIMEFRAME_PERIODS_PER_YEAR[result.timeframe],
+    )
+
+
+def _pre_wp25_cagr(result: BacktestResult) -> float:
+    """Pre-WP2.5 CAGR over the bar-open span ``duration_days`` (CF-26 freeze, SY-25-17)."""
+    return compute_cagr(INITIAL_CAPITAL, result.final_equity, result.duration_days)
+
+
 def _pf_value(profit_factor: float | None, infinite: bool) -> float | None:
     if infinite:
         return math.inf
@@ -901,7 +928,7 @@ async def run_cell(
         "exit_reasons": exit_counts,
         "win_rate": _num(result.win_rate),
         "profit_factor": _pf_json(pf),
-        "cagr": _num(result.cagr),
+        "cagr": _num(_pre_wp25_cagr(result)),
         "max_drawdown_pct": _num(result.max_drawdown_pct),
         "total_return_pct": _num(result.total_return_pct),
         "final_equity": str(result.final_equity),
@@ -923,7 +950,7 @@ async def run_cell(
             "circuit_breaker_by_level": dict(sorted(probe.cb_entry_drops.items())),
         },
         "cb_transitions": probe.cb_transitions,
-        "sharpe_pre_wp25": _num(result.sharpe_ratio),
+        "sharpe_pre_wp25": _num(_pre_wp25_sharpe(result)),
         "open_positions_at_end": len(result.open_positions_mtm),
     }
 

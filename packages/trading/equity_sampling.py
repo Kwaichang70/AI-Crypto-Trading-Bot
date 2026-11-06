@@ -20,8 +20,10 @@ Rule (SY-25-04):
 5. Otherwise (or when ``present_steps`` is requested) mode ``present_steps``: the
    base plus the distinct later stamps, ``carried_slots = 0``.
 
-Grid stamps are bar CLOSE times. A benchmark series keyed by bar OPEN time must be
-shifted by one timeframe before it is joined to a sample (QA-06).
+Grid stamps are bar CLOSE times (``close_i = open_i + tf``). A benchmark series keyed by
+bar OPEN time must be shifted by one timeframe before it is joined to a sample (QA-06,
+SY-25-24): benchmark joins key on ``close_i``, so an open-labelled vendor series
+shifts one timeframe forward.
 
 Purity: standard library only; no logging, environment, wall clock or I/O, and no
 ``trading.*`` / ``common.*`` / ``data.*`` import. Points are duck-typed through

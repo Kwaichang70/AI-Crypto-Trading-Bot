@@ -15,7 +15,8 @@ Financial formulae
 - Calmar: ``CAGR / |max_drawdown|``
 - Profit Factor: ``sum(winning_pnl) / |sum(losing_pnl)|``
 - Exposure: ``bars_in_market / total_bars``
-- Max Drawdown Duration: longest contiguous peak-to-recovery span in bars
+- Max Drawdown Duration: longest contiguous peak-to-recovery span, counted on the per-bar
+  sample (one value per bar; steps in ``present_steps`` mode), not on curve points
 
 Version marker
 --------------
@@ -244,16 +245,29 @@ class BacktestResult(BaseModel):
     total_return_pct: float = Field(
         description="(final_equity - initial_capital) / initial_capital",
     )
-    cagr: float = Field(description="Compound Annual Growth Rate")
+    cagr: float = Field(
+        description=(
+            "Compound Annual Growth Rate over the trading window "
+            "(trading_start_at to trading_end_at, warm-up excluded; the span is floored "
+            "at one day)."
+        ),
+    )
 
     # Risk metrics
     max_drawdown_pct: float = Field(
         ge=0.0,
-        description="Maximum peak-to-trough decline as decimal fraction",
+        description=(
+            "Maximum peak-to-trough decline as decimal fraction, over all curve "
+            "points (intrabar marks included)."
+        ),
     )
     max_drawdown_duration_bars: int = Field(
         ge=0,
-        description="Longest peak-to-recovery span in bars",
+        description=(
+            "Longest peak-to-recovery span in bars of the per-bar sample "
+            "(calendar as-of, last point per stamp, after warm-up). In present_steps "
+            "mode the duration counts steps."
+        ),
     )
     sharpe_ratio: float = Field(
         description="Annualised Sharpe ratio (risk-free rate = 0)",
@@ -262,7 +276,9 @@ class BacktestResult(BaseModel):
         description="Annualised Sortino ratio (downside deviation only)",
     )
     calmar_ratio: float = Field(
-        description="CAGR / max_drawdown",
+        description=(
+            "CAGR (trading window) / max_drawdown (all curve points)."
+        ),
     )
 
     # M4 (Sprint 49): PSR + statistical significance fields
@@ -279,7 +295,10 @@ class BacktestResult(BaseModel):
     n_observations: int = Field(
         default=0,
         ge=0,
-        description="Number of per-period return observations (len(equity_curve) - 1).",
+        description=(
+            "Number of per-bar return observations after warm-up (calendar as-of, last "
+            "point per stamp)."
+        ),
     )
     confidence_flag: Literal["high", "medium", "low"] | None = Field(
         default=None,
@@ -427,7 +446,8 @@ class BacktestResult(BaseModel):
         default=None,
         description=(
             "Annualised Sharpe ratio computed over the out-of-sample window only "
-            "(bars from oos_start_index onward). Net of the run's CostProfile fees + "
+            "(bars from oos_start_index onward, sampled once per bar). Net of the run's "
+            "CostProfile fees + "
             "slippage. None when run() was called without oos_start_index. "
             "0.0 when the OOS window has fewer than 2 per-period returns "
             "(compute_sharpe convention)."
@@ -437,10 +457,48 @@ class BacktestResult(BaseModel):
         default=None,
         ge=0,
         description=(
-            "Number of per-period return observations in the OOS window "
-            "(len(oos_equity_slice) - 1). None when run() was called without "
+            "Number of per-bar return observations in the OOS window "
+            "(calendar as-of, last point per stamp, sliced by time from oos_start_at). "
+            "None when run() was called without "
             "oos_start_index. Used by callers to gauge statistical sufficiency "
             "of oos_sharpe."
+        ),
+    )
+
+    # WP2.5 (SY-25-11): the sampling behind the curve-derived numbers.  All defaulted,
+    # so directly constructed results (tests, stored dicts) are unaffected.
+    metrics_version: str = Field(
+        default="",
+        description="METRICS_VERSION the curve-derived numbers were computed with ('' if unset).",
+    )
+    trading_start_at: datetime | None = Field(
+        default=None,
+        description="Base point of the metric sample: the close of the last warm-up step (UTC).",
+    )
+    trading_end_at: datetime | None = Field(
+        default=None,
+        description="Last equity point of the run (UTC); None when the run stopped in warm-up.",
+    )
+    periods_per_year: float | None = Field(
+        default=None,
+        description="Annualisation factor (periods per 365.25-day year) used for Sharpe/Sortino.",
+    )
+    metric_sampling: Literal["calendar_asof", "present_steps"] | None = Field(
+        default=None,
+        description=(
+            "Sampling mode of the per-bar series: calendar_asof (one slot per timeframe, "
+            "absent slots carry the previous value) or present_steps (off-grid fallback)."
+        ),
+    )
+    carried_slots: int = Field(
+        default=0,
+        ge=0,
+        description="Calendar slots without an own equity point that carried the previous value.",
+    )
+    oos_start_at: datetime | None = Field(
+        default=None,
+        description=(
+            "Base point of the OOS window (close before the first OOS bar); None without OOS."
         ),
     )
 

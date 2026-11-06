@@ -242,7 +242,7 @@ class TestRunnerBookkeeping:
 
     @pytest.mark.parametrize(
         ("idx", "sharpe", "n_returns"),
-        [(1430, -2.156, 85), (1449, -1.159, 62)],
+        [(1430, -2.3805, 70), (1449, -1.2842, 51)],
     )
     async def test_p3_03_oos_index_between_min_len_and_timeline_is_accepted(
         self, idx: int, sharpe: float, n_returns: int

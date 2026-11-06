@@ -46,7 +46,8 @@ from __future__ import annotations
 import math
 import random
 import uuid
-from datetime import datetime
+from collections.abc import Sequence
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any, Protocol
 
@@ -60,6 +61,7 @@ from data.bar_alignment import (
     AlignmentReport,
     AlignmentTolerance,
     BarAlignmentError,
+    Step,
     align_bars,
     check_alignment,
 )
@@ -67,6 +69,7 @@ from data.market_data import BaseMarketDataService
 from common.types import QuoteCurrency, RunMode, TimeFrame
 from trading.clock import BarClock
 from trading.costs import CostProfile, default_cost_profile
+from trading.equity_sampling import sample_equity_per_bar
 from trading.engines.paper import PaperExecutionEngine
 from trading.exit_config import (
     ExitCostModel,
@@ -75,17 +78,17 @@ from trading.exit_config import (
     resolve_allow_pyramiding,
 )
 from trading.metrics import (
+    METRICS_VERSION,
     BacktestResult,
     EquityCurvePoint,
     OpenPositionMTM,
     _derive_confidence_flag,  # noqa: PLC2701 - private helper, same-package call
+    _max_dd_duration,
     compute_cagr,
     compute_calmar,
     compute_exposure,
     compute_max_drawdown,
-    compute_max_drawdown_duration,
     compute_return_metrics,
-    compute_returns_from_equity,
     compute_trade_statistics,
     periods_per_year as _periods_per_year,
 )
@@ -106,6 +109,23 @@ __all__ = [
 ]
 
 logger = structlog.get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# WP2.5 (SY-25-04): bar-close stamps of the metric sample
+# ---------------------------------------------------------------------------
+
+
+def _step_close(timeline: Sequence[Step], k: int, t0: datetime, tf_s: int) -> datetime:
+    """Equity-curve stamp after ``k`` processed timeline steps.
+
+    ``k == 0`` is the seed point ``t0`` (W = 0 has no previous step); otherwise it is the
+    close of step ``k - 1``, i.e. its bar-open stamp plus one timeframe.  ``k = W`` is the
+    first trading base point (``curve[W].timestamp``), ``k = oos_start_index`` the OOS one.
+    """
+    if k == 0:
+        return t0
+    return timeline[k - 1].ts + timedelta(seconds=tf_s)
 
 
 # ---------------------------------------------------------------------------
@@ -556,6 +576,11 @@ class BacktestRunner:
         # the raw dict.
         bars_by_symbol = aligned.bars_by_symbol
 
+        # 1c. WP2.5 (SY-25-07): resolve the annualisation factor ONCE, before the
+        # simulation, so an unsupported timeframe fails fast (strict, no daily fallback).
+        tf_s = self._timeframe_seconds()
+        ann_factor = _periods_per_year(self._timeframe)
+
         # 2. Generate run ID
         run_id = f"bt-{uuid.uuid4().hex[:12]}"
 
@@ -680,32 +705,51 @@ class BacktestRunner:
             (final_equity - self._initial_capital) / self._initial_capital
         ) if self._initial_capital > Decimal("0") else 0.0
 
-        cagr = compute_cagr(self._initial_capital, final_equity, duration_days)
+        # 14. WP2.5 (SY-25-04/05/06/08/10): ONE equity value per bar, from the first
+        # trading base point on (``curve[W].timestamp``), sampled AFTER the run from
+        # the curve (engine, portfolio and curve are untouched).  Every return metric,
+        # the drawdown duration and the CAGR read this sample; ``max_drawdown_pct``
+        # stays on all curve points so it agrees with every point's ``drawdown_pct``.
+        # The mode is never passed: the automatic off-grid fallback is the only way
+        # to ``present_steps`` (library single-symbol runs).
+        trading_start_at = _step_close(timeline, self._warmup_bars, t0, tf_s)
+        sample = sample_equity_per_bar(
+            equity_curve, start_at=trading_start_at, timeframe_s=tf_s
+        )
+        trading_end_at: datetime | None = (
+            equity_curve[-1].timestamp if sample.stamps else None
+        )
+        if sample.stamps and sample.mode == "present_steps":
+            self._log.warning(
+                "backtest.metric_sampling_fallback",
+                metric_sampling=sample.mode,
+                n_returns=sample.n_returns,
+            )
 
-        # 14. Compute risk metrics
-        max_dd = compute_max_drawdown(equity_curve)
-        max_dd_duration = compute_max_drawdown_duration(equity_curve)
-
-        # WP2.5 P1: strict annualisation (an unknown timeframe raises; no silent
-        # daily fallback).  SR, Sortino, PSR and n come from ONE call below.
-        ann_factor = _periods_per_year(self._timeframe)
-        per_period_returns = compute_returns_from_equity(equity_curve)
-
-        full_metrics = compute_return_metrics(per_period_returns, ann_factor)
+        full_metrics = compute_return_metrics(sample.returns(), ann_factor)
         sharpe = full_metrics.sharpe
         sortino = full_metrics.sortino
+
+        if trading_end_at is not None:
+            span_days = max(
+                1.0, (trading_end_at - trading_start_at).total_seconds() / 86400
+            )
+            cagr = compute_cagr(sample.equity[0], final_equity, span_days)
+        else:
+            cagr = 0.0
+
+        max_dd = compute_max_drawdown(equity_curve)
+        max_dd_duration = _max_dd_duration(sample.equity)
         calmar = compute_calmar(cagr, max_dd)
 
-        # Sprint 50 Cycle 6 (IMPL-C6-003): realized OOS Sharpe over the OOS window.
-        # The equity curve is NOT 1:1 with bars (every fill appends an extra
-        # point), so we do NOT compute an offset from oos_start_index. Instead we
-        # read the boundary the engine captured (the LIVE equity-curve length at
-        # the moment processing crossed into the first OOS bar) and slice the
-        # equity curve there. Returns into the OOS window = compute_returns over
-        # equity_curve[boundary-1:] (the return INTO the first OOS point belongs
-        # to the OOS window; boundary-1 includes the prior point as the return base).
+        # Sprint 50 Cycle 6 / WP2.5 (SY-25-10): realized OOS Sharpe over the OOS
+        # window, sliced BY TIME.  The window starts at the close before the first OOS
+        # bar (``close_{oos-1}``), so fill points inside the window never add returns:
+        # ``oos_n_returns == N - oos_start_index``.  The engine's point offset is read
+        # only to detect "the loop never reached the OOS bar" (and logged).
         oos_sharpe: float | None = None
         oos_n_returns: int | None = None
+        oos_start_at: datetime | None = None
         if oos_start_index is not None:
             oos_offset = engine_summary.get("oos_equity_curve_offset")
             n_bars_total = len(timeline)
@@ -730,15 +774,12 @@ class BacktestRunner:
                     ),
                 )
             else:
-                # boundary is the curve length BEFORE the first OOS bar appended
-                # any point. The return INTO the first OOS point uses the point at
-                # index (boundary-1) as its base, so slice the curve from
-                # (boundary-1) to capture that first OOS return. Clamp at 0.
-                slice_start = max(0, int(oos_offset) - 1)
-                oos_curve = equity_curve[slice_start:]
-                oos_returns = compute_returns_from_equity(oos_curve)
-                oos_n_returns = len(oos_returns)
-                oos_sharpe = compute_return_metrics(oos_returns, ann_factor).sharpe
+                oos_start_at = _step_close(timeline, oos_start_index, t0, tf_s)
+                oos_metrics = compute_return_metrics(
+                    sample.from_stamp(oos_start_at).returns(), ann_factor
+                )
+                oos_sharpe = oos_metrics.sharpe
+                oos_n_returns = oos_metrics.n
                 self._log.info(
                     "backtest.oos_sharpe_computed",
                     oos_start_index=oos_start_index,
@@ -749,7 +790,8 @@ class BacktestRunner:
                 )
 
         # M4 (Sprint 49): PSR + statistical confidence fields, from the same
-        # return series as the Sharpe above (``compute_return_metrics``).
+        # return series as the Sharpe above (``compute_return_metrics``); n counts
+        # per-bar returns after warm-up (WP2.5).
         n_obs = full_metrics.n
         psr = full_metrics.psr
 
@@ -839,6 +881,14 @@ class BacktestRunner:
             # oos_start_index was supplied).
             oos_sharpe=oos_sharpe,
             oos_n_returns=oos_n_returns,
+            # WP2.5 (SY-25-11): the sampling that produced the curve-derived numbers
+            metrics_version=METRICS_VERSION,
+            trading_start_at=trading_start_at,
+            trading_end_at=trading_end_at,
+            periods_per_year=ann_factor,
+            metric_sampling=sample.mode,
+            carried_slots=sample.carried_slots,
+            oos_start_at=oos_start_at,
         )
 
         self._log.info(
@@ -864,6 +914,8 @@ class BacktestRunner:
             total_fees=str(portfolio.total_fees_paid),
             psr=f"{psr:.4f}" if psr is not None else "n/a",
             confidence_flag=confidence_flag or "n/a",
+            n_returns=n_obs,
+            metric_sampling=sample.mode,
         )
 
         self._last_execution_engine = exec_engine
