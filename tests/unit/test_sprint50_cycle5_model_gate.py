@@ -77,7 +77,10 @@ class TestCheckOOSEligibility:
     def test_eligible_when_oos_skill_score_above_threshold(self) -> None:
         from api.services.model_activation_gate import check_oos_eligibility
 
-        mv = _make_model_version(oos_skill_score=0.8)
+        # WP2.5 (SY-25-16): a labelled model passes without the pre-WP2.5 warning.
+        mv = _make_model_version(
+            oos_skill_score=0.8, extra={"walk_forward": {"metrics": "wp25-1"}}
+        )
         result = check_oos_eligibility(mv, min_oos_skill_score=0.5)
 
         assert result.eligible is True

@@ -41,12 +41,14 @@ from trading.costs import (
     resolve_run_cost_profile,
 )
 from trading.exit_config import EXIT_SEMANTICS_VERSION
+from trading.metrics import KNOWN_METRICS_VERSIONS, METRICS_VERSION
 from trading.safety import BACKTEST_CIRCUIT_BREAKER_DEFAULT
 from trading.strategy_engine import _TIMEFRAME_SECONDS
 
 __all__ = [
     "COST_MODEL_VERSION",
     "KNOWN_BAR_ALIGNMENTS",
+    "KNOWN_METRICS_VERSIONS",
     "KNOWN_TIMESTAMP_CLOCKS",
     "MAX_BACKTEST_BARS",
     "MAX_BACKTEST_SYMBOLS",
@@ -57,6 +59,7 @@ __all__ = [
     "cost_profile_http_error",
     "cost_response_fields",
     "engine_semantics",
+    "metrics_response_fields",
     "new_run_cost_profile_or_422",
     "requested_bar_window",
     "stamp_cost_config",
@@ -133,6 +136,12 @@ def engine_semantics(
     bar-pairing semantics (by timestamp, absent symbols skipped); it is read by
     :func:`bar_alignment_response_fields`.  ``timestamp_clock`` is deliberately NOT bumped.
 
+    ``metrics`` (WP2.5, SY-25-03) is written on the same two modes and names the
+    curve-derived metric semantics (``trading.metrics.METRICS_VERSION``: one return per
+    bar after warm-up); it is read by :func:`metrics_response_fields` and by the
+    leaderboard rule.  Neither ``timestamp_clock`` nor ``bar_alignment`` is bumped.
+    Paper / live never carry it.
+
     ``backtest_circuit_breaker`` exists ONLY on backtest runs and optimization
     ``run_metadata`` (the breaker is always on in paper / live, SY-21-11): ``False``
     in WP2.1a / 2.1b, ``True`` from WP2.1c.  The value is the one the engine will
@@ -153,6 +162,9 @@ def engine_semantics(
         # WP2.3 (SY-23-16): bars are paired by timestamp.  Backtest + optimize only;
         # paper / live are out of scope (SY-23-19) and never carry it.
         semantics["bar_alignment"] = BAR_ALIGNMENT_VERSION
+        # WP2.5 (SY-25-03): the numbers behind this marker are the per-bar ones.  Backtest +
+        # optimize only (promote_to_live re-stamps mode "live", so it cannot leak).
+        semantics["metrics"] = METRICS_VERSION
     return semantics
 
 
@@ -253,6 +265,29 @@ def bar_alignment_response_fields(
             marker = semantics.get("bar_alignment") if isinstance(semantics, Mapping) else None
             legacy = not (isinstance(marker, str) and marker in KNOWN_BAR_ALIGNMENTS)
     return {"legacy_bar_alignment": legacy}
+
+
+def metrics_response_fields(config: Mapping[str, object] | None, run_mode: str) -> dict[str, Any]:
+    """``legacy_metrics`` for one RUN or OPTIMIZATION run (WP2.5, SY-25-13).
+
+    True iff ``run_mode`` is ``"backtest"`` or ``"optimize"`` AND
+    ``engine_semantics.metrics`` is not a ``str`` in :data:`KNOWN_METRICS_VERSIONS`
+    (missing, unknown, non-string, ``None``, a malformed ``engine_semantics`` or
+    ``config=None``).  Its Sharpe / Sortino / PSR / n were computed from every equity
+    point (fill and warm-up points included), not one return per bar.
+
+    Unlike :func:`bar_alignment_response_fields` there is NO single-symbol exemption: the
+    defect hit every run.  Paper / live (and any unknown mode) are never flagged.  Nothing
+    here maps an unknown mode to ``backtest`` (contrast :func:`cost_response_fields`).
+    Computed server-side from the stored config, never taken from a request.  Never
+    raises, never logs.
+    """
+    legacy = False
+    if run_mode in ("backtest", "optimize"):
+        semantics = config.get("engine_semantics") if isinstance(config, Mapping) else None
+        marker = semantics.get("metrics") if isinstance(semantics, Mapping) else None
+        legacy = not (isinstance(marker, str) and marker in KNOWN_METRICS_VERSIONS)
+    return {"legacy_metrics": legacy}
 
 
 def bar_alignment_http_error(exc: BarAlignmentError) -> HTTPException:

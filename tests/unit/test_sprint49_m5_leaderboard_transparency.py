@@ -75,7 +75,11 @@ def _config_with_metrics(**kwargs: Any) -> dict[str, Any]:
 # WP2.1 (U-5): leaderboard eligibility now also requires a live-equivalent REGISTRY cost
 # profile -- a run WITHOUT a persisted profile is a legacy-cost run and never qualifies.
 # The M5 threshold tests below therefore run on a run that carries the default profile.
-_COST_CFG: dict[str, Any] = {"cost_profile": DEFAULT_COST_PROFILE.to_metadata()}
+# WP2.5 (UD-1): ... and a known ``engine_semantics.metrics`` marker (per-bar metrics).
+_COST_CFG: dict[str, Any] = {
+    "cost_profile": DEFAULT_COST_PROFILE.to_metadata(),
+    "engine_semantics": {"metrics": "wp25-1"},
+}
 
 
 # ---------------------------------------------------------------------------

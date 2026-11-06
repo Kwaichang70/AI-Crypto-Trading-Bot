@@ -115,11 +115,13 @@ class TestT13Marker:
             **_PRE_P3_BACKTEST,
             "timestamp_clock": "wp22-1",
             "bar_alignment": "wp23-1",
+            "metrics": "wp25-1",  # WP2.5 (SY-25-03)
         }
         assert engine_semantics("optimize") == {
             **_PRE_P3_BACKTEST,
             "timestamp_clock": "wp22-1",
             "bar_alignment": "wp23-1",
+            "metrics": "wp25-1",  # WP2.5 (SY-25-03)
         }
         assert engine_semantics("paper") == {
             k: v for k, v in _PRE_P3_BACKTEST.items() if k != "backtest_circuit_breaker"

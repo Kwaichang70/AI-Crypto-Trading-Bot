@@ -209,6 +209,7 @@ class TestEngineSemantics:
             "backtest_circuit_breaker": True,
             "timestamp_clock": "wp22-1",
             "bar_alignment": "wp23-1",  # WP2.3 (SY-23-16)
+            "metrics": "wp25-1",  # WP2.5 (SY-25-03)
         }
 
 

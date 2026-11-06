@@ -34,7 +34,7 @@ import uuid
 from collections.abc import Sequence
 from datetime import UTC, date, datetime, time
 from decimal import Decimal
-from typing import Any, Final
+from typing import Any, Final, Literal
 
 import structlog
 from pydantic import ValidationError
@@ -60,6 +60,7 @@ from api.schemas import (
 from api.services.cost_profiles import (
     bar_alignment_response_fields,
     cost_response_fields,
+    metrics_response_fields,
     timestamp_response_fields,
 )
 from common.types import OrderSide, OrderStatus, OrderType
@@ -133,6 +134,8 @@ def run_orm_to_response(run: RunORM) -> RunResponse:
     response = response.model_copy(update=timestamp_response_fields(run.config, run.run_mode))
     # WP2.3 (SY-23-16): server-computed legacy bar-alignment flag (multi-symbol backtests).
     response = response.model_copy(update=bar_alignment_response_fields(run.config, run.run_mode))
+    # WP2.5 (SY-25-13): server-computed legacy-metrics flag (every symbol count).
+    response = response.model_copy(update=metrics_response_fields(run.config, run.run_mode))
 
     # Step 2: extract JSONB-resident leaderboard fields (confidence_flag, psr).
     # These are NOT top-level SQL columns; they live in config["backtest_metrics"].
@@ -214,6 +217,7 @@ def run_orm_to_detail_response(run: RunORM) -> RunDetailResponse:
     base = base.model_copy(update=cost_response_fields(run.config, run.run_mode))
     base = base.model_copy(update=timestamp_response_fields(run.config, run.run_mode))
     base = base.model_copy(update=bar_alignment_response_fields(run.config, run.run_mode))
+    base = base.model_copy(update=metrics_response_fields(run.config, run.run_mode))
 
     # Attempt to populate backtest_metrics from the JSONB config blob
     raw_metrics: dict[str, Any] | None = (run.config or {}).get("backtest_metrics")
@@ -222,11 +226,13 @@ def run_orm_to_detail_response(run: RunORM) -> RunDetailResponse:
             base = base.model_copy(
                 update={"backtest_metrics": BacktestMetricsResponse.model_validate(raw_metrics)}
             )
-        except Exception:  # noqa: BLE001  -- best-effort; never fail a GET on bad stored data
+        except Exception as exc:  # noqa: BLE001  -- best-effort; never fail a GET on bad stored data
+            # WP2.5 (SY-25-12): the type name only.  Pydantic's message (and so a traceback)
+            # embeds the offending stored value, which a tampered JSONB field could fill.
             logger.warning(
                 "runs.backtest_metrics_parse_error",
                 run_id=str(run.id),
-                exc_info=True,
+                error_type=type(exc).__name__,
             )
 
     return base
@@ -235,6 +241,42 @@ def run_orm_to_detail_response(run: RunORM) -> RunDetailResponse:
 # ---------------------------------------------------------------------------
 # Backtest result -> metrics response
 # ---------------------------------------------------------------------------
+
+
+def _datetime_attr(result: object, name: str) -> datetime | None:
+    """``result.<name>`` if it is a ``datetime``, else ``None`` (stub-safe, SY-25-12)."""
+    value = getattr(result, name, None)
+    return value if isinstance(value, datetime) else None
+
+
+def _finite_float_attr(result: object, name: str) -> float | None:
+    """``result.<name>`` if it is a finite real number (not a bool), else ``None``."""
+    value = getattr(result, name, None)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        as_float = float(value)
+    except OverflowError:
+        return None
+    return as_float if math.isfinite(as_float) else None
+
+
+def _sampling_mode_attr(result: object) -> Literal["calendar_asof", "present_steps"] | None:
+    """``result.metric_sampling`` if it is one of the two closed modes, else ``None``."""
+    value = getattr(result, "metric_sampling", None)
+    if value == "calendar_asof":
+        return "calendar_asof"
+    if value == "present_steps":
+        return "present_steps"
+    return None
+
+
+def _carried_slots_attr(result: object) -> int:
+    """``result.carried_slots`` if it is a non-negative int (not a bool), else ``0``."""
+    value = getattr(result, "carried_slots", 0)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0
+    return value
 
 
 def build_backtest_metrics(result: Any) -> BacktestMetricsResponse:
@@ -296,6 +338,14 @@ def build_backtest_metrics(result: Any) -> BacktestMetricsResponse:
         psr=getattr(result, "psr", None),
         n_observations=getattr(result, "n_observations", 0),
         confidence_flag=getattr(result, "confidence_flag", None),
+        # WP2.5 (SY-25-12): the sampling behind the curve-derived numbers.  getattr guards
+        # keep stub results (tests) working; ``oos_start_at`` / ``metrics_version`` stay
+        # engine-level.
+        trading_start_at=_datetime_attr(result, "trading_start_at"),
+        trading_end_at=_datetime_attr(result, "trading_end_at"),
+        periods_per_year=_finite_float_attr(result, "periods_per_year"),
+        metric_sampling=_sampling_mode_attr(result),
+        carried_slots=_carried_slots_attr(result),
         # M6 (Sprint 49): currency labeling — getattr guards for pre-M6 BacktestResult objects
         quote_currency=getattr(result, "quote_currency", None),
         reporting_currency=getattr(result, "reporting_currency", None),

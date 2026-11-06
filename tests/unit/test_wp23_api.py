@@ -186,8 +186,9 @@ class TestMarker:
         assert KNOWN_TIMESTAMP_CLOCKS == frozenset({"wp22-1"})
         for mode in ("backtest", "optimize"):
             sem = engine_semantics(mode)
-            assert sem == {**_PRE_P4_BACKTEST, "bar_alignment": "wp23-1"}
-            assert set(sem) - set(_PRE_P4_BACKTEST) == {"bar_alignment"}
+            # WP2.5 (SY-25-03): ``metrics`` is the second added key.
+            assert sem == {**_PRE_P4_BACKTEST, "bar_alignment": "wp23-1", "metrics": "wp25-1"}
+            assert set(sem) - set(_PRE_P4_BACKTEST) == {"bar_alignment", "metrics"}
 
     def test_p4_05_the_stale_comment_is_gone(self) -> None:
         src = (_REPO / "apps/api/services/cost_profiles.py").read_text()

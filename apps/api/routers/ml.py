@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from api.db import get_db
 from api.schemas import ModelVersionListResponse, ModelVersionResponse
 from trading.costs import CostProfile, default_cost_profile
+from trading.metrics import METRICS_VERSION
 from trading.safety import BACKTEST_CIRCUIT_BREAKER_DEFAULT
 
 __all__ = ["router"]
@@ -200,6 +201,10 @@ async def train_model(
         "schema_version": 3,
         "metric_type": "realized_oos_sharpe",
         "oos_measurement": "oos_window",
+        # WP2.5 (SY-25-16): the fold Sharpes below are per-bar ones.  Absent on models
+        # trained before WP2.5; the activation gate warns about those.  Same key name as
+        # engine_semantics.metrics; ``schema_version`` / ``metric_type`` stay (gate keys).
+        "metrics": METRICS_VERSION,
         "status": result.get("walk_forward_status", "ok"),
         "num_folds": num_wf_folds,
         # Gate-read keys (unchanged names so the gate keeps working):

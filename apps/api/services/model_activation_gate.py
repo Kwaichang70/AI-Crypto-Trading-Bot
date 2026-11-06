@@ -33,7 +33,10 @@ Gate logic (in order):
    reason="worst_fold_below_floor".
 5. If any fold's OOS max drawdown > ``max_fold_drawdown`` (B1): reject with
    reason="fold_drawdown_exceeds_floor".
-6. Otherwise: eligible.
+6. Otherwise: eligible.  If the ``walk_forward`` block carries no known ``metrics`` label
+   (a model trained before WP2.5, whose fold Sharpes counted every equity point), the
+   result is still eligible but carries a fixed ``warning`` (UD-3: thresholds are kept,
+   nothing is auto-rejected).
 
 CR5v2-002 (Option A): ``OOSEligibility`` has a separate ``detail`` field for
 human-readable rejection messages (distinct from ``warning`` which is reserved
@@ -48,8 +51,15 @@ from typing import Any
 import structlog
 
 from api.db.models import ModelVersionORM
+from trading.metrics import KNOWN_METRICS_VERSIONS, METRICS_VERSION
 
 __all__ = ["OOSEligibility", "check_oos_eligibility"]
+
+#: Fixed pass-with-warning text for a model whose ``walk_forward`` block carries no known
+#: ``metrics`` label (WP2.5, SY-25-16 / UD-3).  Constant: no stored value is echoed.
+_PRE_WP25_WARNING = (
+    f"walk-forward Sharpe predates WP2.5 (metrics {METRICS_VERSION}); retrain via POST /ml/train"
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -329,10 +339,16 @@ def check_oos_eligibility(
         threshold=min_oos_skill_score,
         note="OOS gate uses the realized OOS trading Sharpe (net fees + slippage)",
     )
+    # WP2.5 (SY-25-16): a passing model whose walk-forward block has no known ``metrics``
+    # label was measured on the pre-WP2.5 Sharpe.  Fail closed on the label: a missing,
+    # unknown, non-string or malformed value warns.  The gate maths above are unchanged.
+    wf_metrics = wf_meta.get("metrics")
+    predates_wp25 = not (isinstance(wf_metrics, str) and wf_metrics in KNOWN_METRICS_VERSIONS)
     return OOSEligibility(
         eligible=True,
         oos_skill_score=oos_skill_score,
         threshold=min_oos_skill_score,
+        warning=_PRE_WP25_WARNING if predates_wp25 else "",
         worst_fold_skill_score=worst_fold_skill_score,
         worst_fold_drawdown_observed=worst_fold_drawdown,
     )

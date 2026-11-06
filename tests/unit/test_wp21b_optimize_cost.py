@@ -264,7 +264,10 @@ class TestLiveEquivalentCosts:
         assert none.leaderboard_eligible is False and none.live_equivalent_costs is True
 
     def test_the_detail_response_and_the_wire_name(self) -> None:
-        cfg = {"cost_profile": DEFAULT_COST_PROFILE.to_metadata()}
+        cfg = {
+            "cost_profile": DEFAULT_COST_PROFILE.to_metadata(),
+            "engine_semantics": {"metrics": "wp25-1"},  # WP2.5 (UD-1): eligible needs the marker
+        }
         detail = run_orm_to_detail_response(_run(cfg, n_trades=None, flag=None))
         assert detail.live_equivalent_costs is True
         body = run_orm_to_response(_run(cfg, n_trades=50, flag="high")).model_dump(

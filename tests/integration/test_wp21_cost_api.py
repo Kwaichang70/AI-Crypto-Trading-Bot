@@ -200,6 +200,7 @@ class TestT20CreatePersistsCostProfile:
             "backtest_circuit_breaker": True,  # WP2.1c (SY-21-13); false in 2.1a/2.1b
             "timestamp_clock": "wp22-1",
             "bar_alignment": "wp23-1",  # WP2.3 (SY-23-16)
+            "metrics": "wp25-1",  # WP2.5 (SY-25-03)
         }
         body = resp.json()
         assert body["costProfile"]["id"] == "coinbase_advanced_1"

@@ -331,7 +331,8 @@ class TestT25RunOrmToResponse:
 
 
 def _cfg(profile: CostProfile | None, **extra: Any) -> dict[str, Any]:
-    cfg: dict[str, Any] = dict(extra)
+    # WP2.5 (UD-1): an "eligible" config also carries the per-bar metrics marker.
+    cfg: dict[str, Any] = {"engine_semantics": {"metrics": "wp25-1"}, **extra}
     if profile is not None:
         cfg["cost_profile"] = profile.to_metadata()
     return cfg

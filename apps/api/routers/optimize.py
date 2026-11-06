@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import math
 import uuid
+from collections.abc import Mapping
 from datetime import datetime
 from decimal import Decimal
 from typing import Annotated, Any
@@ -33,6 +34,7 @@ from api.services.cost_profiles import (
     bar_alignment_http_error,
     check_backtest_request_bounds,
     cost_response_fields,
+    metrics_response_fields,
     new_run_cost_profile_or_422,
     requested_bar_window,
     stamp_cost_config,
@@ -238,6 +240,14 @@ class OptimizationRunSummary(BaseModel):
             "profile that is not legacy (same rule as RunResponse.live_equivalent_costs)."
         ),
     )
+    legacy_metrics: bool = Field(
+        default=False,
+        description=(
+            "WP2.5 (SY-25-13): True iff run_metadata has no known engine_semantics.metrics "
+            "marker, so the ranking metrics (Sharpe, Sortino, ...) were computed before the "
+            "per-bar sampling and are not comparable with current runs.  Server-computed."
+        ),
+    )
 
 
 class OptimizeResponse(BaseModel):
@@ -290,6 +300,29 @@ class OptimizeResponse(BaseModel):
             "profile that is not legacy (same rule as RunResponse.live_equivalent_costs)."
         ),
     )
+    legacy_metrics: bool = Field(
+        default=False,
+        description=(
+            "WP2.5 (SY-25-13): True iff run_metadata has no known engine_semantics.metrics "
+            "marker, so the ranking metrics (Sharpe, Sortino, ...) were computed before the "
+            "per-bar sampling and are not comparable with current runs.  Server-computed."
+        ),
+    )
+
+
+def _scrub_non_finite(metrics: Mapping[str, Any]) -> dict[str, Any]:
+    """Entry metrics with every non-finite float replaced by ``None`` (SY-25-22).
+
+    Applied at the persistence and response edge only: PostgreSQL JSONB and the JSON
+    response encoder reject ``inf`` / ``nan``, and WP2.5 can now yield ``+inf`` CAGR /
+    Calmar (a short span, where HEAD raised) next to Sortino's existing ``+inf``.  The
+    optimizer's in-memory entries and ranking are untouched; finite values and ``None``
+    pass through unchanged (byte-identical).  Never logs.
+    """
+    return {
+        k: (None if isinstance(v, float) and not math.isfinite(v) else v)
+        for k, v in metrics.items()
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -494,7 +527,7 @@ async def run_optimization(
         OptimizeEntryResponse(
             rank=e.rank,
             params=e.params,
-            metrics=e.metrics,
+            metrics=_scrub_non_finite(e.metrics),
         )
         for e in result.entries
     ]
@@ -538,7 +571,7 @@ async def run_optimization(
                 optimization_run_id=orm_run.id,
                 rank=e.rank,
                 params=e.params,
-                metrics=e.metrics,
+                metrics=_scrub_non_finite(e.metrics),
             )
         )
 
@@ -564,6 +597,7 @@ async def run_optimization(
         # POST and GET share one code path: what is returned here is exactly what a
         # later GET /optimize/{id} derives from the persisted ``run_metadata``.
         **cost_response_fields(run_metadata, "optimize"),
+        **metrics_response_fields(run_metadata, "optimize"),
     )
 
 
@@ -620,6 +654,7 @@ async def list_optimization_runs(
             created_at=row.created_at,
             # WP2.1b: NULL / missing / malformed run_metadata is legacy, never a 500.
             **cost_response_fields(row.run_metadata, "optimize"),
+            **metrics_response_fields(row.run_metadata, "optimize"),
         )
         for row in rows
     ]
@@ -689,7 +724,9 @@ async def get_optimization_run(
         OptimizeEntryResponse(
             rank=e.rank,
             params=e.params,
-            metrics={k: (float(v) if v is not None else None) for k, v in e.metrics.items()},
+            metrics=_scrub_non_finite(
+                {k: (float(v) if v is not None else None) for k, v in e.metrics.items()}
+            ),
         )
         for e in row.entries
     ]
@@ -707,4 +744,5 @@ async def get_optimization_run(
         entries=entries,
         # WP2.1b: NULL / missing / malformed run_metadata is legacy, never a 500.
         **cost_response_fields(row.run_metadata, "optimize"),
+        **metrics_response_fields(row.run_metadata, "optimize"),
     )

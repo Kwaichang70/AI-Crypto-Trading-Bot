@@ -40,6 +40,7 @@ from pydantic.alias_generators import to_camel
 
 from common.types import OrderSide, OrderStatus, OrderType, RunMode, TimeFrame
 from trading.costs import CostProfile, FeeSource, is_leaderboard_cost_eligible
+from trading.metrics import KNOWN_METRICS_VERSIONS
 
 __all__ = [
     # Pagination
@@ -91,6 +92,7 @@ __all__ = [
     "LEADERBOARD_MIN_CLOSED_TRADES",
     "LEADERBOARD_ELIGIBLE_FLAGS",
     "build_cost_profile_summary",
+    "is_leaderboard_metrics_eligible",
     "leaderboard_eligible",
     "meets_trade_confidence_thresholds",
 ]
@@ -368,22 +370,39 @@ def meets_trade_confidence_thresholds(n_trades: object, confidence_flag: object)
     )
 
 
+def is_leaderboard_metrics_eligible(config: Mapping[str, object] | None) -> bool:
+    """The metrics half of leaderboard eligibility (WP2.5, SY-25-15 / UD-1).
+
+    True iff ``config["engine_semantics"]["metrics"]`` is a ``str`` in
+    ``KNOWN_METRICS_VERSIONS``.  A run without the marker (missing, unknown, non-string,
+    ``None``, a malformed ``engine_semantics`` or ``config=None``) was scored on every
+    equity point, so its Sharpe scale and its confidence tier (derived from an inflated
+    n) are not comparable with current runs.  Fails closed; never raises, never logs.
+    """
+    semantics = config.get("engine_semantics") if isinstance(config, Mapping) else None
+    marker = semantics.get("metrics") if isinstance(semantics, Mapping) else None
+    return isinstance(marker, str) and marker in KNOWN_METRICS_VERSIONS
+
+
 def leaderboard_eligible(
     n_trades: object,
     confidence_flag: object,
     config: Mapping[str, object] | None,
 ) -> bool:
-    """The ONE leaderboard-eligibility rule (M5 + WP2.1 SY-21-10).
+    """The ONE leaderboard-eligibility rule (M5 + WP2.1 SY-21-10 + WP2.5 SY-25-15).
 
     ``n_trades >= LEADERBOARD_MIN_CLOSED_TRADES`` AND ``confidence_flag`` in
     the eligible tiers AND the run's cost model is a valid, persisted,
-    ``live_equivalent`` registry profile that is not legacy.  Legacy, stress,
-    diagnostic, override and invalid cost models are never eligible.  Used by
+    ``live_equivalent`` registry profile that is not legacy AND the run carries a known
+    ``engine_semantics.metrics`` marker.  Legacy, stress, diagnostic, override and
+    invalid cost models, and pre-WP2.5 metrics, are never eligible.  Used by
     ``RunResponse`` and by the portfolio aggregate so the two cannot drift.
     """
-    return meets_trade_confidence_thresholds(
-        n_trades, confidence_flag
-    ) and is_leaderboard_cost_eligible(config)
+    return (
+        meets_trade_confidence_thresholds(n_trades, confidence_flag)
+        and is_leaderboard_cost_eligible(config)
+        and is_leaderboard_metrics_eligible(config)
+    )
 
 
 class CostProfileSummary(BaseModel):
@@ -503,8 +522,9 @@ class RunResponse(BaseModel):
         default=False,
         description=(
             "True iff n_closed_trades >= 10 AND confidence_flag in {'high', 'medium'}. "
-            "False when data is missing, below threshold, or the run's cost "
-            "model is not a live-equivalent registry profile (WP2.1)."
+            "False when data is missing, below threshold, the run's cost "
+            "model is not a live-equivalent registry profile (WP2.1), or the run "
+            "predates the per-bar metrics (legacy_metrics, WP2.5)."
         ),
     )
 
@@ -548,6 +568,17 @@ class RunResponse(BaseModel):
             "truncated to the shortest series.  A missing or malformed symbol list counts "
             "as not-single (fails closed).  Single-symbol runs are identical and are never "
             "flagged; always False for paper / live."
+        ),
+    )
+    legacy_metrics: bool = Field(
+        default=False,
+        description=(
+            "WP2.5 (SY-25-13): True iff the run is a backtest whose Sharpe / Sortino / PSR / "
+            "n_observations / confidence_flag / CAGR were computed before the per-bar sampling "
+            "(config['engine_semantics']['metrics'] missing or unknown): equity points "
+            "(warm-up and fill points) were counted as periods, so those numbers are not "
+            "comparable with current runs.  Applies to every symbol count; always False for "
+            "paper / live.  Server-computed, never taken from a request."
         ),
     )
     live_equivalent_costs: bool = Field(
@@ -654,7 +685,8 @@ class BacktestMetricsResponse(BaseModel):
             "Trading steps after warm-up: aligned timeline steps minus the warm-up window "
             "(WP2.3, SY-23-11).  A multi-symbol run counts one step per timestamp on which "
             "at least one symbol has a bar, so it can differ from any single symbol's bar "
-            "count.  Single-symbol runs are unchanged."
+            "count.  Single-symbol runs are unchanged.  Not the number of return "
+            "observations: see n_observations (WP2.5)."
         ),
     )
     bars_in_market: int
@@ -684,12 +716,15 @@ class BacktestMetricsResponse(BaseModel):
         description=(
             "Probabilistic Sharpe Ratio per Bailey & López de Prado (2012). "
             "Probability that the true Sharpe exceeds zero given observed sample. "
-            "None when fewer than 30 per-period return observations."
+            "None when fewer than 30 per-bar return observations."
         ),
     )
     n_observations: int = Field(
         default=0,
-        description="Number of per-period return observations (equity curve length - 1).",
+        description=(
+            "Number of per-bar return observations after warm-up (WP2.5: calendar as-of, "
+            "last equity point per bar stamp; fill points and warm-up are not counted)."
+        ),
     )
     confidence_flag: Literal["high", "medium", "low"] | None = Field(
         default=None,
@@ -698,6 +733,44 @@ class BacktestMetricsResponse(BaseModel):
             "'medium' (PSR>=0.80, trades>=30), 'low' (otherwise), "
             "None (PSR not computable)."
         ),
+    )
+
+    # WP2.5 (SY-25-12): the sampling behind the curve-derived numbers.  All optional, so
+    # stored pre-WP2.5 dicts validate unchanged.  ``oos_start_at`` and the metrics version
+    # are deliberately NOT exposed (engine-level / redundant with engine_semantics.metrics).
+    trading_start_at: datetime | None = Field(
+        default=None,
+        description=(
+            "Base point of the per-bar metric sample: the bar close that ends warm-up "
+            "(UTC).  Distinct from start_date (first bar OPEN).  None for pre-WP2.5 runs."
+        ),
+    )
+    trading_end_at: datetime | None = Field(
+        default=None,
+        description=(
+            "Last equity point of the run (UTC).  None for pre-WP2.5 runs and when the run "
+            "stopped before the sample had a point."
+        ),
+    )
+    periods_per_year: float | None = Field(
+        default=None,
+        description=(
+            "Annualisation factor behind sharpe_ratio / sortino_ratio (periods per "
+            "365.25-day year for the run's timeframe).  None for pre-WP2.5 runs."
+        ),
+    )
+    metric_sampling: Literal["calendar_asof", "present_steps"] | None = Field(
+        default=None,
+        description=(
+            "calendar_asof: one slot per timeframe between trading_start_at and "
+            "trading_end_at, an absent slot carries the previous value; present_steps: "
+            "off-grid fallback (distinct stamps only).  None for pre-WP2.5 runs."
+        ),
+    )
+    carried_slots: int = Field(
+        default=0,
+        ge=0,
+        description="Calendar slots without an own equity point that carried the previous value.",
     )
 
     # M6 (Sprint 49): currency labeling
@@ -1130,8 +1203,8 @@ class AggregatePortfolioResponse(BaseModel):
         default=0,
         description=(
             "Number of backtest runs that satisfy leaderboard eligibility criteria "
-            "(n_closed_trades>=10, confidence_flag in {'high','medium'}, and a "
-            "live-equivalent registry cost profile). "
+            "(n_closed_trades>=10, confidence_flag in {'high','medium'}, a "
+            "live-equivalent registry cost profile, and per-bar WP2.5 metrics). "
             "Shows as denominator: 'best return from N of M runs'."
         ),
     )
@@ -1141,6 +1214,15 @@ class AggregatePortfolioResponse(BaseModel):
             "WP2.1 (U-5): runs that meet the trade-count and confidence criteria but "
             "were excluded from best/worst because their cost model is legacy, stress, "
             "diagnostic, an override or invalid."
+        ),
+    )
+    legacy_metrics_runs_excluded: int = Field(
+        default=0,
+        description=(
+            "WP2.5 (UD-1): runs that meet the trade-count, confidence and cost criteria but "
+            "were excluded from best/worst because their metrics predate the per-bar "
+            "sampling (no known engine_semantics.metrics marker).  Counted after the cost "
+            "exclusion, so legacy_cost_runs_excluded is unaffected."
         ),
     )
 
