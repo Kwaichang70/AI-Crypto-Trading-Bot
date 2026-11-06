@@ -6,7 +6,10 @@ BacktestRunner -- high-level API for running deterministic backtests.
 This module provides a clean, self-contained entry point that:
 1. Wires together PaperExecutionEngine + DefaultRiskManager +
    PortfolioAccounting + StrategyEngine
-2. Validates input data (bar ordering, alignment, warm-up sufficiency)
+2. Validates input data (bar ordering, duplicates), aligns multi-symbol bars on
+   TIMESTAMP (WP2.3: union timeline + per-step present mask, tolerance check,
+   trimming to the first/last full row) and checks warm-up sufficiency on the
+   aligned timeline
 3. Runs the backtest via StrategyEngine.run_backtest()
 4. Collects the equity curve, trade log, and computes all metrics
 5. Returns a fully-populated BacktestResult
@@ -45,12 +48,21 @@ import random
 import uuid
 from datetime import datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, Protocol
 
 import numpy as np
 import structlog
 
+from common.metrics import metrics as _metrics
 from common.models import OHLCVBar
+from data.bar_alignment import (
+    DEFAULT_ALIGNMENT_TOLERANCE,
+    AlignmentReport,
+    AlignmentTolerance,
+    BarAlignmentError,
+    align_bars,
+    check_alignment,
+)
 from data.market_data import BaseMarketDataService
 from common.types import QuoteCurrency, RunMode, TimeFrame
 from trading.clock import BarClock
@@ -84,9 +96,16 @@ from trading.risk import RiskParameters
 from trading.risk_manager import DefaultRiskManager
 from trading.safety import BACKTEST_CIRCUIT_BREAKER_DEFAULT, build_run_circuit_breaker
 from trading.strategy import BaseStrategy
-from trading.strategy_engine import StrategyEngine
+from trading.strategy_engine import (
+    _TIMEFRAME_SECONDS,
+    StrategyEngine,
+)
 
-__all__ = ["BacktestRunner"]
+__all__ = [
+    "BacktestRunner",
+    "record_bar_alignment",
+    "record_bar_alignment_outcome",
+]
 
 logger = structlog.get_logger(__name__)
 
@@ -150,6 +169,116 @@ convergence.
 """
 
 
+# ---------------------------------------------------------------------------
+# WP2.3 (SY-23-15): bar-alignment telemetry
+# ---------------------------------------------------------------------------
+
+class _EventLog(Protocol):
+    """The slice of a structlog bound logger the alignment telemetry uses."""
+
+    def info(self, event: str, **kw: object) -> object: ...
+
+    def warning(self, event: str, **kw: object) -> object: ...
+
+    def debug(self, event: str, **kw: object) -> object: ...
+
+
+_GAP_LOG_SPANS: int = 5
+"""Number of gap spans carried by one ``backtest.bar_alignment_gaps`` event."""
+
+
+def _count(log: _EventLog, name: str, value: int, labels: dict[str, str]) -> None:
+    """Increment a counter on ``common.metrics`` directly; metrics never raise.
+
+    Deliberately NOT ``StrategyEngine._metric`` (that adds a ``run_id`` label and so
+    one series per run).  Every call of one metric name uses the same label keys
+    (the Prometheus bridge takes the label names from the first sample).
+    """
+    try:
+        _metrics.increment(name, value, labels=labels)
+    except Exception as exc:  # pragma: no cover - defensive; CF-36: no exception text
+        log.debug("backtest.bar_alignment_metric_failed", error_type=type(exc).__name__)
+
+
+def _is_gapped(report: AlignmentReport) -> bool:
+    return (
+        bool(report.warnings)
+        or report.all_absent_slots > 0
+        or any(s.missing > 0 or s.head > 0 or s.tail > 0 for s in report.per_symbol)
+    )
+
+
+def record_bar_alignment(
+    report: AlignmentReport, *, timeframe: str, enforced: bool, log: _EventLog
+) -> None:
+    """Log the alignment report and count missing bars (once per run; SY-23-15).
+
+    CF-36: names, numbers, symbols and ISO timestamps only; never exception text.
+    ``timeframe`` is the metric label value (``TimeFrame.value``).
+    """
+    log.info(
+        "backtest.bar_alignment",
+        version=report.version,
+        policy=report.policy,
+        window_requested=report.window_requested,
+        enforced=enforced,
+        expected=report.expected,
+        steps=report.steps,
+        all_present_steps=report.all_present_steps,
+        all_absent_slots=report.all_absent_slots,
+        warnings=len(report.warnings),
+        violations=len(report.violations),
+        presence_digest=report.presence_digest,
+    )
+    for sym in report.per_symbol:
+        if sym.missing <= 0 and not sym.gap_runs:
+            continue
+        spans = [
+            {"start": g.start_iso, "bars": g.bars, "kind": g.kind}
+            for g in sym.gap_runs[:_GAP_LOG_SPANS]
+        ]
+        log.warning(
+            "backtest.bar_alignment_gaps",
+            symbol=sym.symbol,
+            missing=sym.missing,
+            missing_ppm=sym.missing_ppm,
+            zero_volume=sym.zero_volume,
+            max_gap_bars=sym.max_gap_bars,
+            head=sym.head,
+            tail=sym.tail,
+            first_gap_at=sym.gap_runs[0].start_iso if sym.gap_runs else None,
+            gap_spans=spans,
+        )
+        if sym.missing >= 1:
+            _count(
+                log,
+                "bar_alignment_missing_bars_total",
+                sym.missing,
+                {"symbol": sym.symbol, "timeframe": timeframe},
+            )
+
+
+def record_bar_alignment_outcome(
+    report: AlignmentReport, *, log: _EventLog, rejected: BarAlignmentError | None = None
+) -> None:
+    """Count the run outcome (``ok`` / ``ok_with_gaps`` / ``rejected``) exactly once."""
+    if rejected is None:
+        outcome = "ok_with_gaps" if _is_gapped(report) else "ok"
+        _count(log, "bar_alignment_runs_total", 1, {"outcome": outcome})
+        return
+    first = rejected.violations[0] if rejected.violations else None
+    log.warning(
+        "backtest.bar_alignment_rejected",
+        code=rejected.code,
+        symbol=first.symbol if first is not None else None,
+        observed=first.observed if first is not None else None,
+        limit=first.limit if first is not None else None,
+        fold=first.fold if first is not None else None,
+    )
+    _count(log, "bar_alignment_runs_total", 1, {"outcome": "rejected"})
+    _count(log, "bar_alignment_rejected_total", 1, {"reason": rejected.code})
+
+
 def _total_slippage_cost(exec_engine: PaperExecutionEngine) -> Decimal:
     """SY-21-15: sum over all fills of ``|fill price - expected price| * quantity``.
 
@@ -200,6 +329,9 @@ class BacktestRunner:
         pre-WP1.6) behaviour exactly -- the baseline-attribution path of the D13
         re-baseline.  The value is NOT an API option; the API persists
         ``engine_semantics.backtest_circuit_breaker`` next to it.
+    alignment_tolerance : AlignmentTolerance | None
+        WP2.3 (SY-23-03): tests and scripts only (never an API field).  ``None``
+        -> ``DEFAULT_ALIGNMENT_TOLERANCE``.
     """
 
     def __init__(
@@ -215,6 +347,7 @@ class BacktestRunner:
         allow_pyramiding: bool | None = None,
         enable_circuit_breaker: bool = BACKTEST_CIRCUIT_BREAKER_DEFAULT,
         cost_profile: CostProfile | None = None,
+        alignment_tolerance: AlignmentTolerance | None = None,
     ) -> None:
         if not strategies:
             raise ValueError("At least one strategy is required")
@@ -239,6 +372,9 @@ class BacktestRunner:
         if seed is None:
             seed = random.randint(0, 2**31 - 1)
         self._seed: int = seed
+        self._alignment_tolerance: AlignmentTolerance = (
+            alignment_tolerance if alignment_tolerance is not None else DEFAULT_ALIGNMENT_TOLERANCE
+        )
         self._trailing_stop_pct = trailing_stop_pct
         # WP1.6 (U-2) opt-in, default ON since WP2.1c (SY-21-13).
         self._enable_circuit_breaker: bool = enable_circuit_breaker
@@ -291,6 +427,7 @@ class BacktestRunner:
 
         self._last_execution_engine: PaperExecutionEngine | None = None
         self._last_portfolio: PortfolioAccounting | None = None
+        self._last_alignment: AlignmentReport | None = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -322,6 +459,8 @@ class BacktestRunner:
         htf_bars: dict[str, dict[str, list[OHLCVBar]]] | None = None,
         *,
         oos_start_index: int | None = None,
+        requested_window: tuple[datetime, datetime] | None = None,
+        record_alignment: bool = True,
     ) -> BacktestResult:
         """
         Execute a backtest over the provided historical bars.
@@ -330,7 +469,10 @@ class BacktestRunner:
         ----------
         bars_by_symbol : dict[str, list[OHLCVBar]]
             Pre-fetched OHLCV bars keyed by symbol.  Each list must be
-            sorted by timestamp ascending and use the same timeframe.
+            sorted by timestamp ascending and use the same timeframe.  The
+            lists may differ in length: WP2.3 pairs bars by TIMESTAMP (union
+            timeline, absent symbols skipped per step) and trims the input to
+            the first/last row on which every symbol has a bar.
         htf_bars : dict[str, dict[str, list[OHLCVBar]]] | None
             Optional higher-timeframe bars keyed by timeframe string,
             then by symbol. Passed through to the strategy engine for
@@ -340,10 +482,21 @@ class BacktestRunner:
             out-of-sample trading Sharpe over bars [oos_start_index:] only and
             populate result.oos_sharpe / result.oos_n_returns. The warmup region
             and the in-sample (train) region are excluded. Must satisfy
-            self._warmup_bars <= oos_start_index < num_bars; out-of-range values
+            self._warmup_bars <= oos_start_index < len(timeline), an ordinal into
+            the ALIGNED timeline (WP2.3, SY-23-17); out-of-range values
             are logged and the OOS fields are left None (no crash). Default None
             (no OOS measurement — strictly zero behaviour change for all existing
             backtest/paper/optimizer call-sites).
+        requested_window : tuple[datetime, datetime] | None
+            WP2.3 (SY-23-02/14): the requested ``[start, end)`` of bar open
+            times.  Given (every API backtest): the grid is measured against it
+            and the tolerance is enforced even for ONE symbol.  ``None``
+            (library, scripts, ML gate): the union span, and a single-symbol
+            run is report-only (SY-23-05).
+        record_alignment : bool
+            ``False`` for the optimizer's inner runners (SY-23-18): trim and
+            build the timeline but skip telemetry and the tolerance check (the
+            optimizer already did both once).
 
         Returns
         -------
@@ -353,9 +506,17 @@ class BacktestRunner:
         Raises
         ------
         ValueError
-            If bar data fails validation (unsorted, misaligned, or
-            insufficient for warm-up).
+            If bar data fails validation (unsorted, duplicate timestamps, or
+            fewer timeline steps than the warm-up needs).
+        BarAlignmentError
+            (a ``ValueError``) If the alignment is outside the tolerance.  Raised
+            BEFORE the run id and the engine exist (I-6); ``str(exc)`` is fixed
+            text, the closed ``.code`` identifies the reason.
         """
+        # 0a. WP2.3 CR-04: never leave the previous run's report behind, whatever
+        # fails first (validation, an unsupported timeframe, a rejection).
+        self._last_alignment = None
+
         # 0. Deterministic seed — always non-None after M7 __init__ guard.
         # Seeds both Python random and numpy.random so sklearn PRNG (used by
         # ModelStrategy) and any future stochastic elements are reproducible.
@@ -363,8 +524,39 @@ class BacktestRunner:
         np.random.seed(self._seed)
         self._log.info("backtest.seed_set", seed=self._seed)
 
-        # 1. Validate input bars
+        # 1. Validate input bars (presence, order, duplicates)
         self._validate_bars(bars_by_symbol)
+
+        # 1b. WP2.3 (SY-23-11): align on timestamp -> telemetry -> tolerance check
+        # -> warm-up check on the TIMELINE -> rebind to the aligned dict.  All of
+        # it happens before ``run_id`` and the engine exist (I-6).
+        aligned = align_bars(
+            bars_by_symbol,
+            self._symbols,
+            self._timeframe_seconds(),
+            window=requested_window,
+            tolerance=self._alignment_tolerance,
+            warmup_bars=self._warmup_bars,
+        )
+        report = aligned.report
+        timeline = aligned.timeline
+        self._last_alignment = report
+        if record_alignment:
+            self._record_and_check_alignment(
+                report, enforce=self._enforce_alignment(requested_window)
+            )
+        elif not timeline and len(set(self._symbols)) > 1:
+            check_alignment(report)  # structural: off_grid / no_common_row, never swallowed
+        if len(timeline) <= self._warmup_bars:
+            raise ValueError(
+                f"Insufficient bars for warm-up. The aligned timeline has "
+                f"{len(timeline)} steps but warm-up requires {self._warmup_bars}. "
+                f"Provide at least {self._warmup_bars + 1} common bars."
+            )
+        # Every later read (t0, terminal MTM, start/end/duration, total_bars, the
+        # exposure denominators, the OOS range) sees the aligned window E, never
+        # the raw dict.
+        bars_by_symbol = aligned.bars_by_symbol
 
         # 2. Generate run ID
         run_id = f"bt-{uuid.uuid4().hex[:12]}"
@@ -464,11 +656,9 @@ class BacktestRunner:
         # 9. Build equity curve points with drawdown annotation
         equity_curve = self._build_equity_curve(raw_equity_curve)
 
-        # 10. Compute total bars processed (shortest symbol series minus warmup)
-        num_bars_per_symbol = min(
-            len(bars_by_symbol[s]) for s in self._symbols
-        )
-        total_bars_processed = max(0, num_bars_per_symbol - self._warmup_bars)
+        # 10. Compute total bars processed (WP2.3: timeline steps minus warmup; the
+        # same denominator feeds the per-symbol exposure and compute_exposure)
+        total_bars_processed = max(0, len(timeline) - self._warmup_bars)
 
         # 11. M2 (Sprint 49): read authoritative exposure counters from the engine
         # summary dict.  These were populated by run_backtest()'s per-bar tracker
@@ -519,7 +709,7 @@ class BacktestRunner:
         oos_n_returns: int | None = None
         if oos_start_index is not None:
             oos_offset = engine_summary.get("oos_equity_curve_offset")
-            n_bars_total = min(len(bars_by_symbol[s]) for s in self._symbols)
+            n_bars_total = len(timeline)
             if oos_start_index < self._warmup_bars or oos_start_index >= n_bars_total:
                 self._log.warning(
                     "backtest.oos_start_index_out_of_range",
@@ -710,6 +900,34 @@ class BacktestRunner:
     # Engine wiring
     # ------------------------------------------------------------------
 
+    def _timeframe_seconds(self) -> int:
+        try:
+            return _TIMEFRAME_SECONDS[self._timeframe]
+        except KeyError:
+            raise ValueError("unsupported timeframe for bar alignment") from None
+
+    def _enforce_alignment(self, requested_window: tuple[datetime, datetime] | None) -> bool:
+        """SY-23-05: enforce for several symbols or whenever a window was requested."""
+        return len(set(self._symbols)) > 1 or requested_window is not None
+
+    def _record_and_check_alignment(self, report: AlignmentReport, *, enforce: bool) -> None:
+        """Telemetry first, then the tolerance check (raises ``BarAlignmentError``).
+
+        Not enforced (single symbol without a window): the report and its
+        violations are logged, nothing is raised, so every golden, script and the
+        ML gate keep their behaviour.
+        """
+        record_bar_alignment(
+            report, timeframe=self._timeframe.value, enforced=enforce, log=self._log
+        )
+        if enforce:
+            try:
+                check_alignment(report)
+            except BarAlignmentError as exc:
+                record_bar_alignment_outcome(report, log=self._log, rejected=exc)
+                raise
+        record_bar_alignment_outcome(report, log=self._log)
+
     def _build_engine_config(self) -> dict[str, object]:
         """Build the StrategyEngine config dict, including optional trailing
         stop and fixed/ATR bracket exits."""
@@ -810,6 +1028,11 @@ class BacktestRunner:
         return self._last_execution_engine
 
     @property
+    def last_alignment(self) -> AlignmentReport | None:
+        """The WP2.3 alignment report of the most recent run (even a rejected one)."""
+        return self._last_alignment
+
+    @property
     def last_portfolio(self) -> PortfolioAccounting | None:
         """Return the portfolio from the most recent run, or None."""
         return self._last_portfolio
@@ -829,9 +1052,11 @@ class BacktestRunner:
         ------
         1. All configured symbols have bar data.
         2. Each symbol's bars are sorted by timestamp ascending.
-        3. All symbols have the same number of bars (or at least
-           enough after truncation to the shortest series).
-        4. The shortest series has enough bars for the warm-up period.
+        3. No duplicate timestamps.
+
+        WP2.3: the series may differ in length (they are paired by timestamp in
+        ``align_bars``); the warm-up check moved to the aligned timeline in
+        :meth:`run`, and the ``bar_count_mismatch`` warning is retired.
 
         Parameters
         ----------
@@ -874,29 +1099,10 @@ class BacktestRunner:
                         f"deterministic bar processing."
                     )
 
-        # Check 3: sufficient bars for warm-up
-        min_bars = min(len(bars_by_symbol[s]) for s in self._symbols)
-        if min_bars <= self._warmup_bars:
-            raise ValueError(
-                f"Insufficient bars for warm-up. Shortest series has "
-                f"{min_bars} bars but warm-up requires {self._warmup_bars}. "
-                f"Provide at least {self._warmup_bars + 1} bars per symbol."
-            )
-
-        # Check 4: log alignment info
-        bar_counts = {s: len(bars_by_symbol[s]) for s in self._symbols}
-        if len(set(bar_counts.values())) > 1:
-            self._log.warning(
-                "backtest.bar_count_mismatch",
-                bar_counts=bar_counts,
-                note="Series will be truncated to shortest length",
-            )
-
         self._log.info(
             "backtest.bars_validated",
-            bar_counts=bar_counts,
+            bar_counts={s: len(bars_by_symbol[s]) for s in self._symbols},
             warmup_bars=self._warmup_bars,
-            effective_bars=min_bars - self._warmup_bars,
         )
 
     # ------------------------------------------------------------------

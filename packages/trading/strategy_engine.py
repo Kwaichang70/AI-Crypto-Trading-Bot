@@ -46,7 +46,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -522,6 +522,12 @@ class StrategyEngine:
         self._risk_manager = risk_manager
         self._market_data = market_data
         self._portfolio = portfolio
+        # WP2.3 ARCH-04: the symbols are distinct.  The leaf keys its single-symbol
+        # identity branch on DISTINCT symbols and this engine on ``len(symbols)``;
+        # a duplicate (``["A", "A"]``) made them disagree and double-counted the
+        # exposure.  Rejecting it here keeps both layers on one definition.
+        if len(set(symbols)) != len(symbols):
+            raise ValueError("duplicate symbols are not allowed")
         self._symbols = list(symbols)
         self._timeframe = timeframe
         self._run_mode = run_mode
@@ -1618,6 +1624,13 @@ class StrategyEngine:
                 )
                 continue
 
+        # 4a. WP2.3 ARCH-06 (I-5): in BACKTEST a signal for a symbol with no bar at
+        # this step (absent under the union timeline) is dropped and logged, so
+        # "no fill for an absent symbol" holds by construction and not only by
+        # strategy convention.  Paper/live are untouched (CF-23-01).
+        if self._run_mode == RunMode.BACKTEST and bar_signals:
+            bar_signals = self._drop_absent_symbol_signals(bar_signals, current_bars)
+
         # 4b. WP1.2 (S6) + WP1.6 (C23): the SINGLE BUY-only entry filter.  The
         # first matching reason wins, so a dropped BUY gets exactly one skip
         # record and one block reason (K-10); the risk gate is never asked
@@ -2671,6 +2684,23 @@ class StrategyEngine:
         if current is not None and symbol in current:
             return current[symbol]
         return self._bar_windows.get(symbol, [])
+
+    def _drop_absent_symbol_signals(
+        self, signals: list[Signal], current_bars: Mapping[str, OHLCVBar]
+    ) -> list[Signal]:
+        """Keep only the signals whose symbol has a bar at this step (names only logged)."""
+        kept: list[Signal] = []
+        for signal in signals:
+            if signal.symbol in current_bars:
+                kept.append(signal)
+                continue
+            self._log.warning(
+                "engine.signal_dropped_symbol_absent",
+                symbol=signal.symbol,
+                strategy_id=signal.strategy_id,
+                direction=signal.direction.value,
+            )
+        return kept
 
     def _metric(self, name: str, **labels: str) -> None:
         """Increment a run-labelled counter; metrics never raise."""

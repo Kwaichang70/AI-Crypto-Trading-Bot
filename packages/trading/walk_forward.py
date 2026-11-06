@@ -39,7 +39,9 @@ before live deployment; a future sprint can tighten the statistics.
 from __future__ import annotations
 
 import math
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Literal
 
 from common.models import OHLCVBar
@@ -90,12 +92,16 @@ class WalkForwardFold:
 class WalkForwardValidator:
     """Split OHLCV history into train/test folds for walk-forward evaluation.
 
-    Both *expanding* and *rolling* schemes are supported.  The validator is
-    symbol-agnostic: it slices every symbol's bar list by the same index
-    boundaries so each fold covers the same calendar window for every
-    symbol (implicitly assuming all symbols share the same timeframe and
-    bar timestamps, which is how :class:`BacktestRunner` already consumes
-    the data).
+    Both *expanding* and *rolling* schemes are supported.  WP2.3 (SY-23-17):
+    the split is TIME based.  Fold boundaries are ordinals on the union
+    timeline of the bar-open times and are snapped to *full rows* (a timestamp
+    on which every symbol has a bar) at BOTH edges of every slice, including the
+    rolling ``train_start``.  Each symbol is then sliced by ``bisect`` on its
+    timestamps, so every fold covers the identical ``[start, end)`` window for
+    every symbol even when the symbols differ in bar count.  A slice therefore
+    starts and ends on a full row, which is what the engine requires of
+    multi-symbol input.  One symbol (and any input whose symbols share one
+    timeline) yields exactly the old index slices.
 
     Parameters
     ----------
@@ -153,20 +159,22 @@ class WalkForwardValidator:
         Raises
         ------
         ValueError
-            When the input is empty, when symbols have inconsistent bar
-            counts, or when the derived fold sizes would be degenerate
-            (train or test window empty for any fold).
+            When the input is empty or when the derived fold sizes would be
+            degenerate (train or test window empty for any fold, including a
+            window that holds no full row).  Unequal bar counts are legal.
         """
         if not bars_by_symbol:
             raise ValueError("bars_by_symbol must contain at least one symbol")
 
-        bar_counts = {sym: len(bars) for sym, bars in bars_by_symbol.items()}
-        unique_counts = set(bar_counts.values())
-        if len(unique_counts) != 1:
-            raise ValueError(
-                f"All symbols must have the same number of bars; got {bar_counts}"
-            )
-        total_bars = next(iter(unique_counts))
+        symbols = list(bars_by_symbol)
+        stamps: dict[str, list[datetime]] = {
+            sym: [b.timestamp for b in bars] for sym, bars in bars_by_symbol.items()
+        }
+        single = len(symbols) == 1
+        timeline: list[datetime] = (
+            stamps[symbols[0]] if single else sorted(set().union(*stamps.values()))
+        )
+        total_bars = len(timeline)
         if total_bars < self._num_folds * 2:
             raise ValueError(
                 f"Need at least {self._num_folds * 2} bars for "
@@ -204,6 +212,33 @@ class WalkForwardValidator:
                 "or reduce num_folds"
             )
 
+        # Full rows: timestamps on which every symbol has a bar (all of them for one
+        # symbol, whose index slicing is kept verbatim: byte-identical, I-1).
+        full: list[datetime] = (
+            []
+            if single
+            else sorted(set(stamps[symbols[0]]).intersection(*(stamps[s] for s in symbols[1:])))
+        )
+
+        def first_full_from(ts: datetime) -> datetime | None:
+            k = bisect_left(full, ts)
+            return full[k] if k < len(full) else None
+
+        def last_full_before(ts: datetime | None) -> datetime | None:
+            k = len(full) if ts is None else bisect_left(full, ts)
+            return full[k - 1] if k > 0 else None
+
+        def cut(
+            lo: datetime | None, hi: datetime | None, what: str, i: int
+        ) -> dict[str, list[OHLCVBar]]:
+            # [lo, hi] inclusive of the last full row; both edges are full rows.
+            if lo is None or hi is None or lo > hi:
+                raise ValueError(f"fold {i} {what} window holds no full row")
+            return {
+                sym: bars[bisect_left(stamps[sym], lo) : bisect_right(stamps[sym], hi)]
+                for sym, bars in bars_by_symbol.items()
+            }
+
         folds: list[WalkForwardFold] = []
         for i in range(self._num_folds):
             test_start = initial_train + i * test_size
@@ -222,24 +257,35 @@ class WalkForwardValidator:
 
             train_end = test_start
 
-            train_slice = {
-                sym: bars[train_start:train_end]
-                for sym, bars in bars_by_symbol.items()
-            }
-            test_slice = {
-                sym: bars[test_start:test_end]
-                for sym, bars in bars_by_symbol.items()
-            }
+            train_slice: dict[str, list[OHLCVBar]]
+            test_slice: dict[str, list[OHLCVBar]]
+            if single:
+                bars = bars_by_symbol[symbols[0]]
+                train_slice = {symbols[0]: bars[train_start:train_end]}
+                test_slice = {symbols[0]: bars[test_start:test_end]}
+            else:
+                # Ordinals -> timeline stamps -> full-row edges.  A start edge moves
+                # FORWARD to the first full row; an (exclusive) end ordinal moves
+                # BACK to the last full row before it (None = the end of the data).
+                train_slice = cut(
+                    first_full_from(timeline[train_start]),
+                    last_full_before(timeline[train_end]),
+                    "train",
+                    i,
+                )
+                test_slice = cut(
+                    first_full_from(timeline[test_start]),
+                    last_full_before(timeline[test_end] if test_end < total_bars else None),
+                    "test",
+                    i,
+                )
 
-            # Defence-in-depth: the slicing math above guarantees non-empty
-            # windows, but assert so a future refactor cannot silently emit
-            # a degenerate fold.
-            assert all(len(v) > 0 for v in train_slice.values()), (
-                f"fold {i} train slice empty for some symbol"
-            )
-            assert all(len(v) > 0 for v in test_slice.values()), (
-                f"fold {i} test slice empty for some symbol"
-            )
+            # Defence-in-depth (explicit raises: ``assert`` vanishes under ``-O``):
+            # never emit a degenerate fold.
+            if not all(len(v) > 0 for v in train_slice.values()):
+                raise ValueError(f"fold {i} train slice empty for some symbol")
+            if not all(len(v) > 0 for v in test_slice.values()):
+                raise ValueError(f"fold {i} test slice empty for some symbol")
 
             folds.append(
                 WalkForwardFold(

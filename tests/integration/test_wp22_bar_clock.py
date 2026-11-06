@@ -52,6 +52,7 @@ from api.db.models import (
 from api.services.run_persistence import persist_backtest_results, persist_paper_results
 from common.models import OHLCVBar
 from common.types import OrderSide, OrderStatus, OrderType, RunMode, SignalDirection, TimeFrame
+from data.bar_alignment import AlignmentTolerance
 from tests._wp15_logging import _structlog_unfiltered  # noqa: F401
 from tests.integration.fakes.bar_paths import TIMEFRAME_DELTA, scripted_path
 from tests.integration.fakes.scripted_strategy import ScriptedSequenceStrategy
@@ -153,6 +154,12 @@ def _strategy(script: dict[int, str], *, targets: dict[int, str] | None = None) 
     )
 
 
+# WP2.3 P3: the runner enforces the default tolerance (1% missing); the two on-grid
+# missing-bar fixtures below drop 1-2 of 60-70 bars on purpose, so they run with a
+# permissive tolerance.  The rejection itself is pinned in tests/unit/test_wp23_runner.py.
+_LENIENT_TOLERANCE = AlignmentTolerance(max_missing_ppm=1_000_000, warn_missing_ppm=1_000_000)
+
+
 async def _run(
     closes: Sequence[int | str],
     script: dict[int, str],
@@ -164,6 +171,7 @@ async def _run(
     breaker: bool = True,
     symbols: tuple[str, ...] = (SYM,),
     bars: dict[str, list[OHLCVBar]] | None = None,
+    alignment_tolerance: AlignmentTolerance | None = None,
 ) -> Run:
     runner = BacktestRunner(
         strategies=[_strategy(script)],
@@ -176,6 +184,7 @@ async def _run(
         allow_pyramiding=False,
         enable_circuit_breaker=breaker,
         cost_profile=LEGACY,
+        alignment_tolerance=alignment_tolerance,
     )
     if bars is None:
         bars = {
@@ -531,7 +540,13 @@ class TestT05MisalignedMultiSymbol:
         # ETH misses two bars INSIDE the trading region; its first and last bars are present
         lag = [b for k, b in enumerate(_offset_bars(other, F1_FIRST_OPEN, 70)) if k not in (55, 56)]
         assert len(lag) == 68
-        run = await _run([], {}, symbols=(SYM, other), bars={SYM: lead, other: lag})
+        run = await _run(
+            [],
+            {},
+            symbols=(SYM, other),
+            bars={SYM: lead, other: lag},
+            alignment_tolerance=_LENIENT_TOLERANCE,
+        )
         assert run.t0 == lead[0].timestamp == F1_FIRST_OPEN
         # one curve point per timeline step (70, not min(len) = 68), stamped step + tf
         expected = [b.timestamp + H for b in lead]
@@ -551,6 +566,7 @@ class TestT05MisalignedMultiSymbol:
             seed=7,
             enable_circuit_breaker=False,
             cost_profile=LEGACY,
+            alignment_tolerance=_LENIENT_TOLERANCE,
         )
         result = await runner.run({SYM: lead, other: lag})
         run = Run(runner, result, {SYM: lead, other: lag}, H)
