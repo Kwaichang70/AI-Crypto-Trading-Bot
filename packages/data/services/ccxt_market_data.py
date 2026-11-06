@@ -65,6 +65,9 @@ logger = structlog.get_logger(__name__)
 
 #: Default maximum number of candles per exchange request.
 #: Coinbase caps at 300; using a conservative default prevents silent truncation.
+#: ``page_limit`` must be <= the exchange's own maximum per request: after an empty
+#: page ``fetch_ohlcv_range`` jumps ``page_limit * tf``, which skips windows if the
+#: exchange answers fewer candles than that per request.
 _DEFAULT_PAGE_LIMIT: int = 300
 
 #: Maximum number of retry attempts on transient errors (429, NetworkError).
@@ -97,6 +100,18 @@ _TIMEFRAME_DURATION_MS: dict[str, int] = {
     "1d":  24 * 60 * 60 * 1_000,
     "1w":  7 * 24 * 60 * 60 * 1_000,
 }
+
+
+def _now_ms() -> int:
+    """Wall-clock milliseconds since the Unix epoch (WP2.3 P0 test seam).
+
+    ``fetch_ohlcv_range`` reads the clock ONLY through this function so that
+    tests can patch ``data.services.ccxt_market_data._now_ms``.  The value is
+    used to stop paging at the forming bar (``floor_tf(now) + tf``) when the
+    requested ``end`` lies in the future.
+    """
+    return int(time.time() * 1000)
+
 
 # ---------------------------------------------------------------------------
 # Internal cache entry type alias
@@ -160,6 +175,8 @@ class CCXTMarketDataService(BaseMarketDataService):
         sandbox: bool = False,
         extra_exchange_config: dict[str, Any] | None = None,
     ) -> None:
+        if page_limit < 1:
+            raise ValueError("page_limit must be >= 1")
         super().__init__(exchange_id=exchange_id, cache_ttl_seconds=cache_ttl_seconds)
 
         self._api_key = api_key
@@ -344,9 +361,24 @@ class CCXTMarketDataService(BaseMarketDataService):
         """
         Fetch all candles within the half-open interval ``[start, end)``.
 
-        Paginates automatically: issues repeated requests advancing the
-        ``since`` cursor until all candles up to ``end`` are retrieved or
-        the exchange returns an empty page.
+        No bar outside ``[start, min(end, floor_tf(now) + tf))`` is returned.
+
+        Paginates by advancing a ``since`` cursor until it reaches
+        ``stop = min(end, floor_tf(now) + tf)`` (WP2.3 P0, SY-23-12).
+
+        Cursor rule (correct for window-based exchanges such as Coinbase, which
+        omit buckets without trades, and for count-based exchanges):
+
+        * non-empty page: ``cursor = last_ts + tf``;
+        * empty page: ``cursor += page_limit * tf`` (an empty window in the
+          middle of a range is skipped, not treated as the end of the data).
+
+        A short page is never treated as the end.  The number of requests is
+        bounded by ``2 * ceil((stop - start) / (eff * tf)) + 2`` where ``eff`` is
+        ``max(page_limit // 4, min(page_limit, longest page so far))``
+        (``page_limit`` until a non-empty page is seen); when that cap is reached
+        ``fetch_ohlcv_range_page_cap`` is logged and the bars gathered so far are
+        returned.
 
         Duplicates at page boundaries (same timestamp appearing in two
         consecutive pages) are removed.  The result is always sorted
@@ -362,6 +394,20 @@ class CCXTMarketDataService(BaseMarketDataService):
 
         start_ms = self._datetime_to_ms(start)
         end_ms = self._datetime_to_ms(end)
+        tf_ms = self._timeframe_duration_ms(timeframe)
+        window_ms = self._page_limit * tf_ms
+        # Never page past the forming bar: an ``end`` in the future would
+        # otherwise issue requests for buckets that cannot exist yet.
+        stop_ms = min(end_ms, (_now_ms() // tf_ms) * tf_ms + tf_ms)
+        span_ms = max(stop_ms - start_ms, 0)
+        # Page cap.  Until a non-empty page is seen it assumes full pages; afterwards the
+        # effective page size is the longest page so far (an exchange whose own maximum is
+        # below ``page_limit`` is not cut off, CR-01 / SEC-04), floored at ``page_limit // 4``
+        # so a 1-bar-per-page answer costs at most ~4x the page_limit cap (WP23-P0-R2-SEC-01).
+        # Count-based exchanges with a maximum >= page_limit / 8 are still read in full.
+        max_pages = 2 * (-(-span_ms // window_ms)) + 2
+        eff_floor = max(1, self._page_limit // 4)
+        max_page_len = 0
 
         self._log.info(
             "fetch_ohlcv_range_start",
@@ -374,78 +420,91 @@ class CCXTMarketDataService(BaseMarketDataService):
         all_bars: list[OHLCVBar] = []
         seen_timestamps: set[int] = set()
         cursor_ms = start_ms
+        pages = 0
+        empty_pages = 0
 
-        while True:
+        while cursor_ms < stop_ms:
+            if pages >= max_pages:
+                self._log.warning(
+                    "fetch_ohlcv_range_page_cap",
+                    symbol=symbol,
+                    timeframe=timeframe.value,
+                    pages=pages,
+                    max_pages=max_pages,
+                    cursor_ms=cursor_ms,
+                    stop_ms=stop_ms,
+                    bars_fetched=len(all_bars),
+                )
+                break
+
             page = await self._fetch_raw_with_retry(
                 symbol=symbol,
                 timeframe=timeframe,
                 since_ms=cursor_ms,
                 limit=self._page_limit,
             )
+            pages += 1
 
             if not page:
-                # Exchange returned nothing — we have exhausted available data.
+                # Window-based exchanges return nothing for a window without
+                # trades while later windows still hold data: skip the window.
+                empty_pages += 1
                 self._log.debug(
                     "fetch_ohlcv_range_empty_page",
                     symbol=symbol,
                     timeframe=timeframe.value,
                     cursor_ms=cursor_ms,
                 )
-                break
+                cursor_ms += window_ms
+                continue
+
+            max_page_len = max(max_page_len, len(page))
+            eff = max(eff_floor, min(self._page_limit, max_page_len))
+            max_pages = 2 * (-(-span_ms // (eff * tf_ms))) + 2
 
             new_bars_in_page = 0
-            last_ts_ms = cursor_ms
+            last_ts_ms = cursor_ms  # max new timestamp; floored at the cursor
+            reached_end = False
 
             for bar in page:
                 ts_ms = int(bar.timestamp.timestamp() * 1000)
 
-                if ts_ms >= end_ms:
-                    # Past the requested end boundary — stop pagination.
-                    # Bars before this boundary were already collected by the
-                    # normal path on earlier iterations; do NOT extend again.
+                if ts_ms < start_ms:
+                    # Never return a bar before the window (e.g. the bucket containing an
+                    # unaligned ``start``); a page of only such bars fails closed below.
+                    continue
+
+                if ts_ms >= stop_ms:
+                    # Past the requested end (or the forming bar) -- stop pagination.
                     self._log.debug(
                         "fetch_ohlcv_range_reached_end",
                         symbol=symbol,
                         last_ts=bar.timestamp.isoformat(),
                     )
-                    cursor_ms = end_ms
+                    reached_end = True
                     break
 
                 if ts_ms not in seen_timestamps:
                     all_bars.append(bar)
                     seen_timestamps.add(ts_ms)
                     new_bars_in_page += 1
-                    last_ts_ms = ts_ms
-            else:
-                # for-loop completed without break: all bars were before end_ms
-                if new_bars_in_page == 0:
-                    # All bars in this page were duplicates — no forward progress.
-                    self._log.warning(
-                        "fetch_ohlcv_range_no_progress",
-                        symbol=symbol,
-                        timeframe=timeframe.value,
-                        cursor_ms=cursor_ms,
-                    )
-                    break
+                    last_ts_ms = max(last_ts_ms, ts_ms)
 
-                if len(page) < self._page_limit:
-                    # Fewer rows than requested — no more data available.
-                    self._log.debug(
-                        "fetch_ohlcv_range_short_page",
-                        symbol=symbol,
-                        rows_returned=len(page),
-                        page_limit=self._page_limit,
-                    )
-                    break
+            if reached_end:
+                break
 
-                # Advance cursor past the last bar we received.
-                # Add one timeframe-duration to avoid refetching the same bar.
-                tf_ms = self._timeframe_duration_ms(timeframe)
-                cursor_ms = last_ts_ms + tf_ms
-                continue
+            if new_bars_in_page == 0:
+                # All bars in this page were duplicates -- no forward progress.
+                self._log.warning(
+                    "fetch_ohlcv_range_no_progress",
+                    symbol=symbol,
+                    timeframe=timeframe.value,
+                    cursor_ms=cursor_ms,
+                )
+                break
 
-            # for-loop broke via the ts_ms >= end_ms guard — stop outer loop.
-            break
+            # Advance past the last bar received (never backwards).
+            cursor_ms = max(last_ts_ms + tf_ms, cursor_ms + tf_ms)
 
         # Final sort + dedup pass (defensive; should already be clean)
         all_bars.sort(key=lambda b: b.timestamp)
@@ -455,6 +514,8 @@ class CCXTMarketDataService(BaseMarketDataService):
             symbol=symbol,
             timeframe=timeframe.value,
             bars_fetched=len(all_bars),
+            pages=pages,
+            empty_pages=empty_pages,
         )
         return all_bars
 
@@ -671,7 +732,8 @@ class CCXTMarketDataService(BaseMarketDataService):
 
             except ccxt_async.RateLimitExceeded as exc:
                 retry_after = self._extract_retry_after(exc)
-                wait = retry_after if retry_after else self._backoff(attempt)
+                capped = min(retry_after, _BACKOFF_CAP) if retry_after else None
+                wait = capped if capped else self._backoff(attempt)
                 self._log.warning(
                     "rate_limit_hit",
                     symbol=symbol,

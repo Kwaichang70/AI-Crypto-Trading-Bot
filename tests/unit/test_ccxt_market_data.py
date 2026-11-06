@@ -606,13 +606,13 @@ class TestFetchOHLCVRangePagination:
         return service, mock_ex
 
     async def test_range_single_page_no_pagination(self) -> None:
-        """When all bars fit in one page (< page_limit rows returned), no second request is made."""
+        """When one page covers the whole range, the cursor reaches ``end``: no second request."""
         service, mock_ex = await self._setup_range_service(page_limit=10)
-        raw = _raw_bars(3)  # 3 < 10 (page_limit) → short page, stops immediately
+        raw = _raw_bars(3)  # 3 hourly bars cover [start, end): cursor == end after one page
         mock_ex.fetch_ohlcv = AsyncMock(return_value=raw)
 
         start = datetime(2024, 1, 1, tzinfo=UTC)
-        end = datetime(2024, 1, 2, tzinfo=UTC)
+        end = datetime(2024, 1, 1, 3, tzinfo=UTC)
         bars = await service.fetch_ohlcv_range(_SYMBOL, TimeFrame.ONE_HOUR, start, end)
 
         assert mock_ex.fetch_ohlcv.call_count == 1
@@ -623,12 +623,12 @@ class TestFetchOHLCVRangePagination:
         service, mock_ex = await self._setup_range_service(page_limit=3)
         # Page 1: 3 bars (= page_limit → triggers pagination).
         page1 = _raw_bars(3, start_ts_ms=_BASE_TS_MS)
-        # Page 2: 2 bars (< page_limit → stops pagination).
+        # Page 2: 2 bars; the cursor then reaches ``end`` (5 hourly slots).
         page2 = _raw_bars(2, start_ts_ms=_BASE_TS_MS + 3 * _ONE_HOUR_MS)
         mock_ex.fetch_ohlcv = AsyncMock(side_effect=[page1, page2])
 
         start = datetime(2024, 1, 1, tzinfo=UTC)
-        end = datetime(2024, 1, 2, tzinfo=UTC)
+        end = datetime(2024, 1, 1, 5, tzinfo=UTC)
         bars = await service.fetch_ohlcv_range(_SYMBOL, TimeFrame.ONE_HOUR, start, end)
 
         assert mock_ex.fetch_ohlcv.call_count == 2
@@ -652,29 +652,40 @@ class TestFetchOHLCVRangePagination:
         assert len(bars) == 1
         assert bars[0].timestamp == datetime.fromtimestamp(_BASE_TS_MS / 1000, tz=UTC)
 
-    async def test_range_short_page_stops_pagination(self) -> None:
-        """A page with fewer rows than page_limit signals end of data — stops."""
+    async def test_range_short_page_does_not_stop_pagination(self) -> None:
+        """WP2.3 P0: a short page is NOT the end of the data -- the cursor advances past it.
+
+        HEAD stopped at the first page with fewer than ``page_limit`` rows, which
+        silently truncated windowed exchanges (Coinbase omits no-trade buckets).
+        """
         service, mock_ex = await self._setup_range_service(page_limit=5)
-        raw = _raw_bars(3)  # 3 < 5 → short page
-        mock_ex.fetch_ohlcv = AsyncMock(return_value=raw)
+        page1 = _raw_bars(3, start_ts_ms=_BASE_TS_MS)  # 3 < 5 -> short page
+        page2 = _raw_bars(2, start_ts_ms=_BASE_TS_MS + 3 * _ONE_HOUR_MS)  # short again
+        page3 = _raw_bars(1, start_ts_ms=_BASE_TS_MS + 5 * _ONE_HOUR_MS)
+        mock_ex.fetch_ohlcv = AsyncMock(side_effect=[page1, page2, page3])
 
         start = datetime(2024, 1, 1, tzinfo=UTC)
-        end = datetime(2024, 1, 2, tzinfo=UTC)
+        end = datetime(2024, 1, 1, 6, tzinfo=UTC)  # 6 hourly slots; cursor reaches end
         bars = await service.fetch_ohlcv_range(_SYMBOL, TimeFrame.ONE_HOUR, start, end)
 
-        assert mock_ex.fetch_ohlcv.call_count == 1
-        assert len(bars) == 3
+        assert mock_ex.fetch_ohlcv.call_count == 3
+        assert len(bars) == 6
 
-    async def test_range_empty_page_stops_pagination(self) -> None:
-        """An empty page response causes the loop to break immediately."""
+    async def test_range_empty_page_is_skipped_and_bounded(self) -> None:
+        """WP2.3 P0: an empty page is skipped by one window; paging stays bounded.
+
+        HEAD treated an empty page as the end of the data, so an empty window (or a
+        ``start`` before the listing) dropped every later bar.  Now the cursor jumps
+        ``page_limit * tf`` and stops at ``end``: 12 slots / 5 per page = 3 calls.
+        """
         service, mock_ex = await self._setup_range_service(page_limit=5)
         mock_ex.fetch_ohlcv = AsyncMock(return_value=[])
 
         start = datetime(2024, 1, 1, tzinfo=UTC)
-        end = datetime(2024, 1, 2, tzinfo=UTC)
+        end = datetime(2024, 1, 1, 12, tzinfo=UTC)
         bars = await service.fetch_ohlcv_range(_SYMBOL, TimeFrame.ONE_HOUR, start, end)
 
-        assert mock_ex.fetch_ohlcv.call_count == 1
+        assert mock_ex.fetch_ohlcv.call_count == 3
         assert bars == []
 
     async def test_range_no_progress_stops_pagination(self) -> None:
@@ -711,14 +722,15 @@ class TestFetchOHLCVRangePagination:
         service, mock_ex = await self._setup_range_service(page_limit=3)
         # Page 1: bars at hours 0, 1, 2.
         page1 = _raw_bars(3, start_ts_ms=_BASE_TS_MS)
-        # Page 2: bar at hour 2 (duplicate) + bar at hour 3 (new) — 2 entries < page_limit.
+        # Page 2: bar at hour 2 (duplicate) + bar at hour 3 (new) — 2 entries; the cursor
+        # then reaches ``end``.
         overlap_ts = _BASE_TS_MS + 2 * _ONE_HOUR_MS
         new_ts = _BASE_TS_MS + 3 * _ONE_HOUR_MS
         page2 = [_raw_bar(overlap_ts), _raw_bar(new_ts)]
         mock_ex.fetch_ohlcv = AsyncMock(side_effect=[page1, page2])
 
         start = datetime(2024, 1, 1, tzinfo=UTC)
-        end = datetime(2024, 1, 2, tzinfo=UTC)
+        end = datetime(2024, 1, 1, 4, tzinfo=UTC)
         bars = await service.fetch_ohlcv_range(_SYMBOL, TimeFrame.ONE_HOUR, start, end)
 
         timestamps = [b.timestamp for b in bars]
