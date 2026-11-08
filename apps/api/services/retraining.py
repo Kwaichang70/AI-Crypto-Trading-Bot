@@ -45,6 +45,8 @@ from typing import Any
 
 import structlog
 
+from common.logging import exc_log_fields
+
 __all__ = ["RetrainingService"]
 
 logger = structlog.get_logger(__name__)
@@ -161,8 +163,13 @@ class RetrainingService:
                         "retraining_service.check_failed",
                         symbol=symbol,
                         timeframe=timeframe,
-                        error=str(exc),
-                        error_type=type(exc).__name__,
+                        **exc_log_fields(exc),
+                    )
+                    self._log.debug(
+                        "retraining_service.check_failed.trace",
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        exc_info=exc,
                     )
 
     # ------------------------------------------------------------------ #
@@ -273,7 +280,12 @@ class RetrainingService:
             self._log.error(
                 "retraining_service.ohlcv_fetch_failed",
                 symbol=symbol,
-                error=str(exc),
+                **exc_log_fields(exc),
+            )
+            self._log.debug(
+                "retraining_service.ohlcv_fetch_failed.trace",
+                symbol=symbol,
+                exc_info=exc,
             )
             return
 
@@ -306,7 +318,10 @@ class RetrainingService:
             except Exception as exc:
                 self._log.warning(
                     "retraining_service.fgi_history_fetch_failed",
-                    error=str(exc),
+                    **exc_log_fields(exc),
+                )
+                self._log.debug(
+                    "retraining_service.fgi_history_fetch_failed.trace", exc_info=exc
                 )
             try:
                 from data.market_signals import (
@@ -320,7 +335,10 @@ class RetrainingService:
             except Exception as exc:
                 self._log.warning(
                     "retraining_service.btc_dom_history_fetch_failed",
-                    error=str(exc),
+                    **exc_log_fields(exc),
+                )
+                self._log.debug(
+                    "retraining_service.btc_dom_history_fetch_failed.trace", exc_info=exc
                 )
 
         # 3. Train in thread (scikit-learn is CPU-bound + synchronous)
@@ -342,15 +360,24 @@ class RetrainingService:
             self._log.warning(
                 "retraining_service.dataset_error",
                 symbol=symbol,
-                error=str(exc),
+                **exc_log_fields(exc),
+            )
+            self._log.debug(
+                "retraining_service.dataset_error.trace",
+                symbol=symbol,
+                exc_info=exc,
             )
             return
         except Exception as exc:
             self._log.error(
                 "retraining_service.train_failed",
                 symbol=symbol,
-                error=str(exc),
-                error_type=type(exc).__name__,
+                **exc_log_fields(exc),
+            )
+            self._log.debug(
+                "retraining_service.train_failed.trace",
+                symbol=symbol,
+                exc_info=exc,
             )
             return
 
@@ -643,7 +670,12 @@ class RetrainingService:
                     self._log.warning(
                         "retraining_service.model_file_delete_failed",
                         path=str(model_file),
-                        error=str(exc),
+                        **exc_log_fields(exc),
+                    )
+                    self._log.debug(
+                        "retraining_service.model_file_delete_failed.trace",
+                        path=str(model_file),
+                        exc_info=exc,
                     )
             # Delete DB row
             async with self._db_session_factory() as session:

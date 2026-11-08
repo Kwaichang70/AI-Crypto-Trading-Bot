@@ -42,6 +42,8 @@ if TYPE_CHECKING:
 import structlog
 from pydantic import BaseModel, Field, field_validator
 
+from common.logging import exc_log_fields
+
 __all__ = [
     "FearGreedSnapshot",
     "FearGreedClient",
@@ -266,8 +268,11 @@ class FearGreedClient:
         except Exception as exc:
             self._log.warning(
                 "fear_greed_client.fetch_failed",
-                error=str(exc),
+                **exc_log_fields(exc),
                 type="latest",
+            )
+            self._log.debug(
+                "fear_greed_client.fetch_failed.trace", type="latest", exc_info=exc
             )
             # Return stale cache if available rather than None
             if self._latest_cache is not None:
@@ -317,8 +322,11 @@ class FearGreedClient:
         except Exception as exc:
             self._log.warning(
                 "fear_greed_client.fetch_failed",
-                error=str(exc),
+                **exc_log_fields(exc),
                 type="history",
+            )
+            self._log.debug(
+                "fear_greed_client.fetch_failed.trace", type="history", exc_info=exc
             )
             if self._history_cache is not None:
                 return self._history_cache[0]

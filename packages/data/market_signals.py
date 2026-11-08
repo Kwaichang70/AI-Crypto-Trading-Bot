@@ -43,6 +43,8 @@ if TYPE_CHECKING:
 import structlog
 from pydantic import BaseModel, Field
 
+from common.logging import exc_log_fields
+
 __all__ = [
     "CoinGeckoSnapshot",
     "CoinGeckoClient",
@@ -293,8 +295,9 @@ class CoinGeckoClient:
         except Exception as exc:
             self._log.warning(
                 "coingecko_client.fetch_failed",
-                error=str(exc),
+                **exc_log_fields(exc),
             )
+            self._log.debug("coingecko_client.fetch_failed.trace", exc_info=exc)
             # Return stale cache rather than None when available
             if self._latest_cache is not None:
                 self._log.debug("coingecko_client.stale_cache_used")
@@ -407,7 +410,10 @@ class CoinGeckoClient:
         except Exception as exc:
             self._log.warning(
                 "coingecko_client.btc_dom_history_fetch_failed",
-                error=str(exc),
+                **exc_log_fields(exc),
+            )
+            self._log.debug(
+                "coingecko_client.btc_dom_history_fetch_failed.trace", exc_info=exc
             )
             if self._btc_dom_history is not None:
                 self._log.debug("coingecko_client.btc_dom_history_stale_cache_used")
