@@ -2,8 +2,8 @@
 
 Binding spec: ``reports/vp2-wp2.4/synthesis-spec.md`` (SY-24-01, SY-24-03, WP24-T-07 AST part,
 WP24-T-11). Same style as ``tests/unit/test_wp25_ast_pins.py`` (exact import whitelist, banned
-names, mutated-source self-test). The engine part of the pins (WP24-T-17, P1) is added to this
-module by a later commit.
+names, mutated-source self-test). The engine part of the pins (WP24-T-17, P1) is the second half
+of this module (``TestEngineAstPin`` and the helpers above it).
 
 The ingestion helpers (``available_at_estimated`` / ``available_at_vintage``) have exactly one
 in-leaf caller: the JSONL lag floor in ``parse_jsonl_lines`` (QR-09). ``asof`` and
@@ -357,3 +357,546 @@ class TestNoLagInTheJoin:
     def test_lag_pin_notices_a_missing_join_method(self) -> None:
         src = _LEAF.read_text().replace("def coverage_ppm(", "def coverage_count(")
         assert any(p.startswith("missing:") for p in lag_problems(src))
+
+
+# ===========================================================================
+# WP24-T-17 (P1): the engine part -- C10 stays closed by construction
+# ===========================================================================
+
+_ENGINE = _REPO / "packages" / "trading" / "strategy_engine.py"
+_SIGNALS = _REPO / "packages" / "trading" / "mtf_signals.py"
+_PROVIDER_MODULES = frozenset(
+    {"data.sentiment", "data.market_signals", "data.macro_data", "data.whale_tracker"}
+)
+_PROVIDER_LEAVES = frozenset({"sentiment", "market_signals", "macro_data", "whale_tracker"})
+_SIGNAL_BANNED = frozenset(
+    {
+        "now", "utcnow", "today", "time", "monotonic", "perf_counter", "getenv", "environ",
+        "putenv", "open", "print", "input", "getLogger", "logging", "structlog", "logger",
+        "random", "uuid4", "os", "sleep", "exc_log_fields", "available_at_estimated",
+        "available_at_vintage", "get_global_client",
+    }
+)  # fmt: skip
+_LIVE_SCOPE = ["LiveSignals", "values_at"]
+
+
+def _enclosing_names(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> list[str]:
+    names: list[str] = []
+    cur: ast.AST | None = parents.get(node)
+    while cur is not None:
+        if isinstance(cur, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+            names.append(cur.name)
+        cur = parents.get(cur)
+    return list(reversed(names))
+
+
+def _parent_map(tree: ast.AST) -> dict[ast.AST, ast.AST]:
+    return {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+
+
+def _provider_refs(tree: ast.AST) -> list[ast.AST]:
+    """Every node that imports or names one of the four provider modules / their getters."""
+    refs: list[ast.AST] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            mod = node.module or ""
+            if mod in _PROVIDER_MODULES or (
+                mod == "data" and any(a.name in _PROVIDER_LEAVES for a in node.names)
+            ):
+                refs.append(node)
+        elif isinstance(node, ast.Import):
+            if any(a.name in _PROVIDER_MODULES for a in node.names):
+                refs.append(node)
+        elif isinstance(node, ast.Attribute) and node.attr in _PROVIDER_LEAVES | {
+            "get_global_client"
+        }:
+            refs.append(node)
+        elif isinstance(node, ast.Name) and node.id in {"get_global_client"}:
+            refs.append(node)
+    return refs
+
+
+def engine_import_problems(src: str) -> list[str]:
+    """The engine module reaches no provider client: no import, no attribute, no getter."""
+    return [f"provider: line {n.lineno}" for n in _provider_refs(ast.parse(src))]
+
+
+def live_scope_problems(src: str) -> list[str]:
+    """In mtf_signals.py only ``LiveSignals.values_at`` may reference a provider module."""
+    tree = ast.parse(src)
+    parents = _parent_map(tree)
+    out: list[str] = []
+    for node in _provider_refs(tree):
+        scope = _enclosing_names(node, parents)
+        if scope != _LIVE_SCOPE:
+            out.append(f"provider outside LiveSignals.values_at: {'.'.join(scope) or '<module>'}")
+    n_imports = sum(isinstance(n, ast.ImportFrom) for n in _provider_refs(tree))
+    if n_imports != len(_PROVIDER_MODULES):
+        out.append(f"provider imports: {n_imports}")
+    return out
+
+
+def signal_purity_problems(src: str) -> list[str]:
+    """Everything in mtf_signals.py outside ``LiveSignals`` is pure: no wall, env, I/O, logging."""
+    tree = ast.parse(src)
+    out: list[str] = []
+    for top in tree.body:
+        if isinstance(top, ast.ClassDef) and top.name == "LiveSignals":
+            continue
+        used = {n.id for n in ast.walk(top) if isinstance(n, ast.Name)} | {
+            n.attr for n in ast.walk(top) if isinstance(n, ast.Attribute)
+        }
+        out += [f"banned: {name}" for name in sorted(used & _SIGNAL_BANNED)]
+    return out
+
+
+def signal_logging_problems(src: str) -> list[str]:
+    """The whole module (the moved live block included) logs nothing new (SY-24-18)."""
+    tree = ast.parse(src)
+    used = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)} | {
+        n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)
+    }
+    out = [f"logging: {n}" for n in sorted(used & {"logging", "structlog", "getLogger", "print",
+                                                    "exc_log_fields", "logger", "environ",
+                                                    "getenv", "os"})]
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import | ast.ImportFrom):
+            names = [a.name for a in node.names]
+            mod = getattr(node, "module", None) or ""
+            if {mod, *names} & {"logging", "structlog", "os", "common.logging"}:
+                out.append(f"import: {mod or names}")
+    return out
+
+
+def _method(tree: ast.Module, cls: str, name: str) -> ast.FunctionDef | ast.AsyncFunctionDef:
+    klass = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == cls)
+    return next(
+        n
+        for n in klass.body
+        if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef) and n.name == name
+    )
+
+
+def _calls(fn: ast.AST, attr: str) -> list[ast.Call]:
+    return [
+        c
+        for c in ast.walk(fn)
+        if isinstance(c, ast.Call)
+        and ((isinstance(c.func, ast.Attribute) and c.func.attr == attr)
+             or (isinstance(c.func, ast.Name) and c.func.id == attr))
+    ]
+
+
+def swallow_problems(src: str) -> list[str]:
+    """CR-01 / SEC-07 / RISK-09: swallow-all handlers live ONLY in the moved live block.
+
+    Reports every ``except`` handler (``except*`` included) of any type outside
+    ``LiveSignals.values_at``, any shape other than exactly the four HEAD handlers
+    (``except Exception: pass``) inside it, and any use of ``suppress`` anywhere.
+    """
+    tree = ast.parse(src)
+    parents = _parent_map(tree)
+    out: list[str] = []
+    live: list[ast.ExceptHandler] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ExceptHandler):
+            scope = _enclosing_names(node, parents)
+            if scope == _LIVE_SCOPE:
+                live.append(node)
+            else:
+                out.append(
+                    f"except handler outside LiveSignals.values_at: {'.'.join(scope) or '<module>'}"
+                )
+        elif (isinstance(node, ast.Name) and node.id == "suppress") or (
+            isinstance(node, ast.Attribute) and node.attr == "suppress"
+        ):
+            out.append(f"suppress: {'.'.join(_enclosing_names(node, parents)) or '<module>'}")
+    malformed = [
+        h for h in live
+        if not (
+            h.type is not None
+            and ast.unparse(h.type) == "Exception"
+            and h.name is None
+            and len(h.body) == 1
+            and isinstance(h.body[0], ast.Pass)
+        )
+    ]
+    if len(live) != 4 or malformed:
+        out.append(f"live swallow handlers: count={len(live)} malformed={len(malformed)}")
+    return out
+
+
+def pit_join_problems(src: str) -> list[str]:
+    """CR-02 / CF-SYN-02: ``PitSignals.values_at`` takes no lag and reaches no ingestion helper."""
+    tree = ast.parse(src)
+    klass = next(
+        (n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "PitSignals"), None
+    )
+    fn = next(
+        (n for n in (klass.body if klass else [])
+         if isinstance(n, ast.FunctionDef) and n.name == "values_at"),
+        None,
+    )
+    if fn is None:
+        return ["missing: PitSignals.values_at"]
+    args = fn.args
+    names = [a.arg for a in (*args.posonlyargs, *args.args, *args.kwonlyargs)]
+    out: list[str] = []
+    if args.vararg or args.kwarg:
+        out.append("lag: values_at takes *args/**kwargs")
+    out += [f"lag: values_at parameter {n}" for n in names if "lag" in n.lower()]
+    if names != ["self", "decision_at"]:
+        out.append(f"lag: values_at signature {names}")
+    used = {n.id for n in ast.walk(fn) if isinstance(n, ast.Name)} | {
+        n.attr for n in ast.walk(fn) if isinstance(n, ast.Attribute)
+    }
+    banned = _LAG_CONSTANTS | _INGESTION_ONLY
+    out += [f"lag: values_at references {n}" for n in sorted(used & banned)]
+    return out
+
+
+def engine_wiring_problems(src: str) -> list[str]:
+    """``close_i`` is the decision time; the swap body is a single source call; guards hold."""
+    tree = ast.parse(src)
+    out: list[str] = []
+
+    run = _method(tree, "StrategyEngine", "run_backtest")
+    pb = _calls(run, "_process_bar")
+    if len(pb) != 1:
+        out.append(f"run_backtest _process_bar calls: {len(pb)}")
+    else:
+        kws = {k.arg: k.value for k in pb[0].keywords}
+        value = kws.get("decision_at")
+        if not (isinstance(value, ast.Name) and value.id == "close_i"):
+            out.append("run_backtest does not pass the close_i name as decision_at")
+        if [ast.unparse(a) for a in pb[0].args] != ["current_bars", "history_by_symbol"]:
+            out.append("run_backtest _process_bar positional args changed")
+    # decision_at is only ever the close_i NAME (no recomputation in the call)
+    # CR-03: EVERY binding of ``close_i`` counts (Assign, AugAssign, AnnAssign, NamedExpr,
+    # for/with targets, unpacking): exactly one, the clock-advance ``Assign``.
+    close_binds = [
+        n for n in ast.walk(run)
+        if isinstance(n, ast.Name) and n.id == "close_i" and isinstance(n.ctx, ast.Store)
+    ]
+    if len(close_binds) != 1:
+        out.append(f"close_i assignments in run_backtest: {len(close_binds)}")
+
+    for cls_fn in ("_process_bar", "_build_mtf_context"):
+        fn = _method(tree, "StrategyEngine", cls_fn)
+        kwonly = {a.arg: d for a, d in zip(fn.args.kwonlyargs, fn.args.kw_defaults, strict=True)}
+        d = kwonly.get("decision_at")
+        if not (isinstance(d, ast.Constant) and d.value is None):
+            out.append(f"{cls_fn}: decision_at must be a keyword-only argument defaulting to None")
+
+    process = _method(tree, "StrategyEngine", "_process_bar")
+    builds = _calls(process, "_build_mtf_context")
+    if len(builds) != 1 or [ast.unparse(k.value) for k in builds[0].keywords
+                            if k.arg == "decision_at"] != ["decision_at"]:
+        out.append("_process_bar does not forward decision_at to _build_mtf_context")
+
+    build = _method(tree, "StrategyEngine", "_build_mtf_context")
+    swallow = [
+        n for n in ast.walk(build)
+        if isinstance(n, ast.ExceptHandler) and ast.unparse(n.type or ast.Constant("")) in
+        {"Exception", "BaseException", ""}
+    ]  # the HTF branch keeps its narrow ``except ValueError``; the swallow-all moved out
+    if swallow or any(isinstance(n, ast.Import | ast.ImportFrom) for n in ast.walk(build)):
+        out.append("_build_mtf_context still contains try/import (the live block must be moved)")
+    swaps = [
+        c for c in _calls(build, "values_at")
+        if ast.unparse(c.func) == "self._mtf_signals.values_at"
+        and [ast.unparse(a) for a in c.args] == ["decision_at"]
+    ]
+    if len(swaps) != 1:
+        out.append("_build_mtf_context does not call self._mtf_signals.values_at(decision_at)")
+
+    # the paper/live path never passes a decision time (the wall path is untouched)
+    stamped = [
+        c for c in _calls(tree, "_process_bar") if any(k.arg == "decision_at" for k in c.keywords)
+    ]
+    if len(stamped) != 1:
+        out.append(f"_process_bar calls with decision_at: {len(stamped)} (expected 1)")
+
+    init = _method(tree, "StrategyEngine", "__init__")
+    text = ast.unparse(init)
+    for needle in (
+        "isinstance(mtf_signals, BacktestSignalSource)",
+        "mtf_signals is not LIVE_SIGNALS",
+        "isinstance(mtf_signals, LiveSignals)",
+        "BacktestSignalSource not in type(mtf_signals).__mro__",
+    ):
+        if needle not in text:
+            out.append(f"__init__ guard missing: {needle}")
+    return out
+
+
+class TestEngineAstPin:
+    def test_the_engine_imports_no_provider_module(self) -> None:  # WP24-T-17
+        assert engine_import_problems(_ENGINE.read_text()) == []
+
+    def test_only_live_signals_values_at_references_the_providers(self) -> None:
+        assert live_scope_problems(_SIGNALS.read_text()) == []
+
+    def test_everything_but_the_live_class_is_pure_and_nothing_logs(self) -> None:
+        assert signal_purity_problems(_SIGNALS.read_text()) == []
+        assert signal_logging_problems(_SIGNALS.read_text()) == []
+
+    def test_pit_signals_has_no_wall_clock_and_no_lag(self) -> None:
+        tree = ast.parse(_SIGNALS.read_text())
+        pit = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "PitSignals")
+        used = {n.id for n in ast.walk(pit) if isinstance(n, ast.Name)} | {
+            n.attr for n in ast.walk(pit) if isinstance(n, ast.Attribute)
+        }
+        assert not used & {"now", "utcnow", "today", "time", "available_at_estimated",
+                           "available_at_vintage"}
+        assert not _calls(pit, "now")
+        for fn in (n for n in ast.walk(pit) if isinstance(n, ast.FunctionDef)):
+            params = [a.arg for a in (*fn.args.posonlyargs, *fn.args.args, *fn.args.kwonlyargs)]
+            assert not [p for p in params if "lag" in p.lower()], (fn.name, params)
+
+    def test_run_backtest_passes_close_i_as_the_decision_time(self) -> None:
+        assert engine_wiring_problems(_ENGINE.read_text()) == []
+
+    def test_the_wp22_clock_lines_are_textually_unchanged(self) -> None:
+        text = _ENGINE.read_text()
+        block = (
+            "                close_i = max(b.timestamp for b in current_bars.values()) + "
+            "timedelta(\n"
+            "                    seconds=_TIMEFRAME_SECONDS[self._timeframe]\n"
+            "                )\n"
+            "                bar_clock.advance(close_i)\n"
+            "                _advance_clock = getattr(self._portfolio, \"advance_clock\", None)\n"
+            "                if callable(_advance_clock):\n"
+            "                    _advance_clock(close_i)\n"
+        )
+        assert text.count(block) == 1
+
+    # -- the pins can fail ---------------------------------------------------
+
+    @pytest.mark.parametrize(
+        "addition",
+        [
+            "from data.sentiment import get_global_client as _g",
+            "from data import market_signals",
+            "import data.macro_data",
+            "_x = whale_tracker.get_global_client",
+        ],
+    )
+    def test_engine_import_pin_fails_on_mutated_source(self, addition: str) -> None:
+        src = _ENGINE.read_text()
+        assert engine_import_problems(src) == []
+        assert engine_import_problems(src + f"\n{addition}\n")
+
+    def test_live_scope_pin_fails_when_a_provider_is_read_elsewhere(self) -> None:
+        src = _SIGNALS.read_text()
+        assert live_scope_problems(src) == []
+        leaked = src + "\n\ndef _leak() -> object:\n    from data.sentiment import get_global_client\n    return get_global_client()\n"  # noqa: E501
+        assert any("outside LiveSignals.values_at" in p for p in live_scope_problems(leaked))
+        in_pit = src.replace(
+            "        decision_ms = to_ms(decision_at)",
+            "        from data.sentiment import get_global_client as _g\n"
+            "        decision_ms = to_ms(decision_at)",
+        )
+        assert in_pit != src and live_scope_problems(in_pit)
+
+    @pytest.mark.parametrize(
+        ("old", "new", "expected"),
+        [
+            ("        decision_ms = to_ms(decision_at)",
+             "        decision_ms = to_ms(datetime.now())",
+             "banned: now"),
+            ("        decision_ms = to_ms(decision_at)",
+             "        decision_ms = to_ms(decision_at) - available_at_estimated('x', 0)",
+             "banned: available_at_estimated"),
+            ("        decision_ms = to_ms(decision_at)",
+             "        _ = os.environ",
+             "banned: environ"),
+        ],
+    )
+    def test_purity_pin_fails_on_mutated_source(self, old: str, new: str, expected: str) -> None:
+        src = _SIGNALS.read_text()
+        assert src.count(old) == 1, "mutation anchor drifted: update this test"
+        assert expected in signal_purity_problems(src.replace(old, new))
+
+    def test_logging_pin_fails_on_a_logger(self) -> None:
+        src = _SIGNALS.read_text()
+        assert signal_logging_problems(src + "\nimport structlog\n_log = structlog.get_logger()\n")
+        assert signal_logging_problems(src + "\n_x = print\n")
+
+    @pytest.mark.parametrize(
+        ("old", "new", "expected"),
+        [
+            ("await self._process_bar(current_bars, history_by_symbol, decision_at=close_i)",
+             "await self._process_bar(current_bars, history_by_symbol)",
+             "run_backtest does not pass the close_i name as decision_at"),
+            ("await self._process_bar(current_bars, history_by_symbol, decision_at=close_i)",
+             "await self._process_bar(current_bars, history_by_symbol, decision_at=datetime.now())",
+             "run_backtest does not pass the close_i name as decision_at"),
+            ("await self._process_bar(current_bars, history_by_symbol, decision_at=close_i)",
+             "await self._process_bar(current_bars, history_by_symbol, "
+             "decision_at=bar_clock.now())",
+             "run_backtest does not pass the close_i name as decision_at"),
+            ("        mtf_context = self._build_mtf_context(bar_timestamp, "
+             "decision_at=decision_at)",
+             "        mtf_context = self._build_mtf_context(bar_timestamp)",
+             "_process_bar does not forward decision_at to _build_mtf_context"),
+            ("        ctx_kwargs: dict[str, Any] = self._mtf_signals.values_at(decision_at)"
+             ".to_context_kwargs()",
+             "        ctx_kwargs: dict[str, Any] = self._mtf_signals.values_at(None)"
+             ".to_context_kwargs()",
+             "_build_mtf_context does not call self._mtf_signals.values_at(decision_at)"),
+            ("        elif mtf_signals is not None and mtf_signals is not LIVE_SIGNALS:",
+             "        elif mtf_signals is not None and not isinstance(mtf_signals, LiveSignals):",
+             "__init__ guard missing: mtf_signals is not LIVE_SIGNALS"),
+        ],
+    )
+    def test_wiring_pin_fails_on_mutated_source(self, old: str, new: str, expected: str) -> None:
+        src = _ENGINE.read_text()
+        assert src.count(old) == 1, "mutation anchor drifted: update this test"
+        assert engine_wiring_problems(src) == []
+        assert expected in engine_wiring_problems(src.replace(old, new))
+
+    def test_wiring_pin_fails_when_the_live_block_comes_back_into_the_engine(self) -> None:
+        src = _ENGINE.read_text()
+        old = "        ctx_kwargs: dict[str, Any] = self._mtf_signals.values_at(decision_at)"
+        new = (
+            "        try:\n            pass\n        except Exception:\n            pass\n" + old
+        )
+        assert src.count(old) == 1
+        assert any("still contains try/import" in p for p in
+                   engine_wiring_problems(src.replace(old, new)))
+
+
+    # -- WP2.4 P1 r2 (E1): the swallow-all pin ---------------------------------
+
+    def test_swallow_alls_are_confined_to_the_live_block(self) -> None:
+        assert swallow_problems(_SIGNALS.read_text()) == []
+
+    @pytest.mark.parametrize(
+        ("old", "new", "expected"),
+        [
+            # (i) the critic's surviving mutant: a swallow around the int()/float() conversion
+            ("            out[name] = int(value) if name in _INT_FIELDS else float(value)\n",
+             "            try:\n"
+             "                out[name] = int(value) if name in _INT_FIELDS else float(value)\n"
+             "            except Exception:\n"
+             "                pass\n",
+             "except handler outside LiveSignals.values_at: PitSignals.values_at"),
+            # (ii) a narrow handler in PitSignals
+            ("        return SignalValues(**out)  # type: ignore[arg-type]\n",
+             "        try:\n"
+             "            return SignalValues(**out)  # type: ignore[arg-type]\n"
+             "        except ValueError:\n"
+             "            return SignalValues()\n",
+             "except handler outside LiveSignals.values_at: PitSignals.values_at"),
+            # (iii) a module-level helper
+            ("\n\n@final\nclass LiveSignals:",
+             "\n\ndef _swallow() -> None:\n    try:\n        pass\n    except Exception:\n"
+             "        pass\n\n\n@final\nclass LiveSignals:",
+             "except handler outside LiveSignals.values_at: _swallow"),
+            # (iv) one live handler narrowed (security M6)
+            ("        except Exception:\n            pass  # FRED is best-effort",
+             "        except ValueError:\n            pass  # FRED is best-effort",
+             "live swallow handlers: count=4 malformed=1"),
+            # (v) a 5th handler inside LiveSignals.values_at
+            ("            pass  # Whale Alert is best-effort; never crash bar processing\n",
+             "            pass  # Whale Alert is best-effort; never crash bar processing\n"
+             "        try:\n            pass\n        except Exception:\n            pass\n",
+             "live swallow handlers: count=5 malformed=0"),
+            # (vi) contextlib.suppress
+            ("        decision_ms = to_ms(decision_at)  # plain int",
+             "        from contextlib import suppress\n\n"
+             "        with suppress(Exception):\n            pass\n"
+             "        decision_ms = to_ms(decision_at)  # plain int",
+             "suppress: PitSignals.values_at"),
+        ],
+    )
+    def test_swallow_pin_fails_on_mutated_source(self, old: str, new: str, expected: str) -> None:
+        src = _SIGNALS.read_text()
+        assert src.count(old) == 1, "mutation anchor drifted: update this test"
+        assert swallow_problems(src) == []
+        problems = swallow_problems(src.replace(old, new))
+        assert expected in problems, problems
+
+    # -- WP2.4 P1 r2 (E2): the lag pin on PitSignals.values_at ------------------
+
+    def test_pit_values_at_takes_no_lag_and_never_reaches_the_ingestion_helpers(self) -> None:
+        assert pit_join_problems(_SIGNALS.read_text()) == []
+        assert ingestion_references(_SIGNALS.read_text()) == []
+
+    @pytest.mark.parametrize(
+        ("old", "new", "expected"),
+        [
+            ("    def values_at(self, decision_at: datetime | None) -> SignalValues:\n"
+             "        if decision_at is None:",
+             "    def values_at(self, decision_at: datetime | None, offset_ms: int = 0) "
+             "-> SignalValues:\n        if decision_at is None:",
+             "lag: values_at signature ['self', 'decision_at', 'offset_ms']"),
+            ("        decision_ms = to_ms(decision_at)  # plain int",
+             "        decision_ms = to_ms(decision_at) - _FGI_LAG_MS  # plain int",
+             "lag: values_at references _FGI_LAG_MS"),
+        ],
+    )
+    def test_pit_join_pin_fails_on_mutated_source(self, old: str, new: str, expected: str) -> None:
+        src = _SIGNALS.read_text()
+        assert src.count(old) == 1, "mutation anchor drifted: update this test"
+        assert pit_join_problems(src) == []
+        problems = pit_join_problems(src.replace(old, new))
+        assert expected in problems, problems
+
+    def test_pit_join_pin_reports_a_missing_method_instead_of_raising(self) -> None:
+        src = _SIGNALS.read_text()
+        old = "class PitSignals(BacktestSignalSource):"
+        assert src.count(old) == 1
+        assert pit_join_problems(src.replace(old, "class PitSignalsX(BacktestSignalSource):")) == [
+            "missing: PitSignals.values_at"
+        ]
+
+    def test_an_ingestion_alias_in_the_signals_module_is_caught(self) -> None:
+        src = _SIGNALS.read_text()
+        assert ingestion_references(src) == []
+        assert ingestion_references(src + "\n_est = available_at_estimated\n") == ["<module>"]
+
+    # -- WP2.4 P1 r2 (E3): every close_i binding is counted --------------------
+
+    @pytest.mark.parametrize(
+        "stmt",
+        [
+            "close_i += timedelta(0)",
+            "close_i: datetime = close_i + timedelta(0)",
+            "(close_i := close_i + timedelta(0))",
+        ],
+    )
+    def test_close_i_pin_fails_on_every_rebinding_form(self, stmt: str) -> None:
+        src = _ENGINE.read_text()
+        call = "await self._process_bar(current_bars, history_by_symbol, decision_at=close_i)"
+        old = "                " + call
+        assert src.count(old) == 1, "mutation anchor drifted: update this test"
+        assert engine_wiring_problems(src) == []
+        problems = engine_wiring_problems(src.replace(old, f"                {stmt}\n{old}"))
+        assert "close_i assignments in run_backtest: 2" in problems, problems
+
+    # -- WP2.4 P1 r2 (E4): each BACKTEST guard clause is pinned ----------------
+
+    @pytest.mark.parametrize(
+        ("old", "new", "needle"),
+        [
+            ("                isinstance(mtf_signals, LiveSignals)\n                or ",
+             "                ",
+             "isinstance(mtf_signals, LiveSignals)"),
+            ("                or BacktestSignalSource not in type(mtf_signals).__mro__\n",
+             "",
+             "BacktestSignalSource not in type(mtf_signals).__mro__"),
+            ("                or not isinstance(mtf_signals, BacktestSignalSource)\n",
+             "",
+             "isinstance(mtf_signals, BacktestSignalSource)"),
+        ],
+    )
+    def test_init_guard_pin_fails_when_a_backtest_clause_is_removed(
+        self, old: str, new: str, needle: str
+    ) -> None:
+        src = _ENGINE.read_text()
+        assert src.count(old) == 1, "mutation anchor drifted: update this test"
+        assert engine_wiring_problems(src) == []
+        problems = engine_wiring_problems(src.replace(old, new))
+        assert f"__init__ guard missing: {needle}" in problems, problems

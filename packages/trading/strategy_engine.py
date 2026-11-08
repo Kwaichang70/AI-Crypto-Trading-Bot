@@ -86,6 +86,7 @@ from trading.exit_config import (
     resolve_allow_pyramiding,
 )
 from trading.models import Fill, Order, Position, Signal, TradeResult
+from trading.mtf_signals import LIVE_SIGNALS, UNAVAILABLE, BacktestSignalSource, LiveSignals
 from trading.portfolio import PortfolioAccounting
 from trading.risk import BaseRiskManager
 from trading.safety import CircuitBreaker, CircuitBreakerDecision, CircuitBreakerResponse
@@ -474,6 +475,14 @@ class StrategyEngine:
         (``ValueError``, type names only) -- outside a backtest the clock is
         the wall clock, full stop.  The execution engine receives the clock
         only through ``attach_clock``, duck-typed, in BACKTEST mode.
+    mtf_signals :
+        WP2.4 (SY-24-02): the source of the external signal fields of the
+        multi-timeframe context.  BACKTEST accepts only ``None``
+        (``UNAVAILABLE``: every field ``None``) or an instance of a real subclass of
+        ``BacktestSignalSource`` (``ABC.register`` is not honoured; a ``LiveSignals``
+        never passes);
+        PAPER and LIVE accept only ``None`` or the ``LIVE_SIGNALS`` singleton,
+        checked by IDENTITY (``ValueError``, type names only).
     """
 
     def __init__(
@@ -491,6 +500,7 @@ class StrategyEngine:
         protective_mode: bool = False,
         cost_profile: CostProfile | None = None,
         clock: Clock | None = None,
+        mtf_signals: BacktestSignalSource | LiveSignals | None = None,
     ) -> None:
         if not strategies:
             raise ValueError("At least one strategy is required")
@@ -511,6 +521,33 @@ class StrategyEngine:
                 f"{run_mode.value} StrategyEngine accepts only the wall clock, "
                 f"got {type(clock).__name__}"
             )
+        # WP2.4 (SY-24-02): mode-dependent signal-source allowlist, same pattern as the
+        # clock guard.  BACKTEST: None or a BacktestSignalSource.  PAPER / LIVE: None or
+        # the LIVE_SIGNALS singleton by IDENTITY.  Type names only (CF-36).
+        if run_mode == RunMode.BACKTEST:
+            # SEC-03 / RISK-05: a REAL subclass only. ABCMeta.register() virtual subclasses,
+            # spec-mocks and anything that is also a LiveSignals are rejected (fail closed).
+            if mtf_signals is not None and (
+                isinstance(mtf_signals, LiveSignals)
+                or not isinstance(mtf_signals, BacktestSignalSource)
+                or BacktestSignalSource not in type(mtf_signals).__mro__
+            ):
+                raise ValueError(
+                    "BACKTEST StrategyEngine accepts only a backtest signal source, "
+                    f"got {type(mtf_signals).__name__}"
+                )
+        elif mtf_signals is not None and mtf_signals is not LIVE_SIGNALS:
+            raise ValueError(
+                f"{run_mode.value} StrategyEngine accepts only the live signal source, "
+                f"got {type(mtf_signals).__name__}"
+            )
+        #: where the context's external signal fields come from (UNAVAILABLE in a backtest
+        #: by default, the verbatim provider reads in paper/live).
+        self._mtf_signals: BacktestSignalSource | LiveSignals = (
+            mtf_signals
+            if mtf_signals is not None
+            else (UNAVAILABLE if run_mode == RunMode.BACKTEST else LIVE_SIGNALS)
+        )
         #: the clock exit-time stamps are read from: bar clock (BACKTEST) or wall.
         self._clock: Clock = WALL_CLOCK if clock is None else clock
         #: WP22-P2B2 (SEC-07): True while a ``run_backtest`` call owns this engine.
@@ -1399,7 +1436,8 @@ class StrategyEngine:
                     continue
 
                 # Process this bar
-                await self._process_bar(current_bars, history_by_symbol)
+                # CF-23-18 / WP2.4: the SAME close_i object that drove the clocks above.
+                await self._process_bar(current_bars, history_by_symbol, decision_at=close_i)
 
                 # M2 (Sprint 49): after _process_bar has applied fills, query live
                 # portfolio positions to count this bar authoritatively.
@@ -1533,6 +1571,8 @@ class StrategyEngine:
         self,
         current_bars: dict[str, OHLCVBar],
         history_by_symbol: dict[str, list[OHLCVBar]],
+        *,
+        decision_at: datetime | None = None,
     ) -> None:
         """
         Process a single bar across all strategies and symbols.
@@ -1546,6 +1586,9 @@ class StrategyEngine:
             The latest bar for each symbol.
         history_by_symbol :
             Full bar history per symbol up to and including the current bar.
+        decision_at :
+            WP2.4: the bar's close time (``close_i``) in a backtest -- the instant
+            the signal source answers for.  ``None`` in paper/live.
         """
         bar_start = time.monotonic()
         # WP1.3b-a: the entry hook (``_on_fill_routed``) anchors against the
@@ -1606,7 +1649,7 @@ class StrategyEngine:
         bar_fills: int = 0
 
         # Build multi-timeframe context (look-ahead bias filtered)
-        mtf_context = self._build_mtf_context(bar_timestamp)
+        mtf_context = self._build_mtf_context(bar_timestamp, decision_at=decision_at)
         # C3: Store for use in trade recording / skip logging (Sprint 32)
         self._last_mtf_context = mtf_context
 
@@ -2115,105 +2158,19 @@ class StrategyEngine:
     def _build_mtf_context(
         self,
         current_timestamp: datetime,
+        *,
+        decision_at: datetime | None = None,
     ) -> MultiTimeframeContext | None:
         """
         Build a MultiTimeframeContext filtered to prevent look-ahead bias.
 
         Only includes HTF bars whose full period has completed before
-        the current primary bar timestamp.  Also injects all available
-        external market signal values from module-level singleton clients
-        (FGI, CoinGecko, FRED, Whale Alert).  All signal reads are
-        best-effort: any exception is swallowed to ensure bar processing
-        never crashes due to a failed external signal fetch.
+        the current primary bar timestamp.  The external market signal values
+        (FGI, CoinGecko, FRED, Whale Alert) come from the engine's signal source
+        (WP2.4): ``UNAVAILABLE`` / ``PitSignals`` answering for ``decision_at`` in a
+        backtest, the verbatim provider-singleton reads in paper/live.
         """
-        # Read cached FGI value (best-effort; never crash bar processing
-        # if the client is unavailable or has not populated its cache yet).
-        fgi_value: int | None = None
-        fgi_value_7d_ago: int | None = None
-        try:
-            from data.sentiment import get_global_client as _get_fgi_client
-            _fgi_client = _get_fgi_client()
-            if _fgi_client is not None:
-                fgi_value = _fgi_client.cached_value
-                # QT-007 v2 feature pipeline: cache-only sync read (no I/O).
-                # Returns None when history has not been populated yet by the
-                # background refresh task; v2 feature builder treats None as
-                # "no observed change".
-                fgi_value_7d_ago = _fgi_client.value_at_offset_from_cache(
-                    days_ago=7,
-                )
-        except Exception:
-            pass  # FGI is best-effort; never crash bar processing
-
-        # CoinGecko market structure signals (best-effort)
-        btc_dominance: float | None = None
-        btc_dominance_7d_ago: float | None = None
-        market_cap_change_24h: float | None = None
-        total_volume_change_24h: float | None = None
-        try:
-            from data.market_signals import get_global_client as _get_cg_client
-            _cg_client = _get_cg_client()
-            if _cg_client is not None:
-                _cg_snap = _cg_client.cached_value
-                if _cg_snap is not None:
-                    btc_dominance = _cg_snap.btc_dominance
-                    market_cap_change_24h = _cg_snap.market_cap_change_24h
-                    total_volume_change_24h = _cg_snap.total_volume_change_24h
-                # QT-007 v2 feature pipeline: cache-only sync read (no I/O).
-                btc_dominance_7d_ago = (
-                    _cg_client.btc_dominance_at_offset_from_cache(days_ago=7)
-                )
-        except Exception:
-            pass  # CoinGecko is best-effort; never crash bar processing
-
-        # FRED macro-economic signals (best-effort)
-        fed_funds_rate: float | None = None
-        yield_curve_spread: float | None = None
-        try:
-            from data.macro_data import get_global_client as _get_fred_client
-            _fred_client = _get_fred_client()
-            if _fred_client is not None:
-                _fred_snap = _fred_client.cached_value
-                if _fred_snap is not None:
-                    fed_funds_rate = _fred_snap.fed_funds_rate
-                    yield_curve_spread = _fred_snap.yield_curve_spread
-        except Exception:
-            pass  # FRED is best-effort; never crash bar processing
-
-        # Whale Alert on-chain flow signals (best-effort)
-        whale_net_flow: float | None = None
-        try:
-            from data.whale_tracker import get_global_client as _get_whale_client
-            _whale_client = _get_whale_client()
-            if _whale_client is not None:
-                _whale_snap = _whale_client.cached_value
-                if _whale_snap is not None:
-                    whale_net_flow = _whale_snap.net_flow
-        except Exception:
-            pass  # Whale Alert is best-effort; never crash bar processing
-
-        # Build kwargs for MultiTimeframeContext — only include non-None signal
-        # fields so the frozen dataclass default values are used for all absent
-        # signals, preserving backward compatibility with existing tests.
-        ctx_kwargs: dict[str, Any] = {}
-        if fgi_value is not None:
-            ctx_kwargs["fear_greed_index"] = fgi_value
-        if btc_dominance is not None:
-            ctx_kwargs["btc_dominance"] = btc_dominance
-        if market_cap_change_24h is not None:
-            ctx_kwargs["market_cap_change_24h"] = market_cap_change_24h
-        if total_volume_change_24h is not None:
-            ctx_kwargs["total_volume_change_24h"] = total_volume_change_24h
-        if fed_funds_rate is not None:
-            ctx_kwargs["fed_funds_rate"] = fed_funds_rate
-        if yield_curve_spread is not None:
-            ctx_kwargs["yield_curve_spread"] = yield_curve_spread
-        if whale_net_flow is not None:
-            ctx_kwargs["whale_net_flow"] = whale_net_flow
-        if fgi_value_7d_ago is not None:
-            ctx_kwargs["fear_greed_index_7d_ago"] = fgi_value_7d_ago
-        if btc_dominance_7d_ago is not None:
-            ctx_kwargs["btc_dominance_7d_ago"] = btc_dominance_7d_ago
+        ctx_kwargs: dict[str, Any] = self._mtf_signals.values_at(decision_at).to_context_kwargs()
 
         # Always return a context carrying the signal fields (fgi/btc_dom/...)
         # even when no HTF bars exist — strategies may condition on sentiment
