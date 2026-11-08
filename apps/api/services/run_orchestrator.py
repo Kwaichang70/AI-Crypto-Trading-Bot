@@ -58,6 +58,7 @@ from trading.safety import (
     CircuitBreakerResponse,
     CircuitBreakerTransition,
     build_run_circuit_breaker,
+    live_context_consumer_refusal,
 )
 from trading.smoke_guard import SMOKE_STRATEGY_NAMES, SmokeGuardError, validate_smoke_run
 
@@ -1630,6 +1631,16 @@ async def run_live_engine(
                 allow_pyramiding=allow_pyramiding,
                 enable_adaptive_learning=enable_adaptive_learning,
             )
+            # CF-24-01 (SY-01-05, G-11): defence in depth for the live context-consumer
+            # gate, in the same block as the smoke guard so a mode=protective resume
+            # (which drops every entry and must stay able to exit) is exempt.  The
+            # router already answers 422 before this task is spawned; this holds the line
+            # for a caller that bypasses it.  Fail-closed (a missing or unreadable class
+            # is refused), BEFORE settings and the exchange build.  The message is the
+            # closed code only.
+            _refusal = live_context_consumer_refusal(strategy_name, strategy_cls)
+            if _refusal is not None:
+                raise RuntimeError(_refusal)
 
         settings = get_settings()
         capital = Decimal(initial_capital)

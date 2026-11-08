@@ -76,6 +76,9 @@ __all__ = [
     "REDUCE_MULTIPLIER",
     "BACKTEST_CIRCUIT_BREAKER_DEFAULT",
     "build_run_circuit_breaker",
+    "LIVE_CONTEXT_CONSUMER_ALLOWLIST",
+    "LIVE_CONTEXT_CONSUMER_BLOCKED_CODE",
+    "live_context_consumer_refusal",
 ]
 
 logger = structlog.get_logger(__name__)
@@ -1513,3 +1516,50 @@ def build_run_circuit_breaker(run_id: str, params: RiskParameters) -> CircuitBre
         reduce_position_multiplier=float(thresholds.reduce_multiplier),
     )
     return CircuitBreaker(config=config, run_id=run_id, thresholds=thresholds)
+
+
+# ---------------------------------------------------------------------------
+# CF-24-01 (SY-01-05): live gate for strategies that consume external context
+# ---------------------------------------------------------------------------
+
+#: The closed error code of the live gate below (API 422 detail and orchestrator error).
+LIVE_CONTEXT_CONSUMER_BLOCKED_CODE: Final[str] = "live_context_consumer_blocked"
+
+#: Registry keys of context-consuming strategies that may run LIVE.  EMPTY by design: a
+#: strategy is lifted by a reviewed one-line commit here, per strategy, only after the
+#: UD-2 conditions (gate G-F).  Never env, never request input.
+LIVE_CONTEXT_CONSUMER_ALLOWLIST: Final[frozenset[str]] = frozenset()
+
+
+def live_context_consumer_refusal(strategy_name: str, strategy: object) -> str | None:
+    """The closed refusal code for a LIVE run of this strategy, or ``None`` (CF-24-01).
+
+    Fail-closed and pure: no I/O, no clock, no logging, no exception text, and no import of
+    any strategy registry (the registry lives in ``apps/``; the caller looks the class up
+    and passes it).  The consumed signal-field set is read from the argument:
+
+    - an INSTANCE (not a ``type``): ``strategy.mtf_signal_fields()`` (an ensemble reports
+      the union over its sub-strategies);
+    - a CLASS: its ``consumes_mtf_signals`` ClassVar.
+
+    Returns :data:`LIVE_CONTEXT_CONSUMER_BLOCKED_CODE` when the set is not a ``frozenset``,
+    when reading it raises or the attribute is missing (``None`` = unknown strategy: a
+    failed lookup), or when it is non-empty and ``strategy_name`` is not in
+    :data:`LIVE_CONTEXT_CONSUMER_ALLOWLIST`.  An empty ``frozenset`` is allowed
+    (``momentum_breakout`` and the other strategies that consume nothing).
+    """
+    try:
+        fields: object
+        if isinstance(strategy, type):
+            fields = strategy.consumes_mtf_signals  # type: ignore[attr-defined]
+        else:
+            fields = strategy.mtf_signal_fields()  # type: ignore[attr-defined]
+        if not isinstance(fields, frozenset):
+            return LIVE_CONTEXT_CONSUMER_BLOCKED_CODE
+        if not fields:
+            return None
+        if isinstance(strategy_name, str) and strategy_name in LIVE_CONTEXT_CONSUMER_ALLOWLIST:
+            return None
+        return LIVE_CONTEXT_CONSUMER_BLOCKED_CODE
+    except Exception:  # fail closed on ANY failure; the cause is never logged
+        return LIVE_CONTEXT_CONSUMER_BLOCKED_CODE

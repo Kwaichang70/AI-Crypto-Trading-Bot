@@ -107,7 +107,7 @@ async def _drive(mode: str, *, resume: bool, protective: bool = False) -> _Captu
     listener = MagicMock(name="alert-listener")
     common: dict[str, Any] = {
         "run_id_str": str(uuid.uuid4()),
-        "strategy_cls": MagicMock,
+        "strategy_cls": MagicMock(**{"mtf_signal_fields.return_value": frozenset()}),
         "strategy_name": "grid_trading",
         "strategy_params": {},
         "symbols": [SYM],

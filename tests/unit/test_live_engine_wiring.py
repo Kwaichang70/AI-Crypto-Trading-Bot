@@ -236,6 +236,7 @@ def _make_strategy_cls_mock() -> MagicMock:
     """Build a minimal strategy class mock that satisfies the constructor call."""
     mock_instance = MagicMock()
     mock_cls = MagicMock(return_value=mock_instance)
+    mock_cls.mtf_signal_fields.return_value = frozenset()  # CF-24-01: consumes no context
     return mock_cls
 
 

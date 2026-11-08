@@ -999,7 +999,7 @@ async def _drive_orchestrator(mode: str, resume: Any) -> _RecordingEngine:
     _RecordingEngine.instances.clear()
     common: dict[str, Any] = {
         "run_id_str": str(uuid4()),
-        "strategy_cls": MagicMock,
+        "strategy_cls": MagicMock(**{"mtf_signal_fields.return_value": frozenset()}),
         "strategy_name": "grid_trading",
         "strategy_params": {},
         "symbols": [SYMBOL],

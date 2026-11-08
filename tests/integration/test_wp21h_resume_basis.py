@@ -134,7 +134,11 @@ def _live_resume_response(
     from tests.integration import test_wp18a_resume_endpoint as resume_mod
 
     app = _live_resume_app(monkeypatch, resume_mod)
-    monkeypatch.setattr(runs_module, "_STRATEGY_REGISTRY", {"grid_trading": MagicMock()})
+    monkeypatch.setattr(
+        runs_module,
+        "_STRATEGY_REGISTRY",
+        {"grid_trading": MagicMock(**{"mtf_signal_fields.return_value": frozenset()})},
+    )
     run_row = resume_mod._make_run_row(status="orphaned")
     run_row.config["bracket_config"] = dict(bracket or _BRACKET)
     if stored is not None:

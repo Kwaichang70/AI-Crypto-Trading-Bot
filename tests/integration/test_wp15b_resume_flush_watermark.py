@@ -83,7 +83,9 @@ async def _run_until_final_flush(
 
     common: dict[str, Any] = {
         "run_id_str": snapshot.run_id,
-        "strategy_cls": MagicMock(side_effect=_Stop),
+        "strategy_cls": MagicMock(
+            side_effect=_Stop, **{"mtf_signal_fields.return_value": frozenset()}
+        ),
         "strategy_name": "grid_trading",
         "strategy_params": {},
         "symbols": [SYM],

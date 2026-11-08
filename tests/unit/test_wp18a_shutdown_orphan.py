@@ -221,7 +221,7 @@ class TestLiveEngineShutdownOrphaning:
             with pytest.raises(asyncio.CancelledError):
                 await orchestrator.run_live_engine(
                     run_id_str=str(run_row.id),
-                    strategy_cls=MagicMock,
+                    strategy_cls=MagicMock(**{"mtf_signal_fields.return_value": frozenset()}),
                     strategy_name="grid_trading",
                     strategy_params={},
                     symbols=["BTC/USD"],

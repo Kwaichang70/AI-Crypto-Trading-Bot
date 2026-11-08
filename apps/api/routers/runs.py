@@ -125,7 +125,7 @@ from trading.exit_config import (
     validate_run_exit_config,
 )
 from trading.recovery import ResumeRejected, check_fill_integrity, replay_sort_key
-from trading.safety import BACKTEST_CIRCUIT_BREAKER_DEFAULT
+from trading.safety import BACKTEST_CIRCUIT_BREAKER_DEFAULT, live_context_consumer_refusal
 from trading.smoke_guard import SMOKE_STRATEGY_NAMES, SmokeGuardError, validate_smoke_run
 from trading.strategy_availability import get_availability, is_mode_allowed
 from trading.strategy_engine import FlattenResult, build_synthetic_flatten_result
@@ -213,6 +213,21 @@ def _is_postgresql(db: AsyncSession) -> bool:
     except Exception:
         return False
 
+
+
+def _reject_live_context_consumer(strategy_name: str, strategy_cls: object, log: Any) -> None:  # noqa: ANN401
+    """CF-24-01 (SY-01-05): 422 for a LIVE run of a context-consuming strategy.
+
+    Fail-closed (an unknown strategy is refused too).  The detail is the closed code only:
+    no strategy name, no request field, no exception text.
+    """
+    code = live_context_consumer_refusal(strategy_name, strategy_cls)
+    if code is not None:
+        log.warning("runs.live_context_consumer_blocked")
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": code},
+        )
 
 
 def _get_strategy_registry() -> dict[str, Any]:
@@ -1000,6 +1015,12 @@ async def create_run(
                     f"or raise MAX_CONCURRENT_RUNS in settings."
                 ),
             )
+
+    # CF-24-01 (SY-01-05): live context-consumer gate.  Placed after every existing
+    # live rejection (live gate 403, kill switch 409, concurrency cap 503) so their
+    # order and codes are unchanged, and before the idempotency claim (no store touch).
+    if body.mode == "live":
+        _reject_live_context_consumer(strategy_name, strategy_cls, log)
 
     # ------------------------------------------------------------------
     # WP7.0 (SY-70-02): the idempotency claim point. Placed AFTER every
@@ -3039,6 +3060,10 @@ async def promote_to_live(
             ),
         )
 
+    # CF-24-01 (SY-01-05): live context-consumer gate, after every existing promote
+    # rejection and before the claim.
+    _reject_live_context_consumer(promotion_strategy_name, promotion_strategy_cls, log)
+
     # ------------------------------------------------------------------
     # WP7.0 (SY-70-02): claim point -- after the 404 source-run lookup
     # above and every other rejection (availability 422, exit-config 422,
@@ -3637,6 +3662,14 @@ async def resume_run(
                 "Stop an existing run before resuming."
             ),
         )
+
+    # CF-24-01 (SY-01-05, G-11): live context-consumer gate for a mode=normal resume,
+    # after every existing pre-CAS resume rejection and immediately before the CAS (the
+    # run stays orphaned and untouched).  A mode=protective resume is exempt like the
+    # kill-switch and smoke gates: it drops every entry, and refusing it would strand
+    # the exits of an open position.
+    if mode == "normal":
+        _reject_live_context_consumer(strategy_name, strategy_cls, log)
 
     # Transaction (a): compare-and-set orphaned -> resuming, committed
     # IMMEDIATELY (WP18a-S2-01) -- 0 rows updated means either the run was

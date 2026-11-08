@@ -606,7 +606,11 @@ class TestT22LegacyRunsStayResumable:
         from api.main import create_app
 
         app = create_app()
-        monkeypatch.setattr(runs_module, "_STRATEGY_REGISTRY", {"grid_trading": MagicMock()})
+        monkeypatch.setattr(
+            runs_module,
+            "_STRATEGY_REGISTRY",
+            {"grid_trading": MagicMock(**{"mtf_signal_fields.return_value": frozenset()})},
+        )
         run_row = resume_mod._make_run_row(status="orphaned")
         run_row.config["bracket_config"] = dict(_LEGACY_BRACKET)
         original_config = {
@@ -686,7 +690,11 @@ class TestT22LegacyRunsStayResumable:
         from api.main import create_app
 
         app = create_app()
-        monkeypatch.setattr(runs_module, "_STRATEGY_REGISTRY", {"grid_trading": MagicMock()})
+        monkeypatch.setattr(
+            runs_module,
+            "_STRATEGY_REGISTRY",
+            {"grid_trading": MagicMock(**{"mtf_signal_fields.return_value": frozenset()})},
+        )
         run_row = resume_mod._make_run_row(status="orphaned")
         run_row.config["bracket_config"] = dict(bracket)
         session = resume_mod._DispatchSession(run_row=run_row, runs_update_rowcounts=[1, 1])
