@@ -97,7 +97,7 @@ Volgens de P2b-security-review zijn R1–R15 allemaal MET. R14 is MET sinds P2b.
 | API-semantiek | niet in het plan | **Toegevoegd** als P3 | SY-22-08/09/15/16 |
 | Retraining | niet in het plan | **P4 in scope** | SY-22-11, U2(a) |
 | Sequence-key | — | **Geen `seq`-kolom en geen migratie** (quantvoorstel QD-05 afgewezen) | SY-22-06 |
-| DoD "geen wall-clock in backtest-tabellen" | ongescoped | Vijf tabellen. De MTF-wall-reads blijven tot WP2.4. | SY-22-14/18 |
+| DoD "geen wall-clock in backtest-tabellen" | ongescoped | Vijf tabellen. De MTF-wall-reads bleven open tot WP2.4; voor nieuwe runs gesloten door WP2.4 P1 (`2697090`, G14): `regime_at_entry`/`signal_context` zijn point-in-time of `None`. Oude rijen blijven zoals opgeslagen. Zie `Documentation/WP2.4-register.md`. | SY-22-14/18 |
 | Hardening | — | **Toegevoegd:** P2a.1, P2b.1, P2b.2 en P5 (reviewnits; zie de commit-tabel) | SY-22-R2-04, reviews |
 | Inspanning | 1,5 cycli | Spec 2,5 cycli (incl. 0,35 voor review- en fixrondes en de PG-gate) | synthesis-spec §6 |
 

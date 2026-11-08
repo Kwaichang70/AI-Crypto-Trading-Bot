@@ -480,3 +480,58 @@ Core trading engine containing the heart of the system.
   CAGR/Calmar over short windows are extrapolations, and the optimizer's `cagr`/`calmar` ranking now depends on
   each trial's span (WP2.7).
 - See `reports/vp2-wp2.5/synthesis-spec.md` and `Documentation/WP2.5-register.md`.
+
+### WP2.4 (point-in-time MTF context: `trading/mtf_signals.py`, `data/point_in_time.py`)
+- Defect closed (C10): `main.py` calls `get_latest()` only at boot (lines 306, 469, 512, 538), so API backtests used to inject
+  boot-frozen FGI, BTC dominance, yield spread and whale flow (plus a wall-clock "7d ago") into every bar, while scripts got
+  `None`. Since WP2.4 Phase A (P0-P3, `a9459c3..b669894`) a BACKTEST `StrategyEngine` never touches a provider singleton or the
+  wall clock. The API passes no source in Phase A, so API backtests run with `UNAVAILABLE` (all nine fields `None`) = the old
+  "no clients" path = the script path. No golden constant changed. Phase B (store, migration 021, backfill CLI, API PIT loading)
+  is NOT built yet.
+- `trading.mtf_signals` (`MTF_CONTEXT_VERSION = "wp24-1"`, `KNOWN_MTF_CONTEXT_VERSIONS`): `SignalValues` (9 fields, `None`
+  default; `to_context_kwargs()` is the old non-None rule, FGI as `int`, the rest `float`), `BacktestSignalSource`
+  (`UnavailableSignals` / singleton `UNAVAILABLE`, `PitSignals`) and `LiveSignals` / `LIVE_SIGNALS`. `LiveSignals` is NOT a
+  `BacktestSignalSource`. Its `values_at` body is `strategy_engine.py:2129-2193` (line numbers at `bbe7142`) moved verbatim (sha256-pinned in
+  `test_wp24_live_parity.py`; same lazy imports, same swallow-all); the `:2195-2216` non-None rule was re-expressed as
+  `to_context_kwargs`, not moved.
+- Engine guard (`StrategyEngine.__init__(..., mtf_signals=None)`): BACKTEST accepts `None` (= `UNAVAILABLE`) or an instance of a
+  REAL subclass of `BacktestSignalSource` (`register()` is not honoured; a `LiveSignals` never passes; checked via
+  `isinstance`, `not isinstance(.., LiveSignals)` and `BacktestSignalSource in type(x).__mro__`). PAPER/LIVE accept `None`
+  (= `LIVE_SIGNALS`) or `x is LIVE_SIGNALS`. Anything else is `ValueError` with the type name only. The orchestrator is not
+  edited. `check_backtest_source` applies the same rule in the runner and optimizer constructors, before any run id exists.
+- Wiring: `run_backtest` passes `decision_at=close_i` (the object that feeds `bar_clock.advance`) to `_process_bar`;
+  `_build_mtf_context(ts, *, decision_at=None)` calls `self._mtf_signals.values_at(decision_at).to_context_kwargs()`. The HTF
+  branch keeps its bar-open key (byte-identical; moving it to `close_i` is CF-24-12). Paper/live behaviour is byte-identical.
+- `data.point_in_time` (stdlib-only, AST-pinned in `test_wp24_ast_pins.py`): `PIT_VERSION`, `PitSeries.asof(decision_ms, *,
+  max_age_ms)` and `coverage_ppm(...)` (neither takes a lag argument), `Observation` (`Decimal` value, integer ms),
+  `series_digest`, `parse_jsonl_lines`, `PitError` (closed codes, fixed messages). The lag is applied ONCE at ingestion into
+  `available_at` (`available_at_estimated`, `available_at_vintage`; both reject any input that is not 00:00 UTC); the join
+  never adds a lag. Visible iff `available_ms <= close_i`; staleness runs from the FIRST availability, inclusive; "7d ago" is
+  `asof(close_i - 7d)`. Constants: FGI +24h / max 48h, T10Y2Y vintage `realtime_start`+1d or +2 business days+1d / max 7d,
+  BTC dominance (6h) and whale (2h) `recorded` only, `MIN_COVERAGE_PPM = 990_000`. `FEDFUNDS`, `market_cap_change_24h` and
+  `total_volume_change_24h` are never served (`NOT_SERVED_FIELDS`).
+- Per run (`select_mtf_signals`, once in `BacktestRunner.run` and once in `ParameterOptimizer.run`; inner optimizer runs use
+  `select_mtf_context=False`): a field is ON iff its coverage over the trading decisions `close_k`, `k in [W, N)`, is
+  `>= 990_000` ppm (all-or-nothing per field). `last_mtf_context` (an `MtfContextReport`; `.to_metadata()` is the persisted
+  block) is reset at the start of each `run`. `BacktestResult` has NO new field. Status is derived over the consumed fields only:
+  `not_used` (none consumed; the source is forced to `UNAVAILABLE`), `unavailable`, `partial`, `pit`. `FieldStatus` is
+  `pit` / `no_source` / `insufficient_coverage` / `not_served`. `pit` means "passed coverage; served iff consumed, or the
+  now-partner of a served consumed 7d field"; `source == "pit"` iff `status` is `pit` or `partial`.
+- `BaseStrategy.consumes_mtf_signals: ClassVar[frozenset[str]]` (default: all nine fields, fail-closed) is declared explicitly
+  on every registry strategy. `rsi_mean_reversion` and `dca_rsi_hybrid`: `{fear_greed_index, btc_dominance,
+  yield_curve_spread, whale_net_flow}`; `model_strategy`: `{fear_greed_index, fear_greed_index_7d_ago, btc_dominance,
+  btc_dominance_7d_ago}`; `ma_crossover`, `breakout`, `grid_trading`, `sl_tp_reversion`, `momentum_breakout`,
+  `smoke_roundtrip`: `frozenset()`. `EnsembleStrategy.mtf_signal_fields()` is the union of its subs. A new strategy must declare
+  its set; `regime_at_entry` is computed for EVERY strategy, which is why `not_used` runs get `UNAVAILABLE`.
+- Measured at design time (synthetic GBM, `quant-design.md` QD-04): dca return x0.44..x1.17 under the frozen context in a bull regime (x0.16 in a flat regime), rsi
+  trades deleted or turned into buy-and-hold, 10-24% of decisions of a context-trained ML v2 changed, `momentum_breakout`
+  unaffected.
+- Pins to respect: `test_wp24_ast_pins.py` (leaf import whitelist and no-lag pins; name-reference allowlists that keep
+  `LIVE_SIGNALS` / `LiveSignals` / `BacktestSignalSource` inside `mtf_signals.py`, `strategy_engine.py`, `backtest.py` and
+  `optimizer.py`; no `.register(` on the source), `test_wp24_live_parity.py` (frozen oracle and moved-block hash),
+  `test_wp22_ast_pins.py` (unedited). Do not add an `except` handler to `PitSignals.select` or coverage code without a
+  reviewed pin change.
+- Open: CF-24-01 (paper/live context is frozen at API boot; own live-safety WP), CF-24-02 (`str(exc)` log sites in the provider
+  modules), CF-24-03 (v2 training join is not PIT), CF-24-05 (live 7d nearest-snapshot rule), and the P7 preconditions
+  CF-P3-08..10. P1-P3 must ship in one release.
+- See `reports/vp2-wp2.4/synthesis-spec.md` and `Documentation/WP2.4-register.md`.
