@@ -38,6 +38,7 @@ from sqlalchemy import (
     Index,
     Integer,
     Numeric,
+    PrimaryKeyConstraint,
     String,
     Text,
     UniqueConstraint,
@@ -62,6 +63,7 @@ __all__ = [
     "AuditEventORM",
     "IdempotencyKeyORM",
     "KillSwitchStateORM",
+    "ContextObservationORM",
 ]
 
 # ---------------------------------------------------------------------------
@@ -1721,3 +1723,85 @@ class KillSwitchStateORM(Base):
 
     def __repr__(self) -> str:
         return f"<KillSwitchStateORM active={self.active} reason={self.reason!r}>"
+
+
+# ---------------------------------------------------------------------------
+# 14. context_observations  -- WP2.4 point-in-time context series (append-only)
+# ---------------------------------------------------------------------------
+
+class ContextObservationORM(Base):
+    """One immutable point-in-time observation of a context series (SY-24-09).
+
+    See ``infra/alembic/versions/021_add_context_observations.py`` and
+    ``apps/api/services/context_store.py``.
+
+    The primary key ``(series_id, observed_at, available_at)`` makes a revision a
+    NEW row with a later ``available_at``. Backtests join on
+    ``available_at <= close_i`` only; ``ingested_at`` is audit data and never
+    decides visibility.
+
+    Append-only: application code never issues UPDATE or DELETE against this
+    table (pinned by tests). Rows are written through the store's
+    ``INSERT ... WHERE NOT EXISTS ... ON CONFLICT DO NOTHING`` statement, not
+    ``session.add`` (which would raise on a conflict). This class exists for
+    metadata / autogenerate parity and read queries.
+    """
+
+    __tablename__ = "context_observations"
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "series_id",
+            "observed_at",
+            "available_at",
+            name="pk_context_observations",
+        ),
+        CheckConstraint(
+            "available_at >= observed_at",
+            name="ck_context_obs_avail_after_obs",
+        ),
+        CheckConstraint("value <> 'NaN'", name="ck_context_obs_value_finite"),
+        CheckConstraint(
+            "available_at_basis IN ('recorded', 'estimated_lag', 'vintage')",
+            name="ck_context_obs_basis",
+        ),
+        CheckConstraint("series_id <> ''", name="ck_context_obs_series_id"),
+    )
+
+    series_id: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        comment="Namespaced series id, e.g. 'coingecko:btc_dominance'.",
+    )
+    observed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        comment="Period the value describes.",
+    )
+    available_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        comment="First instant a trader could have known the value (the join key).",
+    )
+    value: Mapped[Decimal] = mapped_column(
+        Numeric(24, 8),
+        nullable=False,
+        comment="Exact value; canonical digest text derives from it.",
+    )
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    available_at_basis: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        comment="recorded | estimated_lag | vintage.",
+    )
+    ingested_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        comment="Audit only; feeds ingest_cutoff, never the join.",
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<ContextObservationORM series={self.series_id!r} "
+            f"observed_at={self.observed_at!r} available_at={self.available_at!r}>"
+        )

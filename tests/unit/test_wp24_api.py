@@ -1055,5 +1055,7 @@ class TestT32LogHygiene:
 
     def test_p3_43_alembic_has_no_new_revision(self) -> None:
         versions = sorted((_REPO / "infra/alembic/versions").glob("0*.py"))
-        assert versions[-1].name.startswith("020_")
-        assert not list((_REPO / "infra/alembic/versions").glob("021_*"))
+        # Phase A (P0..P4) adds no migration; the only revision after 020 is the Phase B
+        # context store (021, WP2.4 P5).
+        later = [v.name for v in versions if v.name[:3] > "020"]
+        assert later in ([], ["021_add_context_observations.py"])

@@ -10,7 +10,13 @@ Deployment configuration and database migrations.
 
 ### Contents
 - `docker-compose.yml` — Orchestrates: api + ui + postgres + redis
-- `migrations/` — Database migration scripts (Alembic)
+- `alembic/` — Alembic config (`alembic.ini`, `env.py`); migration scripts are in `alembic/versions/`
+  (head `021`). There is no `infra/migrations/` directory.
+- `alembic/versions/021_add_context_observations.py` — WP2.4 append-only `context_observations` table
+  (point-in-time context series; PK `series_id, observed_at, available_at`). No retention or purge by
+  design (a run's recorded digest must stay reproducible); `recorded` rows cannot be re-fetched, so
+  include the table in backups. The downgrade refuses while `recorded` rows exist unless run with
+  `-x allow_drop_context=1`.
 - Dockerfile definitions for each service
 
 ### Requirements

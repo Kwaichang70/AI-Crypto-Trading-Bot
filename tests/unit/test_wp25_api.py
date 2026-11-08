@@ -1055,11 +1055,16 @@ class TestT33OptimizeScrub:
 
 
 class TestT34HeadAndHygiene:
-    def test_alembic_head_is_still_020(self) -> None:
+    def test_alembic_head_descends_from_020(self) -> None:
+        # WP2.4 P5 adds migration 021 on top of 020; WP2.5 itself added no migration.
         from alembic.script import ScriptDirectory
 
-        heads = ScriptDirectory(str(_REPO / "infra/alembic")).get_heads()
-        assert heads == ["020"]
+        script = ScriptDirectory(str(_REPO / "infra/alembic"))
+        heads = script.get_heads()
+        assert len(heads) == 1
+        ancestry = {r.revision for r in script.walk_revisions(base="base", head=heads[0])}
+        assert "020" in ancestry
+        assert script.get_revision("020").down_revision == "019"
 
     def test_the_orm_metadata_gained_no_wp25_column(self) -> None:
         for table in (RunORM.__table__, OptimizationRunORM.__table__):
