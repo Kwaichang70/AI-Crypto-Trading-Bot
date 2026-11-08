@@ -44,6 +44,20 @@ import structlog
 from pydantic import BaseModel, Field
 
 from common.logging import exc_log_fields
+from data.provider_bands import (
+    CHANGE_24H_MAX,
+    CHANGE_24H_MIN,
+    COINGECKO_PROVIDER_STALE_MS,
+    DOMINANCE_MAX,
+    DOMINANCE_MIN_EXCLUSIVE,
+    Reject,
+    in_band,
+    mapping,
+    require,
+    to_decimal,
+    unix_seconds,
+)
+from data.provider_http import MAX_BYTES_COINGECKO, Err, Ok, fetch_json
 
 __all__ = [
     "CoinGeckoSnapshot",
@@ -304,6 +318,38 @@ class CoinGeckoClient:
                 return self._latest_cache[0]
             return None
 
+    async def fetch_validated(self, *, now_ms: int | None = None) -> Ok[CoinGeckoSnapshot] | Err:
+        """One strict ``/global`` fetch. Never reads or writes a cache (SY-01-21b).
+
+        ``btc`` is required (no 0.0 default). ``data.updated_at``, when present, older than
+        ``COINGECKO_PROVIDER_STALE_MS`` (cap/4) is ``provider_stale``.
+        """
+        fetch_ms = now_ms if now_ms is not None else int(datetime.now(UTC).timestamp() * 1000)
+        try:
+            session = await self._get_session()
+            got = await fetch_json(
+                session,
+                _ENDPOINT,
+                params=None,
+                max_bytes=MAX_BYTES_COINGECKO,
+            )
+            if isinstance(got, Err):
+                self._log.debug("coingecko_client.fetch_validated_err", outcome=got.outcome)
+                return got
+            snapshot = _validate_global(got.value, fetch_ms)
+        except Reject as rej:
+            self._log.debug("coingecko_client.fetch_validated_invalid", reason=rej.reason)
+            return Err("invalid_payload", rej.reason)
+        except Exception as exc:
+            self._log.warning("coingecko_client.fetch_validated_error", **exc_log_fields(exc))
+            return Err("invalid_payload", "internal_error")
+        self._log.debug("coingecko_client.fetch_validated_ok")
+        return Ok(snapshot)
+
+    def adopt_validated(self, snapshot: CoinGeckoSnapshot, *, now_mono: float) -> None:
+        """Sole writer of ``_latest_cache`` for validated snapshots (SY-01-21b)."""
+        self._latest_cache = (snapshot, now_mono)
+
     async def fetch_btc_dominance_history(
         self,
         days: int = 30,
@@ -412,9 +458,7 @@ class CoinGeckoClient:
                 "coingecko_client.btc_dom_history_fetch_failed",
                 **exc_log_fields(exc),
             )
-            self._log.debug(
-                "coingecko_client.btc_dom_history_fetch_failed.trace", exc_info=exc
-            )
+            self._log.debug("coingecko_client.btc_dom_history_fetch_failed.trace", exc_info=exc)
             if self._btc_dom_history is not None:
                 self._log.debug("coingecko_client.btc_dom_history_stale_cache_used")
                 return self._btc_dom_history
@@ -604,3 +648,29 @@ class CoinGeckoClient:
             total_volume_change_24h=total_volume_change_24h,
             timestamp=datetime.now(UTC),
         )
+
+
+def _validate_global(payload: object, fetch_ms: int) -> CoinGeckoSnapshot:
+    """Strict parse of ``/global``; raises :class:`Reject` with a closed reason.
+
+    The two 24h change fields are display-only (not served): optional, but banded when present.
+    """
+    data = mapping(require(payload, "data"))
+    share = require(require(data, "market_cap_percentage"), "btc")
+    dominance = in_band(to_decimal(share), DOMINANCE_MIN_EXCLUSIVE, DOMINANCE_MAX, low_open=True)
+    changes: list[float] = []
+    for key in ("market_cap_change_percentage_24h_usd", "total_volume_change_percentage_24h"):
+        if key in data:
+            changes.append(float(in_band(to_decimal(data[key]), CHANGE_24H_MIN, CHANGE_24H_MAX)))
+        else:
+            changes.append(0.0)
+    if "updated_at" in data:
+        age_ms = fetch_ms - unix_seconds(data["updated_at"]) * 1000
+        if age_ms > COINGECKO_PROVIDER_STALE_MS:
+            raise Reject("provider_stale")
+    return CoinGeckoSnapshot(
+        btc_dominance=float(dominance),
+        market_cap_change_24h=changes[0],
+        total_volume_change_24h=changes[1],
+        timestamp=datetime.fromtimestamp(fetch_ms / 1000, tz=UTC),
+    )

@@ -43,6 +43,19 @@ import structlog
 from pydantic import BaseModel, Field, field_validator
 
 from common.logging import exc_log_fields
+from data.provider_bands import (
+    FGI_MAX,
+    FGI_MIN,
+    FGI_PAGE_LIMIT,
+    Reject,
+    fgi_label,
+    in_band,
+    require,
+    sequence,
+    to_decimal,
+    unix_seconds,
+)
+from data.provider_http import MAX_BYTES_FGI, Err, Ok, fetch_json
 
 __all__ = [
     "FearGreedSnapshot",
@@ -271,9 +284,7 @@ class FearGreedClient:
                 **exc_log_fields(exc),
                 type="latest",
             )
-            self._log.debug(
-                "fear_greed_client.fetch_failed.trace", type="latest", exc_info=exc
-            )
+            self._log.debug("fear_greed_client.fetch_failed.trace", type="latest", exc_info=exc)
             # Return stale cache if available rather than None
             if self._latest_cache is not None:
                 self._log.debug("fear_greed_client.stale_cache_used")
@@ -300,13 +311,15 @@ class FearGreedClient:
             history, fetched_at = self._history_cache
             if self._is_cache_valid(fetched_at):
                 self._log.debug("fear_greed_client.cache_hit", type="history")
-                return history
+                return self._newest(history, limit)
 
         try:
             session = await self._get_session()
+            # SY-01-21e (CF-24-09): always request the maximum, cache the full list,
+            # and serve the newest ``min(limit, 30)`` points from every path.
             async with session.get(
                 _FNG_API_URL,
-                params={"limit": min(limit, 30), "format": "json"},
+                params={"limit": 30, "format": "json"},
             ) as response:
                 response.raise_for_status()
                 data = await response.json(content_type=None)
@@ -317,7 +330,7 @@ class FearGreedClient:
                 "fear_greed_client.history_fetched",
                 count=len(history),
             )
-            return history
+            return self._newest(history, limit)
 
         except Exception as exc:
             self._log.warning(
@@ -325,12 +338,57 @@ class FearGreedClient:
                 **exc_log_fields(exc),
                 type="history",
             )
-            self._log.debug(
-                "fear_greed_client.fetch_failed.trace", type="history", exc_info=exc
-            )
+            self._log.debug("fear_greed_client.fetch_failed.trace", type="history", exc_info=exc)
             if self._history_cache is not None:
-                return self._history_cache[0]
+                return self._newest(self._history_cache[0], limit)
             return []
+
+    @staticmethod
+    def _newest(history: list[FearGreedSnapshot], limit: int) -> list[FearGreedSnapshot]:
+        """Newest ``min(limit, 30)`` points by timestamp; never reorders the cached list."""
+        newest = sorted(history, key=lambda s: s.timestamp, reverse=True)
+        return newest[: max(0, min(limit, 30))]
+
+    # ------------------------------------------------------------------
+    # CF-24-01 P2: side-effect-free validated fetch + the only cache writer
+    # ------------------------------------------------------------------
+
+    async def fetch_validated(self) -> Ok[list[FearGreedSnapshot]] | Err:
+        """One strict ``limit=30`` fetch. Never reads or writes a cache (SY-01-21b).
+
+        Returns ``Ok(list30)`` in provider order, or ``Err(outcome)``. Day stamps must be
+        midnight UTC; the classification is derived from the value (5 fixed labels).
+        """
+        try:
+            session = await self._get_session()
+            got = await fetch_json(
+                session,
+                _FNG_API_URL,
+                params={"limit": FGI_PAGE_LIMIT, "format": "json"},
+                max_bytes=MAX_BYTES_FGI,
+                allow_text_plain=True,
+            )
+            if isinstance(got, Err):
+                self._log.debug("fear_greed_client.fetch_validated_err", outcome=got.outcome)
+                return got
+            history = _validate_history(got.value)
+        except Reject as rej:
+            self._log.debug("fear_greed_client.fetch_validated_invalid", reason=rej.reason)
+            return Err("invalid_payload", rej.reason)
+        except Exception as exc:
+            self._log.warning("fear_greed_client.fetch_validated_error", **exc_log_fields(exc))
+            return Err("invalid_payload", "internal_error")
+        self._log.debug("fear_greed_client.fetch_validated_ok", count=len(history))
+        return Ok(history)
+
+    def adopt_validated(self, snapshot: list[FearGreedSnapshot], *, now_mono: float) -> None:
+        """Sole writer of the caches (N-1/A-1): ``_latest_cache`` = newest point,
+        ``_history_cache`` = the same list object, in the unchanged tuple shape."""
+        if not snapshot:
+            raise ValueError("fgi_adopt_empty")
+        newest = max(snapshot, key=lambda s: s.timestamp)
+        self._latest_cache = (newest, now_mono)
+        self._history_cache = (snapshot, now_mono)
 
     async def get_history_as_series(
         self, limit: int = 30,
@@ -346,11 +404,9 @@ class FearGreedClient:
         Parameters
         ----------
         limit:
-            Number of historical points to fetch (capped at 30 by the
-            underlying API).  The ``limit`` parameter only takes effect
-            on a cache miss; a cached response with more points than
-            ``limit`` will return all cached points (see ``get_history``
-            cache contract).
+            Number of historical points to return (at most 30).
+            ``get_history`` always requests 30 points, caches the full
+            list and returns the newest ``min(limit, 30)`` (SY-01-21e).
 
         Returns
         -------
@@ -413,10 +469,9 @@ class FearGreedClient:
 
         Cache caveat
         ------------
-        ``get_history``'s cache is not keyed by ``limit``.  If a prior
-        call populated the cache with a smaller ``limit`` than required
-        here, the closest-match search may miss and return ``None`` --
-        a DEBUG log records the cache shortfall when this happens.
+        ``get_history`` always requests 30 points, caches the full list
+        and returns the newest ``min(limit, 30)`` (SY-01-21e).  A shortfall
+        here is therefore a provider gap, not a cache-key effect.
 
         Parameters
         ----------
@@ -551,3 +606,31 @@ class FearGreedClient:
             classification=str(item.get("value_classification", "Unknown")),
             timestamp=item["timestamp"],
         )
+
+
+def _validate_history(payload: object) -> list[FearGreedSnapshot]:
+    """Strict parse of the alternative.me body; raises :class:`Reject` with a closed reason."""
+    rows = sequence(require(payload, "data"))
+    if not 1 <= len(rows) <= FGI_PAGE_LIMIT:
+        raise Reject("bad_shape")
+    history: list[FearGreedSnapshot] = []
+    seen: set[int] = set()
+    for row in rows:
+        number = in_band(to_decimal(require(row, "value")), FGI_MIN, FGI_MAX)
+        if number != number.to_integral_value():
+            raise Reject("bad_number")
+        day = unix_seconds(require(row, "timestamp"))
+        if day % 86400 != 0:
+            raise Reject("bad_timestamp")
+        if day in seen:
+            raise Reject("bad_shape")
+        seen.add(day)
+        value = int(number)
+        history.append(
+            FearGreedSnapshot(
+                value=value,
+                classification=fgi_label(value),
+                timestamp=datetime.fromtimestamp(day, tz=UTC),
+            )
+        )
+    return history
