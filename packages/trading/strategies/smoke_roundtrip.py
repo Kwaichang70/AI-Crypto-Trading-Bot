@@ -140,6 +140,8 @@ class SmokeRoundtripStrategy(BaseStrategy):
     # (ST-27 in test_wp13a_exit_config.py).
     requires_exit_manager: ClassVar[bool] = True
     default_allow_pyramiding: ClassVar[bool] = False
+    # WP2.4 (SY-24-06): on_bar reads no external signal field.
+    consumes_mtf_signals: ClassVar[frozenset[str]] = frozenset()
 
     def __init__(self, strategy_id: str, params: dict[str, Any] | None = None) -> None:
         super().__init__(strategy_id, params)

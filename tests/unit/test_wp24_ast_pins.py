@@ -154,6 +154,8 @@ def ingestion_references(src: str) -> list[str]:
             name = node.id if isinstance(node, ast.Name) else node.attr
             if name in _INGESTION_ONLY:
                 scopes.add(owner.get(node, "<module>"))
+        elif isinstance(node, ast.alias) and node.name.split(".")[-1] in _INGESTION_ONLY:
+            scopes.add(owner.get(node, "<module>"))  # ``from m import helper as _h``
     return sorted(scopes)
 
 
@@ -900,3 +902,387 @@ class TestEngineAstPin:
         assert engine_wiring_problems(src) == []
         problems = engine_wiring_problems(src.replace(old, new))
         assert f"__init__ guard missing: {needle}" in problems, problems
+
+
+# ===========================================================================
+# WP2.4 P2 carry-forwards (p1-synthesis.md section 6)
+#   CF-P1-02  PitSignals.select joins the lag / ingestion / no-swallow pins
+#   CF-P1-04  production name-reference allowlist for the live and backtest sources
+# ===========================================================================
+
+_SELECT_SIGNATURE = ["self", "decision_times", "fields"]
+
+
+def pit_select_problems(src: str) -> list[str]:
+    """CF-P1-02: ``PitSignals.select`` takes no lag, reaches no ingestion helper or lag constant.
+
+    Same shape as :func:`pit_join_problems` (which keeps pinning ``values_at`` unchanged). The
+    "no ``except`` anywhere but the moved live block" half is :func:`swallow_problems` (E1): a
+    handler in ``select`` is reported there as ``except handler outside LiveSignals.values_at``.
+    """
+    tree = ast.parse(src)
+    klass = next(
+        (n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "PitSignals"), None
+    )
+    fn = next(
+        (n for n in (klass.body if klass else [])
+         if isinstance(n, ast.FunctionDef) and n.name == "select"),
+        None,
+    )
+    if fn is None:
+        return ["missing: PitSignals.select"]
+    args = fn.args
+    names = [a.arg for a in (*args.posonlyargs, *args.args, *args.kwonlyargs)]
+    out: list[str] = []
+    if args.vararg or args.kwarg:
+        out.append("lag: select takes *args/**kwargs")
+    out += [f"lag: select parameter {n}" for n in names if "lag" in n.lower()]
+    if names != _SELECT_SIGNATURE:
+        out.append(f"lag: select signature {names}")
+    used = {n.id for n in ast.walk(fn) if isinstance(n, ast.Name)} | {
+        n.attr for n in ast.walk(fn) if isinstance(n, ast.Attribute)
+    } | {n.name for n in ast.walk(fn) if isinstance(n, ast.alias)}
+    banned = _LAG_CONSTANTS | _INGESTION_ONLY
+    out += [f"lag: select references {n}" for n in sorted(used & banned)]
+    return out
+
+
+class TestCfP102SelectPin:
+    def test_select_takes_no_lag_and_never_reaches_the_ingestion_helpers(self) -> None:
+        src = _SIGNALS.read_text()
+        assert pit_select_problems(src) == []
+        assert pit_join_problems(src) == []  # values_at stays pinned as before
+        assert ingestion_references(src) == []
+        assert swallow_problems(src) == []
+
+    def test_the_expected_ingestion_sites_are_unchanged(self) -> None:
+        assert _EXPECTED_INGESTION_SITES == [
+            "parse_jsonl_lines -> available_at_estimated",
+            "parse_jsonl_lines -> available_at_vintage",
+        ]
+        assert ingestion_call_sites(_LEAF.read_text()) == _EXPECTED_INGESTION_SITES
+
+    @pytest.mark.parametrize(
+        ("old", "new", "expected"),
+        [
+            ("        self, decision_times: Iterable[datetime], fields: Iterable[str]\n"
+             "    ) -> tuple[BacktestSignalSource, MtfContextReport]:",
+             "        self, decision_times: Iterable[datetime], fields: Iterable[str],"
+             " offset_ms: int = 0\n    ) -> tuple[BacktestSignalSource, MtfContextReport]:",
+             "lag: select signature ['self', 'decision_times', 'fields', 'offset_ms']"),
+            ("        self, decision_times: Iterable[datetime], fields: Iterable[str]\n"
+             "    ) -> tuple[BacktestSignalSource, MtfContextReport]:",
+             "        self, decision_times: Iterable[datetime], fields: Iterable[str],"
+             " *, lag_ms: int = 0\n    ) -> tuple[BacktestSignalSource, MtfContextReport]:",
+             "lag: select parameter lag_ms"),
+            ("        self, decision_times: Iterable[datetime], fields: Iterable[str]\n"
+             "    ) -> tuple[BacktestSignalSource, MtfContextReport]:",
+             "        self, fields: Iterable[str], decision_times: Iterable[datetime]\n"
+             "    ) -> tuple[BacktestSignalSource, MtfContextReport]:",
+             "lag: select signature ['self', 'fields', 'decision_times']"),
+            ("        decisions = tuple(to_ms(moment) for moment in decision_times)",
+             "        decisions = tuple(to_ms(moment) - _FGI_LAG_MS for moment in decision_times)",
+             "lag: select references _FGI_LAG_MS"),
+            ("        decisions = tuple(to_ms(moment) for moment in decision_times)",
+             "        decisions = (available_at_estimated('x', 0),)",
+             "lag: select references available_at_estimated"),
+        ],
+    )
+    def test_select_pin_fails_on_mutated_source(self, old: str, new: str, expected: str) -> None:
+        src = _SIGNALS.read_text()
+        assert src.count(old) == 1, "mutation anchor drifted: update this test"
+        assert pit_select_problems(src) == []
+        problems = pit_select_problems(src.replace(old, new))
+        assert expected in problems, problems
+
+    def test_select_pin_reports_a_missing_method_instead_of_raising(self) -> None:
+        src = _SIGNALS.read_text()
+        old = "    def select(\n"
+        assert src.count(old) == 1
+        assert pit_select_problems(src.replace(old, "    def choose(\n")) == [
+            "missing: PitSignals.select"
+        ]
+
+    def test_an_ingestion_alias_inside_select_is_caught_by_the_reference_scan(self) -> None:
+        src = _SIGNALS.read_text()
+        old = "        decisions = tuple(to_ms(moment) for moment in decision_times)"
+        assert src.count(old) == 1
+        mutated = src.replace(old, "        _est = available_at_estimated\n" + old)
+        assert ingestion_references(mutated) == ["select"]
+
+    def test_an_import_alias_inside_select_is_caught(self) -> None:
+        # CR-06: ``from m import helper as _v; _v(0)`` has no Name/Attribute node for the helper
+        src = _SIGNALS.read_text()
+        old = "        decisions = tuple(to_ms(moment) for moment in decision_times)"
+        assert src.count(old) == 1
+        mutated = src.replace(
+            old,
+            "        from data.point_in_time import available_at_vintage as _v\n"
+            "        _v(0)\n" + old,
+        )
+        assert "lag: select references available_at_vintage" in pit_select_problems(mutated)
+        assert ingestion_references(mutated) == ["select"]
+        assert pit_select_problems(src) == [] and ingestion_references(src) == []
+
+    def test_an_except_handler_in_select_is_caught_by_the_swallow_pin(self) -> None:
+        src = _SIGNALS.read_text()
+        old = (
+            "        decisions = tuple(to_ms(moment) for moment in decision_times)"
+            "  # naive -> PitError\n"
+        )
+        assert src.count(old) == 1, "mutation anchor drifted: update this test"
+        assert swallow_problems(src) == []
+        mutated = src.replace(
+            old,
+            "        try:\n            decisions = tuple(to_ms(m) for m in decision_times)\n"
+            "        except PitError:\n            decisions = ()\n",
+        )
+        assert "except handler outside LiveSignals.values_at: PitSignals.select" in (
+            swallow_problems(mutated)
+        )
+
+    def test_coverage_code_added_to_the_module_is_covered_by_the_same_swallow_pin(self) -> None:
+        src = _SIGNALS.read_text()
+        anchor = "\n\ndef check_backtest_source("
+        assert src.count(anchor) == 1
+        extra = (
+            "\n\ndef _coverage_helper(x: int) -> int:\n    try:\n        return x\n"
+            "    except Exception:\n        return 0"
+        )
+        assert "except handler outside LiveSignals.values_at: _coverage_helper" in (
+            swallow_problems(src.replace(anchor, extra + anchor))
+        )
+
+
+# --- CF-P1-04: who may name the live / backtest sources ---------------------
+
+_MTF = "packages/trading/mtf_signals.py"
+_ENGINE_REL = "packages/trading/strategy_engine.py"
+_RUNNER_REL = "packages/trading/backtest.py"
+_RUNNER = _REPO / "packages" / "trading" / "backtest.py"
+_OPTIMIZER_REL = "packages/trading/optimizer.py"
+_STRATEGY_REL = "packages/trading/strategy.py"
+_LIVE_NAMES = frozenset({"LIVE_SIGNALS", "LiveSignals"})
+_SOURCE_NAME = "BacktestSignalSource"
+#: LIVE_SIGNALS / LiveSignals: the module that defines them and the engine that guards them.
+_LIVE_ALLOWED = frozenset({_MTF, _ENGINE_REL})
+#: BacktestSignalSource: those two plus the runner / optimizer sites that take the source parameter.
+_SOURCE_ALLOWED = _LIVE_ALLOWED | {_RUNNER_REL, _OPTIMIZER_REL}
+#: Who may import the module at all (strategy.py only for ``ALL_MTF_SIGNAL_FIELDS``).
+_MODULE_IMPORTERS = _SOURCE_ALLOWED | {_STRATEGY_REL}
+_ALLOWED_SUBCLASSES = frozenset({"UnavailableSignals", "PitSignals"})
+_META_CALLS = frozenset({"new_class", "ABCMeta"})
+
+
+def production_files() -> list[tuple[str, Path]]:
+    """Every production ``.py`` under ``packages/`` and ``apps/`` (tests and caches excluded)."""
+    out: list[tuple[str, Path]] = []
+    for root in ("packages", "apps"):
+        for path in sorted((_REPO / root).rglob("*.py")):
+            rel = path.relative_to(_REPO)
+            parts = rel.parts
+            if any(p in {"tests", "__pycache__", ".venv", "node_modules"} for p in parts):
+                continue
+            if path.name.startswith("test_") or path.name == "conftest.py":
+                continue
+            out.append((rel.as_posix(), path))
+    return out
+
+
+def _mentions(node: ast.AST, name: str) -> bool:
+    return any(
+        (isinstance(n, ast.Name) and n.id == name)
+        or (isinstance(n, ast.Attribute) and n.attr == name)
+        or (isinstance(n, ast.Constant) and n.value == name)
+        for n in ast.walk(node)
+    )
+
+
+def _is_module_import(node: ast.AST) -> bool:
+    if isinstance(node, ast.ImportFrom):
+        mod = (node.module or "").split(".")[-1]
+        return mod == "mtf_signals" or any(a.name == "mtf_signals" for a in node.names)
+    if isinstance(node, ast.Import):
+        return any(a.name.split(".")[-1] == "mtf_signals" for a in node.names)
+    return False
+
+
+def name_reference_problems(rel: str, src: str) -> list[str]:
+    """CF-P1-04 / SEC-R2-03: the name allowlist, the importer allowlist and the construction ban."""
+    tree = ast.parse(src)
+    out: list[str] = []
+    for node in ast.walk(tree):
+        name: str | None = None
+        if isinstance(node, ast.Name):
+            name = node.id
+        elif isinstance(node, ast.Attribute):
+            name = node.attr
+        elif isinstance(node, ast.alias):
+            name = node.name.split(".")[-1]
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            name = node.value
+        if name in _LIVE_NAMES and rel not in _LIVE_ALLOWED:
+            out.append(f"{rel}: {name} referenced outside {sorted(_LIVE_ALLOWED)}")
+        elif name == _SOURCE_NAME and rel not in _SOURCE_ALLOWED:
+            out.append(f"{rel}: {name} referenced outside {sorted(_SOURCE_ALLOWED)}")
+
+        if _is_module_import(node):
+            if rel not in _MODULE_IMPORTERS:
+                allowed = sorted(_MODULE_IMPORTERS)
+                out.append(f"{rel}: imports trading.mtf_signals outside {allowed}")
+            if isinstance(node, ast.ImportFrom) and any(a.name == "*" for a in node.names):
+                out.append(f"{rel}: star import of mtf_signals")
+        if (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and node.value.split(".")[-1] == "mtf_signals"
+            and "." in node.value
+            and rel not in _MODULE_IMPORTERS
+        ):
+            out.append(f"{rel}: dynamic reference to the mtf_signals module")
+
+        if isinstance(node, ast.ClassDef):
+            heads = [*node.bases, *(k.value for k in node.keywords)]
+            if any(_mentions(h, _SOURCE_NAME) for h in heads):
+                if rel != _MTF:
+                    out.append(f"{rel}: class {node.name} derives from {_SOURCE_NAME}")
+                elif node.name not in _ALLOWED_SUBCLASSES:
+                    out.append(f"{rel}: unexpected subclass {node.name} of {_SOURCE_NAME}")
+            if node.name == _SOURCE_NAME and rel == _MTF:
+                if [ast.unparse(b) for b in node.bases] != ["abc.ABC"] or node.keywords:
+                    out.append(f"{rel}: {_SOURCE_NAME} must be a plain abc.ABC subclass")
+                hooks = {
+                    n.name for n in node.body if isinstance(n, ast.FunctionDef)
+                } & {"__subclasshook__", "__instancecheck__", "__subclasscheck__", "register"}
+                out += [f"{rel}: {_SOURCE_NAME} defines {h}" for h in sorted(hooks)]
+
+        if isinstance(node, ast.Call) and rel in _SOURCE_ALLOWED:
+            func = node.func
+            fname = func.id if isinstance(func, ast.Name) else getattr(func, "attr", "")
+            if fname == "register":
+                out.append(f"{rel}: .register( call in a file that names the sources")
+            if fname in _META_CALLS:
+                out.append(f"{rel}: {fname}( in a file that names the sources")
+            if isinstance(func, ast.Name) and func.id == "type" and len(node.args) == 3:
+                out.append(f"{rel}: three-argument type( in a file that names the sources")
+    return out
+
+
+class TestCfP104NameReferenceAllowlist:
+    def test_the_production_tree_passes(self) -> None:
+        files = production_files()
+        assert len(files) > 50  # the scan really sees the tree
+        assert _MTF in {rel for rel, _ in files}
+        problems = [
+            p for rel, path in files for p in name_reference_problems(rel, path.read_text())
+        ]
+        assert problems == []
+
+    def test_the_allowlists_are_tight_not_stale(self) -> None:
+        live: set[str] = set()
+        source: set[str] = set()
+        for rel, path in production_files():
+            tree = ast.parse(path.read_text())
+            for name in (_SOURCE_NAME, *_LIVE_NAMES):
+                if _mentions(tree, name) or any(
+                    isinstance(n, ast.alias) and n.name == name for n in ast.walk(tree)
+                ):
+                    (live if name in _LIVE_NAMES else source).add(rel)
+        assert live == set(_LIVE_ALLOWED)
+        assert source == set(_SOURCE_ALLOWED)
+
+    def test_only_the_expected_files_import_the_module(self) -> None:
+        importers = {
+            rel
+            for rel, path in production_files()
+            if any(_is_module_import(n) for n in ast.walk(ast.parse(path.read_text())))
+        }
+        assert importers == set(_MODULE_IMPORTERS) - {_MTF}  # the module never imports itself
+
+    def test_the_two_real_subclasses_are_the_only_ones(self) -> None:
+        tree = ast.parse(_SIGNALS.read_text())
+        subs = sorted(
+            n.name
+            for n in tree.body
+            if isinstance(n, ast.ClassDef) and any(_mentions(b, _SOURCE_NAME) for b in n.bases)
+        )
+        assert subs == sorted(_ALLOWED_SUBCLASSES)
+
+    @pytest.mark.parametrize(
+        ("rel", "src", "needle"),
+        [
+            ("packages/trading/other.py", "x = LIVE_SIGNALS\n", "LIVE_SIGNALS referenced outside"),
+            ("packages/trading/other.py", "from trading.mtf_signals import LiveSignals\n",
+             "LiveSignals referenced outside"),
+            ("apps/api/routers/runs.py", "import trading.mtf_signals as m\ny = m.LIVE_SIGNALS\n",
+             "imports trading.mtf_signals outside"),
+            ("packages/trading/backtest.py", "x = LIVE_SIGNALS\n",
+             "LIVE_SIGNALS referenced outside"),
+            ("packages/trading/optimizer.py", "def f(s: LiveSignals) -> None: ...\n",
+             "LiveSignals referenced outside"),
+            ("packages/trading/other.py", "y = getattr(m, 'BacktestSignalSource')\n",
+             "BacktestSignalSource referenced outside"),
+            ("packages/trading/other.py", "from trading import mtf_signals\n",
+             "imports trading.mtf_signals outside"),
+            ("packages/trading/other.py", "from trading.mtf_signals import *\n",
+             "star import of mtf_signals"),
+            ("packages/trading/other.py", "m = importlib.import_module('trading.mtf_signals')\n",
+             "dynamic reference to the mtf_signals module"),
+            ("packages/trading/other.py",
+             "class Evil(BacktestSignalSource):\n    pass\n",
+             "class Evil derives from BacktestSignalSource"),
+            ("packages/trading/backtest.py",
+             "class Evil(BacktestSignalSource):\n    pass\n",
+             "class Evil derives from BacktestSignalSource"),
+            ("packages/trading/backtest.py",
+             "class Evil(abc.ABC, metaclass=BacktestSignalSource):\n    pass\n",
+             "class Evil derives from BacktestSignalSource"),
+            ("packages/trading/mtf_signals.py",
+             "class Evil(BacktestSignalSource):\n    pass\n",
+             "unexpected subclass Evil of BacktestSignalSource"),
+            ("packages/trading/backtest.py",
+             "BacktestSignalSource.register(Evil)\n",
+             ".register( call in a file that names the sources"),
+            ("packages/trading/strategy_engine.py",
+             "_b = BacktestSignalSource\n_b.register(Evil)\n",
+             ".register( call in a file that names the sources"),
+            ("packages/trading/backtest.py",
+             "Evil = type('Evil', (BacktestSignalSource,), {})\n",
+             "three-argument type( in a file that names the sources"),
+            ("packages/trading/optimizer.py",
+             "Evil = abc.ABCMeta('Evil', (BacktestSignalSource,), {})\n",
+             "ABCMeta( in a file that names the sources"),
+            ("packages/trading/optimizer.py",
+             "Evil = types.new_class('Evil', (BacktestSignalSource,))\n",
+             "new_class( in a file that names the sources"),
+        ],
+    )
+    def test_the_pin_fails_on_every_route(self, rel: str, src: str, needle: str) -> None:
+        problems = name_reference_problems(rel, src)
+        assert any(needle in p for p in problems), problems
+
+    def test_the_pin_fails_on_a_mutated_real_file(self) -> None:
+        src = _RUNNER.read_text()
+        assert name_reference_problems(_RUNNER_REL, src) == []
+        assert name_reference_problems(
+            _RUNNER_REL, src + "\nclass _Evil(BacktestSignalSource):\n    pass\n"
+        )
+        sig = _SIGNALS.read_text()
+        assert name_reference_problems(_MTF, sig) == []
+        assert name_reference_problems(
+            _MTF, sig.replace("class BacktestSignalSource(abc.ABC):",
+                              "class BacktestSignalSource(abc.ABC, metaclass=abc.ABCMeta):")
+        )
+        hooked = sig.replace(
+            "    mode: ClassVar[str]\n\n    @abc.abstractmethod",
+            "    mode: ClassVar[str]\n\n    @classmethod\n"
+            "    def __subclasshook__(cls, other: type) -> bool:\n        return True\n\n"
+            "    @abc.abstractmethod",
+        )
+        assert hooked != sig
+        assert any("defines __subclasshook__" in p for p in name_reference_problems(_MTF, hooked))
+
+    def test_the_pin_is_blind_to_tests_by_design(self) -> None:
+        # tests may subclass the source (the P1 guard tests do): they are not production files
+        assert all("/tests/" not in rel and not Path(rel).name.startswith("test_")
+                   for rel, _ in production_files())

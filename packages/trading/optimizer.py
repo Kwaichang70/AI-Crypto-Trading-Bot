@@ -33,6 +33,7 @@ from data.bar_alignment import (
     AlignmentReport,
     AlignmentTolerance,
     BarAlignmentError,
+    Step,
     align_bars,
     check_alignment,
     fold_check,
@@ -45,6 +46,12 @@ from trading.backtest import (
 from trading.costs import CostProfile, default_cost_profile
 from trading.exit_config import policy_cost_model, validate_param_grid_exit_config
 from trading.metrics import BacktestResult
+from trading.mtf_signals import (
+    BacktestSignalSource,
+    MtfContextReport,
+    check_backtest_source,
+    select_mtf_signals,
+)
 from trading.safety import BACKTEST_CIRCUIT_BREAKER_DEFAULT
 from trading.strategy import BaseStrategy
 from trading.strategy_engine import (
@@ -157,6 +164,21 @@ class ParameterOptimizer:
     alignment_tolerance :
         WP2.3 (SY-23-03): tests and scripts only (never an API field).
         ``None`` -> ``DEFAULT_ALIGNMENT_TOLERANCE``.
+    mtf_signals :
+        WP2.4 (SY-24-05, T-24): the point-in-time signal source (scripts and tests; never
+        an API field in Phase A).  ``None`` -> ``UNAVAILABLE``: results equal the pre-P2
+        ones.  Selected ONCE per ``run`` over the whole aligned window: every timeline
+        step ``k`` in ``[0, N)`` is a decision (warm-up 0), because the warm-up depends on
+        each combination.  This is a superset of every combination's trading decisions
+        ``[W_c, N)``.  It is PIT-safe (every served value is still ``asof(close_i)``; never
+        look-ahead) but NOT monotone.  When coverage holes are early (a late-starting
+        series, the QD-14 case), a field fails toward OFF.  With interior holes, a field
+        can be ON although its hole share in a combination's trading window exceeds 1%,
+        bounded by ``floor(0.01 * N) / (N - W_c)``.  So an optimize run's statuses can
+        differ from a single ``BacktestRunner`` run of the same combination on the same
+        data, in either direction.  Every combination and walk-forward fold then shares
+        the SAME immutable selected source, and the inner runners skip coverage.  The
+        consumed fields are the strategy CLASS's ``consumes_mtf_signals``.
     """
 
     def __init__(
@@ -176,7 +198,9 @@ class ParameterOptimizer:
         walk_forward_mode: str = "expanding",
         enable_circuit_breaker: bool = BACKTEST_CIRCUIT_BREAKER_DEFAULT,
         alignment_tolerance: AlignmentTolerance | None = None,
+        mtf_signals: BacktestSignalSource | None = None,
     ) -> None:
+        check_backtest_source(mtf_signals)  # CF-P1-01: type name only in the message
         if not param_grid:
             raise ValueError("param_grid must contain at least one parameter")
         if rank_by not in SUPPORTED_METRICS:
@@ -210,6 +234,9 @@ class ParameterOptimizer:
             alignment_tolerance if alignment_tolerance is not None else DEFAULT_ALIGNMENT_TOLERANCE
         )
         self._last_alignment: AlignmentReport | None = None
+        self._mtf_signals: BacktestSignalSource | None = mtf_signals
+        self._mtf_selected: BacktestSignalSource | None = None
+        self._last_mtf_context: MtfContextReport | None = None
         self._walk_forward = walk_forward
         self._walk_forward_folds = walk_forward_folds
         self._walk_forward_train_fraction = walk_forward_train_fraction
@@ -260,6 +287,14 @@ class ParameterOptimizer:
         return self._last_alignment
 
     @property
+    def last_mtf_context(self) -> MtfContextReport | None:
+        """The WP2.4 MTF-context report of the most recent ``run`` (one per run).
+
+        ``None`` until the run has selected its source (reset at every ``run`` entry).
+        """
+        return self._last_mtf_context
+
+    @property
     def total_combinations(self) -> int:
         """Total number of parameter combinations to evaluate."""
         return len(self._combinations)
@@ -296,8 +331,19 @@ class ParameterOptimizer:
             WP2.3 (SY-23-18): the bars are aligned and checked ONCE, before any
             combination (for walk-forward including every test-fold window).  It
             is never swallowed into ``failed_combinations``.
+        PitError
+            WP2.4 (CF-P1-01): with a ``PitSignals`` source and a consuming strategy, a
+            naive bar timestamp (``pit_naive_time``) or an unknown consumed field
+            (``pit_unknown_series``).  Raised by the ONE selection before any combination
+            and never swallowed into ``failed_combinations``.  A ``ValueError``.
+        ValueError
+            WP2.4: ``mtf_signals`` is a ``BacktestSignalSource`` subclass other than
+            ``UnavailableSignals`` / ``PitSignals`` (type name only).  Raised before any
+            combination.
         """
         self._last_alignment = None  # WP2.3 CR-04: no stale report from an earlier run
+        self._last_mtf_context = None  # WP2.4: same rule
+        self._mtf_selected = None
         self._log.info(
             "optimizer.starting",
             combinations=len(self._combinations),
@@ -306,7 +352,8 @@ class ParameterOptimizer:
         )
         start_time = time.monotonic()
 
-        aligned_bars, folds = self._align_once(bars_by_symbol, requested_window)
+        aligned_bars, folds, timeline = self._align_once(bars_by_symbol, requested_window)
+        self._select_mtf(aligned_bars, timeline)  # once per run, before any combination (T-24)
 
         if self._walk_forward:
             result = await self._run_walk_forward(aligned_bars, start_time, folds=folds)
@@ -336,7 +383,7 @@ class ParameterOptimizer:
         self,
         bars_by_symbol: dict[str, list[OHLCVBar]],
         requested_window: tuple[datetime, datetime] | None,
-    ) -> tuple[dict[str, list[OHLCVBar]], list[WalkForwardFold] | None]:
+    ) -> tuple[dict[str, list[OHLCVBar]], list[WalkForwardFold] | None, tuple[Step, ...]]:
         """Align, record and check the whole run (and every test fold) exactly once.
 
         Returns the aligned (trimmed) bars every inner runner receives with
@@ -379,7 +426,28 @@ class ParameterOptimizer:
             record_bar_alignment_outcome(report, log=self._log)
             raise
         record_bar_alignment_outcome(report, log=self._log)
-        return aligned.bars_by_symbol, folds
+        return aligned.bars_by_symbol, folds, aligned.timeline
+
+    def _select_mtf(
+        self, bars_by_symbol: dict[str, list[OHLCVBar]], timeline: tuple[Step, ...]
+    ) -> None:
+        """WP2.4: choose the run's ONE signal source and report (a bad input raises here).
+
+        Runs outside the per-combination ``try`` (which swallows failures into
+        ``failed_combinations``), so a naive timestamp or a bad source fails the whole run
+        before any combination starts.  The decision of a step is computed from the BARS like
+        the engine's ``close_i`` (latest present bar timestamp + one timeframe): the timeline
+        stamps are always aware and would hide a naive bar.
+        """
+        step = timedelta(seconds=_TIMEFRAME_SECONDS[self._timeframe])
+        self._mtf_selected, self._last_mtf_context = select_mtf_signals(
+            self._mtf_signals,
+            (
+                max(bars_by_symbol[sym][idx].timestamp for sym, idx in item.present) + step
+                for item in timeline
+            ),
+            self._strategy_cls.consumes_mtf_signals,
+        )
 
     def _split_and_check_folds(
         self,
@@ -691,10 +759,14 @@ class ParameterOptimizer:
             allow_pyramiding=allow_pyramiding,
             enable_circuit_breaker=self._enable_circuit_breaker,
             seed=42,
+            mtf_signals=self._mtf_selected,
         )
         # WP2.3 (SY-23-18): the optimizer aligned and checked once; inner runners
         # trim and build the timeline but record nothing and skip the check.
-        return await runner.run(bars_by_symbol, record_alignment=False)
+        # WP2.4 (T-24): likewise the source was selected once; inner runners skip coverage.
+        return await runner.run(
+            bars_by_symbol, record_alignment=False, select_mtf_context=False
+        )
 
     def _extract_metrics(self, result: BacktestResult) -> dict[str, float | None]:
         """Extract the standard metric dict from a BacktestResult.

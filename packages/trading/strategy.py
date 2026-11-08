@@ -27,6 +27,7 @@ import structlog
 
 from common.models import MultiTimeframeContext, OHLCVBar
 from trading.models import Signal
+from trading.mtf_signals import ALL_MTF_SIGNAL_FIELDS
 
 __all__ = ["BaseStrategy", "StrategyMetadata"]
 
@@ -106,6 +107,15 @@ class BaseStrategy(abc.ABC):
     #: (SY-13a-08/E11, D-13a-1).
     default_allow_pyramiding: ClassVar[bool] = False
 
+    #: WP2.4 (SY-24-06): the external signal fields of ``MultiTimeframeContext``
+    #: (``fear_greed_index``, ``btc_dominance``, ``yield_curve_spread``, ``whale_net_flow``,
+    #: their 7d companions, ...) that ``on_bar`` actually reads.  The backtest run decides its
+    #: ``mtf_context`` status over exactly these fields; an empty set means the run never
+    #: receives a point-in-time source (status ``not_used``).  Every registry strategy
+    #: declares it explicitly in its own class body (test-enforced); the fail-closed default
+    #: here is ALL nine fields, so a new, unclassified strategy is treated as a consumer.
+    consumes_mtf_signals: ClassVar[frozenset[str]] = ALL_MTF_SIGNAL_FIELDS
+
     def __init__(self, strategy_id: str, params: dict[str, Any] | None = None) -> None:
         self._strategy_id = strategy_id
         self._params: dict[str, Any] = self._validate_params(params or {})
@@ -144,6 +154,14 @@ class BaseStrategy(abc.ABC):
             Minimum bar count. Default 0 (subclasses override).
         """
         return 0
+
+    def mtf_signal_fields(self) -> frozenset[str]:
+        """The signal fields this strategy instance consumes (SY-24-06).
+
+        The class declaration by default; ``EnsembleStrategy`` overrides it with the union
+        over its sub-strategies.
+        """
+        return self.consumes_mtf_signals
 
     @property
     def htf_timeframes(self) -> list[str]:

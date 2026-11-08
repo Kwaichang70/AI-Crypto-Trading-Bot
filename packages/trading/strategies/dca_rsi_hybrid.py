@@ -411,6 +411,10 @@ class DCARSIHybridStrategy(BaseStrategy):
     # forbidden by E11 unless allowPyramiding=false is explicit.
     requires_exit_manager: ClassVar[bool] = False
     default_allow_pyramiding: ClassVar[bool] = True
+    # WP2.4 (SY-24-06): on_bar reads the Fear & Greed, dominance, yield-curve and whale fields.
+    consumes_mtf_signals: ClassVar[frozenset[str]] = frozenset(
+        {"fear_greed_index", "btc_dominance", "yield_curve_spread", "whale_net_flow"}
+    )
 
     def _validate_params(self, params: dict[str, Any]) -> dict[str, Any]:
         """Validate and coerce parameters via the Pydantic schema."""

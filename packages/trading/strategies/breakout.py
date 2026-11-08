@@ -239,6 +239,8 @@ class BreakoutStrategy(BaseStrategy):
     # WP1.3a (SY-13a-06/08): explicit per-strategy declaration --
     # Emits its own SELL on channel/trend exit (D-13a-2: LIVE warning W8 only, pending CF-13a-6).
     requires_exit_manager: ClassVar[bool] = False
+    # WP2.4 (SY-24-06): on_bar reads no external signal field.
+    consumes_mtf_signals: ClassVar[frozenset[str]] = frozenset()
 
     def _validate_params(self, params: dict[str, Any]) -> dict[str, Any]:
         """

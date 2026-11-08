@@ -201,6 +201,8 @@ class GridTradingStrategy(BaseStrategy):
     # forbidden by E11 unless allowPyramiding=false is explicit.
     requires_exit_manager: ClassVar[bool] = False
     default_allow_pyramiding: ClassVar[bool] = True
+    # WP2.4 (SY-24-06): on_bar reads no external signal field.
+    consumes_mtf_signals: ClassVar[frozenset[str]] = frozenset()
 
     def _validate_params(self, params: dict[str, Any]) -> dict[str, Any]:
         """Validate and coerce parameters via the Pydantic schema."""

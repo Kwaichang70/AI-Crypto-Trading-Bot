@@ -239,6 +239,15 @@ class ModelStrategy(BaseStrategy):
     # Emits its own SELL when the model predicts SELL (D-13a-2: LIVE
     # warning W8 only, pending CF-13a-6).
     requires_exit_manager: ClassVar[bool] = False
+    # WP2.4 (SY-24-06): the v2 feature builder reads the FGI and dominance fields (v1: none).
+    consumes_mtf_signals: ClassVar[frozenset[str]] = frozenset(
+        {
+            "fear_greed_index",
+            "fear_greed_index_7d_ago",
+            "btc_dominance",
+            "btc_dominance_7d_ago",
+        }
+    )
 
     def _validate_params(self, params: dict[str, Any]) -> dict[str, Any]:
         """Validate and coerce parameters via the Pydantic schema."""

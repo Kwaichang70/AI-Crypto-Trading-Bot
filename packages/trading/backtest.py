@@ -92,6 +92,13 @@ from trading.metrics import (
     compute_trade_statistics,
     periods_per_year as _periods_per_year,
 )
+from trading.mtf_signals import (
+    BacktestSignalSource,
+    UNAVAILABLE,
+    MtfContextReport,
+    check_backtest_source,
+    select_mtf_signals,
+)
 from trading.portfolio import PortfolioAccounting
 from trading.risk import RiskParameters
 from trading.risk_manager import DefaultRiskManager
@@ -350,6 +357,13 @@ class BacktestRunner:
     alignment_tolerance : AlignmentTolerance | None
         WP2.3 (SY-23-03): tests and scripts only (never an API field).  ``None``
         -> ``DEFAULT_ALIGNMENT_TOLERANCE``.
+    mtf_signals : BacktestSignalSource | None
+        WP2.4 (SY-24-02/05/07): the point-in-time signal source (scripts and tests; never an
+        API field in Phase A).  ``None`` -> ``UNAVAILABLE``: every result equals the pre-P2
+        one.  A ``PitSignals`` is reduced per run (:meth:`PitSignals.select`) to the fields
+        the run's strategies consume that reach the coverage floor; the outcome is
+        ``last_mtf_context``.  Anything but ``None`` or a real ``BacktestSignalSource``
+        raises ``ValueError`` here and again before the run id exists (CF-P1-01).
     """
 
     def __init__(
@@ -366,7 +380,9 @@ class BacktestRunner:
         enable_circuit_breaker: bool = BACKTEST_CIRCUIT_BREAKER_DEFAULT,
         cost_profile: CostProfile | None = None,
         alignment_tolerance: AlignmentTolerance | None = None,
+        mtf_signals: BacktestSignalSource | None = None,
     ) -> None:
+        check_backtest_source(mtf_signals)  # CF-P1-01: fail at construction, type name only
         if not strategies:
             raise ValueError("At least one strategy is required")
         if not symbols:
@@ -446,6 +462,8 @@ class BacktestRunner:
         self._last_execution_engine: PaperExecutionEngine | None = None
         self._last_portfolio: PortfolioAccounting | None = None
         self._last_alignment: AlignmentReport | None = None
+        self._mtf_signals: BacktestSignalSource | None = mtf_signals
+        self._last_mtf_context: MtfContextReport | None = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -479,6 +497,7 @@ class BacktestRunner:
         oos_start_index: int | None = None,
         requested_window: tuple[datetime, datetime] | None = None,
         record_alignment: bool = True,
+        select_mtf_context: bool = True,
     ) -> BacktestResult:
         """
         Execute a backtest over the provided historical bars.
@@ -515,6 +534,12 @@ class BacktestRunner:
             ``False`` for the optimizer's inner runners (SY-23-18): trim and
             build the timeline but skip telemetry and the tolerance check (the
             optimizer already did both once).
+        select_mtf_context : bool
+            WP2.4 (SY-24-05, T-24): ``False`` for the optimizer's inner runners: the source
+            handed to the constructor was already selected once per optimizer run, so it is
+            used as is (no coverage, no report, ``last_mtf_context`` stays ``None``).
+            Optimizer-internal: pass ``False`` only with a source that was already selected;
+            ``False`` with a raw ``PitSignals`` bypasses G8, coverage and the report.
 
         Returns
         -------
@@ -530,10 +555,20 @@ class BacktestRunner:
             (a ``ValueError``) If the alignment is outside the tolerance.  Raised
             BEFORE the run id and the engine exist (I-6); ``str(exc)`` is fixed
             text, the closed ``.code`` identifies the reason.
+        PitError
+            WP2.4 (CF-P1-01): with a ``PitSignals`` source and a consuming strategy, a
+            naive bar timestamp (``pit_naive_time``) or an unknown consumed field
+            (``pit_unknown_series``).  Raised by the ONE selection before the run id and the
+            engine exist.  A ``ValueError``.
+        ValueError
+            WP2.4: ``mtf_signals`` is a ``BacktestSignalSource`` subclass other than
+            ``UnavailableSignals`` / ``PitSignals`` (type name only).  Raised before the run
+            id and the engine exist.
         """
         # 0a. WP2.3 CR-04: never leave the previous run's report behind, whatever
         # fails first (validation, an unsupported timeframe, a rejection).
         self._last_alignment = None
+        self._last_mtf_context = None  # WP2.4: never leave the previous run's report behind
 
         # 0. Deterministic seed — always non-None after M7 __init__ guard.
         # Seeds both Python random and numpy.random so sklearn PRNG (used by
@@ -581,6 +616,30 @@ class BacktestRunner:
         tf_s = self._timeframe_seconds()
         ann_factor = _periods_per_year(self._timeframe)
 
+        # 1d. WP2.4 (SY-24-05/07, CF-P1-01): choose the run's signal source ONCE, before
+        # ``run_id`` and the engine exist.  The decisions are the trading steps' bar closes
+        # ``close_k`` (k in [W, N)), computed from the BARS exactly like the engine's
+        # ``close_i`` (latest present bar timestamp + one timeframe), not from the timeline
+        # stamps (those are always aware, which would hide a naive bar).  A naive timestamp
+        # or a bad source fails HERE, so the bar loop cannot raise.  The decisions are only
+        # iterated when a ``PitSignals`` is offered: with no source this costs nothing.
+        mtf_source: BacktestSignalSource | None = self._mtf_signals
+        if select_mtf_context:
+            step = timedelta(seconds=tf_s)
+            consumed: frozenset[str] = frozenset()
+            for strategy in self._strategies:
+                consumed |= strategy.mtf_signal_fields()
+            mtf_source, mtf_report = select_mtf_signals(
+                self._mtf_signals,
+                (
+                    max(bars_by_symbol[sym][idx].timestamp for sym, idx in timeline[k].present)
+                    + step
+                    for k in range(self._warmup_bars, len(timeline))
+                ),
+                consumed,
+            )
+            self._last_mtf_context = mtf_report
+
         # 2. Generate run ID
         run_id = f"bt-{uuid.uuid4().hex[:12]}"
 
@@ -592,7 +651,9 @@ class BacktestRunner:
         bar_clock = BarClock(start=t0)
 
         # 3. Build engine components
-        engine, portfolio, risk_manager, exec_engine = self._build_engine(run_id, clock=bar_clock)
+        engine, portfolio, risk_manager, exec_engine = self._build_engine(
+            run_id, clock=bar_clock, mtf_signals=mtf_source
+        )
 
         self._log.info(
             "backtest.starting",
@@ -975,6 +1036,7 @@ class BacktestRunner:
         run_id: str,
         *,
         clock: BarClock | None = None,
+        mtf_signals: BacktestSignalSource | None = None,
     ) -> tuple[StrategyEngine, PortfolioAccounting, DefaultRiskManager, PaperExecutionEngine]:
         """
         Wire up all trading core components for a backtest run.
@@ -992,6 +1054,9 @@ class BacktestRunner:
             ``None`` (tests calling ``_build_engine(run_id)`` directly): the
             engine creates its own ``BarClock`` in ``run_backtest``; only the
             portfolio's seed point then keeps a wall stamp.
+        mtf_signals : BacktestSignalSource | None
+            WP2.4: the run's already-selected source.  ``None`` -> the constructor's source
+            (``None`` there -> the engine's ``UNAVAILABLE``).
 
         Returns
         -------
@@ -1027,6 +1092,12 @@ class BacktestRunner:
         # still requires one.  We provide a stub.
         market_data_stub = _BacktestMarketDataStub()
 
+        # WP2.4: with no (or the no-op ``UNAVAILABLE``) source the constructor call is
+        # byte-identical to the pre-P2 one -- the engine's own default is ``UNAVAILABLE``.
+        source = mtf_signals if mtf_signals is not None else self._mtf_signals
+        source_kwargs: dict[str, Any] = (
+            {} if source is None or source is UNAVAILABLE else {"mtf_signals": source}
+        )
         engine = StrategyEngine(
             strategies=self._strategies,
             execution_engine=execution_engine,
@@ -1044,6 +1115,7 @@ class BacktestRunner:
             ),
             cost_profile=self._cost_profile,
             clock=clock,
+            **source_kwargs,
         )
 
         return engine, portfolio, risk_manager, execution_engine
@@ -1057,6 +1129,15 @@ class BacktestRunner:
     def last_alignment(self) -> AlignmentReport | None:
         """The WP2.3 alignment report of the most recent run (even a rejected one)."""
         return self._last_alignment
+
+    @property
+    def last_mtf_context(self) -> MtfContextReport | None:
+        """The WP2.4 MTF-context report of the most recent ``run`` (``None`` until selected).
+
+        Reset at every ``run`` entry.  ``None`` for an inner optimizer runner
+        (``select_mtf_context=False``): the optimizer holds the one report.
+        """
+        return self._last_mtf_context
 
     @property
     def last_portfolio(self) -> PortfolioAccounting | None:
