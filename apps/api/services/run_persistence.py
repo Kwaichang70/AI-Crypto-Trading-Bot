@@ -61,6 +61,7 @@ from api.services.cost_profiles import (
     bar_alignment_response_fields,
     cost_response_fields,
     metrics_response_fields,
+    mtf_context_response_fields,
     timestamp_response_fields,
 )
 from common.types import OrderSide, OrderStatus, OrderType
@@ -136,6 +137,8 @@ def run_orm_to_response(run: RunORM) -> RunResponse:
     response = response.model_copy(update=bar_alignment_response_fields(run.config, run.run_mode))
     # WP2.5 (SY-25-13): server-computed legacy-metrics flag (every symbol count).
     response = response.model_copy(update=metrics_response_fields(run.config, run.run_mode))
+    # WP2.4 (SY-24-08): legacy-MTF-context flag (consumer strategies) + the stored status.
+    response = response.model_copy(update=mtf_context_response_fields(run.config, run.run_mode))
 
     # Step 2: extract JSONB-resident leaderboard fields (confidence_flag, psr).
     # These are NOT top-level SQL columns; they live in config["backtest_metrics"].
@@ -218,6 +221,7 @@ def run_orm_to_detail_response(run: RunORM) -> RunDetailResponse:
     base = base.model_copy(update=timestamp_response_fields(run.config, run.run_mode))
     base = base.model_copy(update=bar_alignment_response_fields(run.config, run.run_mode))
     base = base.model_copy(update=metrics_response_fields(run.config, run.run_mode))
+    base = base.model_copy(update=mtf_context_response_fields(run.config, run.run_mode))
 
     # Attempt to populate backtest_metrics from the JSONB config blob
     raw_metrics: dict[str, Any] | None = (run.config or {}).get("backtest_metrics")

@@ -25,7 +25,7 @@ import uuid
 from collections.abc import Mapping
 from datetime import datetime
 from decimal import Decimal
-from typing import Any, Generic, Literal, Self, TypeVar
+from typing import Any, Final, Generic, Literal, Self, TypeVar
 
 from pydantic import (
     BaseModel,
@@ -41,7 +41,10 @@ from pydantic.alias_generators import to_camel
 from common.types import OrderSide, OrderStatus, OrderType, RunMode, TimeFrame
 from trading.costs import CostProfile, FeeSource, is_leaderboard_cost_eligible
 from trading.metrics import KNOWN_METRICS_VERSIONS
+from trading.mtf_signals import KNOWN_MTF_CONTEXT_VERSIONS, MTF_CONTEXT_VERSION
 
+# Version constants ONLY (WP2.4): the one apps/ importer of this module, so the CF-P1-04 importer
+# allowlist grows by exactly this file.  ``cost_profiles`` takes both names from here.
 __all__ = [
     # Pagination
     "PaginationParams",
@@ -92,7 +95,14 @@ __all__ = [
     "LEADERBOARD_MIN_CLOSED_TRADES",
     "LEADERBOARD_ELIGIBLE_FLAGS",
     "build_cost_profile_summary",
+    "KNOWN_MTF_CONTEXT_VERSIONS",
+    "MTF_CONTEXT_VERSION",
     "is_leaderboard_metrics_eligible",
+    "is_leaderboard_mtf_eligible",
+    "is_legacy_mtf_context",
+    "LEGACY_MTF_CONSUMER_STRATEGIES",
+    "KNOWN_MTF_CONTEXT_STATUSES",
+    "stored_mtf_context_status",
     "leaderboard_eligible",
     "meets_trade_confidence_thresholds",
 ]
@@ -384,24 +394,116 @@ def is_leaderboard_metrics_eligible(config: Mapping[str, object] | None) -> bool
     return isinstance(marker, str) and marker in KNOWN_METRICS_VERSIONS
 
 
+#: WP2.4 (SY-24-08): the strategies that CONSUMED the C10 multi-timeframe signals at
+#: bbe7142 (``dca_rsi_hybrid`` / ``rsi_mean_reversion`` / ``model_strategy`` read the nine
+#: fields; the ensemble passes its subs' through).  A frozen HISTORIC fact -- it names who
+#: read boot-frozen provider values in a backtest BEFORE the ``mtf_context`` marker existed,
+#: so it must NOT follow later changes to ``consumes_mtf_signals``.  A test pins it equal to
+#: the registry derivation plus ``ensemble``.  Registry keys, as stored in
+#: ``config["strategy_name"]``.
+LEGACY_MTF_CONSUMER_STRATEGIES: Final[frozenset[str]] = frozenset(
+    {"rsi_mean_reversion", "dca_rsi_hybrid", "model_strategy", "ensemble"}
+)
+
+#: The same strategies by CLASS name.  ``optimization_runs.strategy_name`` stores
+#: ``strategy_cls.__name__`` (``result.strategy_name``), not the registry key, so the
+#: optimize read paths can only match on this spelling.  Kept in step with the set above by
+#: a test (registry class names plus ``EnsembleStrategy``).
+LEGACY_MTF_CONSUMER_CLASS_NAMES: Final[frozenset[str]] = frozenset(
+    {"RSIMeanReversionStrategy", "DCARSIHybridStrategy", "ModelStrategy", "EnsembleStrategy"}
+)
+
+#: The closed set of ``config["mtf_context"]["status"]`` values a response may echo
+#: (``trading.mtf_signals`` ``not_used`` / ``unavailable`` / ``partial`` / ``pit``).  A test
+#: pins it to the engine's constants.
+KNOWN_MTF_CONTEXT_STATUSES: Final[frozenset[str]] = frozenset(
+    {"not_used", "unavailable", "partial", "pit"}
+)
+
+
+def _is_mtf_consumer_name(name: object) -> bool:
+    """True iff ``name`` is a legacy consumer, or is not a usable ``str`` (fail-closed)."""
+    if not isinstance(name, str) or not name.strip():
+        return True
+    return (
+        name in LEGACY_MTF_CONSUMER_STRATEGIES
+        or name in LEGACY_MTF_CONSUMER_CLASS_NAMES
+        or name.lower().replace("-", "_") in LEGACY_MTF_CONSUMER_STRATEGIES
+    )
+
+
+def is_legacy_mtf_context(
+    config: Mapping[str, object] | None,
+    run_mode: str,
+    strategy_name: object = None,
+) -> bool:
+    """The ONE legacy-MTF-context predicate (WP2.4, SY-24-08).
+
+    True iff ALL of: ``run_mode`` is ``backtest`` / ``optimize``; ``engine_semantics.mtf_context``
+    is not a ``str`` in ``KNOWN_MTF_CONTEXT_VERSIONS``; and the strategy (the argument if
+    given, else ``config["strategy_name"]``) is a legacy consumer -- or its name is missing,
+    empty or whitespace-only, or not a ``str`` (fail-closed).  Lives here so
+    :func:`is_leaderboard_mtf_eligible` and ``cost_profiles.mtf_context_response_fields`` share
+    it without an import cycle.  Never raises, never logs.
+    """
+    if run_mode not in ("backtest", "optimize"):
+        return False
+    semantics = config.get("engine_semantics") if isinstance(config, Mapping) else None
+    marker = semantics.get("mtf_context") if isinstance(semantics, Mapping) else None
+    if isinstance(marker, str) and marker in KNOWN_MTF_CONTEXT_VERSIONS:
+        return False
+    if strategy_name is None:
+        strategy_name = config.get("strategy_name") if isinstance(config, Mapping) else None
+    return _is_mtf_consumer_name(strategy_name)
+
+
+def stored_mtf_context_status(config: Mapping[str, object] | None, run_mode: str) -> str | None:
+    """``config["mtf_context"]["status"]`` iff it is in the closed set, else ``None``.
+
+    Backtest / optimize only.  A tampered or malformed stored value is never echoed.  Reads
+    ``status`` ONLY (CF-P2-01 / CF-P2-02): neither ``reason`` nor ``source`` nor ``fields``.
+    Never raises, never logs.
+    """
+    if run_mode not in ("backtest", "optimize"):
+        return None
+    block = config.get("mtf_context") if isinstance(config, Mapping) else None
+    status = block.get("status") if isinstance(block, Mapping) else None
+    if isinstance(status, str) and status in KNOWN_MTF_CONTEXT_STATUSES:
+        return status
+    return None
+
+
+def is_leaderboard_mtf_eligible(config: Mapping[str, object] | None) -> bool:
+    """The MTF-context half of leaderboard eligibility (WP2.4, SY-24-11 / UD-3a).
+
+    False iff the run is a legacy-MTF-context consumer run (:func:`is_legacy_mtf_context`
+    in ``backtest`` mode).  Keys off the marker and the strategy name ONLY -- never off
+    ``mtf_context.status`` or ``reason`` (CF-P2-01 / CF-P2-02): ``partial`` /
+    ``unavailable`` / ``not_used`` runs stay eligible and carry a status label.
+    """
+    return not is_legacy_mtf_context(config, "backtest")
+
+
 def leaderboard_eligible(
     n_trades: object,
     confidence_flag: object,
     config: Mapping[str, object] | None,
 ) -> bool:
-    """The ONE leaderboard-eligibility rule (M5 + WP2.1 SY-21-10 + WP2.5 SY-25-15).
+    """The ONE leaderboard-eligibility rule (M5 + WP2.1 SY-21-10 + WP2.5 SY-25-15 + WP2.4 SY-24-11).
 
     ``n_trades >= LEADERBOARD_MIN_CLOSED_TRADES`` AND ``confidence_flag`` in
     the eligible tiers AND the run's cost model is a valid, persisted,
     ``live_equivalent`` registry profile that is not legacy AND the run carries a known
-    ``engine_semantics.metrics`` marker.  Legacy, stress, diagnostic, override and
-    invalid cost models, and pre-WP2.5 metrics, are never eligible.  Used by
+    ``engine_semantics.metrics`` marker AND the run is not a legacy-MTF-context consumer
+    run (WP2.4).  Legacy, stress, diagnostic, override and invalid cost models, pre-WP2.5
+    metrics and pre-WP2.4 consumer runs are never eligible.  Used by
     ``RunResponse`` and by the portfolio aggregate so the two cannot drift.
     """
     return (
         meets_trade_confidence_thresholds(n_trades, confidence_flag)
         and is_leaderboard_cost_eligible(config)
         and is_leaderboard_metrics_eligible(config)
+        and is_leaderboard_mtf_eligible(config)
     )
 
 
@@ -579,6 +681,26 @@ class RunResponse(BaseModel):
             "(warm-up and fill points) were counted as periods, so those numbers are not "
             "comparable with current runs.  Applies to every symbol count; always False for "
             "paper / live.  Server-computed, never taken from a request."
+        ),
+    )
+    legacy_mtf_context: bool = Field(
+        default=False,
+        description=(
+            "WP2.4 (SY-24-08): True iff the run is a backtest of a strategy that consumed the "
+            "multi-timeframe signals (dca_rsi_hybrid, rsi_mean_reversion, model_strategy, "
+            "ensemble) and carries no known engine_semantics.mtf_context marker: its context "
+            "was boot-frozen provider values, not point-in-time ones.  A missing strategy name "
+            "fails closed.  Always False for paper / live.  Server-computed, never taken from "
+            "a request."
+        ),
+    )
+    mtf_context_status: str | None = Field(
+        default=None,
+        description=(
+            "WP2.4 (SY-24-07): config['mtf_context']['status'] -- not_used, unavailable, "
+            "partial or pit -- or None when absent, malformed or not one of those.  "
+            "unavailable / partial consumer runs stay leaderboard-eligible but are not "
+            "promotion evidence.  Server-computed, never echoed from a tampered value."
         ),
     )
     live_equivalent_costs: bool = Field(
@@ -1223,6 +1345,15 @@ class AggregatePortfolioResponse(BaseModel):
             "were excluded from best/worst because their metrics predate the per-bar "
             "sampling (no known engine_semantics.metrics marker).  Counted after the cost "
             "exclusion, so legacy_cost_runs_excluded is unaffected."
+        ),
+    )
+    legacy_mtf_context_runs_excluded: int = Field(
+        default=0,
+        description=(
+            "WP2.4 (SY-24-11): runs that meet the trade-count, confidence, cost and metrics "
+            "criteria but were excluded from best/worst because they are consumer-strategy "
+            "backtests without a known engine_semantics.mtf_context marker.  Counted last "
+            "(cost, then metrics, then mtf), so the other two counters are unaffected."
         ),
     )
 

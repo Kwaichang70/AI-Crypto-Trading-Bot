@@ -180,8 +180,11 @@ class TestT26Marker:
     @pytest.mark.parametrize("mode", ["backtest", "optimize"])
     def test_the_dict_differs_from_the_wp23_dict_by_exactly_the_one_key(self, mode: str) -> None:
         sem = engine_semantics(mode)
-        assert set(sem) - set(_PRE_WP25_BACKTEST) == {"metrics"}
-        assert {k: v for k, v in sem.items() if k != "metrics"} == _PRE_WP25_BACKTEST
+        # WP2.4 (SY-24-07) adds ``mtf_context`` next to it; nothing else moves.
+        assert set(sem) - set(_PRE_WP25_BACKTEST) == {"metrics", "mtf_context"}
+        assert {
+            k: v for k, v in sem.items() if k not in ("metrics", "mtf_context")
+        } == _PRE_WP25_BACKTEST
         # neither earlier marker is bumped (SY-25-03)
         assert sem["timestamp_clock"] == "wp22-1"
         assert sem["bar_alignment"] == "wp23-1"
@@ -583,7 +586,8 @@ class TestT28ResponseFields:
 def _eligible_cfg(*, marked: bool, profile: Any = DEFAULT_COST_PROFILE) -> dict[str, Any]:
     cfg: dict[str, Any] = {"cost_profile": profile.to_metadata()}
     if marked:
-        cfg["engine_semantics"] = {"schema": 1, "metrics": _MARKER}
+        # WP2.4 (SY-24-11): an eligible config also carries the MTF-context marker.
+        cfg["engine_semantics"] = {"schema": 1, "metrics": _MARKER, "mtf_context": "wp24-1"}
     return cfg
 
 

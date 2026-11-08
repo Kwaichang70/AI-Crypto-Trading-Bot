@@ -35,6 +35,7 @@ from api.services.cost_profiles import (
     check_backtest_request_bounds,
     cost_response_fields,
     metrics_response_fields,
+    mtf_context_response_fields,
     new_run_cost_profile_or_422,
     requested_bar_window,
     stamp_cost_config,
@@ -248,6 +249,23 @@ class OptimizationRunSummary(BaseModel):
             "per-bar sampling and are not comparable with current runs.  Server-computed."
         ),
     )
+    legacy_mtf_context: bool = Field(
+        default=False,
+        description=(
+            "WP2.4 (SY-24-08): True iff the strategy consumed the multi-timeframe signals "
+            "(dca_rsi_hybrid, rsi_mean_reversion, model_strategy, ensemble) and run_metadata "
+            "has no known engine_semantics.mtf_context marker, so the ranking was computed "
+            "on boot-frozen provider values.  Server-computed."
+        ),
+    )
+    mtf_context_status: str | None = Field(
+        default=None,
+        description=(
+            "WP2.4 (SY-24-07): run_metadata['mtf_context']['status'] (not_used, unavailable, "
+            "partial or pit) or None.  An optimize run's status can differ from a single "
+            "re-backtest of its best combination (CF-P2-05).  Server-computed."
+        ),
+    )
 
 
 class OptimizeResponse(BaseModel):
@@ -306,6 +324,23 @@ class OptimizeResponse(BaseModel):
             "WP2.5 (SY-25-13): True iff run_metadata has no known engine_semantics.metrics "
             "marker, so the ranking metrics (Sharpe, Sortino, ...) were computed before the "
             "per-bar sampling and are not comparable with current runs.  Server-computed."
+        ),
+    )
+    legacy_mtf_context: bool = Field(
+        default=False,
+        description=(
+            "WP2.4 (SY-24-08): True iff the strategy consumed the multi-timeframe signals "
+            "(dca_rsi_hybrid, rsi_mean_reversion, model_strategy, ensemble) and run_metadata "
+            "has no known engine_semantics.mtf_context marker, so the ranking was computed "
+            "on boot-frozen provider values.  Server-computed."
+        ),
+    )
+    mtf_context_status: str | None = Field(
+        default=None,
+        description=(
+            "WP2.4 (SY-24-07): run_metadata['mtf_context']['status'] (not_used, unavailable, "
+            "partial or pit) or None.  An optimize run's status can differ from a single "
+            "re-backtest of its best combination (CF-P2-05).  Server-computed."
         ),
     )
 
@@ -548,6 +583,11 @@ async def run_optimization(
     # Compare runs by ``presence_digest``, not ``fingerprint`` (warm-up 0 in the optimizer).
     if optimizer.last_alignment is not None:
         run_metadata["bar_alignment"] = optimizer.last_alignment.to_metadata()
+    # WP2.4 (SY-24-07): the run-level MTF-context report (one selection per run, not per
+    # combination).  Built from the run's bars and the source it was given -- none in Phase A,
+    # so ``source == "unavailable"`` -- never from the request.
+    if optimizer.last_mtf_context is not None:
+        run_metadata["mtf_context"] = optimizer.last_mtf_context.to_metadata()
 
     orm_run = OptimizationRunORM(
         id=uuid.uuid4(),
@@ -598,6 +638,7 @@ async def run_optimization(
         # later GET /optimize/{id} derives from the persisted ``run_metadata``.
         **cost_response_fields(run_metadata, "optimize"),
         **metrics_response_fields(run_metadata, "optimize"),
+        **mtf_context_response_fields(run_metadata, "optimize", orm_run.strategy_name),
     )
 
 
@@ -655,6 +696,7 @@ async def list_optimization_runs(
             # WP2.1b: NULL / missing / malformed run_metadata is legacy, never a 500.
             **cost_response_fields(row.run_metadata, "optimize"),
             **metrics_response_fields(row.run_metadata, "optimize"),
+            **mtf_context_response_fields(row.run_metadata, "optimize", row.strategy_name),
         )
         for row in rows
     ]
@@ -745,4 +787,5 @@ async def get_optimization_run(
         # WP2.1b: NULL / missing / malformed run_metadata is legacy, never a 500.
         **cost_response_fields(row.run_metadata, "optimize"),
         **metrics_response_fields(row.run_metadata, "optimize"),
+        **mtf_context_response_fields(row.run_metadata, "optimize", row.strategy_name),
     )

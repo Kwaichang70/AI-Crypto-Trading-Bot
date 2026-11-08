@@ -266,7 +266,8 @@ class TestLiveEquivalentCosts:
     def test_the_detail_response_and_the_wire_name(self) -> None:
         cfg = {
             "cost_profile": DEFAULT_COST_PROFILE.to_metadata(),
-            "engine_semantics": {"metrics": "wp25-1"},  # WP2.5 (UD-1): eligible needs the marker
+            # WP2.5 (UD-1) + WP2.4 (SY-24-11): eligible needs both markers
+            "engine_semantics": {"metrics": "wp25-1", "mtf_context": "wp24-1"},
         }
         detail = run_orm_to_detail_response(_run(cfg, n_trades=None, flag=None))
         assert detail.live_equivalent_costs is True

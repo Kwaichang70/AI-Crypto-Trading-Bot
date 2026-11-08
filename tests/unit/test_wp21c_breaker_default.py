@@ -210,6 +210,7 @@ class TestEngineSemantics:
             "timestamp_clock": "wp22-1",
             "bar_alignment": "wp23-1",  # WP2.3 (SY-23-16)
             "metrics": "wp25-1",  # WP2.5 (SY-25-03)
+            "mtf_context": "wp24-1",  # WP2.4 (SY-24-07)
         }
 
 

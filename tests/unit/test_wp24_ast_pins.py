@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import ast
 import sys
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Final
 
 import pytest
 
@@ -1069,7 +1071,21 @@ _LIVE_ALLOWED = frozenset({_MTF, _ENGINE_REL})
 #: BacktestSignalSource: those two plus the runner / optimizer sites that take the source parameter.
 _SOURCE_ALLOWED = _LIVE_ALLOWED | {_RUNNER_REL, _OPTIMIZER_REL}
 #: Who may import the module at all (strategy.py only for ``ALL_MTF_SIGNAL_FIELDS``).
-_MODULE_IMPORTERS = _SOURCE_ALLOWED | {_STRATEGY_REL}
+#: WP2.4 P3: ``apps/api/schemas.py`` imports the two VERSION constants only.  The names are
+#: pinned per file by ``_PINNED_IMPORT_NAMES`` (``pinned_import_problems`` and its tests); the
+#: name bans above still apply to it: it may not mention LIVE_SIGNALS / LiveSignals /
+#: BacktestSignalSource.
+_API_SCHEMAS_REL = "apps/api/schemas.py"
+_MODULE_IMPORTERS = _SOURCE_ALLOWED | {_STRATEGY_REL, _API_SCHEMAS_REL}
+#: Every ``apps/`` importer of the module, with the EXACT names it may take (CR-01 / SEC-05).
+_PINNED_IMPORT_NAMES: Final[Mapping[str, frozenset[str]]] = {
+    _API_SCHEMAS_REL: frozenset({"KNOWN_MTF_CONTEXT_VERSIONS", "MTF_CONTEXT_VERSION"}),
+}
+#: Identifiers a pinned file may not use: they are how the module is reached without an import
+#: statement (``trading.mtf_signals.X``, ``__import__``, ``importlib``, ``sys.modules``).
+_DYNAMIC_IMPORT_IDENTS: Final = frozenset(
+    {"importlib", "import_module", "__import__", "modules", "mtf_signals"}
+)
 _ALLOWED_SUBCLASSES = frozenset({"UnavailableSignals", "PitSignals"})
 _META_CALLS = frozenset({"new_class", "ABCMeta"})
 
@@ -1168,6 +1184,53 @@ def name_reference_problems(rel: str, src: str) -> list[str]:
     return out
 
 
+def pinned_import_problems(src: str, names: frozenset[str]) -> list[str]:
+    """CR-01 / SEC-05: ``src`` imports exactly ``names`` from ``trading.mtf_signals``, nothing else.
+
+    Exactly one import statement, a plain absolute ``from trading.mtf_signals import ...`` with
+    exactly ``names`` (no alias, star, duplicate, drop or extra), and no other way to reach the
+    module: no ``importlib`` / ``import_module`` / ``__import__`` / ``modules`` / ``mtf_signals``
+    identifier and no string constant naming the module.  Pure, so it also runs on hostile text.
+    """
+    tree = ast.parse(src)
+    out: list[str] = []
+    imports = [n for n in ast.walk(tree) if _is_module_import(n)]
+    if len(imports) != 1:
+        out.append(f"{len(imports)} import statements of trading.mtf_signals, expected 1")
+    for node in imports:
+        if not (
+            isinstance(node, ast.ImportFrom)
+            and node.module == "trading.mtf_signals"
+            and node.level == 0
+        ):
+            out.append("not a plain absolute 'from trading.mtf_signals import ...'")
+            continue
+        if sorted(a.name for a in node.names) != sorted(names):
+            out.append(f"imported names {[a.name for a in node.names]} != pin {sorted(names)}")
+        if any(a.asname is not None for a in node.names):
+            out.append("aliased import")
+    for node in ast.walk(tree):
+        ident: str | None = None
+        if isinstance(node, ast.Name):
+            ident = node.id
+        elif isinstance(node, ast.Attribute):
+            ident = node.attr
+        elif isinstance(node, ast.alias):
+            ident = node.name.split(".")[0]
+        if ident in _DYNAMIC_IMPORT_IDENTS:
+            out.append(f"dynamic-import or module-object reference: {ident}")
+        if (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and (node.value == "mtf_signals" or node.value.endswith(".mtf_signals"))
+        ):
+            out.append(f"string reference to the module: {node.value!r}")
+    return out
+
+
+_PIN_LINE = "from trading.mtf_signals import KNOWN_MTF_CONTEXT_VERSIONS, MTF_CONTEXT_VERSION\n"
+
+
 class TestCfP104NameReferenceAllowlist:
     def test_the_production_tree_passes(self) -> None:
         files = production_files()
@@ -1198,6 +1261,58 @@ class TestCfP104NameReferenceAllowlist:
             if any(_is_module_import(n) for n in ast.walk(ast.parse(path.read_text())))
         }
         assert importers == set(_MODULE_IMPORTERS) - {_MTF}  # the module never imports itself
+
+    def test_every_apps_importer_has_a_name_pin(self) -> None:
+        # No ``apps/`` file can join the importer allowlist without a per-name pin (CF-P3-09).
+        assert {f for f in _MODULE_IMPORTERS if f.startswith("apps/")} == set(_PINNED_IMPORT_NAMES)
+
+    def test_pinned_files_import_exactly_their_names(self) -> None:
+        for rel, names in _PINNED_IMPORT_NAMES.items():
+            assert pinned_import_problems((_REPO / rel).read_text(), names) == [], rel
+
+    def test_the_pin_helper_accepts_the_exact_line(self) -> None:
+        assert pinned_import_problems(_PIN_LINE, _PINNED_IMPORT_NAMES[_API_SCHEMAS_REL]) == []
+
+    @pytest.mark.parametrize(
+        "src",
+        [
+            _PIN_LINE.replace("VERSION\n", "VERSION, PitSignals\n"),
+            _PIN_LINE.replace("VERSION\n", "VERSION, select_mtf_signals\n"),
+            _PIN_LINE + "import trading.mtf_signals as _m\nx = getattr(_m, 'LIVE_' + 'SIGNALS')\n",
+            _PIN_LINE + "import importlib\nm = importlib.import_module('trading.mtf_signals')\n",
+            _PIN_LINE.replace("MTF_CONTEXT_VERSION\n", "MTF_CONTEXT_VERSION as V\n"),
+            _PIN_LINE + "from trading.mtf_signals import UNAVAILABLE\n",
+            "from trading.mtf_signals import *\n",
+            "from trading import mtf_signals\n",
+            "from .mtf_signals import KNOWN_MTF_CONTEXT_VERSIONS, MTF_CONTEXT_VERSION\n",
+            _PIN_LINE.replace("VERSION\n", "VERSION, MTF_CONTEXT_VERSION\n"),
+            "from trading.mtf_signals import KNOWN_MTF_CONTEXT_VERSIONS\n",
+            _PIN_LINE + "import trading\nx = trading.mtf_signals.PitSignals\n",
+            _PIN_LINE + "m = __import__('trading.' + 'mtf_signals')\n",
+            _PIN_LINE + "import sys\nm = sys.modules['trading.mtf' + '_signals']\n",
+            _PIN_LINE
+            + "import importlib\nm = importlib.import_module('trading.' + 'mtf_signals')\n",
+        ],
+        ids=[
+            "extra-PitSignals",
+            "extra-select",
+            "module-alias-getattr",
+            "importlib-string",
+            "name-alias",
+            "second-ImportFrom",
+            "star",
+            "from-trading-import-module",
+            "relative",
+            "duplicate",
+            "dropped",
+            "ARB-1-attribute",
+            "ARB-2-dunder-import",
+            "ARB-3-sys-modules",
+            "ARB-4-import-module-split",
+        ],
+    )
+    def test_the_pin_helper_catches_widening(self, src: str) -> None:
+        assert pinned_import_problems(src, _PINNED_IMPORT_NAMES[_API_SCHEMAS_REL]) != []
 
     def test_the_two_real_subclasses_are_the_only_ones(self) -> None:
         tree = ast.parse(_SIGNALS.read_text())

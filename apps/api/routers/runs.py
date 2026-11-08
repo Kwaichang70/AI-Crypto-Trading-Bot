@@ -1251,6 +1251,12 @@ async def create_run(
                 # ``_persist_backtest_results`` (it rebuilds config from ``run_orm.config``).
                 if runner.last_alignment is not None:
                     config_snapshot["bar_alignment"] = runner.last_alignment.to_metadata()
+                # WP2.4 (SY-24-07): what the MTF context actually was.  Built by the engine's
+                # selection from the run's own bars and the source it was given (no source
+                # in Phase A, so ``source == "unavailable"``); never read from the request.
+                # Ints / strings / bools / ISO only; same carry path as ``bar_alignment``.
+                if runner.last_mtf_context is not None:
+                    config_snapshot["mtf_context"] = runner.last_mtf_context.to_metadata()
 
                 # Step 4: Persist results (trades + equity curve + metrics in config)
                 await _persist_backtest_results(
@@ -3094,7 +3100,9 @@ async def promote_to_live(
             "promoted_from_run_id": str(run_id),
         }
         # Remove backtest-specific keys that have no meaning for live mode.
-        for _key in ("backtest_start", "backtest_end", "seed", "backtest_metrics"):
+        # WP2.4: ``mtf_context`` is a backtest report; a live run never carries it (the
+        # ``engine_semantics`` marker is already re-stamped for mode "live" below).
+        for _key in ("backtest_start", "backtest_end", "seed", "backtest_metrics", "mtf_context"):
             promoted_config.pop(_key, None)
 
         # WP1.3a (I8): persist the NORMALISED bracket config and the RESOLVED

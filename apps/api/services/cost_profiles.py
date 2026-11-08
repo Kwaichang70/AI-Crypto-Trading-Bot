@@ -27,7 +27,16 @@ from typing import Any, Final
 
 from fastapi import HTTPException, status
 
-from api.schemas import CostProfileSummary, build_cost_profile_summary
+from api.schemas import (
+    KNOWN_MTF_CONTEXT_STATUSES,
+    KNOWN_MTF_CONTEXT_VERSIONS,
+    LEGACY_MTF_CONSUMER_STRATEGIES,
+    MTF_CONTEXT_VERSION,
+    CostProfileSummary,
+    build_cost_profile_summary,
+    is_legacy_mtf_context,
+    stored_mtf_context_status,
+)
 from common.types import TimeFrame
 from data.bar_alignment import BAR_ALIGNMENT_CODES, BAR_ALIGNMENT_VERSION, BarAlignmentError
 from trading.clock import TIMESTAMP_CLOCK_VERSION
@@ -49,7 +58,10 @@ __all__ = [
     "COST_MODEL_VERSION",
     "KNOWN_BAR_ALIGNMENTS",
     "KNOWN_METRICS_VERSIONS",
+    "KNOWN_MTF_CONTEXT_STATUSES",
+    "KNOWN_MTF_CONTEXT_VERSIONS",
     "KNOWN_TIMESTAMP_CLOCKS",
+    "LEGACY_MTF_CONSUMER_STRATEGIES",
     "MAX_BACKTEST_BARS",
     "MAX_BACKTEST_SYMBOLS",
     "MIN_BACKTEST_START",
@@ -60,6 +72,7 @@ __all__ = [
     "cost_response_fields",
     "engine_semantics",
     "metrics_response_fields",
+    "mtf_context_response_fields",
     "new_run_cost_profile_or_422",
     "requested_bar_window",
     "stamp_cost_config",
@@ -142,6 +155,14 @@ def engine_semantics(
     leaderboard rule.  Neither ``timestamp_clock`` nor ``bar_alignment`` is bumped.
     Paper / live never carry it.
 
+    ``mtf_context`` (WP2.4, SY-24-07) is written on the same two modes and names the
+    point-in-time MTF-context semantics (``trading.mtf_signals.MTF_CONTEXT_VERSION``: a
+    backtest never reads a provider singleton or the wall clock); it is read by
+    :func:`mtf_context_response_fields` and by the leaderboard rule.  The run-specific
+    ``config["mtf_context"]`` block is a SEPARATE key written by the router from the
+    engine's report, never from a request.  Paper / live (and, via the live re-stamp,
+    promote) never carry the marker.
+
     ``backtest_circuit_breaker`` exists ONLY on backtest runs and optimization
     ``run_metadata`` (the breaker is always on in paper / live, SY-21-11): ``False``
     in WP2.1a / 2.1b, ``True`` from WP2.1c.  The value is the one the engine will
@@ -165,6 +186,9 @@ def engine_semantics(
         # WP2.5 (SY-25-03): the numbers behind this marker are the per-bar ones.  Backtest +
         # optimize only (promote_to_live re-stamps mode "live", so it cannot leak).
         semantics["metrics"] = METRICS_VERSION
+        # WP2.4 (SY-24-07): the backtest MTF context is point-in-time (or None).  Same two
+        # modes; promote_to_live re-stamps mode "live", so it cannot leak.
+        semantics["mtf_context"] = MTF_CONTEXT_VERSION
     return semantics
 
 
@@ -288,6 +312,34 @@ def metrics_response_fields(config: Mapping[str, object] | None, run_mode: str) 
         marker = semantics.get("metrics") if isinstance(semantics, Mapping) else None
         legacy = not (isinstance(marker, str) and marker in KNOWN_METRICS_VERSIONS)
     return {"legacy_metrics": legacy}
+
+
+def mtf_context_response_fields(
+    config: Mapping[str, object] | None,
+    run_mode: str,
+    strategy_name: str | None = None,
+) -> dict[str, Any]:
+    """``legacy_mtf_context`` / ``mtf_context_status`` for one RUN or OPTIMIZATION run (WP2.4).
+
+    ``legacy_mtf_context`` is True iff ALL of: ``run_mode`` is ``"backtest"`` or
+    ``"optimize"``; ``engine_semantics.mtf_context`` is not a ``str`` in
+    :data:`KNOWN_MTF_CONTEXT_VERSIONS` (missing, unknown, non-string, ``None``, a malformed
+    ``engine_semantics`` or ``config=None``); and the strategy -- ``strategy_name`` if given,
+    else ``config["strategy_name"]`` -- is in :data:`LEGACY_MTF_CONSUMER_STRATEGIES`, or its
+    name is missing / not a ``str`` (fail-closed).  The optimize read paths pass
+    ``OptimizationRunORM.strategy_name`` (a CLASS name, which the shared rule also knows).
+
+    ``mtf_context_status`` is ``config["mtf_context"]["status"]`` only if it is one of
+    :data:`KNOWN_MTF_CONTEXT_STATUSES`, else ``None``: a tampered stored value is never
+    echoed.  Eligibility never reads ``reason`` / ``source`` / ``fields`` (CF-P2-01/02).
+    Paper / live (and any unknown mode) are never flagged and carry no status.  Computed
+    server-side from the stored config, never taken from a request.  Never raises, never
+    logs.
+    """
+    return {
+        "legacy_mtf_context": is_legacy_mtf_context(config, run_mode, strategy_name),
+        "mtf_context_status": stored_mtf_context_status(config, run_mode),
+    }
 
 
 def bar_alignment_http_error(exc: BarAlignmentError) -> HTTPException:

@@ -146,6 +146,9 @@ class TestPostWritesRunMetadata:
         # two keys stay exactly as before.
         metadata = dict(run.run_metadata)
         assert metadata.pop("bar_alignment")["version"] == "wp23-1"
+        # WP2.4 (SY-24-07): ... and the run-level MTF-context report (Phase A: no source).
+        mtf = metadata.pop("mtf_context")
+        assert (mtf["version"], mtf["source"]) == ("wp24-1", "unavailable")
         assert metadata == {
             "cost_profile": DEFAULT_COST_PROFILE.to_metadata(),
             "engine_semantics": engine_semantics("optimize"),

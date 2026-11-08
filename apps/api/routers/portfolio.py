@@ -51,6 +51,7 @@ from api.schemas import (
     PositionResponse,
     TradeListResponse,
     TradeResponse,
+    is_leaderboard_metrics_eligible,
     leaderboard_eligible,
     meets_trade_confidence_thresholds,
 )
@@ -688,6 +689,7 @@ async def get_aggregate_portfolio(
     eligible_runs_count: int = 0
     legacy_cost_runs_excluded: int = 0
     legacy_metrics_runs_excluded: int = 0
+    legacy_mtf_context_runs_excluded: int = 0
     return_pcts_eligible: list[float] = []
 
     for cfg in config_rows:
@@ -718,11 +720,16 @@ async def get_aggregate_portfolio(
             # (UD-1): cost first, so the cost counter's semantics do not move; a run
             # that passes trades, confidence AND cost is excluded by its metrics
             # (no known engine_semantics.metrics marker) and counted separately.
+            # WP2.4 (SY-24-11): the order is cost, then metrics, then mtf -- a run that
+            # passes cost AND metrics is excluded by its MTF context (a consumer strategy
+            # without a known engine_semantics.mtf_context marker) and counted last.
             if meets_trade_confidence_thresholds(n_trades, flag):
-                if is_leaderboard_cost_eligible(cfg):
+                if not is_leaderboard_cost_eligible(cfg):
+                    legacy_cost_runs_excluded += 1
+                elif not is_leaderboard_metrics_eligible(cfg):
                     legacy_metrics_runs_excluded += 1
                 else:
-                    legacy_cost_runs_excluded += 1
+                    legacy_mtf_context_runs_excluded += 1
             continue
 
         eligible_runs_count += 1
@@ -759,4 +766,5 @@ async def get_aggregate_portfolio(
         eligible_runs_count=eligible_runs_count,
         legacy_cost_runs_excluded=legacy_cost_runs_excluded,
         legacy_metrics_runs_excluded=legacy_metrics_runs_excluded,
+        legacy_mtf_context_runs_excluded=legacy_mtf_context_runs_excluded,
     )
