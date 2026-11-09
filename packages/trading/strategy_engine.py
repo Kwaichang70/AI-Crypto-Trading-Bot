@@ -550,8 +550,9 @@ class StrategyEngine:
                 f"{run_mode.value} StrategyEngine accepts only the live signal source, "
                 f"got {type(mtf_signals).__name__}"
             )
+        self._strategies = list(strategies)
         #: where the context's external signal fields come from (UNAVAILABLE in a backtest
-        #: by default, the verbatim provider reads in paper/live).
+        #: by default, the live context book in paper/live).
         self._mtf_signals: BacktestSignalSource | LiveSignals = (
             mtf_signals
             if mtf_signals is not None
@@ -560,7 +561,7 @@ class StrategyEngine:
         #: CF-24-01: the fields a paper/live run serves (the strategies' union, SY-01-02), else
         #: ``None``; and the rollout stage, read ONCE here and fenced to LIVE_SIGNALS (SY-01-21h).
         self._live_fields: frozenset[str] | None = (
-            live_served_fields(s.mtf_signal_fields() for s in strategies)
+            live_served_fields(s.mtf_signal_fields() for s in self._strategies)
             if self._mtf_signals is LIVE_SIGNALS
             else None
         )
@@ -572,7 +573,6 @@ class StrategyEngine:
         #: WP22-P2B2 (SEC-07): True while a ``run_backtest`` call owns this engine.
         self._backtest_running: bool = False
 
-        self._strategies = list(strategies)
         self._circuit_breaker = circuit_breaker
         self._execution_engine = execution_engine
         self._risk_manager = risk_manager
@@ -1734,6 +1734,8 @@ class StrategyEngine:
                 skip_reason=_entry_skip_reason,
                 log_event=_entry_log_event,
             )
+        # 4b'. CF-24-01 (SY-01-16, P4b): the LAST reasons, BUYs of context-trained models only.
+        bar_signals = self._drop_context_model_buys(bar_signals, current_bars)
 
         # REDUCE (WP1.6): the multiplier rides on each BUY ``Signal`` and is
         # applied to the FINAL resolved quantity in the execution engine.
@@ -2149,6 +2151,62 @@ class StrategyEngine:
             )
         return kept
 
+    def _drop_context_model_buys(
+        self, signals: list[Signal], current_bars: dict[str, OHLCVBar]
+    ) -> list[Signal]:
+        """SY-01-16: drop a context-trained strategy's BUYs (LIVE always; PAPER while a consumed
+        field is None). Reads it now; a raise counts as True (N-4)."""
+        if self._run_mode == RunMode.BACKTEST:
+            return signals
+        buyers = {s.strategy_id for s in signals if s.direction == SignalDirection.BUY}
+        blocked: set[str] = set()
+        for strategy in self._strategies:
+            if strategy.strategy_id not in buyers:
+                continue
+            try:
+                trained = strategy.context_trained() is True
+            except Exception as exc:
+                trained = True
+                self._log.error(
+                    "engine.context_trained_failed",
+                    strategy_id=strategy.strategy_id,
+                    error_type=type(exc).__name__,
+                )
+            try:  # RK-P4B-03: a malformed field set blocks the BUY; it never skips the exits
+                block = trained and (
+                    self._run_mode == RunMode.LIVE
+                    or any(
+                        getattr(self._last_mtf_context, f, None) is None
+                        for f in strategy.mtf_signal_fields()
+                    )
+                )
+            except Exception as exc:
+                block = True
+                self._log.error(
+                    "engine.context_fields_failed",
+                    strategy_id=strategy.strategy_id,
+                    error_type=type(exc).__name__,
+                )
+            if block:
+                blocked.add(strategy.strategy_id)
+        victims = [
+            s for s in signals if s.direction == SignalDirection.BUY and s.strategy_id in blocked
+        ]
+        if not victims:
+            return signals
+        self._drop_entry_signals(
+            victims,
+            current_bars,
+            skip_reason=(
+                "mtf_context_model_unverified"
+                if self._run_mode == RunMode.LIVE
+                else "mtf_context_model_input_missing"
+            ),
+            log_event="engine.context_model_entries_blocked",
+        )
+        gone = {id(s) for s in victims}
+        return [s for s in signals if id(s) not in gone]
+
     # ------------------------------------------------------------------
     # Strategy invocation
     # ------------------------------------------------------------------
@@ -2213,8 +2271,14 @@ class StrategyEngine:
             if self._live_stage == "neutral_shadow":
                 if self._live_fields:  # a non-consumer emits no shadow event
                     seen = {n: getattr(values, n) for n in sorted(self._live_fields)}
+                    # SY-01-21l-N1: integer epoch ms of the bar, exact; never from the book
+                    ts = current_timestamp
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=UTC)
+                    bar_ms = (ts - datetime(1970, 1, 1, tzinfo=UTC)) // timedelta(milliseconds=1)
                     self._log.info(
                         "engine.mtf_context_shadow",
+                        bar_ts_ms=bar_ms,
                         values=seen,
                         states={n: "none" if v is None else "served" for n, v in seen.items()},
                     )

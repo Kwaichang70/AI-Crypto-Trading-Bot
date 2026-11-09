@@ -163,6 +163,10 @@ class BaseStrategy(abc.ABC):
         """
         return self.consumes_mtf_signals
 
+    def context_trained(self) -> bool:
+        """SY-01-16 / SY-01-21g: True iff decisions depend on a trained context feature."""
+        return False
+
     @property
     def htf_timeframes(self) -> list[str]:
         """

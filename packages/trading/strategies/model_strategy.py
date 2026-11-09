@@ -88,10 +88,11 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
+import math
 from collections.abc import Sequence
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Final
 
 import structlog
 from pydantic import BaseModel, Field, field_validator
@@ -119,6 +120,9 @@ _LABEL_TO_DIRECTION: dict[int, SignalDirection] = {
     _LABEL_HOLD: SignalDirection.HOLD,
     _LABEL_BUY: SignalDirection.BUY,
 }
+
+#: SY-01-16: the context columns = the v2 columns that v1 does not have (4 today).
+_CONTEXT_FEATURES: Final = frozenset(feature_names_for_schema(2)) - set(feature_names_for_schema(1))
 
 # ---------------------------------------------------------------------------
 # Parameter schema (Pydantic validation)
@@ -230,6 +234,24 @@ class ModelStrategy(BaseStrategy):
         # load time via sidecar.schema_version then model.n_features_in_.
         # Defaults to v1 for backward compatibility with pre-Sprint-46 models.
         self._active_schema_version: int = 1
+        #: SY-01-16: fail-closed until a loaded artefact is classified (no artefact -> True).
+        self._context_trained: bool = True
+
+    def context_trained(self) -> bool:
+        """The value cached at the last model (re)load (SY-01-16)."""
+        return self._context_trained
+
+    def _classify_context_trained(self) -> bool:
+        """Context importances sum > 0; missing or unresolvable importances -> True."""
+        try:
+            names = feature_names_for_schema(self._active_schema_version)
+            weights = [float(w) for w in self._model.feature_importances_]
+            if len(weights) != len(names) or not all(math.isfinite(w) and w >= 0 for w in weights):
+                return True
+            return sum(w for n, w in zip(names, weights, strict=True) if n in _CONTEXT_FEATURES) > 0
+        except Exception as exc:
+            self._log.warning("model_strategy.importances_failed", error_type=type(exc).__name__)
+            return True
 
     # ------------------------------------------------------------------ #
     # Parameter validation
@@ -311,6 +333,7 @@ class ModelStrategy(BaseStrategy):
             self._active_schema_version = self._detect_schema_version(
                 model=self._model, sidecar_data=None,
             )
+            self._context_trained = self._classify_context_trained()
             self._log.info(
                 "model_strategy.model_loaded",
                 model_path=str(model_path),
@@ -439,12 +462,14 @@ class ModelStrategy(BaseStrategy):
             new_model_path = data["model_path"]
             new_model = self._load_model_with_timeout(new_model_path)
             self._model = new_model
+            self._context_trained = True  # fail-closed until the new artefact is classified
             self._model_loaded = True
             self._active_version_id = sidecar_version_id
             # Re-detect schema -- a hot-swap may move us between v1 and v2.
             self._active_schema_version = self._detect_schema_version(
                 model=new_model, sidecar_data=data,
             )
+            self._context_trained = self._classify_context_trained()
 
             self._log.info(
                 "model_strategy.hot_swap",
@@ -642,4 +667,5 @@ class ModelStrategy(BaseStrategy):
         # Sprint 46 (QT-007c-2): reset to v1 default so a recycled instance
         # cannot inherit v2 dispatch state into a fresh on_start cycle.
         self._active_schema_version = 1
+        self._context_trained = True
         super().on_stop()

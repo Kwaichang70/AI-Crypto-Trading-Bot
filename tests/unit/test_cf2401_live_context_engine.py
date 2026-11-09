@@ -422,7 +422,7 @@ class TestT21Stage:
             assert engine._build_mtf_context(NOW) is None
         (event,) = shadow_events(logs)
         bound = set(structlog.get_context(engine._log))  # component, run_mode, timeframe, ...
-        assert set(event) - bound == {"event", "log_level", "values", "states"}
+        assert set(event) - bound == {"event", "log_level", "bar_ts_ms", "values", "states"}
         assert set(event["values"]) == set(event["states"]) == set(engine._live_fields)
         assert event["values"] == {
             "btc_dominance": 52.5, "btc_dominance_7d_ago": 52.5, "fear_greed_index": 31,
