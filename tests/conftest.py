@@ -140,6 +140,19 @@ def _kill_switch_loaded_unlatched() -> None:
     _kill_switch.reset_state_for_tests()
 
 
+# CF-24-01 P3 (SY-01-21f, T-14b): LIVE_BOOK and LIVE_CONSUMERS are process-global. Reset both
+# (series, high-water mark, regressed_reads, consumer counts) around every test.
+@pytest.fixture(autouse=True)
+def _cf2401_live_context_isolated() -> Iterator[None]:
+    from data.live_context import LIVE_BOOK, LIVE_CONSUMERS
+
+    LIVE_BOOK.reset()
+    LIVE_CONSUMERS.reset()
+    yield
+    LIVE_BOOK.reset()
+    LIVE_CONSUMERS.reset()
+
+
 # ---------------------------------------------------------------------------
 # OHLCVBar factories
 # ---------------------------------------------------------------------------
