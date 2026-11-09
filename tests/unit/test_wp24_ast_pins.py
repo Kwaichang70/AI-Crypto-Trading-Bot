@@ -16,6 +16,7 @@ hashes and compares Decimal values and integer milliseconds only.
 from __future__ import annotations
 
 import ast
+import hashlib
 import sys
 from collections.abc import Mapping
 from pathlib import Path
@@ -420,24 +421,41 @@ def _provider_refs(tree: ast.AST) -> list[ast.AST]:
     return refs
 
 
+_ENGINE_BANNED = ("data.live_context", "data.live_context_policy", "api.services.context_poller")
+_ENGINE_BANNED_IDENTS = frozenset(
+    {"live_context", "live_context_policy", "context_poller", "LIVE_BOOK"}
+)
+
+
 def engine_import_problems(src: str) -> list[str]:
-    """The engine module reaches no provider client: no import, no attribute, no getter."""
-    return [f"provider: line {n.lineno}" for n in _provider_refs(ast.parse(src))]
+    """The engine module reaches no provider client (no import, attribute or getter) and no live
+    context module, book or poller (CF-24-01 T-14 (4), T-23); it takes ``LIVE_CONSUMERS`` from
+    ``trading.mtf_signals`` (SY-01-21j)."""
+    tree = ast.parse(src)
+    out = [f"provider: line {n.lineno}" for n in _provider_refs(tree)]
+    for node in ast.walk(tree):
+        mods: list[str] = []
+        if isinstance(node, ast.ImportFrom):
+            mods = [node.module or "", *[f"{node.module}.{a.name}" for a in node.names]]
+        elif isinstance(node, ast.Import):
+            mods = [a.name for a in node.names]
+        if any(m == b or m.startswith(b + ".") for m in mods for b in _ENGINE_BANNED):
+            out.append(f"live-context import: line {node.lineno}")
+        ident = getattr(node, "id", None) or getattr(node, "attr", None)
+        if ident in _ENGINE_BANNED_IDENTS:
+            out.append(f"live-context name {ident}: line {node.lineno}")
+    return out
 
 
 def live_scope_problems(src: str) -> list[str]:
-    """In mtf_signals.py only ``LiveSignals.values_at`` may reference a provider module."""
+    """CF-24-01 (PC-5, SY-01-11), inverted: ``mtf_signals.py`` references no provider module,
+    client or getter anywhere, ``LiveSignals.values_at`` included."""
     tree = ast.parse(src)
     parents = _parent_map(tree)
-    out: list[str] = []
-    for node in _provider_refs(tree):
-        scope = _enclosing_names(node, parents)
-        if scope != _LIVE_SCOPE:
-            out.append(f"provider outside LiveSignals.values_at: {'.'.join(scope) or '<module>'}")
-    n_imports = sum(isinstance(n, ast.ImportFrom) for n in _provider_refs(tree))
-    if n_imports != len(_PROVIDER_MODULES):
-        out.append(f"provider imports: {n_imports}")
-    return out
+    return [
+        f"provider reference: {'.'.join(_enclosing_names(n, parents)) or '<module>'}"
+        for n in _provider_refs(tree)
+    ]
 
 
 def signal_purity_problems(src: str) -> list[str]:
@@ -495,8 +513,9 @@ def swallow_problems(src: str) -> list[str]:
     """CR-01 / SEC-07 / RISK-09: swallow-all handlers live ONLY in the moved live block.
 
     Reports every ``except`` handler (``except*`` included) of any type outside
-    ``LiveSignals.values_at``, any shape other than exactly the four HEAD handlers
-    (``except Exception: pass``) inside it, and any use of ``suppress`` anywhere.
+    ``LiveSignals.values_at``, any shape other than exactly one
+    ``except Exception: return _LIVE_READ_FAILED`` inside it (CF-24-01, SY-01-21d), and any use
+    of ``suppress`` anywhere.
     """
     tree = ast.parse(src)
     parents = _parent_map(tree)
@@ -522,11 +541,76 @@ def swallow_problems(src: str) -> list[str]:
             and ast.unparse(h.type) == "Exception"
             and h.name is None
             and len(h.body) == 1
-            and isinstance(h.body[0], ast.Pass)
+            and ast.unparse(h.body[0]) == "return _LIVE_READ_FAILED"
         )
     ]
-    if len(live) != 4 or malformed:
+    if len(live) != 1 or malformed:
         out.append(f"live swallow handlers: count={len(live)} malformed={len(malformed)}")
+    return out
+
+
+#: sha256 of the source segment of the WHOLE ``LiveSignals`` ClassDef, from its ``class`` line to
+#: its last line (CF-2401-57 / C12-C13): an ``async def``, a decorator, a default argument, a
+#: stored lambda or a docstring edit changes it.  Changing the class means changing this on purpose.
+_LIVE_BODY_SHA256 = "482fb405695b5a6284aaebee0a69856de816b09c33f94fa3e8b30fc5017be0bf"
+_LIVE_BODY_TEXT = (
+    "try:\n    now = WALL_CLOCK.now()\n"
+    "    return PitSignals(LIVE_BOOK.view(to_ms(now)), _LIVE_FIELDS).values_at(now)\n"
+    "except Exception:\n    return _LIVE_READ_FAILED"
+)
+#: PC-7: the only names the body may reference (``now`` / ``self`` / ``decision_at`` are locals).
+_LIVE_BODY_NAMES = frozenset(
+    {"WALL_CLOCK", "LIVE_BOOK", "to_ms", "PitSignals", "_LIVE_FIELDS", "_LIVE_READ_FAILED"}
+)
+_LIVE_BODY_ATTRS = frozenset({"now", "view", "values_at"})
+
+
+def live_class_segment(src: str) -> str:
+    tree = ast.parse(src)
+    node = next(
+        (n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "LiveSignals"), None
+    )
+    return (ast.get_source_segment(src, node) or "") if node else ""
+
+
+def live_body_problems(src: str, *, check_hash: bool = True) -> list[str]:
+    """CF-24-01 (SY-01-21a, PC-7): ``LiveSignals`` is ``__slots__ = ()`` plus ONE synchronous
+    ``values_at`` whose body is exactly the SY-01-21a text, referencing only the allowlist."""
+    tree = ast.parse(src)
+    classes = [n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "LiveSignals"]
+    if len(classes) != 1:
+        return [f"LiveSignals class definitions: {len(classes)}"]
+    cls = classes[0]
+    out: list[str] = []
+    if [ast.unparse(d) for d in cls.decorator_list] != ["final"] or cls.bases or cls.keywords:
+        out.append("class header: expected bare @final")
+    stmts = [
+        n for n in cls.body
+        if not (isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant)
+                and isinstance(n.value.value, str))
+    ]  # fmt: skip
+    if (
+        len(stmts) != 2
+        or ast.unparse(stmts[0]) != "__slots__ = ()"
+        or type(stmts[1]) is not ast.FunctionDef
+        or stmts[1].name != "values_at"
+    ):
+        out.append("class body is not exactly __slots__ = () and a synchronous values_at")
+    else:
+        fn = stmts[1]
+        if fn.decorator_list or ast.unparse(fn.args) != "self, decision_at: datetime | None=None":
+            out.append("values_at: decorators, defaults or signature changed")
+        if [ast.unparse(s) for s in fn.body] != [_LIVE_BODY_TEXT]:
+            out.append("values_at: body is not the SY-01-21a text")
+        names = {n.id for n in ast.walk(fn) if isinstance(n, ast.Name)}
+        attrs = {n.attr for n in ast.walk(fn) if isinstance(n, ast.Attribute)}
+        local = {"self", "decision_at", "now", "Exception", "datetime", "SignalValues"}
+        allowed = _LIVE_BODY_NAMES | local
+        out += [f"values_at: name {n}" for n in sorted(names - allowed)]
+        out += [f"values_at: attribute {a}" for a in sorted(attrs - _LIVE_BODY_ATTRS)]
+    digest = hashlib.sha256(live_class_segment(src).encode()).hexdigest()
+    if check_hash and digest != _LIVE_BODY_SHA256:
+        out.append("LiveSignals source hash")
     return out
 
 
@@ -684,6 +768,12 @@ class TestEngineAstPin:
             "from data import market_signals",
             "import data.macro_data",
             "_x = whale_tracker.get_global_client",
+            "from data.live_context import LIVE_BOOK",  # CF-24-01 T-14 (4)
+            "import data.live_context",
+            "from data import live_context",
+            "from data.live_context_policy import FLOOR_S",
+            "from api.services.context_poller import ContextPoller",
+            "_b = LIVE_BOOK",
         ],
     )
     def test_engine_import_pin_fails_on_mutated_source(self, addition: str) -> None:
@@ -691,11 +781,16 @@ class TestEngineAstPin:
         assert engine_import_problems(src) == []
         assert engine_import_problems(src + f"\n{addition}\n")
 
-    def test_live_scope_pin_fails_when_a_provider_is_read_elsewhere(self) -> None:
+    def test_live_scope_pin_fails_when_a_provider_is_read_anywhere(self) -> None:
         src = _SIGNALS.read_text()
         assert live_scope_problems(src) == []
         leaked = src + "\n\ndef _leak() -> object:\n    from data.sentiment import get_global_client\n    return get_global_client()\n"  # noqa: E501
-        assert any("outside LiveSignals.values_at" in p for p in live_scope_problems(leaked))
+        assert any("provider reference: _leak" in p for p in live_scope_problems(leaked))
+        old = "            now = WALL_CLOCK.now()\n"  # the old home of the provider reads
+        assert src.count(old) == 1
+        probe = "            from data.sentiment import get_global_client as _g\n"
+        in_live = src.replace(old, probe + old)
+        assert "provider reference: LiveSignals.values_at" in live_scope_problems(in_live)
         in_pit = src.replace(
             "        decision_ms = to_ms(decision_at)",
             "        from data.sentiment import get_global_client as _g\n"
@@ -744,10 +839,8 @@ class TestEngineAstPin:
              "decision_at=decision_at)",
              "        mtf_context = self._build_mtf_context(bar_timestamp)",
              "_process_bar does not forward decision_at to _build_mtf_context"),
-            ("        ctx_kwargs: dict[str, Any] = self._mtf_signals.values_at(decision_at)"
-             ".to_context_kwargs()",
-             "        ctx_kwargs: dict[str, Any] = self._mtf_signals.values_at(None)"
-             ".to_context_kwargs()",
+            ("        values = self._mtf_signals.values_at(decision_at)\n",
+             "        values = self._mtf_signals.values_at(None)\n",
              "_build_mtf_context does not call self._mtf_signals.values_at(decision_at)"),
             ("        elif mtf_signals is not None and mtf_signals is not LIVE_SIGNALS:",
              "        elif mtf_signals is not None and not isinstance(mtf_signals, LiveSignals):",
@@ -762,7 +855,7 @@ class TestEngineAstPin:
 
     def test_wiring_pin_fails_when_the_live_block_comes_back_into_the_engine(self) -> None:
         src = _ENGINE.read_text()
-        old = "        ctx_kwargs: dict[str, Any] = self._mtf_signals.values_at(decision_at)"
+        old = "        values = self._mtf_signals.values_at(decision_at)"
         new = (
             "        try:\n            pass\n        except Exception:\n            pass\n" + old
         )
@@ -798,15 +891,26 @@ class TestEngineAstPin:
              "\n\ndef _swallow() -> None:\n    try:\n        pass\n    except Exception:\n"
              "        pass\n\n\n@final\nclass LiveSignals:",
              "except handler outside LiveSignals.values_at: _swallow"),
-            # (iv) one live handler narrowed (security M6)
-            ("        except Exception:\n            pass  # FRED is best-effort",
-             "        except ValueError:\n            pass  # FRED is best-effort",
-             "live swallow handlers: count=4 malformed=1"),
-            # (v) a 5th handler inside LiveSignals.values_at
-            ("            pass  # Whale Alert is best-effort; never crash bar processing\n",
-             "            pass  # Whale Alert is best-effort; never crash bar processing\n"
-             "        try:\n            pass\n        except Exception:\n            pass\n",
-             "live swallow handlers: count=5 malformed=0"),
+            # (iv) the one live handler narrowed (security M6) / back to the HEAD `pass` shape
+            ("        except Exception:\n            return _LIVE_READ_FAILED",
+             "        except ValueError:\n            return _LIVE_READ_FAILED",
+             "live swallow handlers: count=1 malformed=1"),
+            ("        except Exception:\n            return _LIVE_READ_FAILED",
+             "        except Exception:\n            pass",
+             "live swallow handlers: count=1 malformed=1"),
+            ("        except Exception:\n            return _LIVE_READ_FAILED",
+             "        except Exception:\n            return SignalValues()",
+             "live swallow handlers: count=1 malformed=1"),
+            # (v) a 2nd handler inside LiveSignals.values_at
+            ("            return _LIVE_READ_FAILED\n",
+             "            return _LIVE_READ_FAILED\n"
+             "        try:\n            pass\n        except Exception:\n"
+             "            return _LIVE_READ_FAILED\n",
+             "live swallow handlers: count=2 malformed=0"),
+            # (vii) the handler removed
+            ("        except Exception:\n            return _LIVE_READ_FAILED",
+             "        finally:\n            pass",
+             "live swallow handlers: count=0 malformed=0"),
             # (vi) contextlib.suppress
             ("        decision_ms = to_ms(decision_at)  # plain int",
              "        from contextlib import suppress\n\n"
@@ -821,6 +925,58 @@ class TestEngineAstPin:
         assert swallow_problems(src) == []
         problems = swallow_problems(src.replace(old, new))
         assert expected in problems, problems
+
+    # -- CF-24-01 P4a (T-15, T-22, PC-7, CF-2401-57): the LiveSignals text ----------------
+
+    def test_the_live_class_is_the_sy_01_21a_text_and_its_hash_is_pinned(self) -> None:
+        src = _SIGNALS.read_text()
+        assert live_body_problems(src) == []
+        assert hashlib.sha256(live_class_segment(src).encode()).hexdigest() == _LIVE_BODY_SHA256
+        assert live_class_segment(src).startswith("class LiveSignals:")  # from the `class` line on
+
+    @pytest.mark.parametrize(
+        ("old", "new", "structural"),
+        [
+            ("    def values_at(self, decision_at: datetime | None = None)",
+             "    async def values_at(self, decision_at: datetime | None = None)", True),  # C12
+            ("    def values_at(self, decision_at: datetime | None = None)",
+             "    @staticmethod\n    def values_at(self, decision_at: datetime | None = None)",
+             True),
+            ("decision_at: datetime | None = None) -> SignalValues:\n        try:",
+             "decision_at: datetime | None = LIVE_BOOK.reset()) -> SignalValues:\n"
+             "        try:", True),
+            ("            now = WALL_CLOCK.now()\n",
+             "            now = (lambda: WALL_CLOCK.now())()\n", True),  # C13
+            ("            now = WALL_CLOCK.now()\n",
+             "            _f = lambda: LIVE_BOOK.publish('s', [], 0)\n"
+             "            now = WALL_CLOCK.now()\n",
+             True),
+            ("            now = WALL_CLOCK.now()\n",
+             "            def _f() -> None: ...\n            now = WALL_CLOCK.now()\n", True),
+            # CF-2401-66: the reader passes wall-clock, never a decision time
+            ("LIVE_BOOK.view(to_ms(now))", "LIVE_BOOK.view(to_ms(decision_at))", True),
+            ("LIVE_BOOK.view(to_ms(now))", "LIVE_BOOK.snapshot()", True),
+            ("LIVE_BOOK.view(to_ms(now))", "LIVE_BOOK.heartbeat(to_ms(now))", True),
+            ("_LIVE_FIELDS).values_at(now)", "_LIVE_FIELDS).values_at(decision_at)", True),
+            ("        except Exception:\n            return _LIVE_READ_FAILED",
+             "        except Exception:\n            return SignalValues()", True),
+            ("    __slots__ = ()\n", "    __slots__ = ()\n    x = 1\n", True),
+            ("    __slots__ = ()\n", "    __slots__ = ('x',)\n", True),
+            ("\n\nLIVE_SIGNALS: Final",
+             "    def other(self) -> None: ...\n\n\nLIVE_SIGNALS: Final", True),
+            ("@final\nclass LiveSignals:", "class LiveSignals:", True),
+            # a docstring edit: only the hash notices
+            ("    guard checks it by identity.", "    guard checks it by identity!", False),
+        ],
+    )
+    def test_live_body_pin_fails_on_mutated_source(
+        self, old: str, new: str, structural: bool
+    ) -> None:
+        src = _SIGNALS.read_text()
+        assert src.count(old) == 1, "mutation anchor drifted: update this test"
+        mutated = src.replace(old, new)
+        assert live_body_problems(mutated) != []
+        assert (live_body_problems(mutated, check_hash=False) != []) is structural
 
     # -- WP2.4 P1 r2 (E2): the lag pin on PitSignals.values_at ------------------
 

@@ -551,14 +551,21 @@ def _class(tree: ast.AST, name: str) -> ast.ClassDef:
 
 
 def _public(tree: ast.AST, cls: str) -> set[str]:
-    """Public methods (sync or async) and class-level assignments such as ``expect = None``."""
+    """Public methods (sync or async), nested classes and class-level assignment targets such as
+    ``expect = None`` or ``expect, other = None, None`` (CF-2401-61: unpack targets and nested
+    ``ClassDef`` count; method bodies are never entered, so locals are not names)."""
     names: set[str] = set()
     for f in _class(tree, cls).body:
-        if isinstance(f, ast.FunctionDef | ast.AsyncFunctionDef):
+        if isinstance(f, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
             names.add(f.name)
         elif isinstance(f, ast.Assign | ast.AnnAssign):
             targets = [f.target] if isinstance(f, ast.AnnAssign) else f.targets
-            names |= {t.id for t in targets if isinstance(t, ast.Name)}
+            names |= {
+                n.id
+                for t in targets
+                for n in ast.walk(t)
+                if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)
+            }
     return {n for n in names if not n.startswith("_")}
 
 
@@ -703,6 +710,8 @@ def test_leaf_pin_catches_mutations(mutation: str) -> None:
             "    async def poll(self) -> None: ...\n\n    def snapshot(self)",
         ),
         ("    def snapshot(self)", "    expect: int = 0\n\n    def snapshot(self)"),
+        ("    def snapshot(self)", "    expect, other = None, None\n\n    def snapshot(self)"),
+        ("    def snapshot(self)", "    class expect: ...\n\n    def snapshot(self)"),
         ("LIVE_BOOK: Final = ", "LIVE_BOOK = "),
         ("LIVE_BOOK: Final = ", "LIVE_BOOK: object = "),
         ("LIVE_CONSUMERS: Final = ", "LIVE_CONSUMERS = "),
@@ -1121,3 +1130,320 @@ def test_the_root_conftest_resets_both_singletons_around_every_test() -> None:
         ),  # not autouse
     ]
     assert all(conftest_problems(m) != [] for m in mutations)
+
+
+# --- P4a (T-14 (4), T-19, T-21, T-22 ARC-14, CF-2401-57/61/67): engine pins -- append-only ---
+_ENGINE_FILE = _ROOT / _ENGINE
+_STAGE_VALUE = (
+    "mtf_signals_module.LIVE_CONTEXT_STAGE if self._mtf_signals is LIVE_SIGNALS else None"
+)
+_UNTOUCHED = frozenset(
+    {"_stop_event", "_auto_stop_reason", "evaluate", "_circuit_breaker", "_risk_manager"}
+)  # T-19: staleness never reaches the stop paths or the breaker inputs
+_RELEASE = "if consumer_token is not None:\n    LIVE_CONSUMERS.stopped(consumer_token)"
+
+
+def _engine_method(tree: ast.AST, name: str) -> ast.FunctionDef | ast.AsyncFunctionDef:
+    classes = (n for n in ast.walk(tree) if isinstance(n, ast.ClassDef))
+    klass = next(n for n in classes if n.name == "StrategyEngine")
+    fns = (n for n in klass.body if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef))
+    return next(n for n in fns if n.name == name)
+
+
+def _calls_of(tree: ast.AST, dotted: str) -> list[ast.Call]:
+    return [n for n in ast.walk(tree) if isinstance(n, ast.Call) and ast.unparse(n.func) == dotted]
+
+
+def engine_stage_problems(source: str) -> list[str]:
+    """SY-01-21h / T-21 / T-19 / CF-2401-57: the stage fence and the consumer registration."""
+    tree = ast.parse(source)
+    init, build = _engine_method(tree, "__init__"), _engine_method(tree, "_build_mtf_context")
+    reg = _engine_method(tree, "_register_live_consumer")
+    loop = _engine_method(tree, "run_live_loop")
+    out: list[str] = []
+    stores = [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Attribute) and n.attr == "_live_stage" and isinstance(n.ctx, ast.Store)
+    ]  # fmt: skip
+    values = [
+        ast.unparse(n.value) for n in ast.walk(init)
+        if isinstance(n, ast.AnnAssign) and n.value and ast.unparse(n.target) == "self._live_stage"
+    ]  # fmt: skip
+    if len(stores) != 1 or values != [_STAGE_VALUE]:
+        out.append("_live_stage is not set once, in __init__, behind the LIVE_SIGNALS identity")
+    read = {n.id for n in ast.walk(build) if isinstance(n, ast.Name)}
+    if read & {"LIVE_CONTEXT_STAGE", "mtf_signals_module"}:
+        out.append("_build_mtf_context reads the stage constant instead of self._live_stage")
+    guards = [
+        n for n in ast.walk(build)
+        if isinstance(n, ast.If) and ast.unparse(n.test) == "self._live_stage == 'neutral_shadow'"
+    ]  # fmt: skip
+    names = [
+        n for n in ast.walk(build) if isinstance(n, ast.Constant) and n.value == "neutral_shadow"
+    ]
+    if not (len(guards) == len(names) == 1 == len(_calls_of(guards[0], "SignalValues"))
+            == len(_calls_of(build, "SignalValues"))):  # fmt: skip
+        out.append("the neutral value is not built only under the self._live_stage guard")
+    touched = {n.attr for m in (build, reg) for n in ast.walk(m) if isinstance(n, ast.Attribute)}
+    out += [f"staleness path touches {n}" for n in sorted(touched & _UNTOUCHED)]  # T-19
+    starts = _calls_of(tree, "LIVE_CONSUMERS.started")
+    stops = _calls_of(tree, "LIVE_CONSUMERS.stopped")
+    tries = [t for t in ast.walk(reg) if isinstance(t, ast.Try)]
+    in_body = len(tries) == 1 and any(
+        n is c for s in tries[0].body for n in ast.walk(s) for c in starts
+    )
+    handlers = tries[0].handlers if len(tries) == 1 else []
+    swallowed = (
+        len(handlers) == 1
+        and ast.unparse(handlers[0].type or ast.Pass()) == "Exception"
+        and not any(isinstance(n, ast.Raise) for n in ast.walk(handlers[0]))
+    )
+    if len(starts) != 1 or len(stops) != 1 or not in_body or not swallowed:
+        out.append("LIVE_CONSUMERS.started/stopped: not one guarded start and one stop")
+    loops = [n for n in loop.body if isinstance(n, ast.Try)]
+    if len(loops) != 1:
+        return [*out, "run_live_loop has no single try/finally"]
+    if ast.unparse(loops[0].body[0]) != "consumer_token = self._register_live_consumer()":
+        out.append("the registration is not the first statement of the loop's try")
+    final = loops[0].finalbody  # CF-2401-57: exactly try: await stop-intrabar / finally: release
+    inner = final[0] if len(final) == 1 and isinstance(final[0], ast.Try) else None
+    if not (
+        inner is not None
+        and not inner.handlers
+        and not inner.orelse
+        and [ast.unparse(n) for n in inner.body] == ["await self._stop_intrabar_task()"]
+        and [ast.unparse(n) for n in inner.finalbody] == [_RELEASE]
+    ):
+        out.append("stopped is not in a finally nested after the intra-bar stop")
+    before = [ast.unparse(n) for n in loop.body[: loop.body.index(loops[0])]]
+    if "self._start_intrabar_task()" not in before:
+        out.append("the intra-bar task is not started before the registration")
+    return out
+
+
+def test_the_engine_stage_fence_and_registration_are_pinned() -> None:
+    assert engine_stage_problems(_ENGINE_FILE.read_text("utf-8")) == []
+
+
+_AWAIT, _IF = "await self._stop_intrabar_task()", "if consumer_token is not None:"
+_REL = "LIVE_CONSUMERS.stopped(consumer_token)"  # fragments of the release in ``run_live_loop``
+_NESTED_STOP = (
+    f"            try:\n                {_AWAIT}\n            finally:\n"
+    f"                {_IF}\n                    {_REL}\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("mtf_signals_module.LIVE_CONTEXT_STAGE if self._mtf_signals is LIVE_SIGNALS else None",
+         "mtf_signals_module.LIVE_CONTEXT_STAGE"),  # the fence removed
+        ("mtf_signals_module.LIVE_CONTEXT_STAGE if self._mtf_signals is LIVE_SIGNALS else None",
+         "'fresh' if self._mtf_signals is LIVE_SIGNALS else None"),
+        ("            if self._live_stage == \"neutral_shadow\":\n",
+         "            if True:\n"),  # the guard is not the stage
+        ("        values = self._mtf_signals.values_at(decision_at)\n",
+         "        values = self._mtf_signals.values_at(decision_at)\n"
+         "        if mtf_signals_module.LIVE_CONTEXT_STAGE == 'x':\n            pass\n"),
+        ("        values = self._mtf_signals.values_at(decision_at)\n",
+         "        values = self._mtf_signals.values_at(decision_at)\n"
+         "        self._stop_event.set()\n"),
+        ("            consumer_token = self._register_live_consumer()  # before the first bar\n",
+         "            pass\n            consumer_token = self._register_live_consumer()\n"),
+        ("                if consumer_token is not None:\n"
+         "                    LIVE_CONSUMERS.stopped(consumer_token)\n",
+         "                pass\n"),
+        ("            return LIVE_CONSUMERS.started(self._run_mode.value)\n"
+         "        except Exception as exc:\n",
+         "            return LIVE_CONSUMERS.started(self._run_mode.value)\n"
+         "        except Exception as exc:\n"
+         "            raise\n"),
+        ("        self._start_intrabar_task()\n        consumer_token", "        consumer_token"),
+        (_NESTED_STOP, f"            {_AWAIT}\n            {_IF}\n                {_REL}\n"),  # E1
+        (_NESTED_STOP, f"            {_IF}\n                {_REL}\n            {_AWAIT}\n"),  # E2
+    ],
+)  # fmt: skip
+def test_the_engine_pin_catches_mutations(old: str, new: str) -> None:
+    source = _ENGINE_FILE.read_text("utf-8")
+    assert source.count(old) == 1, old
+    assert engine_stage_problems(source.replace(old, new)) != []
+
+
+_ARC14 = frozenset({"packages/trading/adaptive_learning.py"})  # report-only reader (SY-01-22c)
+
+
+def arc14_problems(rel: str, source: str) -> list[str]:
+    """ARC-14: no strategy-side module reads a provider singleton (``get_global_client``,
+    ``cached_value``, ``*_from_cache``); only the report-only adaptive learning may."""
+    if rel in _ARC14:
+        return []
+    found: list[str] = []
+    for node in ast.walk(ast.parse(source)):
+        names = [getattr(node, "id", None), getattr(node, "attr", None)]
+        names += [a.name for a in node.names] if isinstance(node, ast.ImportFrom) else []
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            names.append(node.value)
+        found += [
+            f"{rel}: {n}" for n in names
+            if isinstance(n, str)
+            and (n in ("get_global_client", "cached_value") or n.endswith("_from_cache"))
+        ]  # fmt: skip
+    return found
+
+
+def test_only_the_report_only_adaptive_learning_reads_provider_singletons() -> None:
+    files = sorted((_ROOT / "packages" / "trading").rglob("*.py"))
+    assert len(files) > 30
+    offenders = {
+        f.relative_to(_ROOT).as_posix(): p
+        for f in files
+        if (p := arc14_problems(f.relative_to(_ROOT).as_posix(), f.read_text("utf-8")))
+    }
+    assert offenders == {}
+    adaptive = _ROOT / next(iter(_ARC14))
+    assert arc14_problems("x.py", adaptive.read_text("utf-8")) != []  # the allowlist is not stale
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "from data.sentiment import get_global_client\n",
+        "x = client.cached_value\n",
+        "y = c.btc_dominance_at_offset_from_cache(days_ago=7)\n",
+        "getattr(c, 'cached_value')\n",
+    ],
+)
+def test_the_arc14_pin_catches_mutations(line: str) -> None:
+    source = (_ROOT / "packages" / "trading" / "mtf_signals.py").read_text("utf-8")
+    assert arc14_problems("packages/trading/mtf_signals.py", source) == []
+    assert arc14_problems("packages/trading/mtf_signals.py", source + "\n" + line) != []
+
+
+def test_public_counts_unpack_targets_and_nested_classes_but_not_method_locals() -> None:
+    source = (
+        "class C:\n    def m(self):\n        a, b = 1, 2\n        class Inner: ...\n"
+        "    x, (y, *z) = 1, (2, 3)\n    class N: ...\n    w: int = 0\n    _p = 1\n"
+    )
+    assert _public(ast.parse(source), "C") == {"m", "x", "y", "z", "N", "w"}
+
+
+_LRF = "_LIVE_READ_FAILED: Final = SignalValues()"
+
+
+def live_read_failed_problems(source: str) -> list[str]:
+    """T-15 / SEC-P4A-01: the failure value is bound once, as the all-None ``SignalValues()``."""
+    tree = ast.parse(source)
+    binds = [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Name | ast.Attribute) and not isinstance(n.ctx, ast.Load)
+        and (getattr(n, "id", None) or getattr(n, "attr", None)) == "_LIVE_READ_FAILED"
+    ]  # fmt: skip
+    exact = [n for n in tree.body if isinstance(n, ast.AnnAssign) and ast.unparse(n) == _LRF]
+    return [] if len(binds) == 1 and len(exact) == 1 else ["_LIVE_READ_FAILED is not one binding"]
+
+
+@pytest.mark.parametrize(
+    "new",
+    [
+        "_LIVE_READ_FAILED: Final = SignalValues(fear_greed_index=50)",  # X1
+        "_LIVE_READ_FAILED: Final = SignalValues(whale_net_flow=0.0)",  # X10
+        "_LIVE_READ_FAILED = SignalValues()",  # no Final
+        f"{_LRF}\n_LIVE_READ_FAILED = SignalValues(fed_funds_rate=1.0)",  # a second binding
+    ],
+)
+def test_the_live_read_failed_pin_is_clean_on_the_real_file_and_catches_mutations(
+    new: str,
+) -> None:
+    source = (_ROOT / _MTF).read_text("utf-8")
+    assert source.count(_LRF) == 1 and live_read_failed_problems(source) == []
+    assert live_read_failed_problems(source.replace(_LRF, new)) != []
+
+
+_STAGE_NAMES = frozenset({"LIVE_CONTEXT_STAGE", "_live_stage"})
+_STAGE_LITERAL = 'LIVE_CONTEXT_STAGE: Final = "neutral_shadow"'
+
+
+def stage_source_problems(source: str, rel: str) -> list[str]:
+    """SY-01-04/19/21h: the stage is one reviewed literal in ``mtf_signals.py``, read only by the
+    engine; nothing else names it, writes it or spells it as a string (setattr / ``__dict__``)."""
+    tree = ast.parse(source)
+    out: list[str] = []
+    in_all = {  # the ``__all__`` entry is the one allowed string spelling, in mtf_signals.py
+        id(c) for a in tree.body if isinstance(a, ast.Assign)
+        and any(getattr(t, "id", "") == "__all__" for t in a.targets) for c in ast.walk(a.value)
+    }  # fmt: skip
+    if rel == _MTF:
+        binds = [
+            n for n in ast.walk(tree)
+            if isinstance(n, ast.Name | ast.Attribute) and not isinstance(n.ctx, ast.Load)
+            and (getattr(n, "id", None) or getattr(n, "attr", None)) == "LIVE_CONTEXT_STAGE"
+        ]  # fmt: skip
+        lit = [
+            n for n in tree.body
+            if isinstance(n, ast.AnnAssign) and ast.unparse(n.target) == "LIVE_CONTEXT_STAGE"
+            and ast.unparse(n.annotation) == "Final"
+            and isinstance(n.value, ast.Constant) and type(n.value.value) is str
+        ]  # fmt: skip
+        if len(binds) != 1 or len(lit) != 1:
+            out.append("stage: not one Final string literal")
+    for n in ast.walk(tree):
+        ident = getattr(n, "id", None) or getattr(n, "attr", None)
+        if ident in _STAGE_NAMES and rel not in (_MTF, _ENGINE):
+            out.append(f"stage name outside its homes: {ident}")
+        if (
+            ident in _STAGE_NAMES and rel == _ENGINE and ident != "_live_stage"
+            and not isinstance(n.ctx, ast.Load)  # type: ignore[attr-defined]
+        ):  # fmt: skip
+            out.append(f"stage store in the engine: {ident}")
+        if isinstance(n, ast.Constant) and n.value in _STAGE_NAMES:
+            if not (rel == _MTF and id(n) in in_all):
+                out.append(f"stage name as a string: {n.value}")
+    return out
+
+
+def test_the_stage_is_one_reviewed_literal_read_only_by_the_engine() -> None:
+    files = [*sorted((_ROOT / "packages").rglob("*.py")), *sorted((_ROOT / "apps").rglob("*.py"))]
+    assert len(files) > 100  # the walk is not vacuous
+    offenders = {}
+    for f in files:
+        rel = f.relative_to(_ROOT).as_posix()
+        if problems := stage_source_problems(f.read_text("utf-8"), rel):
+            offenders[rel] = problems
+    assert offenders == {}
+
+
+_STAGE_REGISTER = "            return LIVE_CONSUMERS.started(self._run_mode.value)\n"
+_ORCHESTRATOR = "apps/api/services/run_orchestrator.py"
+
+
+@pytest.mark.parametrize(
+    ("rel", "anchor", "new"),
+    [
+        (_MTF, _STAGE_LITERAL,  # S3: read from a config file
+         'from pathlib import Path\nLIVE_CONTEXT_STAGE: Final = Path("s").read_text()'),
+        (_MTF, _STAGE_LITERAL, "import sys\nLIVE_CONTEXT_STAGE: Final = sys.argv[-1]"),  # S4
+        (_MTF, _STAGE_LITERAL,  # S6: not a literal
+         'LIVE_CONTEXT_STAGE: Final = {"a": "neutral_shadow"}.get("a", "fresh")'),
+        (_ENGINE, _STAGE_REGISTER,  # S7: the engine stores to the module constant
+         "            mtf_signals_module.LIVE_CONTEXT_STAGE = 'fresh'\n" + _STAGE_REGISTER),
+        (_ENGINE, _STAGE_REGISTER,  # S10: the instance stage forced past the fence
+         "            object.__setattr__(self, '_live_stage', 'fresh')\n" + _STAGE_REGISTER),
+        (_ORCHESTRATOR, None, "engine._live_stage = 'fresh'\n"),  # S19
+        (_ORCHESTRATOR, None, "setattr(engine, '_live_stage', None)\n"),  # S20
+        ("apps/api/routers/runs.py", None,  # S21: a request value
+         "import trading.mtf_signals as m\nm.LIVE_CONTEXT_STAGE = body.stage\n"),
+    ],
+)  # fmt: skip
+def test_the_stage_pin_catches_mutations(rel: str, anchor: str | None, new: str) -> None:
+    if anchor is None:
+        source = new
+    else:
+        real = (_ROOT / rel).read_text("utf-8")
+        assert real.count(anchor) == 1 and stage_source_problems(real, rel) == []
+        source = real.replace(anchor, new)
+    assert stage_source_problems(source, rel) != []
+
+
+def test_a_read_only_import_of_the_stage_is_allowed() -> None:  # S22, CF-2401-81
+    source = "from trading.mtf_signals import LIVE_CONTEXT_STAGE\n"
+    assert stage_source_problems(source, "apps/api/routers/health.py") == []

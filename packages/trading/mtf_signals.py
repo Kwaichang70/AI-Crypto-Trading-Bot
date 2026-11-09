@@ -1,4 +1,3 @@
-# ruff: noqa: S110  (the four best-effort swallow-all reads are moved verbatim from HEAD)
 """Signal sources for the multi-timeframe context (WP2.4, SY-24-02).
 
 ``StrategyEngine._build_mtf_context`` used to read four process-global provider clients
@@ -11,12 +10,13 @@ historical bar: look-ahead (C10). The engine now asks a *signal source* instead:
   :mod:`data.point_in_time` series (``available_at <= close_i``, no lag parameter).
   :meth:`PitSignals.select` makes the per-run, per-field coverage decision (SY-24-05) and
   returns the source the run uses together with its :class:`MtfContextReport` (SY-24-07).
-* :data:`LIVE_SIGNALS` (paper and live): the pre-WP2.4 code, moved verbatim.
+* :data:`LIVE_SIGNALS` (paper and live): a pure read of the live context book at the wall clock
+  (CF-24-01); no provider client is touched.
 
 :class:`LiveSignals` is deliberately NOT a :class:`BacktestSignalSource`. The engine guards
 (``StrategyEngine.__init__``) keep a live source out of a backtest and the reverse.
 
-Logging: this module logs nothing. The moved live code keeps its HEAD swallow-all.
+This module emits nothing: the one swallow-all of ``LiveSignals.values_at`` returns all ``None``.
 """
 
 from __future__ import annotations
@@ -24,10 +24,12 @@ from __future__ import annotations
 import abc
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from dataclasses import fields as dataclass_fields
 from datetime import UTC, datetime, timedelta
 from types import MappingProxyType
 from typing import Any, ClassVar, Final, final
 
+from data.live_context import LIVE_BOOK, LIVE_CONSUMERS
 from data.point_in_time import (
     FIELD_MAP,
     MIN_COVERAGE_PPM,
@@ -38,10 +40,13 @@ from data.point_in_time import (
     series_digest,
     to_ms,
 )
+from trading.clock import WALL_CLOCK
 
 __all__ = [
     "ALL_MTF_SIGNAL_FIELDS",
     "KNOWN_MTF_CONTEXT_VERSIONS",
+    "LIVE_CONSUMERS",
+    "LIVE_CONTEXT_STAGE",
     "LIVE_SIGNALS",
     "MTF_CONTEXT_VERSION",
     "UNAVAILABLE",
@@ -53,6 +58,7 @@ __all__ = [
     "SignalValues",
     "UnavailableSignals",
     "check_backtest_source",
+    "live_served_fields",
     "select_mtf_signals",
 ]
 
@@ -85,6 +91,12 @@ _REASON_LOW_COVERAGE: Final = "insufficient_coverage"
 _REASON_NO_HISTORY: Final = "no_history"
 _REASON_PARTIAL: Final = "partial_fields"
 _EPOCH: Final = datetime(1970, 1, 1, tzinfo=UTC)
+
+#: Rollout stage of the live context (SY-01-04, UD-1 (a)): ``neutral_shadow`` serves consumers
+#: ``SignalValues()`` and emits the shadow event; P9 flips it to ``fresh`` after G-E.
+LIVE_CONTEXT_STAGE: Final = "neutral_shadow"
+#: The six fields the book can serve; the three never-served ones stay ``None`` (CF-2401-30).
+_LIVE_FIELDS: Final[frozenset[str]] = frozenset(FIELD_MAP)
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,6 +141,12 @@ class SignalValues:
             ctx_kwargs["btc_dominance_7d_ago"] = self.btc_dominance_7d_ago
         return ctx_kwargs
 
+    def restricted(self, names: Iterable[str]) -> SignalValues:
+        """A copy that keeps only the fields in ``names``; every other field is ``None``."""
+        keep = frozenset(names)
+        kept = {f.name: getattr(self, f.name) for f in dataclass_fields(self) if f.name in keep}
+        return SignalValues(**kept)
+
 
 class BacktestSignalSource(abc.ABC):
     """Abstract marker base of the sources a BACKTEST engine accepts.
@@ -165,6 +183,17 @@ def _now_field_of(field_name: str) -> str | None:
         if other_spec.series_id == spec.series_id and other_spec.back_ms == 0:
             return other
     return None
+
+
+def live_served_fields(declared: Iterable[object]) -> frozenset[str]:
+    """Fields a paper/live run serves: the union of the strategies' declarations (a non-frozenset
+    declares all nine, SY-24-06) that the book can serve, plus the 'now' partner of each 7d
+    field."""
+    consumed: set[str] = set()
+    for item in declared:
+        consumed |= item if isinstance(item, frozenset) else ALL_MTF_SIGNAL_FIELDS
+    served = frozenset(consumed) & _LIVE_FIELDS
+    return served | {p for p in map(_now_field_of, served) if p is not None}
 
 
 def _iso(ms: int) -> str:
@@ -452,98 +481,26 @@ def select_mtf_signals(
     return UNAVAILABLE, _unavailable_report(consumed, reason)
 
 
+_LIVE_READ_FAILED: Final = SignalValues()
+
+
 @final
 class LiveSignals:
-    """Paper/live source: the pre-WP2.4 provider-singleton reads, moved verbatim.
+    """Paper/live source: the live context book read through the backtest join (CF-24-01).
 
     NOT a :class:`BacktestSignalSource`. Use the :data:`LIVE_SIGNALS` singleton: the engine
-    guard checks it by identity.
+    guard checks it by identity. ``decision_at`` is ignored: the decision time is the wall clock,
+    read once.
     """
 
     __slots__ = ()
 
     def values_at(self, decision_at: datetime | None = None) -> SignalValues:
-        # --- moved verbatim from StrategyEngine._build_mtf_context (HEAD bbe7142,
-        # strategy_engine.py:2129-2193): the four best-effort singleton reads ---
-        # Read cached FGI value (best-effort; never crash bar processing
-        # if the client is unavailable or has not populated its cache yet).
-        fgi_value: int | None = None
-        fgi_value_7d_ago: int | None = None
         try:
-            from data.sentiment import get_global_client as _get_fgi_client
-            _fgi_client = _get_fgi_client()
-            if _fgi_client is not None:
-                fgi_value = _fgi_client.cached_value
-                # QT-007 v2 feature pipeline: cache-only sync read (no I/O).
-                # Returns None when history has not been populated yet by the
-                # background refresh task; v2 feature builder treats None as
-                # "no observed change".
-                fgi_value_7d_ago = _fgi_client.value_at_offset_from_cache(
-                    days_ago=7,
-                )
+            now = WALL_CLOCK.now()
+            return PitSignals(LIVE_BOOK.view(to_ms(now)), _LIVE_FIELDS).values_at(now)
         except Exception:
-            pass  # FGI is best-effort; never crash bar processing
-
-        # CoinGecko market structure signals (best-effort)
-        btc_dominance: float | None = None
-        btc_dominance_7d_ago: float | None = None
-        market_cap_change_24h: float | None = None
-        total_volume_change_24h: float | None = None
-        try:
-            from data.market_signals import get_global_client as _get_cg_client
-            _cg_client = _get_cg_client()
-            if _cg_client is not None:
-                _cg_snap = _cg_client.cached_value
-                if _cg_snap is not None:
-                    btc_dominance = _cg_snap.btc_dominance
-                    market_cap_change_24h = _cg_snap.market_cap_change_24h
-                    total_volume_change_24h = _cg_snap.total_volume_change_24h
-                # QT-007 v2 feature pipeline: cache-only sync read (no I/O).
-                btc_dominance_7d_ago = (
-                    _cg_client.btc_dominance_at_offset_from_cache(days_ago=7)
-                )
-        except Exception:
-            pass  # CoinGecko is best-effort; never crash bar processing
-
-        # FRED macro-economic signals (best-effort)
-        fed_funds_rate: float | None = None
-        yield_curve_spread: float | None = None
-        try:
-            from data.macro_data import get_global_client as _get_fred_client
-            _fred_client = _get_fred_client()
-            if _fred_client is not None:
-                _fred_snap = _fred_client.cached_value
-                if _fred_snap is not None:
-                    fed_funds_rate = _fred_snap.fed_funds_rate
-                    yield_curve_spread = _fred_snap.yield_curve_spread
-        except Exception:
-            pass  # FRED is best-effort; never crash bar processing
-
-        # Whale Alert on-chain flow signals (best-effort)
-        whale_net_flow: float | None = None
-        try:
-            from data.whale_tracker import get_global_client as _get_whale_client
-            _whale_client = _get_whale_client()
-            if _whale_client is not None:
-                _whale_snap = _whale_client.cached_value
-                if _whale_snap is not None:
-                    whale_net_flow = _whale_snap.net_flow
-        except Exception:
-            pass  # Whale Alert is best-effort; never crash bar processing
-
-        # --- end of the verbatim block; the HEAD ``ctx_kwargs`` non-None rule
-        # (strategy_engine.py:2195-2216) is SignalValues.to_context_kwargs ---
-        return SignalValues(
-            fear_greed_index=fgi_value,
-            btc_dominance=btc_dominance,
-            market_cap_change_24h=market_cap_change_24h,
-            total_volume_change_24h=total_volume_change_24h,
-            fed_funds_rate=fed_funds_rate,
-            yield_curve_spread=yield_curve_spread,
-            whale_net_flow=whale_net_flow,
-            fear_greed_index_7d_ago=fgi_value_7d_ago,
-            btc_dominance_7d_ago=btc_dominance_7d_ago,
-        )
+            return _LIVE_READ_FAILED
 
 
 LIVE_SIGNALS: Final = LiveSignals()

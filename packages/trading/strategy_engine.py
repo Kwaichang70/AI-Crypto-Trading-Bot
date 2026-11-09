@@ -57,6 +57,7 @@ from uuid import UUID
 import pandas as pd
 import structlog
 
+import trading.mtf_signals as mtf_signals_module
 from common.logging import exc_log_fields
 from common.models import MultiTimeframeContext, OHLCVBar
 from common.types import OrderSide, OrderStatus, RunMode, SignalDirection, TimeFrame
@@ -86,7 +87,15 @@ from trading.exit_config import (
     resolve_allow_pyramiding,
 )
 from trading.models import Fill, Order, Position, Signal, TradeResult
-from trading.mtf_signals import LIVE_SIGNALS, UNAVAILABLE, BacktestSignalSource, LiveSignals
+from trading.mtf_signals import (
+    LIVE_CONSUMERS,
+    LIVE_SIGNALS,
+    UNAVAILABLE,
+    BacktestSignalSource,
+    LiveSignals,
+    SignalValues,
+    live_served_fields,
+)
 from trading.portfolio import PortfolioAccounting
 from trading.risk import BaseRiskManager
 from trading.safety import CircuitBreaker, CircuitBreakerDecision, CircuitBreakerResponse
@@ -547,6 +556,16 @@ class StrategyEngine:
             mtf_signals
             if mtf_signals is not None
             else (UNAVAILABLE if run_mode == RunMode.BACKTEST else LIVE_SIGNALS)
+        )
+        #: CF-24-01: the fields a paper/live run serves (the strategies' union, SY-01-02), else
+        #: ``None``; and the rollout stage, read ONCE here and fenced to LIVE_SIGNALS (SY-01-21h).
+        self._live_fields: frozenset[str] | None = (
+            live_served_fields(s.mtf_signal_fields() for s in strategies)
+            if self._mtf_signals is LIVE_SIGNALS
+            else None
+        )
+        self._live_stage: str | None = (
+            mtf_signals_module.LIVE_CONTEXT_STAGE if self._mtf_signals is LIVE_SIGNALS else None
         )
         #: the clock exit-time stamps are read from: bar clock (BACKTEST) or wall.
         self._clock: Clock = WALL_CLOCK if clock is None else clock
@@ -1514,7 +1533,9 @@ class StrategyEngine:
         # stopped in the ``finally`` below.  The bar-polling loop body is unchanged:
         # with the feature off nothing here differs from before.
         self._start_intrabar_task()
+        consumer_token: int | None = None
         try:
+            consumer_token = self._register_live_consumer()  # before the first bar
             # Main polling loop
             while not self._stop_event.is_set():
                 loop_start = time.monotonic()
@@ -1540,7 +1561,22 @@ class StrategyEngine:
 
             self._log.info("engine.live_loop_exited")
         finally:
-            await self._stop_intrabar_task()
+            try:
+                await self._stop_intrabar_task()
+            finally:
+                if consumer_token is not None:
+                    LIVE_CONSUMERS.stopped(consumer_token)
+
+    def _register_live_consumer(self) -> int | None:
+        """Count this run as a live-context consumer (SY-01-21j); never raises (RK-P3-10)."""
+        if not self._live_fields:
+            return None
+        self._log.info("engine.live_context", version="cf2401-1", stage=self._live_stage)
+        try:
+            return LIVE_CONSUMERS.started(self._run_mode.value)
+        except Exception as exc:
+            self._log.error("engine.live_consumer_register_failed", error_type=type(exc).__name__)
+            return None
 
     # ------------------------------------------------------------------
     # Core bar processing
@@ -2168,9 +2204,22 @@ class StrategyEngine:
         the current primary bar timestamp.  The external market signal values
         (FGI, CoinGecko, FRED, Whale Alert) come from the engine's signal source
         (WP2.4): ``UNAVAILABLE`` / ``PitSignals`` answering for ``decision_at`` in a
-        backtest, the verbatim provider-singleton reads in paper/live.
+        backtest, the live context book at the wall clock in paper/live (CF-24-01), narrowed
+        to the consumed fields and, in stage ``neutral_shadow``, replaced by ``SignalValues()``.
         """
-        ctx_kwargs: dict[str, Any] = self._mtf_signals.values_at(decision_at).to_context_kwargs()
+        values = self._mtf_signals.values_at(decision_at)
+        if self._live_fields is not None:
+            values = values.restricted(self._live_fields)
+            if self._live_stage == "neutral_shadow":
+                if self._live_fields:  # a non-consumer emits no shadow event
+                    seen = {n: getattr(values, n) for n in sorted(self._live_fields)}
+                    self._log.info(
+                        "engine.mtf_context_shadow",
+                        values=seen,
+                        states={n: "none" if v is None else "served" for n, v in seen.items()},
+                    )
+                values = SignalValues()
+        ctx_kwargs: dict[str, Any] = values.to_context_kwargs()
 
         # Always return a context carrying the signal fields (fgi/btc_dom/...)
         # even when no HTF bars exist — strategies may condition on sentiment
