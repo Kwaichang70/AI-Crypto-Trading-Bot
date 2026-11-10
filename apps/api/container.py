@@ -74,9 +74,9 @@ class BackgroundTaskRegistry:
     """
 
     equity_prune_task: asyncio.Task[Any] | None = None
-    # S47-1: HistoryCacheWarmer instance (not a raw Task -- the object
-    # owns its own asyncio.Task internally and has a stop() coroutine).
-    history_cache_warmer: Any | None = None
+    # CF-24-01 P5: the ContextPoller (replaces the S47-1 HistoryCacheWarmer). The object owns
+    # its supervisor and provider tasks and has an idempotent stop() coroutine.
+    context_poller: Any | None = None
     # M6 (Sprint 49): FX rate cache warmer stub.  Real fetching in M6b.
     fx_cache_warmer: Any | None = None
     # WP1.8a (S8): repeats a critical alert every 15 min while a live run
@@ -97,16 +97,15 @@ class BackgroundTaskRegistry:
             self.orphan_repeater_task.cancel()
             tasks.append(self.orphan_repeater_task)
 
-        # S47-1: HistoryCacheWarmer owns its own task and has its own
-        # cancel coroutine.  Drive it via stop() so the warmer logs its
-        # own clean-shutdown event, then continue with the bulk wait.
-        if self.history_cache_warmer is not None:
+        # CF-24-01 P5: the ContextPoller owns its tasks; stop() is idempotent (the lifespan
+        # has normally stopped it already, before this registry is cancelled).
+        if self.context_poller is not None:
             try:
-                await self.history_cache_warmer.stop()
-            except Exception:
+                await self.context_poller.stop()
+            except Exception as exc:
                 logger.warning(
-                    "background_tasks.cancel_all: history_cache_warmer.stop raised",
-                    exc_info=True,
+                    "background_tasks.cancel_all: context_poller.stop raised (%s)",
+                    type(exc).__name__,
                 )
 
         # M6: FxCacheWarmer drives its own asyncio.Task; stop() is the clean path.
@@ -262,7 +261,7 @@ class AppContainer:
 
         Keys: db_engine, telegram_notifier, retraining_service, fgi_client,
         coingecko_client, fred_client, whale_alert_client, equity_prune_task,
-        history_cache_warmer, fx_cache_warmer, orphan_repeater_task.
+        context_poller, fx_cache_warmer, orphan_repeater_task.
         """
         orphan_repeater_task = self.background_tasks.orphan_repeater_task
         return {
@@ -274,9 +273,9 @@ class AppContainer:
             "fred_client": self.services.fred_client is not None,
             "whale_alert_client": self.services.whale_alert_client is not None,
             "equity_prune_task": self.background_tasks.equity_prune_task is not None,
-            "history_cache_warmer": (
-                self.background_tasks.history_cache_warmer is not None
-                and self.background_tasks.history_cache_warmer.running
+            "context_poller": (
+                self.background_tasks.context_poller is not None
+                and self.background_tasks.context_poller.running
             ),
             "fx_cache_warmer": (
                 self.background_tasks.fx_cache_warmer is not None

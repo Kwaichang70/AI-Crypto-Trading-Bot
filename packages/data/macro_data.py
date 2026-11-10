@@ -151,6 +151,10 @@ class MacroSnapshot(BaseModel):
     yield_curve_observed_on: date | None = Field(
         default=None, description="FRED observation date of yield_curve_spread (validated fetch)"
     )
+    yield_curve_rows: tuple[tuple[date, Decimal], ...] = Field(
+        default=(),
+        description="Every released, in-band T10Y2Y row of the fetched page, oldest first (P5)",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -370,17 +374,46 @@ class FREDClient:
         except Reject as rej:
             return Err("invalid_payload", rej.reason)
 
+    async def _fetch_rows(
+        self, series_id: str, low: Decimal, high: Decimal
+    ) -> Ok[list[tuple[date, Decimal]]] | Err:
+        """CF-2401-49: one ``limit=5`` page as every released, in-band row (oldest first).
+
+        Same request as ``_fetch_observation`` (kept apart so that function is untouched).
+        """
+        session = await self._get_session()
+        got = await fetch_json(
+            session,
+            _BASE_URL,
+            params={
+                "series_id": series_id,
+                "sort_order": "desc",
+                "limit": str(FRED_PAGE_LIMIT),
+                "api_key": self._api_key,
+                "file_type": "json",
+            },
+            max_bytes=MAX_BYTES_FRED,
+        )
+        if isinstance(got, Err):
+            return got
+        try:
+            return Ok(_released_rows(got.value, low, high))
+        except Reject as rej:
+            return Err("invalid_payload", rej.reason)
+
     async def fetch_validated(self) -> Ok[MacroSnapshot] | Err:
         """T10Y2Y (served) then FEDFUNDS (display only), each ``limit=5``. Never touches a cache.
 
         A T10Y2Y failure is the result. A FEDFUNDS failure only leaves ``fed_funds_rate`` None.
+        One bad released T10Y2Y row (band, parse, repeated date) rejects the whole page.
         The key never leaves this method: failures carry closed codes only.
         """
         try:
-            spread = await self._fetch_observation("T10Y2Y", T10Y2Y_MIN, T10Y2Y_MAX)
-            if isinstance(spread, Err):
-                self._log.debug("fred_client.fetch_validated_err", outcome=spread.outcome)
-                return spread
+            page = await self._fetch_rows("T10Y2Y", T10Y2Y_MIN, T10Y2Y_MAX)
+            if isinstance(page, Err):
+                self._log.debug("fred_client.fetch_validated_err", outcome=page.outcome)
+                return page
+            newest_day, newest_value = page.value[-1]  # the newest row stays the served spread
             funds = await self._fetch_observation("FEDFUNDS", FEDFUNDS_MIN, FEDFUNDS_MAX)
             if isinstance(funds, Err):
                 self._log.debug(
@@ -390,9 +423,10 @@ class FREDClient:
                 )
             snapshot = MacroSnapshot(
                 fed_funds_rate=None if isinstance(funds, Err) else float(funds.value[0]),
-                yield_curve_spread=float(spread.value[0]),
+                yield_curve_spread=float(newest_value),
                 timestamp=datetime.now(UTC),
-                yield_curve_observed_on=spread.value[1],
+                yield_curve_observed_on=newest_day,
+                yield_curve_rows=tuple(page.value),
             )
         except Exception as exc:
             self._log.warning("fred_client.fetch_validated_error", **exc_log_fields(exc))
@@ -416,3 +450,21 @@ def _validate_observation(payload: object, low: Decimal, high: Decimal) -> tuple
         raise Reject("no_observation")
     day, raw = max(released, key=lambda item: item[0])
     return in_band(to_decimal(raw), low, high), day
+
+
+def _released_rows(payload: object, low: Decimal, high: Decimal) -> list[tuple[date, Decimal]]:
+    """All released (non-``.``) rows of a page, each banded, oldest first (CF-2401-49).
+
+    One out-of-band or unparseable released row, or a repeated date, rejects the whole page.
+    """
+    rows = sequence(require(payload, "observations"))
+    if len(rows) > FRED_PAGE_LIMIT:
+        raise Reject("bad_shape")
+    pairs = [(iso_date(require(row, "date")), require(row, "value")) for row in rows]
+    released = [(day, raw) for day, raw in pairs if not (isinstance(raw, str) and raw == ".")]
+    if not released:
+        raise Reject("no_observation")
+    if len({day for day, _ in released}) != len(released):
+        raise Reject("bad_shape")
+    banded = [(day, in_band(to_decimal(raw), low, high)) for day, raw in released]
+    return sorted(banded, key=lambda row: row[0])

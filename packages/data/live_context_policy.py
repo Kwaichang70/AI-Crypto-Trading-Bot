@@ -8,7 +8,7 @@ It does not import ``live_context``; the shared 1 h bucket literal is equality-t
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Final
@@ -28,6 +28,9 @@ JITTER_PCT: Final = 10
 BUCKET_MS: Final = 3_600_000  # scheduling bucket of the snapshot series (SY-01-22d)
 BUCKET_JITTER_MAX_S: Final = 300  # first attempt at bucket start + U(0, 300 s)
 BUDGET_WINDOW_MS: Final = 3_600_000
+POLLER_DEAD_AFTER_S: Final = 3 * HEARTBEAT_TICK_S  # no heartbeat for 3 ticks: dead (CF-2401-64)
+STATUS_REMINDER_S: Final = 21_600  # a standing status is re-logged at least every 6 h
+STARTUP_STAGGER_S: Final = 30  # first round of every provider starts at U(0, 30 s) (SY-01-15)
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,11 +67,49 @@ def retry_after_next_s(retry_after_s: int) -> int:
     return max(FLOOR_S, min(retry_after_s, RETRY_AFTER_MAX_S))
 
 
-def wait_fits_cycle(wait_s: float, remaining_s: float) -> bool:
+def wait_fits_cycle(
+    wait_s: float, remaining_s: float, attempt_bound_s: float = ATTEMPT_BOUND_S
+) -> bool:
     """An in-cycle wait is taken only if one more attempt still fits the cycle (SY-01-21c)."""
-    return wait_s + ATTEMPT_BOUND_S <= remaining_s
+    return wait_s + attempt_bound_s <= remaining_s
 
 
 def backoff_s(retry: int, unit: float) -> float:
     """``min(1 s * 2**retry + U(0, 1), 60 s)`` for the zero-based retry index."""
     return min(float(1 << min(retry, 6)) + unit, float(BACKOFF_CAP_S))
+
+
+def _draw(unit: float) -> float:
+    if not 0.0 <= unit <= 1.0:  # also rejects NaN
+        raise ValueError("unit must be a uniform draw in [0, 1]")
+    return unit
+
+
+def jittered_s(base_s: float, unit: float) -> float:
+    """``base_s`` scaled by +-``JITTER_PCT`` percent; ``unit`` is the caller's draw in [0, 1]."""
+    return base_s * (1.0 + (JITTER_PCT / 100.0) * (2.0 * _draw(unit) - 1.0))
+
+
+def clamped_gap_s(series_id: str, base_s: float, unit: float) -> float:
+    """``min(max(jittered, FLOOR_S), cap/4)``: jitter never lifts a gap past cap/4 (CF-2401-52)."""
+    return min(max(jittered_s(base_s, unit), float(FLOOR_S)), float(max_gap_s(series_id)))
+
+
+def bucket_start_ms(at_ms: int) -> int:
+    """Start of the 1 h scheduling bucket that contains ``at_ms``."""
+    return at_ms - at_ms % BUCKET_MS
+
+
+def first_attempt_ms(bucket_ms: int, unit: float) -> int:
+    """First attempt of a bucketed series: bucket start + U(0, 300 s) (SY-01-22d)."""
+    return bucket_ms + int(_draw(unit) * BUCKET_JITTER_MAX_S * 1_000)
+
+
+def requests_in_window(stamps_ms: Iterable[int], at_ms: int) -> int:
+    """Requests stamped inside the rolling ``BUDGET_WINDOW_MS`` that ends at ``at_ms``."""
+    return sum(1 for stamp in stamps_ms if at_ms - BUDGET_WINDOW_MS < stamp <= at_ms)
+
+
+def budget_allows(stamps_ms: Iterable[int], at_ms: int, budget_per_hour: int, cost: int) -> bool:
+    """True when ``cost`` more requests still fit the rolling-hour budget (retries included)."""
+    return requests_in_window(stamps_ms, at_ms) + cost <= budget_per_hour

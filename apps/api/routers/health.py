@@ -6,8 +6,8 @@ S47-6 (Sprint 47) -- background-task health diagnostics endpoint.
 Surfaces the running state of every long-lived async task started by
 the FastAPI lifespan so operators can confirm post-deploy that:
 
-  * the v2 feature pipeline's history cache is being warmed
-    (HistoryCacheWarmer last_run_at_unix is recent)
+  * the live context poller (CF-24-01 P5) is alive and each provider series is
+    ``fresh``, ``stale``, ``invalid``, ... (closed vocabulary, server-written)
   * RetrainingService is polling
   * the active-run task count matches expectations
 
@@ -30,7 +30,10 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from api.services.context_poller import OUTCOMES, REASONS, STATUSES, ContextPoller
+from data.live_context import LIVE_BOOK
 
 # CR-001 (Sprint 47): no ``tags=`` on the APIRouter itself -- the tag is
 # applied exactly once at the ``include_router`` call in main.py.  Two
@@ -45,7 +48,8 @@ router = APIRouter(prefix="/health")
 
 
 class HistoryCacheWarmerHealth(BaseModel):
-    """Health snapshot for the FGI + BTC-dominance history warmer."""
+    """DEPRECATED compat key: the warmer was replaced by the context poller (CF-24-01 P5)
+    and is always reported as not configured. Read ``context_poller`` instead."""
 
     configured: bool = Field(description="True if the warmer was instantiated at startup")
     running: bool = Field(description="True if the warmer's asyncio.Task is alive")
@@ -65,6 +69,58 @@ class HistoryCacheWarmerHealth(BaseModel):
         default=0,
         description="Count of BTC dominance points fetched on the last tick",
     )
+
+
+class ContextSeriesHealth(BaseModel):
+    """One provider series of the live context book (CF-24-01 P5). Closed vocabularies only."""
+
+    series: str
+    status: str = Field(description="fresh | stale | invalid | unavailable | not_configured | ...")
+    last_outcome: str | None = Field(default=None, description="closed poll outcome code")
+    last_reason: str | None = Field(default=None, description="closed rejection reason code")
+    rows: int = 0
+    age_seconds: float | None = None
+    failed_cycles: int = 0
+    task_alive: bool = False
+
+    @field_validator("status")
+    @classmethod
+    def _closed_status(cls, v: str) -> str:
+        if v not in STATUSES:
+            raise ValueError("status outside the closed vocabulary")
+        return v
+
+    @field_validator("last_outcome")
+    @classmethod
+    def _closed_outcome(cls, v: str | None) -> str | None:
+        if v is not None and v not in OUTCOMES:
+            raise ValueError("outcome outside the closed vocabulary")
+        return v
+
+    @field_validator("last_reason")
+    @classmethod
+    def _closed_reason(cls, v: str | None) -> str | None:
+        if v is not None and v not in REASONS and v != "unknown":
+            raise ValueError("reason outside the closed vocabulary")
+        return v
+
+
+class ContextPollerHealth(BaseModel):
+    """The live context poller (CF-24-01 P5, RK-P4A-04: a dead poller is visible here)."""
+
+    configured: bool = Field(description="True if the poller was started with a provider")
+    running: bool = Field(description="True if the supervisor task is alive")
+    alive: bool = Field(description="running AND a supervisor heartbeat within 3 ticks")
+    heartbeat_age_seconds: float | None = None
+    regressed: bool = Field(
+        default=False,
+        description=(
+            "Wall clock behind the book's high-water mark by more than 5 min. The mark is "
+            "raised by every engine read (consumer and non-consumer), so while this is true "
+            "no series is reported fresh and engines read an empty book."
+        ),
+    )
+    series: list[ContextSeriesHealth] = Field(default_factory=list)
 
 
 class RetrainingServiceHealth(BaseModel):
@@ -113,7 +169,8 @@ class FxCacheWarmerHealth(BaseModel):
 class BackgroundHealthResponse(BaseModel):
     """Top-level response from GET /api/v1/health/background."""
 
-    history_cache_warmer: HistoryCacheWarmerHealth
+    history_cache_warmer: HistoryCacheWarmerHealth  # deprecated, constant
+    context_poller: ContextPollerHealth
     retraining_service: RetrainingServiceHealth
     active_runs: ActiveRunsHealth
     fx_cache_warmer: FxCacheWarmerHealth
@@ -134,23 +191,38 @@ async def background_health(request: Request) -> BackgroundHealthResponse:
     """Return running state + diagnostics for every long-lived background task."""
     container: Any = getattr(request.app.state, "container", None)
 
-    # History cache warmer (S47-1).  ``getattr`` guards survive partial
-    # test fixtures where a MagicMock omits some of the diagnostics fields.
-    warmer = (
-        container.background_tasks.history_cache_warmer
-        if container is not None
-        else None
-    )
-    if warmer is not None:
-        warmer_health = HistoryCacheWarmerHealth(
-            configured=True,
-            running=bool(getattr(warmer, "running", False)),
-            last_run_at_unix=getattr(warmer, "last_run_at", None),
-            last_fgi_points=int(getattr(warmer, "last_fgi_points", 0)),
-            last_btc_dom_points=int(getattr(warmer, "last_btc_dom_points", 0)),
+    # Deprecated compat key (CF-24-01 P5): the warmer no longer exists.
+    warmer_health = HistoryCacheWarmerHealth(configured=False, running=False)
+
+    # Live context poller (CF-24-01 P5). The book is read through ``freshness`` only: a
+    # health probe must not move the high-water mark or count a regressed read. ``isinstance``
+    # keeps a partial test double from being reported as a real poller.
+    poller = container.background_tasks.context_poller if container is not None else None
+    if isinstance(poller, ContextPoller):
+        now_ms = poller.now_ms()  # an exact int (CF-2401-62)
+        snap = poller.health(LIVE_BOOK.freshness(now_ms), now_ms)
+        poller_health = ContextPollerHealth(
+            configured=snap.configured,
+            running=snap.running,
+            alive=snap.alive,
+            heartbeat_age_seconds=snap.heartbeat_age_seconds,
+            regressed=snap.regressed,
+            series=[
+                ContextSeriesHealth(
+                    series=row.series_id,
+                    status=row.status,
+                    last_outcome=row.last_outcome,
+                    last_reason=row.last_reason,
+                    rows=row.rows,
+                    age_seconds=row.age_seconds,
+                    failed_cycles=row.failed_cycles,
+                    task_alive=row.task_alive,
+                )
+                for row in snap.series
+            ],
         )
     else:
-        warmer_health = HistoryCacheWarmerHealth(configured=False, running=False)
+        poller_health = ContextPollerHealth(configured=False, running=False, alive=False)
 
     # RetrainingService (Sprint 23).  CR-003: read PUBLIC properties so
     # renaming the internal ``_min_trades`` attribute would be caught at
@@ -206,6 +278,7 @@ async def background_health(request: Request) -> BackgroundHealthResponse:
 
     return BackgroundHealthResponse(
         history_cache_warmer=warmer_health,
+        context_poller=poller_health,
         retraining_service=rsvc_health,
         active_runs=active,
         fx_cache_warmer=fx_warmer_health,

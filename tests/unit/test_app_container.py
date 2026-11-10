@@ -152,7 +152,7 @@ class TestHealthAllFalse:
             "fred_client",
             "whale_alert_client",
             "equity_prune_task",
-            "history_cache_warmer",   # S47-1 (Sprint 47)
+            "context_poller",         # CF-24-01 P5 (replaces the S47-1 warmer)
             "fx_cache_warmer",        # M6 (Sprint 49)
             "orphan_repeater_task",   # WP1.8b (P-06)
         }
@@ -190,6 +190,15 @@ class TestHealthReflectsPopulation:
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
+
+    def test_context_poller_true_only_while_it_runs(self) -> None:
+        container = AppContainer.for_testing()
+        poller = MagicMock()
+        container.background_tasks.context_poller = poller
+        poller.running = True
+        assert container.health()["context_poller"] is True
+        poller.running = False
+        assert container.health()["context_poller"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -281,6 +290,32 @@ class TestBackgroundTaskRegistryCancelAll:
         registry.equity_prune_task = task
 
         await registry.cancel_all(timeout=1.0)  # Must not raise
+
+    async def test_cancel_all_stops_the_context_poller(self) -> None:
+        registry = BackgroundTaskRegistry()
+        poller = MagicMock()
+        poller.stop = AsyncMock()
+        registry.context_poller = poller
+
+        await registry.cancel_all(timeout=1.0)
+
+        poller.stop.assert_awaited_once()
+
+    async def test_a_failing_poller_stop_does_not_block_the_other_cancellations(self) -> None:
+        registry = BackgroundTaskRegistry()
+        poller = MagicMock()
+        poller.stop = AsyncMock(side_effect=RuntimeError("secret-looking text"))
+        registry.context_poller = poller
+
+        async def blocker() -> None:
+            await asyncio.sleep(9999)
+
+        task: asyncio.Task[None] = asyncio.ensure_future(blocker())
+        registry.equity_prune_task = task
+
+        await registry.cancel_all(timeout=1.0)  # Must not raise
+
+        assert task.cancelled()
 
 
 # ---------------------------------------------------------------------------

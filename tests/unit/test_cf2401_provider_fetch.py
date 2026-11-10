@@ -15,6 +15,7 @@ import json
 from collections.abc import Callable
 from datetime import UTC, date, datetime
 from decimal import Decimal
+from pathlib import Path
 from typing import Any, get_args
 from unittest.mock import MagicMock
 
@@ -1025,3 +1026,63 @@ async def test_ok_err_and_invalid_paths_are_silent_at_info(
     debug = production_logging(json_output=True, log_level="DEBUG")  # presence: DEBUG sees them
     await FACTORY[name](*good_items(name)).fetch_validated(**KWARGS[name])
     assert f"{EVENT_PREFIX[name]}.fetch_validated_ok" in debug.text
+
+
+# ---------------------------------------------------------------------------
+# CF-24-01 P5 (ER3-07, CF-2401-49/60/65): every released, in-band T10Y2Y row of the page
+# ---------------------------------------------------------------------------
+_FUNDS = ok(fred_rows(("2024-03-01", "5.33")))
+
+
+async def test_fred_page_delivers_every_released_row_oldest_first_newest_as_the_spread() -> None:
+    page = fred_rows(
+        ("2024-03-12", "."), ("2024-03-11", "0.42"), ("2024-03-08", "-0.5"), ("2024-03-07", "10"),
+        ("2024-03-06", "-10"),  # the band edges are in band
+    )
+    result = await fred(ok(page), _FUNDS).fetch_validated()
+    assert isinstance(result, Ok)
+    snap = result.value
+    assert [(d, str(v)) for d, v in snap.yield_curve_rows] == [
+        (date(2024, 3, 6), "-10"), (date(2024, 3, 7), "10"), (date(2024, 3, 8), "-0.5"),
+        (date(2024, 3, 11), "0.42"),
+    ]
+    assert all(isinstance(v, Decimal) for _, v in snap.yield_curve_rows)
+    assert (snap.yield_curve_spread, snap.yield_curve_observed_on) == (0.42, date(2024, 3, 11))
+
+
+@pytest.mark.parametrize(
+    ("page", "reason"),
+    [
+        (fred_rows(("2024-03-11", "0.4"), ("2024-03-08", "10.01")), "out_of_band"),  # an older row
+        (fred_rows(("2024-03-11", "0.4"), ("2024-03-08", "-10.01")), "out_of_band"),
+        (fred_rows(("2024-03-11", "0.4"), ("2024-03-08", "nan")), "bad_number"),
+        (fred_rows(("2024-03-11", "0.4"), ("2024-03-11", "0.5")), "bad_shape"),  # a repeated date
+        (fred_rows(("2024-03-11", "."), ("2024-03-08", ".")), "no_observation"),
+    ],
+)
+async def test_one_bad_released_row_rejects_the_whole_page(page: object, reason: str) -> None:
+    result = await fred(ok(page), _FUNDS).fetch_validated()
+    assert reason_of(result) == ("invalid_payload", reason)
+
+
+async def test_the_rows_leg_sends_the_same_request_as_the_single_row_leg() -> None:
+    """Drift guard: ``_fetch_rows`` repeats the request of ``_fetch_observation`` (additive)."""
+    client = fred(ok(fred_rows(("2024-03-11", "0.42"))), ok(fred_rows(("2024-03-11", "0.42"))))
+    assert isinstance(await client._fetch_rows("T10Y2Y", Decimal(-10), Decimal(10)), Ok)
+    assert isinstance(await client._fetch_observation("T10Y2Y", Decimal(-10), Decimal(10)), Ok)
+    (url_a, kw_a), (url_b, kw_b) = client._session.calls
+    assert (url_a, kw_a) == (url_b, kw_b)
+
+
+def test_macro_data_keeps_the_p2_log_site_exactly_once() -> None:
+    """CF-2401-60: ``test_log_site_pin_catches_mutated_sources`` asserts ``count(old) == 1``."""
+    text = Path(provider_http.__file__).with_name("macro_data.py").read_text()
+    assert text.count("**exc_log_fields(exc))\n            return Err(") == 1
+
+
+def test_the_new_fred_page_fetch_only_maps_a_reject_and_never_logs() -> None:
+    """N-1 (P5 synthesis): CF-2401-60 as amended: one ``except Reject`` handler, no log."""
+    import inspect
+
+    src = inspect.getsource(FREDClient._fetch_rows)
+    assert src.count("except") == 1 and "except Reject as rej:" in src and "_log" not in src
