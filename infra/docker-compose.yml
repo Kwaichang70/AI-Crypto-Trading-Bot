@@ -205,8 +205,14 @@ services:
       timeout: 5s
       retries: 5
       start_period: 60s
-    # Graceful shutdown — give FastAPI time to drain in-flight requests
-    stop_grace_period: 30s
+    # Graceful shutdown budget (CF-2401-123). SIGKILL lands at this value, so it must cover the
+    # whole shutdown path, in the worst case:
+    #   grace >= uvicorn drain + 0.1 s + recorder flush + background cancel + engine teardown + margin
+    #   75 s  >= 25 s ("--timeout-graceful-shutdown", Dockerfile.api)
+    #            + 0.1 s + 5 s (apps/api/main.py flush_sink) + 5 s (container.shutdown cancel)
+    #            + 30 s (apps/api/main.py asyncio.wait on the run tasks) + 9.9 s margin (client
+    #            closes, dispose_engine). Raise this, or lower the drain, with any of those terms.
+    stop_grace_period: 75s
     deploy:
       resources:
         limits:
