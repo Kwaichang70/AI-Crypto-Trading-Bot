@@ -313,6 +313,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     else:
         log.info("whale_alert_client.disabled", reason="WHALE_ALERT_API_KEY not set")
 
+    _alerts: Any = None  # CF-24-01 P6: its own try; the poller never depends on it (F5)
+    try:
+        from api.services.context_alerts import ContextAlertListener
+
+        _alerts = ContextAlertListener(lambda: container.services.telegram_notifier)  # step 7
+    except Exception as exc:
+        log.error("context_alerts.startup_error", **exc_log_fields(exc))
+
     try:
         from api.services.context_poller import ContextPoller
 
@@ -321,6 +329,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             coingecko=_coingecko_client,
             fred=_fred_client,
             whale=_whale_alert_client,
+            listener=_alerts,
         )
         _poller_task = _context_poller.start()
         # N-5: a dead supervisor cannot report its own death; the done-callback does.
@@ -331,6 +340,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # Fail-closed: without a poller the book stays empty and the context is neutral.
         log.error("context_poller.startup_error", **exc_log_fields(exc))
         metrics.gauge("mtf_context_poller_alive", 0.0)  # CR-P5-09: the P6 rule sees it
+        if _alerts is not None:  # a failed start is a death too; the reminder delivers it
+            await _alerts.on_poller_dead()
 
     # ------------------------------------------------------------------
     # 3c. Recover orphaned paper/live runs (Sprint 24) -- after the poller (SY-01-15)
@@ -533,6 +544,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             await _poller.flush_sink(5.0)
         except Exception as exc:
             log.warning("context_poller.shutdown_error", **exc_log_fields(exc))
+    if _alerts is not None:  # after the poller and before the notifier closes
+        try:
+            await _alerts.aclose()
+        except Exception as exc:
+            log.warning("context_alerts.shutdown_error", **exc_log_fields(exc))
 
     # ------------------------------------------------------------------
     # 0. container.shutdown() — cancels background tasks + run registry

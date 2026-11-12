@@ -126,6 +126,9 @@ class TestAlertExpressionsAreScoped:
             "trading-kill-switch",
             "trading-high-drawdown",
             "trading-api-down",
+            "mtf-context-poller-dead",
+            "mtf-context-stale",
+            "mtf-context-recorder-failing",
         ]
         for rule in group["rules"]:
             assert rule["condition"] == "C"

@@ -10,6 +10,9 @@
 #   trading_kill_switch_active     0/1
 #   trading_drawdown_pct           fraction of peak equity (0.10 = 10%)
 #   up{job="trading-bot-api"}      prometheus scrape health
+#   trading_mtf_context_*          live-context poller (CF-24-01 P6): heartbeat timestamp,
+#                                  fresh / series_configured / consumer_runs_active, recorder
+#                                  write failures (counter, emitted by P7)
 #
 # The three per-run rules (trading-cb-halt, trading-kill-switch,
 # trading-high-drawdown) carry the matcher {run_id!~"bt-.*"}. Since WP2.1c
@@ -152,3 +155,96 @@ groups:
               expression: A
               conditions:
                 - evaluator: { type: lt, params: [0.5] }
+
+      - uid: mtf-context-poller-dead
+        title: Live context poller dead
+        condition: C
+        for: 5m
+        noDataState: Alerting
+        execErrState: Error
+        labels:
+          severity: critical
+        annotations:
+          summary: >-
+            No poller heartbeat for 45 min. Backstop only: a supervisor death is
+            sent to Telegram at once. Keyed on the timestamp, not on alive == 0.
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              expr: time() - max(trading_mtf_context_poller_heartbeat_timestamp_seconds)
+              instant: true
+          - refId: C
+            relativeTimeRange: { from: 0, to: 0 }
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [2700] }
+
+      - uid: mtf-context-stale
+        title: Live context stale
+        condition: C
+        for: 15m
+        noDataState: OK
+        execErrState: Error
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            A configured context series is stale while a consumer run is active.
+            Telegram sends it as CRITICAL while a live run is active.
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              expr: >-
+                count((trading_mtf_context_fresh == 0) and on(series)
+                (trading_mtf_context_series_configured == 1))
+                and on() (sum(trading_mtf_context_consumer_runs_active) > 0)
+              instant: true
+          - refId: C
+            relativeTimeRange: { from: 0, to: 0 }
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [0.5] }
+
+      - uid: mtf-context-recorder-failing
+        title: Live context recorder failing
+        condition: C
+        for: 1m
+        noDataState: OK
+        execErrState: Error
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            The context recorder failed to write in the last 15 min. Recorded
+            history cannot be recovered later.
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              expr: max(increase(trading_mtf_context_recorder_write_failures_total[15m]))
+              instant: true
+          - refId: C
+            relativeTimeRange: { from: 0, to: 0 }
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [0] }
