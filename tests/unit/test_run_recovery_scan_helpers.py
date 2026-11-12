@@ -120,7 +120,7 @@ class TestPrefixExactShapeMatch:
     async def test_uppercase_suffix_is_foreign(self) -> None:
         run_id = uuid4()
         prefix = f"{run_id}-"
-        cid = f"{prefix}{uuid4().hex[:12].upper()}"
+        cid = f"{prefix}A{uuid4().hex[:11].upper()}"
         exchange = _StubExchange([_order(cid)])
 
         matched, foreign = await _fetch_prefixed_orders(
