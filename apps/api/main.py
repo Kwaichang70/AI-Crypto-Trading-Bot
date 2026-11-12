@@ -321,6 +321,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     except Exception as exc:
         log.error("context_alerts.startup_error", **exc_log_fields(exc))
 
+    # CF-24-01 P7: recorder + boot seed (store read, bounded, never raises, empty book on failure),
+    # before the poller so a first sighting cannot pre-empt a stored bucket row.
+    _recorder: Any = None
+    try:
+        from api.services.context_recorder import ContextRecorder
+        from api.services.context_store import SqlContextStore
+
+        _recorder = ContextRecorder(SqlContextStore(get_session_factory()), _alerts)
+        await _recorder.seed(time.time_ns() // 1_000_000)
+    except Exception as exc:
+        log.error("context_recorder.startup_error", **exc_log_fields(exc))
+        _recorder = None
+
     try:
         from api.services.context_poller import ContextPoller
 
@@ -330,10 +343,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             fred=_fred_client,
             whale=_whale_alert_client,
             listener=_alerts,
+            sink=_recorder,
         )
         _poller_task = _context_poller.start()
         # N-5: a dead supervisor cannot report its own death; the done-callback does.
         _poller_task.add_done_callback(_context_poller.on_supervisor_done)
+        if _recorder is not None:  # the writer runs only beside a running poller (flush_sink)
+            try:  # RK-P7-01: a recorder bug never fails the poller start or registration
+                _recorder.start()
+            except Exception as exc:
+                log.error("context_recorder.startup_error", **exc_log_fields(exc))
         container.background_tasks.context_poller = _context_poller
         log.info("context_poller.started")
     except Exception as exc:
@@ -536,6 +555,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # ------------------------------------------------------------------
     log.info("api.shutting_down")
 
+    # CF-2401-99: orphan flag first; the poller stop + recorder flush (<= 5 s) must not delay it.
+    from api.services.run_orchestrator import mark_shutdown_requested
+
+    # WP1.8a (S5): set BEFORE container.shutdown() cancels the run-registry tasks below, so each
+    # run's `except asyncio.CancelledError` branch can tell this graceful shutdown apart from a
+    # user-initiated stop_run and write status='orphaned' instead of 'stopped'.
+    mark_shutdown_requested()
+
     # CF-24-01 P5 (SY-01-15): poller stop -> recorder flush (<= 5 s) -> client close (below).
     _poller = container.background_tasks.context_poller
     if _poller is not None:
@@ -557,14 +584,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     #    first.  The explicit loops beneath are belt-and-suspenders during
     #    the Stap 1c transition period.
     # ------------------------------------------------------------------
-    from api.services.run_orchestrator import mark_shutdown_requested
-
-    # WP1.8a (S5): set BEFORE container.shutdown() cancels the run-registry
-    # tasks below, so each run's `except asyncio.CancelledError` branch can
-    # tell this graceful shutdown apart from a user-initiated stop_run and
-    # write status='orphaned' instead of 'stopped'.
-    mark_shutdown_requested()
-
     await container.shutdown()
 
     # Cancel all active paper/live trading engine tasks
