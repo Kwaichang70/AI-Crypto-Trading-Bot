@@ -43,9 +43,9 @@ flowchart TB
         ROUT[Routers<br/>/runs /orders /portfolio<br/>/ml /optimize /strategies<br/>/health /signals /circuit_breaker<br/>/learning]
         AUTH[API key SHA-256 hash<br/>+ rate limit + audit_events]
         CONT[AppContainer<br/>services + background_tasks<br/>+ run_registry]
-        LIFE[Lifespan<br/>FGI + CG warmup<br/>+ HistoryCacheWarmer<br/>+ RetrainingService<br/>+ recover_orphaned_runs]
+        LIFE[Lifespan<br/>ContextPoller + ContextRecorder<br/>+ RetrainingService<br/>+ recover_orphaned_runs]
         RTRN[RetrainingService<br/>v1/v2 dispatch<br/>+ best-effort FGI/BTC-dom]
-        WARM[HistoryCacheWarmer<br/>30min cadence<br/>S47-1 Sprint 47]
+        WARM[ContextPoller<br/>supervised provider schedule<br/>CF-24-01 P5]
     end
 
     subgraph DB["PostgreSQL"]
@@ -111,7 +111,7 @@ flowchart TB
 /apps
   /api         FastAPI backend (Python 3.11+, async)
     /routers   17 routers — runs, ml, optimize, strategies, portfolio, ...
-    /services  HistoryCacheWarmer (S47-1), RetrainingService, audit_log,
+    /services  ContextPoller, ContextRecorder, ContextAlertListener (CF-24-01), RetrainingService, audit_log,
                run_orchestrator, run_persistence
     container.py  AppContainer + ServiceRegistry + BackgroundTaskRegistry
     main.py    Lifespan, router wiring, settings, structlog
@@ -225,7 +225,7 @@ flowchart TB
 - Structured JSON logging via structlog with TO-008 request_id correlation (Sprint 44).
 - Prometheus `/metrics` endpoint with run_id labels on counters/gauges/histograms.
 - Audit log (Sprint 41 SEC-002): live_trading_enabled, model_activated, circuit_breaker_reset, emergency_stop event types with CHECK constraint.
-- Background tasks: equity_prune (1×/day), RetrainingService (1h cadence), HistoryCacheWarmer (30min S47-1), AdaptiveLearningTask (per-run optional).
+- Background tasks: equity_prune (1×/day), RetrainingService (1h cadence), ContextPoller (CF-24-01: provider cadences per `docs/runbooks/cf2401-live-context.md`), AdaptiveLearningTask (per-run optional).
 - `/api/v1/health/background` endpoint (S47-6): surfaces all background-task state.
 
 **Gaps:**

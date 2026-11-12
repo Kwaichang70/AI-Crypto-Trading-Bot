@@ -3,7 +3,7 @@ apps/api/services/fx_cache_warmer.py
 --------------------------------------
 M6 MVP (Sprint 49) -- FX rate cache warmer background task stub.
 
-Mirrors ``HistoryCacheWarmer`` (S47-1) in structure and lifecycle semantics.
+Same lifecycle as the other periodic tasks (the removed ``HistoryCacheWarmer`` pattern, S47-1).
 
 In M6 MVP, ``_tick()`` is a **no-op log stub** — no network calls are made.
 The class exists to:
@@ -22,7 +22,7 @@ Shutdown
 --------
 ``stop()`` cancels the internal asyncio.Task and awaits clean exit.
 ``BackgroundTaskRegistry.cancel_all()`` drives ``stop()`` — mirrors the
-``HistoryCacheWarmer`` pattern established in Sprint 47.
+periodic-task pattern established in Sprint 47 (``HistoryCacheWarmer``, since removed).
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ logger = structlog.get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 _DEFAULT_INTERVAL_SECONDS: float = 1800.0    # 30-minute cadence
-_DEFAULT_STARTUP_DELAY_SECONDS: float = 10.0  # stagger after HistoryCacheWarmer (5 s delay)
+_DEFAULT_STARTUP_DELAY_SECONDS: float = 10.0  # first tick 10 s after startup
 
 
 class FxCacheWarmer:
@@ -55,7 +55,7 @@ class FxCacheWarmer:
         Seconds between ticks.  Defaults to 1800 (30 min).
     startup_delay_seconds:
         Seconds to sleep before the first tick.  Defaults to 10 s to
-        stagger startup behind ``HistoryCacheWarmer`` (5 s delay).
+        delay the first tick after startup.
     """
 
     def __init__(

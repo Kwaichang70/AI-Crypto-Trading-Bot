@@ -85,10 +85,16 @@ Data acquisition, caching, and feature engineering.
   `pit_bad_value`; it never rewrites `available_ms`.
 - Serie rules (`SERIES_RULES`, `FIELD_MAP`; code constants, not env or API input): `alternative_me:fgi` (+24h, max 48h),
   `fred:T10Y2Y` (vintage or +2 business days, +1d, max 7d), `coingecko:btc_dominance` (recorded, 6h), `whale:net_flow_1h`
-  (recorded, 2h). Nothing under `packages/data` stores or loads these series yet: the `context_observations` table, migration
-  021, the backfill CLI and the recorder are Phase B/C (not built). `data/{sentiment,market_signals,macro_data,whale_tracker}.py`
-  are unchanged and still feed only live/paper through `trading.mtf_signals.LiveSignals`; their `str(exc)` log sites are
-  CF-24-02.
+  (recorded, 2h). Nothing under `packages/data` stores or loads these series: the store (`context_observations`; migration 021 is under `infra/alembic`)
+  and the recorder (CF-24-01 P7) are under `apps/api/services`; the backfill CLI is not built.
+- CF-24-01 live context (R1; `Documentation/CF-24-01-register.md`): `live_context.py` (stdlib + `data.point_in_time`, AST-pinned: no clock, env,
+  I/O or logging) holds `LiveContextBook` / `LIVE_BOOK` (copy-on-write; `view`, `heartbeat`, `publish`, `snapshot`, `freshness`, `reset`,
+  `regressed_reads`; a clock-regression guard with `CLOCK_REGRESSION_TOLERANCE_MS` = 300_000), `ConsumerRegistry` / `LIVE_CONSUMERS` and the converters
+  (`fgi_observations`, `t10y2y_observation(s)`, `snapshot_observation`). `live_context_policy.py` holds the cadence, budgets, `HEARTBEAT_TICK_S`,
+  `POLLER_DEAD_AFTER_S`, `STATUS_REMINDER_S` and pure helpers. `provider_http.py` is transport only (one GET, redirects off, identity encoding, size caps,
+  strict JSON, closed `Ok` / `Err`, no logging); `provider_bands.py` holds the signed-off bands. The four clients gain `fetch_validated` (no cache
+  access) and `adopt_validated` (the only runtime `_latest_cache` writer, called by `apps/api/services/context_poller.py` after `LIVE_BOOK.publish`; the deprecated `get_latest` has no runtime caller, CF-2401-07; `FearGreedClient.get_history` still writes `_history_cache` for `RetrainingService`, CF-2401-06).
+  `trading.mtf_signals.LiveSignals` reads the book; the `str(exc)` log sites of CF-24-02 are fixed.
 - Carry-forwards for the ingestion code that will use this leaf: quantise to 8 decimals with `ROUND_HALF_UP` and never
   `Decimal(float)` (QR-11); load at least `back_ms + max_age_ms` of history before the first decision (QR-12); compute
   `available_at` only through the two helpers (CF-SYN-01).

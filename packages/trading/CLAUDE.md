@@ -486,14 +486,15 @@ Core trading engine containing the heart of the system.
   boot-frozen FGI, BTC dominance, yield spread and whale flow (plus a wall-clock "7d ago") into every bar, while scripts got
   `None`. Since WP2.4 Phase A (P0-P3, `a9459c3..b669894`) a BACKTEST `StrategyEngine` never touches a provider singleton or the
   wall clock. The API passes no source in Phase A, so API backtests run with `UNAVAILABLE` (all nine fields `None`) = the old
-  "no clients" path = the script path. No golden constant changed. Phase B (store, migration 021, backfill CLI, API PIT loading)
-  is NOT built yet.
+  "no clients" path = the script path. No golden constant changed. The store and migration 021 exist (WP2.4-P5) and the live recorder writes dominance and
+  whale (CF-24-01 P7); the backfill CLI and API PIT loading are NOT built (no script or API path loads `context_observations` for a backtest).
 - `trading.mtf_signals` (`MTF_CONTEXT_VERSION = "wp24-1"`, `KNOWN_MTF_CONTEXT_VERSIONS`): `SignalValues` (9 fields, `None`
   default; `to_context_kwargs()` is the old non-None rule, FGI as `int`, the rest `float`), `BacktestSignalSource`
   (`UnavailableSignals` / singleton `UNAVAILABLE`, `PitSignals`) and `LiveSignals` / `LIVE_SIGNALS`. `LiveSignals` is NOT a
-  `BacktestSignalSource`. Its `values_at` body is `strategy_engine.py:2129-2193` (line numbers at `bbe7142`) moved verbatim (sha256-pinned in
-  `test_wp24_live_parity.py`; same lazy imports, same swallow-all); the `:2195-2216` non-None rule was re-expressed as
-  `to_context_kwargs`, not moved.
+  `BacktestSignalSource`. Since CF-24-01 its `values_at(decision_at)` ignores `decision_at` and returns
+  `PitSignals(LIVE_BOOK.view(to_ms(WALL_CLOCK.now())), _LIVE_FIELDS).values_at(now)` with one `except Exception: return
+  _LIVE_READ_FAILED` (all `None`, no logging). `mtf_signals.py` references no provider singleton; the book is `data.live_context.LIVE_BOOK`,
+  filled by the API poller. The non-None rule is `to_context_kwargs`.
 - Engine guard (`StrategyEngine.__init__(..., mtf_signals=None)`): BACKTEST accepts `None` (= `UNAVAILABLE`) or an instance of a
   REAL subclass of `BacktestSignalSource` (`register()` is not honoured; a `LiveSignals` never passes; checked via
   `isinstance`, `not isinstance(.., LiveSignals)` and `BacktestSignalSource in type(x).__mro__`). PAPER/LIVE accept `None`
@@ -501,7 +502,18 @@ Core trading engine containing the heart of the system.
   edited. `check_backtest_source` applies the same rule in the runner and optimizer constructors, before any run id exists.
 - Wiring: `run_backtest` passes `decision_at=close_i` (the object that feeds `bar_clock.advance`) to `_process_bar`;
   `_build_mtf_context(ts, *, decision_at=None)` calls `self._mtf_signals.values_at(decision_at).to_context_kwargs()`. The HTF
-  branch keeps its bar-open key (byte-identical; moving it to `close_i` is CF-24-12). Paper/live behaviour is byte-identical.
+  branch keeps its bar-open key (byte-identical; moving it to `close_i` is CF-24-12). Paper/live: see the CF-24-01 bullets below.
+- CF-24-01 (R1; `Documentation/CF-24-01-register.md`, runbook `docs/runbooks/cf2401-live-context.md`): `LIVE_CONTEXT_STAGE: Final =
+  "neutral_shadow"` in `mtf_signals.py` (one reviewed line, never env; P9 flips it to `"fresh"` after G-E). `StrategyEngine.__init__` sets
+  `_live_fields` (`live_served_fields`: the strategies' declared union that the book can serve, plus the now-partner of each 7d field) and
+  `_live_stage`, both only when the source `is LIVE_SIGNALS`. `_build_mtf_context` restricts the values to `_live_fields`; in
+  `neutral_shadow` a consumer gets `SignalValues()` and logs `engine.mtf_context_shadow` (`bar_ts_ms`, `values`, `states`); a non-consumer
+  (no declared fields) gets `SignalValues()` and logs nothing. A run with `_live_fields` logs `engine.live_context` once and registers in `LIVE_CONSUMERS`
+  (re-exported by `mtf_signals`; `strategy_engine.py` does not import `data.live_context`) before its first bar, released in the loop's `finally`.
+- `_drop_context_model_buys` is the last BUY filter: `BaseStrategy.context_trained()` (False; `ModelStrategy` = importance over the context
+  columns > 0, missing or unreadable = True, reset to True on every hot-swap until classified; ensemble = any) blocks BUYs in LIVE always
+  (`mtf_context_model_unverified`) and in PAPER while a consumed field is `None` (`mtf_context_model_input_missing`, so always in Stage 1). Exits and inert
+  models are never blocked. `safety.LIVE_CONTEXT_CONSUMER_ALLOWLIST` is empty: `live_context_consumer_refusal` gives 422 `live_context_consumer_blocked`.
 - `data.point_in_time` (stdlib-only, AST-pinned in `test_wp24_ast_pins.py`): `PIT_VERSION`, `PitSeries.asof(decision_ms, *,
   max_age_ms)` and `coverage_ppm(...)` (neither takes a lag argument), `Observation` (`Decimal` value, integer ms),
   `series_digest`, `parse_jsonl_lines`, `PitError` (closed codes, fixed messages). The lag is applied ONCE at ingestion into
@@ -528,10 +540,14 @@ Core trading engine containing the heart of the system.
   unaffected.
 - Pins to respect: `test_wp24_ast_pins.py` (leaf import whitelist and no-lag pins; name-reference allowlists that keep
   `LIVE_SIGNALS` / `LiveSignals` / `BacktestSignalSource` inside `mtf_signals.py`, `strategy_engine.py`, `backtest.py` and
-  `optimizer.py`; no `.register(` on the source), `test_wp24_live_parity.py` (frozen oracle and moved-block hash),
+  `optimizer.py`; no `.register(` on the source), `test_wp24_live_parity.py` (adapted: `decision_at` ignored; the frozen oracle and the moved-block hash were retired on purpose),
+  `_LIVE_BODY_SHA256` + `live_body_problems` (the whole `LiveSignals` class), `live_scope_problems` (inverted: no provider reference in
+  `mtf_signals.py`), `swallow_problems` (one handler), `engine_stage_problems` / `stage_source_problems` (stage branch fenced by `self._live_stage`),
+  `context_gate_problems` in `test_cf2401_context_trained.py` (the two reasons live only in `_drop_context_model_buys`: last, BUY-only,
+  fail-closed incl. the E05 `fields-fail-closed` facet, no backtest; limits: B1..B5 pass the pin but are killed behaviourally, B6 is label-only). `mtf_signals.py` must not contain the
+  substrings `logging`, `structlog`, `getLogger`, `print(`, `exc_log_fields`, comments included,
   `test_wp22_ast_pins.py` (unedited). Do not add an `except` handler to `PitSignals.select` or coverage code without a
   reviewed pin change.
-- Open: CF-24-01 (paper/live context is frozen at API boot; own live-safety WP), CF-24-02 (`str(exc)` log sites in the provider
-  modules), CF-24-03 (v2 training join is not PIT), CF-24-05 (live 7d nearest-snapshot rule), and the P7 preconditions
-  CF-P3-08..10. P1-P3 must ship in one release.
+- Open: CF-24-03 (v2 training join is not PIT) and the P7 preconditions CF-P3-08..10. CF-24-01, -02 and -05 are solved in R1 (see
+  the register); until the R1 tag the boot-frozen behaviour applies. P1-P3 must ship in one release.
 - See `reports/vp2-wp2.4/synthesis-spec.md` and `Documentation/WP2.4-register.md`.

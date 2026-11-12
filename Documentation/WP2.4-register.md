@@ -42,7 +42,7 @@
 | ID | Beslissing |
 |---|---|
 | UD-1 | **(a) WP2.4 vóór WP2.6.** Dit wijkt af van de afhankelijkheid in het plan. WP2.4 neemt migratie 021; WP2.6 rebaset (CF-24-14). |
-| UD-2 | **(b) Fase A + B nu.** De forward recorder gaat naar de CF-24-01-WP. Gevolg: CoinGecko- en whale-geschiedenis begint pas als die WP landt en is niet achteraf te herstellen. |
+| UD-2 | **(b) Fase A + B nu.** De forward recorder gaat naar de CF-24-01-WP. Gevolg: CoinGecko- en whale-geschiedenis begint pas als die WP landt en is niet achteraf te herstellen. **Status:** de recorder (P7) zit in R1; gesloten na G-D en de R1-tag (`CF-24-01-register.md`). |
 | UD-4 | **(a) Inerte modellen houden;** context-getrainde modellen zijn geen bewijs en worden later opnieuw getraind (CF-24-03/07). Geen code in WP2.4. |
 | CF-24-01 | Bevroren live-context: **aparte live-safety-WP** (risk + security), direct na Fase A. |
 | UD-3 en UD-5 | **Niet apart gevraagd.** De spec-default (a) is genomen: UD-3 (a) = `legacy_mtf_context` alleen voor consumer-strategieën, leaderboard-uitsluiting en teller; UD-5 (a) = FGI-lag 24 uur. De gebruiker kan dit overrulen (`user-decisions.md`). |
@@ -150,15 +150,15 @@ Een eigenaar met "(v)" is een voorstel van de opsteller; zonder "(v)" komt hij u
 
 | ID | Omschrijving | Eigenaar | Doel |
 |---|---|---|---|
-| CF-24-01 | **LIVE SAFETY.** Paper/live-"latest"-waarden (FGI, CoinGecko, FRED, whale) zijn bevroren bij het opstarten; `get_latest` draait alleen op `main.py:306, 469, 512, 538`. De FGI-7d-delta mengt een bevroren "nu" met een meebewegend "7 dagen geleden". Live dca en rsi dimensioneren posities (×0,33..×1,83) en context-getrainde v2-modellen voorspellen op verouderde input. Fix: periodieke refresh, per-serie-verouderingsgrens in live, fail-closed bij verouderde context; de forward recorder sluit hier aan | risk-management-expert + security-audit-specialist, met trading-engine-architect | **Eigen WP, direct na Fase A** (UD-besluit) |
-| CF-24-02 | Log-hygiëne: `error=str(exc)` op `sentiment.py:269, 320`, `market_signals.py:296, 410`, `retraining.py:164, 276, 309, 323, 345, 352, 646` → `exc_log_fields`; controleer of een CoinGecko-sleutel erin kan staan | security-audit-specialist | CF-36-vervolg |
+| CF-24-01 | **LIVE SAFETY.** Paper/live-"latest"-waarden (FGI, CoinGecko, FRED, whale) zijn bevroren bij het opstarten; `get_latest` draait alleen op `main.py:306, 469, 512, 538`. De FGI-7d-delta mengt een bevroren "nu" met een meebewegend "7 dagen geleden". Live dca en rsi dimensioneren posities (×0,33..×1,83) en context-getrainde v2-modellen voorspellen op verouderde input. Fix: periodieke refresh, per-serie-verouderingsgrens in live, fail-closed bij verouderde context; de forward recorder sluit hier aan | risk-management-expert + security-audit-specialist, met trading-engine-architect | **Eigen WP, direct na Fase A** (UD-besluit). **Status:** opgelost in R1 (P2-P7), gesloten na G-D en de R1-tag; zie `CF-24-01-register.md` |
+| CF-24-02 | Log-hygiëne: `error=str(exc)` op `sentiment.py:269, 320`, `market_signals.py:296, 410`, `retraining.py:164, 276, 309, 323, 345, 352, 646` → `exc_log_fields`; controleer of een CoinGecko-sleutel erin kan staan | security-audit-specialist | CF-36-vervolg. **Status:** de 11 sites zijn gedaan in CF-24-01 P1 (R0, tag `cf2401-r0`) |
 | CF-24-03 | v2-training joint FGI op de bar-open-index zonder `available_at` (`ml_features.py:653-666`) en gebruikt maar 30 punten; herbouwen op `data.point_in_time` bij `close_i` met train/serve-pariteitstest | data-pipeline-engineer | WP2.7 |
 | CF-24-04 | Latente HTF-`reindex(ffill)`-lek in `build_extended_feature_matrix` (`:636-650`) | data-pipeline-engineer (v) | WP2.7 |
-| CF-24-05 | De live-7d-nearest-snapshot-regel plus `datetime.now()` (`sentiment.py:518`, `market_signals.py:542`) → as-of-semantiek | CF-24-01-WP | Met CF-24-01 |
+| CF-24-05 | De live-7d-nearest-snapshot-regel plus `datetime.now()` (`sentiment.py:518`, `market_signals.py:542`) → as-of-semantiek | CF-24-01-WP | Met CF-24-01. **Status:** opgelost in R1 (P3 boek, P4a: `LiveSignals` leest het boek met as-of-semantiek); gesloten na G-D en de R1-tag |
 | CF-24-06 | Per-bar sidecar-hot-swap van `ModelStrategy` in backtests (`model_strategy.py:514-516`) | trading-engine-architect (v) | Nog toe te wijzen |
 | CF-24-07 | Bestaande modellen classificeren op `feature_importances`, context-getrainde hertrainen of labelen (UD-4); schema v3 met expliciete "missing"-codering | quant-strategy-analyst + data-pipeline-engineer (v) | WP2.7 / ML-WP |
-| CF-24-08 | FRED-`.`-sentinel geeft `None` in plaats van de laatste geldige waarde | data-pipeline-engineer (v) | Backlog |
-| CF-24-09 | FGI-geschiedeniscache niet gesleuteld op `limit` | data-pipeline-engineer (v) | Backlog |
+| CF-24-08 | FRED-`.`-sentinel geeft `None` in plaats van de laatste geldige waarde | data-pipeline-engineer (v) | Backlog. **Status:** opgelost in R1 (P2, `limit=5` met observatiedatum); gesloten na G-D en de R1-tag |
+| CF-24-09 | FGI-geschiedeniscache niet gesleuteld op `limit` | data-pipeline-engineer (v) | Backlog. **Status:** opgelost in R1 (P2, altijd `limit=30` gecachet); gesloten na G-D en de R1-tag |
 | CF-24-10 | Legacy `regime_at_entry`/`signal_context` op trades van vóór de marker: `adaptive_learning.py` en `performance_analyzer.py` moeten ze uitsluiten | quant-strategy-analyst (v) | Nog toe te wijzen |
 | CF-24-11 | `test_multi_timeframe` wist alleen de FGI-singleton | testing-quality-specialist (v) | WP4.8 (v) |
 | CF-24-12 | HTF-sleutel naar `close_i` zodra een productie-aanroeper `htf_bars` meegeeft | data-pipeline-engineer (v) | Bij die aanroeper |
@@ -172,6 +172,8 @@ Een eigenaar met "(v)" is een voorstel van de opsteller; zonder "(v)" komt hij u
 | CF-24-20 | Script-side store-loader (scripts staan standaard op `UNAVAILABLE`; JSONL werkt nu al) | database-architect (v) | Na P5 |
 | CF-24-21 | Fold-lokale dekkingsgaten van `ParameterOptimizer` (SY-24-05) meten als WF-resultaten van consumers ertoe doen | quant-strategy-analyst (v) | WP2.7 |
 | CF-24-22 | De "bekende marker"-regel bestaat nu voor metrics en mtf op meerdere plaatsen; houd ze in de pas met `KNOWN_*` | python-backend-specialist (v) | Een later WP |
+
+R1-status: zie `Documentation/CF-24-01-register.md` (ledger, G-D, Stage 2) en `docs/runbooks/cf2401-live-context.md`.
 
 ### 5.2 Uit P0 (`p0-synthesis.md` §6, `p0-quant-r2.md`)
 
@@ -254,7 +256,7 @@ CF-P2-09/10 zijn niet in P4 uitgevoerd: P4 is docs-only (spec §5, P4-rij).
 - **Resultaten komen nu overeen met de research-scripts** (C10-pariteit; API = script). Dca- en rsi-uitkomsten zijn reproduceerbaar en hangen niet meer af van het tijdstip van de laatste herstart. De getallen van consumer-strategieën kunnen sterk veranderen ten opzichte van oude runs (§4, synthetische meting: dca ×0,44..×1,17 in een bull-regime en tot ×0,16 in een vlak regime; rsi-trades verwijderd of buy-and-hold). Dat is de bedoelde correctie, geen regressie.
 - **Oude consumer-runs** (backtest/optimize zonder `engine_semantics.mtf_context`) krijgen `legacyMtfContext = true`, worden uit het leaderboard gehouden en geteld in `/portfolio/summary.legacy_mtf_context_runs_excluded`. Dit is grotendeels theoretisch: elke run van vóór WP2.5 is al uitgesloten door de metrics-helft (WP2.5 UD-1). De mtf-helft raakt alleen consumer-runs die tussen de WP2.5-P3-deploy en de WP2.4-P3-deploy zijn gemaakt. Oude rijen worden nooit herschreven.
 - **Runs met status `unavailable`/`partial`** blijven eligible met label, maar zijn geen WP2.8-promotiebewijs voor consumer-strategieën (alleen een rapportageregel; de promotiegate leest geen metric).
-- **Live en paper zijn ongewijzigd** (byte-identiek, geen marker). **CF-24-01 blijft open:** live-context is bevroren op de opstartwaarden; de aparte live-safety-WP volgt direct op Fase A.
+- **Live en paper zijn ongewijzigd** (byte-identiek, geen marker). **CF-24-01:** was open (live-context bevroren op de opstartwaarden); opgelost in R1 van de live-safety-WP, zie `Documentation/CF-24-01-register.md`. Tot de R1-deploy blijft dit gedrag van kracht.
 - **Geen migratie in Fase A.** Alembic head blijft 020. Alleen JSONB-sleutels (`runs.config`, `optimization_runs.run_metadata`). Migratie 021 komt met P5; deploy die vóór de P7-code.
 - **Versie-bumpbeleid.** Een latere wijziging aan de PIT-semantiek hoogt `MTF_CONTEXT_VERSION` op en voegt de nieuwe waarde toe aan `KNOWN_MTF_CONTEXT_VERSIONS` (CF-24-22). `timestamp_clock`, `bar_alignment` en `metrics` hebben eigen versies.
 - **CF-24-01 R0 (P0, live-context-gate): deploy-gate en runbook.** Na de R0-deploy weigert de API een live create, promote en `mode=normal`-resume van een consumer-strategie (`rsi_mean_reversion`, `dca_rsi_hybrid`, `model_strategy`) met 422 `{"detail": {"code": "live_context_consumer_blocked"}}`. Een `mode=protective`-resume blijft toegestaan (UD-6 a).

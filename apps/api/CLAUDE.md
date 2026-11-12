@@ -28,7 +28,7 @@ Python 3.11+ REST API server using FastAPI framework.
 ### WP2.4 (point-in-time MTF context: API marker, flags, leaderboard)
 - Phase A only. The API passes NO signal source to `BacktestRunner` / `ParameterOptimizer`, so every API backtest and optimize
   run uses `UNAVAILABLE` (consumed fields `None`, status `unavailable`; `not_used` for strategies that consume nothing). The
-  store, migration 021, backfill CLI and API PIT loading (P5-P7) are not built; Alembic head is still 020.
+  store and migration 021 exist (WP2.4-P5, Alembic head 021) and the live recorder (CF-24-01 P7) writes dominance and whale; the backfill CLI and API PIT loading are not built.
 - `cost_profiles.engine_semantics(mode)` adds `mtf_context = MTF_CONTEXT_VERSION` ("wp24-1") for backtest and optimize only
   (paper/live get none; `promote_to_live` re-stamps mode `live` and pops the `mtf_context` block). `timestamp_clock`,
   `bar_alignment` and `metrics` are not bumped. The run-specific block `config["mtf_context"]` (backtest) and
@@ -58,4 +58,14 @@ Python 3.11+ REST API server using FastAPI framework.
 - Open: P7 must keep everything written into `config["mtf_context"]` inside closed values (no exception text, DSN, URL, table
   name; CF-P3-08), extend the dynamic-import scan (CF-P3-10), and keep the marker server-written (CF-P3-11). CF-24-19 is the UI
   work. P1-P3 ship in one release.
+- CF-24-01 (R1; `Documentation/CF-24-01-register.md`, runbook `docs/runbooks/cf2401-live-context.md`). Lifespan: kill switch, clients and `ContextAlertListener`
+  (`services/context_alerts.py`, Telegram), `ContextRecorder` (`services/context_recorder.py`) built and its seed awaited (3 s bound, never raises),
+  `ContextPoller` (`services/context_poller.py`) started, then the recorder writer in its own `try`, then `recover_orphaned_runs()`. The warm-ups and
+  `HistoryCacheWarmer` are gone; the lifespan never awaits a provider. Shutdown: `mark_shutdown_requested()`, poller stop, recorder flush (5 s),
+  listener close, container shutdown, engine-task cancel, client close.
+- The poller is the only runtime writer of the provider `_latest_cache` (`adopt_validated` after `publish`; the deprecated `get_latest` also writes it but has no runtime caller, CF-2401-07; the FGI `_history_cache` is also written by `get_history` for `RetrainingService` when it is empty or older than 6 h, CF-2401-06) and, apart from the boot seed of `ContextRecorder` (P7), of `LIVE_BOOK`; it imports no `trading.*`.
+  `/api/v1/health/background` has a `context_poller` block (closed vocabularies, from `LIVE_BOOK.freshness`); the `history_cache_warmer` key stays as a
+  deprecated compat key. Metrics `mtf_context_*` are exported as `trading_mtf_context_*`. `/signals/current` shows the provider caches (latest validated value,
+  no age); engines read the lagged book. `--workers 1` is pinned (CF-2401-05). Live create, promote and `mode=normal` resume of a consumer strategy: 422
+  `live_context_consumer_blocked` (`routers/runs.py`, `run_orchestrator.run_live_engine`).
 - See `packages/trading/CLAUDE.md` (WP2.4), `reports/vp2-wp2.4/synthesis-spec.md` and `Documentation/WP2.4-register.md`.
