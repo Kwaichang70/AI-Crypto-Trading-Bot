@@ -536,11 +536,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 chat_id=settings.telegram_chat_id,
             )
             container.services.telegram_notifier = _telegram_notifier  # LS-002
-            log.info("telegram.configured", chat_id=settings.telegram_chat_id)
+            log.info("telegram.configured")  # CF-2401-110: no chat id, no token
         except ImportError:
             log.warning("telegram.skipped", reason="trading.telegram not importable")
-        except Exception:
-            log.warning("telegram.startup_error", exc_info=True)
+        except Exception as exc:
+            # CF-2401-110: type + code location only, no exc_info, no .trace sibling.
+            log.warning("telegram.startup_error", **exc_log_fields(exc))
     else:
         log.info("telegram.disabled", reason="TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set")
 
