@@ -119,7 +119,7 @@ Do 3.1 to 3.3 with the **old stack still running**.
     "SELECT id, status FROM runs WHERE run_mode = '"'"'live'"'"' AND status IN ('"'"'running'"'"','"'"'orphaned'"'"','"'"'resuming'"'"');"'
   ```
   Expected: `(0 rows)`. Any row: stop (NO-GO 1). Resolve it through the still-running old API first (stop, or flatten where the old API supports it), then re-check.
-- [ ] Know what the restart will do (the api container is stopped and recreated during this deploy; `stop_grace_period` is 30 s):
+- [ ] Know what the restart will do (the api container is stopped and recreated during this deploy; the api `stop_grace_period` is `75s`, which `docker compose config` shows as `1m15s`; a normal stop takes a few seconds):
   - **Live runs** found `running` at boot are moved to `orphaned`; a live run is never restarted automatically. Only an operator resumes it: `POST /api/v1/runs/{id}/resume?mode=normal|protective`, admin key plus `X-Live-Confirm-Token` plus the live-trading gates.
   - A live resume **cancels every open order the bot placed for that run on the run's symbols** (up to 30 s per order; the scan starts 5 minutes before the run's start time). Any exchange or DB failure returns 409 with no automatic retry; the operator re-sends.
   - **Paper runs** (`running`/`orphaned`/`resuming`) are rebuilt in place under the same run id from persisted fills and restarted at boot, within a bounded resume-count budget. Since WP1.3a, a paper run whose persisted exit config is invalid is marked `error` at boot instead.
@@ -251,7 +251,7 @@ Order: migrations to **019** first, then api and ui together, then Caddy. The en
 
 ### 4.2 Stop the api
 
-- [ ] `$DC stop api` (graceful; up to 30 s). The old ui may show errors until 4.4.
+- [ ] `$DC stop api` (graceful; normally a few seconds, at most the api `stop_grace_period`). The old ui may show errors until 4.4.
 
 ### 4.3 Migrate to 019 with the new image
 
@@ -783,7 +783,7 @@ Do these in order. P-1 to P-3 and P-8 to P-10 are the Release 2 additions; P-5 t
   unset v
   ```
   Record `curl -fsS -H @<(hdrs api) https://<FQDN>/api/v1/emergency/kill-switch` (expected `"latched": false`).
-- [ ] **D-3 Stop the api:** `$DC stop api` (graceful, up to 30 s).
+- [ ] **D-3 Stop the api:** `$DC stop api` (graceful; normally a few seconds, at most the api `stop_grace_period`).
 - [ ] **D-4 Confirm the schema with the new image.** This must change nothing:
   ```bash
   $DC run --rm --no-deps --entrypoint sh api -c \
@@ -850,7 +850,7 @@ Exits (WP1.3b-a/b):
 - Bracket stop and take-profit levels are frozen at entry for each lot; the ATR is read once. Adds keep the first entry's levels. Paper (and backtest) results change for ATR brackets, trailing stops and add-to-position runs; fixed brackets without trailing or adds are byte-identical.
 - **The ATR period is capped at 49** in every mode. Creating, promoting or resuming a run with `bracket_atr_period` 50 to 99 returns 422, and the `momentum_breakout` and `sl_tp_reversion` parameter schema now rejects it. A persisted paper run with a larger period is marked `error` at boot (P-8 lists them).
 - **Live intra-bar check (live only, default on):** a live run with a stop-loss or trailing stop reads the **bid** every `LIVE_EXIT_CHECK_INTERVAL_S` seconds (default 300), confirms a breach with a second reading about 10 s later, and then sells through the normal SELL path. Take-profit stays bar-close only. Live stops are therefore touch-based while the validated backtest is close-based. The warning `bar_close_exit_checks_only` (W8) now also covers 1h and is shown only when the check is **not** effective. `smoke_roundtrip` is always off, so the smoke runbook's "stop-loss at bar close only" statement stays true. Details: `docs/runbooks/circuit-breaker-halt.md` section 7.
-- Operator rules recorded in G-LIVE L-17: a flatten that starts while an intra-bar exit holds the lock can return `in_flight` / `lock_timeout` and latch `flatten_incomplete` (re-read positions, retry the flatten, do not sell by hand while a bot SELL is open); a stop or shutdown can wait up to 15 s for the check, so never shorten `stop_grace_period: 30s` of the `api` service.
+- Operator rules recorded in G-LIVE L-17: a flatten that starts while an intra-bar exit holds the lock can return `in_flight` / `lock_timeout` and latch `flatten_incomplete` (re-read positions, retry the flatten, do not sell by hand while a bot SELL is open); a stop or shutdown can wait up to 15 s for the check, so never shorten the `api` service's `stop_grace_period` below the shutdown formula in the comment above it in `infra/docker-compose.yml` (CF-2401-123); raise it when a term of that formula grows.
 
 Log hygiene (CF-36; section 5.10):
 - Exchange and market-data errors are logged as `error_type`, `http_status` and `error_at` (file, line, function) instead of the exception text. Their tracebacks exist only at `LOG_LEVEL=DEBUG`, as separate `<event>.trace` events; a live image never runs at DEBUG (the self-check fails that config). An unmapped exchange error now reads `Unexpected exchange error (<Class>)` instead of `Exchange error: <text>`.
@@ -887,7 +887,7 @@ Commands containing a pipe are in the numbered blocks of 10.9.4 (`Block L-n`), n
 | L-5 | Transitional stale rows: was the run resumed by pre-1.5b code earlier in the same UTC day? Self-expiring | Block L-5 | `L-5 expired`, or the restart is after 00:00 UTC | WP1.5b |
 | L-12 | Alert channel. Branch A: send the rendered HALT alert through the deployed notifier. Branch B: no push exists until CF-27; record it and watch per L-8 | Block L-12 | Branch A: `sent: True` and the message arrives in the chat. Branch B: decision recorded | WP1.6 |
 | L-14 | Coinbase ticker sanity (1.3b-b): three read-only `fetch_ticker_quote` calls per symbol, 10 s apart; record spread (bps) and trade age; record whether `fetch_ohlcv(limit=N)` returns the forming candle | Block L-14 (read-only, no key printed) | `exchange=coinbase`; bid finite and positive, `ask >= bid`, latency under 2 s on every call; `L-14 result: PASS`; spread and `trade_age_s` recorded (on Coinbase this is the last-trade age, not a book age) | WP1.3b-b |
-| L-17 | Operator rules recorded: (a) D12, no backtest or optimizer on the live API process while live holds positions; (b) live stops are bid-touch with a 10 s confirm, the validated backtest is close-based; (c) TP is bar-close only; (d) flatten during an intra-bar exit can return `lock_timeout`: re-read positions, retry, do not sell by hand while a bot SELL is open; (e) a stop or shutdown can wait up to 15 s: keep `stop_grace_period: 30s` | `grep -n 'stop_grace_period' "$DEPLOY_DIR/infra/docker-compose.yml"` (read-only) | Rules (a) to (e) recorded in the deploy log; the first `stop_grace_period` (api) is `30s` | WP1.3b-a, WP1.3b-b |
+| L-17 | Operator rules recorded: (a) D12, no backtest or optimizer on the live API process while live holds positions; (b) live stops are bid-touch with a 10 s confirm, the validated backtest is close-based; (c) TP is bar-close only; (d) flatten during an intra-bar exit can return `lock_timeout`: re-read positions, retry, do not sell by hand while a bot SELL is open; (e) a stop or shutdown can wait up to 15 s: keep the api `stop_grace_period` at or above the shutdown formula in `infra/docker-compose.yml` (CF-2401-123), never shorter | `grep -n 'stop_grace_period' "$DEPLOY_DIR/infra/docker-compose.yml"` (read-only) | Rules (a) to (e) recorded in the deploy log; the first `stop_grace_period` (api) equals the committed value (`75s`, which compose shows as `1m15s`) | WP1.3b-a, WP1.3b-b |
 | L-18 | Trailing-gap seed: CF-13b-20 is in the image; record that a resume can take up to 40 s per held trailing symbol before the loop starts | Block L-1 (markers) plus a recorded note | 1.3b-b in the image, or acceptance of `seed_partial` for downtimes above 300 bars recorded | WP1.3b-b (CF-13b-20) |
 | L-19 | Log hygiene: CF-36 (a)+(b+)+(e) and CF-A are in the image and hold ((b+) includes `ccxt_retry.retrying`, `ccxt_retry.exhausted`, `live.ticker_fetch_failed`, `live.invalid_ticker_price`; (e) is `engine.warmup_fetch_failed`). With intra-bar enabled the four (b) sites are a prerequisite because ticks reach them every interval | Section 5.10 steps 1, 2 and 2b (R2-8); then the step-2 repeat on the live config when the flag is switched on (smoke §4c step 0, or the equivalent step of the live-restart procedure), before the first live order | Step 1 exit 0, commit and count recorded; `CF36 log hygiene: PASS` on the paper config and again on the live config; `CF36B_MARKERS_OK`; L-8 counters at 0 or each hit explained | CF-36 (cf36a `6047162`; cf36b with cf36b-fix; raised by WP1.6, 1.3b-a, 1.3b-b) |
 | L-21 | Coinbase fee tier (WP2.1, U-1): one read-only check that the account's real spot fee tier matches `DEFAULT_COST_PROFILE_ID` | Block L-21 (read-only, no order, no secret printed) | `FEE_TIER: DEFAULT CONFIRMED`; the four `market … taker=` values equal `fee_tier.taker_fee_rate`; `has_promo_fee: False`. Any other result: §8.4 | WP2.1 |
@@ -1379,7 +1379,7 @@ Do these in order. P3-3 must come before any build.
 
 - [ ] **D3-1 Announce** the changes in section 11.8 (as in 4.1).
 - [ ] **D3-2 Re-check** immediately before stopping: the section 3.1 live-run query returns `(0 rows)`, `$DC exec -T api printenv ENABLE_LIVE_TRADING` prints `false` or nothing (4.1a), and the `.env` live-flag block of 10.6 D-2 prints `OK` (NO-GO 7). Record `curl -fsS -H @<(hdrs api) https://<FQDN>/api/v1/emergency/kill-switch` (expected `"latched": false`). Confirm once more that the schema is `019 (head)` with the first command of 11.3 (NO-GO 14).
-- [ ] **D3-3 Stop the api:** `$DC stop api` (graceful, up to 30 s). The old ui may show errors until D3-5.
+- [ ] **D3-3 Stop the api:** `$DC stop api` (graceful; normally a few seconds, at most the api `stop_grace_period`). The old ui may show errors until D3-5.
 - [ ] **D3-4 Migrate to 020 with the new image.** Check first that no transaction is open longer than 5 s (the query in 4.3). Then:
   ```bash
   $DC run --rm --no-deps --entrypoint sh api -c \
