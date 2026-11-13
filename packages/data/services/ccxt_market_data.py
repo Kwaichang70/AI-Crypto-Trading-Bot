@@ -34,9 +34,10 @@ import math
 import random
 import re
 import time
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Any, Literal
 
 import ccxt.async_support as ccxt_async
 import structlog
@@ -52,7 +53,7 @@ from data.market_data import (
     TickerQuote,
 )
 
-__all__ = ["CCXTMarketDataService"]
+__all__ = ["CCXTMarketDataService", "EndReason", "RangeFetch"]
 
 # ---------------------------------------------------------------------------
 # Module-level logger
@@ -121,6 +122,23 @@ def _now_ms() -> int:
 # (result_payload, expiry_epoch_float)
 _CacheEntry = tuple[list[OHLCVBar], float]
 
+EndReason = Literal["stop", "reached_end", "page_cap", "no_progress"]
+
+
+@dataclass(frozen=True, slots=True)
+class RangeFetch:
+    """Result of :meth:`CCXTMarketDataService.fetch_ohlcv_range_ex` (WP2.6 P5, SY-26-15).
+
+    ``complete`` is true iff the pager ended because the window was exhausted
+    (``stop`` or ``reached_end``), not because a safety limit cut it short.
+    """
+
+    bars: list[OHLCVBar]
+    complete: bool
+    end_reason: EndReason
+    pages: int
+    empty_pages: int
+
 
 class CCXTMarketDataService(BaseMarketDataService):
     """
@@ -155,7 +173,8 @@ class CCXTMarketDataService(BaseMarketDataService):
     enable_rate_limit:
         Sets CCXT's ``enableRateLimit`` (its built-in request throttler).
         Default ``True``; the semaphore and 100 ms spacing of this service
-        apply on top of it either way.
+        apply on top of it either way. ``extra_exchange_config={"enableRateLimit": ...}``
+        overrides it.
 
     Examples
     --------
@@ -365,6 +384,21 @@ class CCXTMarketDataService(BaseMarketDataService):
         start: datetime,
         end: datetime,
     ) -> list[OHLCVBar]:
+        """Fetch all candles within ``[start, end)``; see :meth:`fetch_ohlcv_range_ex`."""
+        return (await self.fetch_ohlcv_range_ex(symbol, timeframe, start, end)).bars
+
+    def check_series(self, symbol: str, timeframe: TimeFrame) -> None:
+        """The symbol and timeframe checks the fetch methods run first (no request is made)."""
+        self._validate_symbol(symbol)
+        self._validate_timeframe(timeframe)
+
+    async def fetch_ohlcv_range_ex(
+        self,
+        symbol: str,
+        timeframe: TimeFrame,
+        start: datetime,
+        end: datetime,
+    ) -> RangeFetch:
         """
         Fetch all candles within the half-open interval ``[start, end)``.
 
@@ -390,6 +424,10 @@ class CCXTMarketDataService(BaseMarketDataService):
         Duplicates at page boundaries (same timestamp appearing in two
         consecutive pages) are removed.  The result is always sorted
         ascending by timestamp.
+
+        Returns a :class:`RangeFetch`: ``fetch_ohlcv_range`` is its ``bars``.  ``complete``
+        is false when the page cap or the no-progress guard ended the fetch.  Exceptions
+        propagate unchanged.
         """
         self._validate_symbol(symbol)
         self._validate_timeframe(timeframe)
@@ -429,9 +467,11 @@ class CCXTMarketDataService(BaseMarketDataService):
         cursor_ms = start_ms
         pages = 0
         empty_pages = 0
+        end_reason: EndReason = "stop"
 
         while cursor_ms < stop_ms:
             if pages >= max_pages:
+                end_reason = "page_cap"
                 self._log.warning(
                     "fetch_ohlcv_range_page_cap",
                     symbol=symbol,
@@ -498,9 +538,11 @@ class CCXTMarketDataService(BaseMarketDataService):
                     last_ts_ms = max(last_ts_ms, ts_ms)
 
             if reached_end:
+                end_reason = "reached_end"
                 break
 
             if new_bars_in_page == 0:
+                end_reason = "no_progress"
                 # All bars in this page were duplicates -- no forward progress.
                 self._log.warning(
                     "fetch_ohlcv_range_no_progress",
@@ -524,7 +566,8 @@ class CCXTMarketDataService(BaseMarketDataService):
             pages=pages,
             empty_pages=empty_pages,
         )
-        return all_bars
+        complete = end_reason in ("stop", "reached_end")
+        return RangeFetch(all_bars, complete, end_reason, pages, empty_pages)
 
     @property
     def supports_ticker_quotes(self) -> bool:

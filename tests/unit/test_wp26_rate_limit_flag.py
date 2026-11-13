@@ -70,6 +70,7 @@ async def test_own_throttle_seam_stays_on_both_fetch_paths(
 
     async def counting() -> None:
         calls.append("t")
+        assert svc._semaphore._value == 2  # the caller holds one of the 3 slots (CF-26-24)
         await original()
 
     monkeypatch.setattr(svc, "_throttle", counting)
