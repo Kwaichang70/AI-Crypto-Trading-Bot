@@ -28,7 +28,7 @@ Python 3.11+ REST API server using FastAPI framework.
 ### WP2.4 (point-in-time MTF context: API marker, flags, leaderboard)
 - Phase A only. The API passes NO signal source to `BacktestRunner` / `ParameterOptimizer`, so every API backtest and optimize
   run uses `UNAVAILABLE` (consumed fields `None`, status `unavailable`; `not_used` for strategies that consume nothing). The
-  store and migration 021 exist (WP2.4-P5, Alembic head 021) and the live recorder (CF-24-01 P7) writes dominance and whale; the backfill CLI and API PIT loading are not built.
+  store and migration 021 exist (WP2.4-P5, Alembic revision 021; the current head is noted in `infra/CLAUDE.md`) and the live recorder (CF-24-01 P7) writes dominance and whale; the backfill CLI and API PIT loading are not built.
 - `cost_profiles.engine_semantics(mode)` adds `mtf_context = MTF_CONTEXT_VERSION` ("wp24-1") for backtest and optimize only
   (paper/live get none; `promote_to_live` re-stamps mode `live` and pops the `mtf_context` block). `timestamp_clock`,
   `bar_alignment` and `metrics` are not bumped. The run-specific block `config["mtf_context"]` (backtest) and

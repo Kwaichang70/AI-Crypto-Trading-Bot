@@ -1055,7 +1055,9 @@ class TestT32LogHygiene:
 
     def test_p3_43_alembic_has_no_new_revision(self) -> None:
         versions = sorted((_REPO / "infra/alembic/versions").glob("0*.py"))
-        # Phase A (P0..P4) adds no migration; the only revision after 020 is the Phase B
-        # context store (021, WP2.4 P5).
+        # Phase A (P0..P4) adds no migration: the FIRST revision after 020 is the Phase B
+        # context store (021, WP2.4 P5). Later revisions (022 OHLCV cache, ...) may follow;
+        # the 020 -> 021 link itself is pinned by test_wp24_migration_021.py. An empty
+        # `later` fails, so the check cannot pass vacuously.
         later = [v.name for v in versions if v.name[:3] > "020"]
-        assert later in ([], ["021_add_context_observations.py"])
+        assert later[:1] == ["021_add_context_observations.py"], later

@@ -39,9 +39,11 @@ from sqlalchemy import (
     Integer,
     Numeric,
     PrimaryKeyConstraint,
+    SmallInteger,
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -64,6 +66,8 @@ __all__ = [
     "IdempotencyKeyORM",
     "KillSwitchStateORM",
     "ContextObservationORM",
+    "OhlcvBarORM",
+    "OhlcvCoverageORM",
 ]
 
 # ---------------------------------------------------------------------------
@@ -1804,4 +1808,138 @@ class ContextObservationORM(Base):
         return (
             f"<ContextObservationORM series={self.series_id!r} "
             f"observed_at={self.observed_at!r} available_at={self.available_at!r}>"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 15. ohlcv_bars / ohlcv_coverage  -- WP2.6 OHLCV cache (first write wins)
+# ---------------------------------------------------------------------------
+
+# Constraint text is identical to ``infra/alembic/versions/022_add_ohlcv_cache.py``
+# (pinned by tests/unit/test_wp26_migration_022.py).
+_OHLCV_TF_LIST = "'1m', '3m', '5m', '15m', '30m', '1h', '4h', '1d'"
+_OHLCV_TF_CASE = (
+    "CASE timeframe WHEN '1m' THEN 60 WHEN '3m' THEN 180 WHEN '5m' THEN 300 "
+    "WHEN '15m' THEN 900 WHEN '30m' THEN 1800 WHEN '1h' THEN 3600 "
+    "WHEN '4h' THEN 14400 WHEN '1d' THEN 86400 END"
+)
+_OHLCV_IDENT = "exchange ~ '^[a-z0-9_]+$' AND symbol ~ '^[!-.0-{}~]+/[!-.0-{}~]+$'"
+
+
+def _ohlcv_epoch(column: str) -> str:
+    return f"CAST(extract(epoch FROM {column}) AS numeric)"
+
+
+class OhlcvBarORM(Base):
+    """One immutable closed OHLCV bar (SY-26-13).
+
+    See ``infra/alembic/versions/022_add_ohlcv_cache.py``. Application code never issues
+    UPDATE or DELETE here; rows are written with ``INSERT ... ON CONFLICT DO NOTHING``
+    through ``text()``. This class exists for metadata parity and read queries.
+    """
+
+    __tablename__ = "ohlcv_bars"
+    __table_args__ = (
+        PrimaryKeyConstraint("exchange", "symbol", "timeframe", "open_time", name="pk_ohlcv_bars"),
+        CheckConstraint(_OHLCV_IDENT, name="ck_ohlcv_bars_ident"),
+        CheckConstraint(f"timeframe IN ({_OHLCV_TF_LIST})", name="ck_ohlcv_bars_timeframe"),
+        CheckConstraint(
+            f"mod({_ohlcv_epoch('open_time')}, {_OHLCV_TF_CASE}) = 0", name="ck_ohlcv_bars_grid"
+        ),
+        CheckConstraint(
+            f"{_ohlcv_epoch('fetched_at')} >= {_ohlcv_epoch('open_time')} + {_OHLCV_TF_CASE}",
+            name="ck_ohlcv_bars_closed",
+        ),
+        CheckConstraint(
+            "low > 0 AND low <= open AND low <= close AND open <= high AND close <= high",
+            name="ck_ohlcv_bars_ohlc",
+        ),
+        CheckConstraint("volume >= 0", name="ck_ohlcv_bars_volume"),
+        CheckConstraint(
+            "open <> 'NaN' AND high <> 'NaN' AND low <> 'NaN' "
+            "AND close <> 'NaN' AND volume <> 'NaN'",
+            name="ck_ohlcv_bars_finite",
+        ),
+    )
+
+    exchange: Mapped[str] = mapped_column(String(32), nullable=False, comment="ccxt exchange id.")
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False, comment="ccxt unified symbol.")
+    timeframe: Mapped[str] = mapped_column(String(4), nullable=False, comment="1m .. 1d, no 1w.")
+    open_time: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        comment="Bar OPEN instant, UTC, on the timeframe grid.",
+    )
+    open: Mapped[Decimal] = mapped_column(Numeric(28, 12), nullable=False)
+    high: Mapped[Decimal] = mapped_column(Numeric(28, 12), nullable=False)
+    low: Mapped[Decimal] = mapped_column(Numeric(28, 12), nullable=False)
+    close: Mapped[Decimal] = mapped_column(Numeric(28, 12), nullable=False)
+    volume: Mapped[Decimal] = mapped_column(
+        Numeric(30, 12), nullable=False, comment="Base-asset volume."
+    )
+    fetched_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        comment="Audit only; never part of a hash.",
+    )
+    ingest_version: Mapped[int] = mapped_column(
+        SmallInteger(),
+        nullable=False,
+        server_default=text("1"),
+        comment="Writer semantics version (pager/quantiser).",
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<OhlcvBarORM {self.exchange!r} {self.symbol!r} {self.timeframe!r} "
+            f"open_time={self.open_time!r}>"
+        )
+
+
+class OhlcvCoverageORM(Base):
+    """One contiguous verified interval per series (SY-26-05, SY-26-13).
+
+    ``[covered_from, covered_to)`` was fully requested from the exchange; a missing bar
+    inside it is a true gap. The store extends it with a conditional UPDATE under a row
+    lock; this class exists for metadata parity and read queries.
+    """
+
+    __tablename__ = "ohlcv_coverage"
+    __table_args__ = (
+        PrimaryKeyConstraint("exchange", "symbol", "timeframe", name="pk_ohlcv_coverage"),
+        CheckConstraint(_OHLCV_IDENT, name="ck_ohlcv_cov_ident"),
+        CheckConstraint("covered_from <= covered_to", name="ck_ohlcv_cov_span"),
+        CheckConstraint(f"timeframe IN ({_OHLCV_TF_LIST})", name="ck_ohlcv_cov_timeframe"),
+        CheckConstraint(
+            f"mod({_ohlcv_epoch('covered_from')}, {_OHLCV_TF_CASE}) = 0 "
+            f"AND mod({_ohlcv_epoch('covered_to')}, {_OHLCV_TF_CASE}) = 0",
+            name="ck_ohlcv_cov_grid",
+        ),
+    )
+
+    exchange: Mapped[str] = mapped_column(String(32), nullable=False, comment="ccxt exchange id.")
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False, comment="ccxt unified symbol.")
+    timeframe: Mapped[str] = mapped_column(String(4), nullable=False, comment="1m .. 1d, no 1w.")
+    covered_from: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        comment="Inclusive start of the verified interval, on the grid.",
+    )
+    covered_to: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        comment="Exclusive end of the verified interval, on the grid.",
+    )
+    verified_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        comment="Audit only.",
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<OhlcvCoverageORM {self.exchange!r} {self.symbol!r} {self.timeframe!r} "
+            f"[{self.covered_from!r}, {self.covered_to!r})>"
         )
