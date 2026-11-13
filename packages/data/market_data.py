@@ -7,9 +7,10 @@ Architecture
 ------------
 - Exchange access is via CCXT's async API.
 - Responses are normalised to UTC datetimes and Decimal prices.
-- A two-level cache is used:
-    L1: In-process LRU (per symbol/timeframe, bounded size)
-    L2: PostgreSQL candle cache (persistent across restarts)
+- L1 is an in-process LRU (per symbol/timeframe, bounded size).  There is no L2 on the live
+  path.  WP2.6 adds an opt-in PostgreSQL history cache for backtest/optimize only
+  (``OHLCV_CACHE_MODE``; ``data.ohlcv_cache`` and ``api.services.ohlcv_store``); paper and live
+  never read it.
 - Rate limiting uses a token-bucket pattern with exponential backoff on 429s.
 - All public methods are async.
 

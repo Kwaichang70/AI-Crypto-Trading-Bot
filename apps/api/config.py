@@ -287,6 +287,15 @@ class Settings(BaseSettings):
         description="Exchange API passphrase (e.g. Coinbase legacy keys) — never logged",
     )
 
+    ohlcv_cache_mode: Literal["off", "read_through", "require"] = Field(
+        default="off",
+        description=(
+            "History cache for backtest/optimize bars (WP2.6): off = exchange only; "
+            "read_through = cache, falls back to the exchange; require = fail closed (503 "
+            "ohlcv_store_unavailable, also for a request far from the cached range: widen it)"
+        ),
+    )
+
     # ------------------------------------------------------------------
     # Live trading safety gates (all three must be satisfied)
     # ------------------------------------------------------------------

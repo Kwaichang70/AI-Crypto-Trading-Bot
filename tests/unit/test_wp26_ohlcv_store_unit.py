@@ -608,6 +608,14 @@ def test_nothing_calls_the_store_yet() -> None:
     users = set()
     for root in ("apps", "packages"):
         for path in (_REPO / root).rglob("*.py"):
-            if re.search(r"^\s*(from|import)\s.*ohlcv_(store|cache)", path.read_text(), re.M):
+            if re.search(
+                r"^\s*(from|import)\s.*ohlcv_(store|cache|history)", path.read_text(), re.M
+            ):
                 users.add(path.relative_to(_REPO).as_posix())
-    assert users == {"apps/api/services/ohlcv_store.py"}  # the adapter imports the contract
+    # the adapter imports the contract; P6a's wiring module is the one caller (SY-26-82), which
+    # runs.py imports lazily inside the helper (test_wp26_api.py pins the laziness)
+    assert users == {
+        "apps/api/services/ohlcv_store.py",
+        "apps/api/services/ohlcv_history.py",
+        "apps/api/routers/runs.py",
+    }

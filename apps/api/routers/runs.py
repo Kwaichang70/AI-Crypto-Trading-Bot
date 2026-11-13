@@ -469,6 +469,8 @@ async def _fetch_bars_for_backtest(
     start: datetime,
     end: datetime,
     log: Any,
+    *,
+    now: datetime | None = None,
 ) -> dict[str, list[Any]]:
     """
     Fetch historical OHLCV bars for all symbols in the requested date range.
@@ -489,11 +491,15 @@ async def _fetch_bars_for_backtest(
         Exclusive end datetime (UTC).
     log:
         Bound structlog logger for contextual logging.
+    now:
+        The router's single clock read (WP2.6, SY-26-16).  With ``OHLCV_CACHE_MODE`` other than
+        ``off`` the bars come through the history cache; ``None`` or ``off`` is today's path.
 
     Returns
     -------
     dict[str, list[OHLCVBar]]
-        Bars keyed by symbol, sorted ascending by timestamp.
+        Bars keyed by symbol, sorted ascending by timestamp.  A ``HistoryBars`` (cache path)
+        also carries the ``ohlcv_data`` block.
 
     Raises
     ------
@@ -537,6 +543,13 @@ async def _fetch_bars_for_backtest(
     )
 
     try:
+        if now is not None and settings.ohlcv_cache_mode != "off":
+            from api.services.ohlcv_history import fetch_history_bars
+
+            mode, window = settings.ohlcv_cache_mode, (start, end)
+            return await fetch_history_bars(
+                service, mode, settings.exchange_id, symbols, timeframe, window, now, log
+            )
         await service.connect()
 
         # Fetch all symbols concurrently using asyncio.gather.
@@ -1223,6 +1236,7 @@ async def create_run(
                     start=body.backtest_start,  # type: ignore[arg-type]
                     end=body.backtest_end,       # type: ignore[arg-type]
                     log=log,
+                    now=_bar_window_now,
                 )
 
                 # Step 2: Instantiate strategy
@@ -1278,6 +1292,10 @@ async def create_run(
                 # Ints / strings / bools / ISO only; same carry path as ``bar_alignment``.
                 if runner.last_mtf_context is not None:
                     config_snapshot["mtf_context"] = runner.last_mtf_context.to_metadata()
+                # WP2.6 (SY-26-10/16): the data block, only from the cache path (a plain dict
+                # from mode ``off`` or a patched fake has none).  Server-written, closed values.
+                if isinstance(ohlcv_block := getattr(bars_by_symbol, "ohlcv_data", None), dict):
+                    config_snapshot["ohlcv_data"] = ohlcv_block
 
                 # Step 4: Persist results (trades + equity curve + metrics in config)
                 await _persist_backtest_results(

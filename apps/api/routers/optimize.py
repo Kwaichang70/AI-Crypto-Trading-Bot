@@ -499,6 +499,7 @@ async def run_optimization(
         start=body.backtest_start,
         end=body.backtest_end,
         log=log,
+        now=bar_window_now,
     )
 
     # Step 2: Build and run optimizer
@@ -588,6 +589,9 @@ async def run_optimization(
     # so ``source == "unavailable"`` -- never from the request.
     if optimizer.last_mtf_context is not None:
         run_metadata["mtf_context"] = optimizer.last_mtf_context.to_metadata()
+    # WP2.6 (SY-26-10/16): the data block of the cache path (see create_run); never a request field.
+    if isinstance(ohlcv_block := getattr(bars_by_symbol, "ohlcv_data", None), dict):
+        run_metadata["ohlcv_data"] = ohlcv_block
 
     orm_run = OptimizationRunORM(
         id=uuid.uuid4(),
