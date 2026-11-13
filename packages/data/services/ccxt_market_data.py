@@ -8,6 +8,7 @@ Architecture overview
 - Exchange I/O uses ``ccxt.async_support`` (HTTP, not WebSocket).
 - An asyncio Semaphore throttles concurrent outbound requests; a simple
   token-bucket style enforces minimum inter-request spacing per exchange.
+  ccxt's own throttler (``enableRateLimit``) is a second layer, on by default.
 - On HTTP 429 the request is retried with truncated binary exponential
   backoff plus uniform jitter (max 3 retries by default).
 - An in-process TTL dict cache (L1) short-circuits repeated identical
@@ -151,6 +152,10 @@ class CCXTMarketDataService(BaseMarketDataService):
     extra_exchange_config:
         Additional key/value pairs forwarded verbatim to the CCXT exchange
         constructor (e.g. ``{"options": {"defaultType": "spot"}}``).
+    enable_rate_limit:
+        Sets CCXT's ``enableRateLimit`` (its built-in request throttler).
+        Default ``True``; the semaphore and 100 ms spacing of this service
+        apply on top of it either way.
 
     Examples
     --------
@@ -174,6 +179,7 @@ class CCXTMarketDataService(BaseMarketDataService):
         max_concurrency: int = _DEFAULT_MAX_CONCURRENCY,
         sandbox: bool = False,
         extra_exchange_config: dict[str, Any] | None = None,
+        enable_rate_limit: bool = True,
     ) -> None:
         if page_limit < 1:
             raise ValueError("page_limit must be >= 1")
@@ -208,7 +214,8 @@ class CCXTMarketDataService(BaseMarketDataService):
             )
 
         ccxt_config: dict[str, Any] = {
-            "enableRateLimit": False,  # We handle rate-limiting ourselves.
+            # ccxt's throttler runs in addition to our semaphore + _throttle.
+            "enableRateLimit": enable_rate_limit,
             "newUpdates": False,
         }
         if api_key is not None:
@@ -530,9 +537,9 @@ class CCXTMarketDataService(BaseMarketDataService):
         Deliberately **no cache and no retry** (WP1.3b DEV-2 ruling): a stale
         or silently re-tried quote would defeat the engine's two-reading
         confirmation, whose second reading *is* the retry.  The call runs under
-        the service's own semaphore and 100 ms throttle (``enableRateLimit`` is
-        off on this handle), so it never queues ahead of an order on the
-        trading handle.
+        the service's own semaphore and 100 ms throttle and, by default, ccxt's
+        throttler on this market-data handle; the trading handle has its own
+        instance, so the ticker never queues ahead of an order.
 
         Errors are mapped like :meth:`_fetch_raw_with_retry` maps them, but the
         raised message is fixed text and the cause is not chained: neither the
