@@ -836,3 +836,25 @@ def test_an_optimize_run_writes_the_same_block_shape(
     )
     block = run.run_metadata["ohlcv_data"]
     assert (block["version"], block["store"], block["series"][0]["n_bars"]) == ("wp26-1", "ok", 300)
+
+
+# ---------------------------------------------------------------------------
+# P6b (CF-26-83): the adapter rows and the engine-bar rebuild run on a worker thread
+# ---------------------------------------------------------------------------
+async def test_the_rebuild_runs_on_a_thread_and_keeps_the_canonical_decimals(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    hops: list[str] = []
+    real = hist.asyncio.to_thread
+    monkeypatch.setattr(
+        hist.asyncio, "to_thread", lambda fn, *a: (hops.append(fn.__name__), real(fn, *a))[1]
+    )
+    world.series = {SYM: mk(SYM, 50)}
+    out = await world.fetch("read_through", [SYM], end=T0 + 50 * H)
+    cols = ("open", "high", "low", "close", "volume")
+    got = [tuple(getattr(b, k).as_tuple() for k in cols) for b in out[SYM]]
+    want = [
+        tuple(getattr(c, k).as_tuple() for k in ("open_", *cols[1:]))
+        for c in canon(world.series[SYM])
+    ]
+    assert sorted(hops) == ["_assemble", "_raw_rows"] and got == want

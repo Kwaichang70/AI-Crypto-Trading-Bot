@@ -2,7 +2,7 @@
 apps/api/services/ohlcv_store.py
 --------------------------------
 WP2.6 P4 (SY-26-06/07/09): the Postgres adapter of ``data.ohlcv_cache.OhlcvStore`` over
-``ohlcv_bars`` / ``ohlcv_coverage`` (migration 022). Nothing calls it yet (P6 wires it).
+``ohlcv_bars`` / ``ohlcv_coverage`` (migration 022). ``ohlcv_history`` wires it (P6a).
 
 * Own short transactions on sessions from ``session_factory``; never the request session.
   ``extend`` pins ``READ COMMITTED`` as its first statement (a REPEATABLE READ server or role
@@ -15,6 +15,11 @@ WP2.6 P4 (SY-26-06/07/09): the Postgres adapter of ``data.ohlcv_cache.OhlcvStore
 * Every bar passes ``prepare_extend`` before any I/O, so a CHECK or range SQLSTATE (23514,
   22003, 22001) aborting a whole batch is not expected; if it happens it maps to ``error``.
 * Rows read back go through ``canonicalise_candle`` only; a failure is ``stored_row_invalid``.
+  The raw rows are fetched inside the transaction; the conversion runs after it, in slices of at
+  most ``_SLICE`` rows, on a worker thread above ``INLINE_MAX_ROWS`` rows (P6b, SY-26-53), as does
+  the ``prepare_extend`` check of a large batch. No session or connection is held across a hop.
+  A bad stored row is reported after every page is fetched, so a later-page SQL failure takes
+  precedence (fail-open either way).
 * ``fetched_at`` / ``verified_at`` are passed explicitly (never the ``now()`` default).
 * Logs: ``exc_log_fields`` and numbers only. Never a DSN, SQL, parameter or value. The store
   logs a failure itself; callers must not log it a second time. The engine behind
@@ -23,9 +28,10 @@ WP2.6 P4 (SY-26-06/07/09): the Postgres adapter of ``data.ohlcv_cache.OhlcvStore
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import asyncio
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
-from typing import Any, Final
+from typing import Any, Final, TypeVar
 
 import structlog
 from sqlalchemy import DateTime, Numeric, bindparam, text
@@ -37,6 +43,7 @@ from sqlalchemy.sql.elements import BindParameter
 from common.logging import exc_log_fields
 from common.metrics import metrics
 from data.ohlcv_cache import (
+    INLINE_MAX_ROWS,
     Coverage,
     ExtendResult,
     OhlcvStoreError,
@@ -57,9 +64,12 @@ __all__ = ["DIVERGENT_METRIC", "SqlOhlcvStore", "store_error_code"]
 
 logger = structlog.get_logger(__name__)
 
+_T = TypeVar("_T")
+
 DIVERGENT_METRIC: Final = "ohlcv_cache_divergent_bars_total"  # SY-26-09: the one metric name
 _INGEST_VERSION: Final = 1
 _PAGE: Final = 50_000  # keyset page of a read (DB-26-19)
+_SLICE: Final = 10_000  # rows per thread hop when canonicalising or validating off the loop
 _READ_TIMEOUT: Final = text("SET LOCAL statement_timeout = '30s'")
 _WRITE_TIMEOUT: Final = text("SET LOCAL statement_timeout = '15s'")
 _LOCK_TIMEOUT: Final = text("SET LOCAL lock_timeout = '5s'")
@@ -186,6 +196,29 @@ def _arrays(batch: Sequence[Candle]) -> dict[str, Any]:
     }
 
 
+async def _off_loop(rows: int, fn: Callable[..., _T], *args: object) -> _T:
+    # inline up to INLINE_MAX_ROWS rows, else on a worker thread (SY-26-53)
+    return fn(*args) if rows <= INLINE_MAX_ROWS else await asyncio.to_thread(fn, *args)
+
+
+def _canon_rows(rows: Sequence[Any], tf_s: int) -> list[Candle]:
+    try:
+        return [canonicalise_candle(_ms(r[0]), *r[1:6], timeframe_s=tf_s)[0] for r in rows]
+    except OhlcvDataError:
+        raise OhlcvStoreError("stored_row_invalid") from None
+
+
+async def _canon(raw: list[Any], tf_s: int) -> tuple[Candle, ...]:
+    # the stored rows as candles, in order, in slices of at most _SLICE rows per thread hop
+    out: list[Candle] = []
+    total = len(raw)
+    while raw:
+        part = raw[:_SLICE]
+        del raw[:_SLICE]  # free converted rows as we go: peak is raw + candles, not both in full
+        out += await _off_loop(total, _canon_rows, part, tf_s)
+    return tuple(out)
+
+
 class SqlOhlcvStore:
     """Postgres ``OhlcvStore``. Raises ``OhlcvStoreError`` (closed code) or ``OhlcvDataError``."""
 
@@ -211,7 +244,8 @@ class SqlOhlcvStore:
                     return StoredRead(None, ())
                 cover = Coverage(_ms(row[0]), _ms(row[1]))
                 lo, hi = max(start_ms, cover.from_ms), min(end_ms, cover.to_ms)
-                return StoredRead(cover, await self._pages(session, key, lo, hi))
+                raw = await self._pages(session, key, lo, hi)
+            return StoredRead(cover, await _canon(raw, key.timeframe_s))  # after the transaction
         except Exception as exc:
             raise self._wrap("read", exc) from None
 
@@ -220,35 +254,29 @@ class SqlOhlcvStore:
             async with self._session_factory() as session, session.begin():
                 await session.execute(text("SET TRANSACTION READ ONLY"))
                 await session.execute(_READ_TIMEOUT)
-                return await self._pages(session, key, start_ms, end_ms)
+                raw = await self._pages(session, key, start_ms, end_ms)
+            return await _canon(raw, key.timeframe_s)  # after the transaction
         except Exception as exc:
             raise self._wrap("read_bars", exc) from None
 
-    async def _pages(
-        self, session: AsyncSession, key: SeriesKey, lo: int, hi: int
-    ) -> tuple[Candle, ...]:
-        out: list[Candle] = []
+    async def _pages(self, session: AsyncSession, key: SeriesKey, lo: int, hi: int) -> list[Any]:
+        # the raw rows of [lo, hi): no CPU work inside the transaction (SY-26-53)
+        out: list[Any] = []
         step = tf_ms(key.timeframe_s)
         while lo < hi:
             params = {**_series(key), "lo": _dt(lo), "hi": _dt(hi), "page": _PAGE}
             rows = (await session.execute(_BARS_SQL, params)).all()
-            for row in rows:
-                try:
-                    candle, _ = canonicalise_candle(
-                        _ms(row[0]), *row[1:6], timeframe_s=key.timeframe_s
-                    )
-                except OhlcvDataError:
-                    raise OhlcvStoreError("stored_row_invalid") from None
-                out.append(candle)
+            out.extend(rows)
             if len(rows) < _PAGE:
                 break
-            lo = out[-1].open_ms + step
-        return tuple(out)
+            lo = _ms(out[-1][0]) + step
+        return out
 
     async def extend(
         self, key: SeriesKey, span: Coverage, bars: Sequence[Candle], *, fetched_at_ms: int
     ) -> ExtendResult:
-        batch = prepare_extend(key, span, bars, fetched_at_ms)  # data errors: before any I/O
+        # data errors surface before any I/O
+        batch = await _off_loop(len(bars), prepare_extend, key, span, bars, fetched_at_ms)
         try:
             result = await self._extend(key, span, batch, _dt(fetched_at_ms))
         except Exception as exc:

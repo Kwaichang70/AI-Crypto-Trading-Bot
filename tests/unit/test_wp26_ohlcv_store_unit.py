@@ -619,3 +619,119 @@ def test_nothing_calls_the_store_yet() -> None:
         "apps/api/services/ohlcv_history.py",
         "apps/api/routers/runs.py",
     }
+
+
+# ---------------------------------------------------------------------------
+# P6b (SY-26-53, CF-26-78): CPU work leaves the loop; constants and the log field set are pinned
+# ---------------------------------------------------------------------------
+def test_page_and_slice_sizes_are_pinned() -> None:
+    assert (store_mod._PAGE, store_mod._SLICE, MAX_EXTEND_BARS) == (50_000, 10_000, 10_000)
+
+
+async def test_the_failure_log_has_exactly_these_fields() -> None:
+    err = DBAPIError("SELECT 1", {"p": "SECRET"}, _pg("42501", "SECRET"))
+    with capture_logs() as logs, pytest.raises(OhlcvStoreError):
+        await _Db(error=err).store().read(KEY, T0, T0 + H)
+    assert set(logs[0]) == {"event", "log_level", "op", "code", "error_type", "error_at"}
+
+
+def _hops(mp: pytest.MonkeyPatch, db: _Db, *, block: bool = False) -> list[tuple[Any, ...]]:
+    """Record every thread hop as (function, rows, transaction closed, statements so far)."""
+    seen: list[tuple[Any, ...]] = []
+    real = store_mod.asyncio.to_thread
+
+    async def spy(fn: Any, *args: Any) -> Any:
+        rows = len(next(a for a in args if isinstance(a, list)))
+        seen.append((fn.__name__, rows, db.rolled_back is False, len(db.calls)))
+        if block:
+            await store_mod.asyncio.get_running_loop().create_future()
+        return await real(fn, *args)
+
+    mp.setattr(store_mod.asyncio, "to_thread", spy)
+    return seen
+
+
+def _stored(n: int) -> list[tuple[Any, ...]]:
+    return [_row(i, c=str(100 + i % 7)) for i in range(n)]
+
+
+@pytest.mark.parametrize(
+    ("n", "page", "slices"),
+    [(8_000, 50_000, []), (8_001, 50_000, [8_001]), (25_000, 10_000, [10_000, 10_000, 5_000])],
+)
+async def test_a_large_read_canonicalises_in_ordered_slices_after_the_transaction(
+    monkeypatch: pytest.MonkeyPatch, n: int, page: int, slices: list[int]
+) -> None:
+    monkeypatch.setattr(store_mod, "_PAGE", page)
+    db = _Db(cover=(T0, T0 + n * H), rows=_stored(n))
+    hops = _hops(monkeypatch, db)
+    got = await db.store().read(KEY, T0, T0 + n * H)
+    assert hops == [("_canon_rows", rows, True, len(db.calls)) for rows in slices]
+    assert [c.open_ms for c in got.bars] == [T0 + i * H for i in range(n)]
+    monkeypatch.setattr(store_mod, "INLINE_MAX_ROWS", 10**9)  # the same read, all inline
+    assert got == await db.store().read(KEY, T0, T0 + n * H) and isinstance(got.bars, tuple)
+
+
+async def test_a_bad_stored_row_in_a_late_slice_fails_after_the_transaction_closed() -> None:
+    rows = _stored(25_000)
+    rows[24_999] = _row(24_999, l="0")
+    db = _Db(cover=(T0, T0 + 25_000 * H), rows=rows)
+    with capture_logs() as logs, pytest.raises(OhlcvStoreError) as err:
+        await db.store().read_bars(KEY, T0, T0 + 25_000 * H)
+    # stored_row_invalid is logged by the source, never by the worker (SEC-26P6B-01)
+    assert logs == [] and err.value.code == "stored_row_invalid" and err.value.__cause__ is None
+    assert db.rolled_back is False  # committed and released before the first slice was checked
+
+
+async def test_cancelling_a_read_during_a_hop_holds_no_transaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = _Db(cover=(T0, T0 + 9_000 * H), rows=_stored(9_000))
+    hops = _hops(monkeypatch, db, block=True)
+    task = store_mod.asyncio.ensure_future(db.store().read(KEY, T0, T0 + 9_000 * H))
+    while not hops and not task.done():
+        await store_mod.asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(store_mod.asyncio.CancelledError):
+        await task
+    assert hops[0][2] is True and db.rolled_back is False
+
+
+@pytest.mark.parametrize(("n", "hopped"), [(8_000, False), (10_000, True)])
+async def test_prepare_extend_runs_off_the_loop_above_the_inline_limit_before_any_io(
+    monkeypatch: pytest.MonkeyPatch, n: int, hopped: bool
+) -> None:
+    db = _Db()
+    hops = _hops(monkeypatch, db)
+    res = await db.store().extend(KEY, span(0, n), [bar(i) for i in range(n)], fetched_at_ms=NOW)
+    assert res.inserted == n
+    assert hops == ([("prepare_extend", n, False, 0)] if hopped else [])
+
+
+# ---------------------------------------------------------------------------
+# P6b (CF-26-92): the importer pin by AST, so a parenthesised import cannot hide
+# ---------------------------------------------------------------------------
+def _imports_ohlcv(source: str) -> bool:
+    names: list[str] = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            names += [part for alias in node.names for part in alias.name.split(".")]
+        elif isinstance(node, ast.ImportFrom):
+            names += [*(node.module or "").split("."), *(alias.name for alias in node.names)]
+    return bool({"ohlcv_store", "ohlcv_cache", "ohlcv_history"} & set(names))
+
+
+def test_only_the_adapter_the_wiring_and_runs_import_the_cache_modules_by_ast() -> None:
+    assert _imports_ohlcv("from api.services import (\n    ohlcv_history,\n)")  # control
+    assert not _imports_ohlcv("from data.ohlcv_integrity import Candle")
+    users = {
+        path.relative_to(_REPO).as_posix()
+        for root in ("apps", "packages")
+        for path in (_REPO / root).rglob("*.py")
+        if _imports_ohlcv(path.read_text())
+    }
+    assert users == {
+        "apps/api/services/ohlcv_store.py",
+        "apps/api/services/ohlcv_history.py",
+        "apps/api/routers/runs.py",
+    }

@@ -699,3 +699,55 @@ class TestLeafAstPin:
         assert leaf_problems(src) == []  # the real leaf is clean ...
         problems = leaf_problems(src + f"\n{addition}\n")  # ... and the pin can fail
         assert expected in problems, problems
+
+
+class TestP6bVectors:
+    """P6b (SY-26-56, CR-26P2-10, SY-26-33): vectors the P2 mutant runs found unpinned."""
+
+    def test_run_digest_sorts_by_exchange_symbol_then_timeframe(self) -> None:
+        rows = [("binance", "ZZZ/EUR", 3600, "d"), ("coinbase", "BTC/EUR", 60, "c")]
+        rows += [("coinbase", "BTC/EUR", 3600, "a"), ("coinbase", "ETH/EUR", 60, "b")]  # sorted
+        want = [SeriesSummary(e, s, t, 0, d * 64) for e, s, t, d in rows]
+        h = _sha("ohlcv-wp26-1|run\n" + "".join(f"{e}|{s}|{t}|0|{d * 64}\n" for e, s, t, d in rows))
+        assert run_digest(want[::-1]) == run_digest(want) == h
+
+    def test_the_price_limit_applies_to_the_high_when_the_low_is_below_it(self) -> None:
+        one, high = Decimal(1), Decimal(10**16)
+        with pytest.raises(OhlcvDataError) as err:
+            series_digest("coinbase", "BTC/EUR", 3600, [Candle(0, one, high, one, one, one)])
+        assert err.value.code == "out_of_range"
+
+    def test_a_decimal_subclass_is_not_canonical(self) -> None:
+        class Sub(Decimal):
+            pass
+
+        one = Decimal(1)
+        with pytest.raises(OhlcvDataError) as err:
+            series_digest("coinbase", "BTC/EUR", 3600, [Candle(0, Sub(1), one, one, one, one)])
+        assert err.value.code == "not_canonical"
+
+    def test_candle_and_summary_are_frozen_and_the_candle_has_slots(self) -> None:
+        candle, summary = Candle(0, *[Decimal(1)] * 5), SeriesSummary("e", "S/Q", 60, 0, "d")
+        for obj, name in ((candle, "open_ms"), (summary, "n")):
+            with pytest.raises(AttributeError):  # FrozenInstanceError
+                setattr(obj, name, 1)
+        assert not hasattr(candle, "__dict__") and "tf_ms" in leaf.__all__
+
+    async def test_worker_threads_give_the_serial_result_whatever_their_decimal_context(
+        self,
+    ) -> None:
+        import asyncio
+        import decimal
+
+        rows = [
+            (i * 60_000, f"{100 + i}.123456789", "300", "1.5", "200.25", "7") for i in range(50)
+        ]
+        serial, _ = _candles(rows, 60)
+
+        def work() -> tuple[list[Candle], str]:  # a hostile thread-local context (SY-26-33)
+            decimal.setcontext(decimal.Context(prec=3, rounding=decimal.ROUND_DOWN))
+            return (mine := _candles(rows, 60)[0]), summarise_series("e", "B/Q", 60, mine).digest
+
+        got = await asyncio.gather(*(asyncio.to_thread(work) for _ in range(8)))
+        want = summarise_series("e", "B/Q", 60, serial).digest
+        assert all(c == serial and d == want for c, d in got)

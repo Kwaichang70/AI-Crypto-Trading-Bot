@@ -15,6 +15,9 @@ touch it (AST-pinned in ``tests/unit/test_wp26_api.py``): the live tail stays on
   The pre-existing ``DataNotAvailableError`` (400) and ``MarketDataError`` (502) pass through to
   the helper's own ``except`` chain unchanged.
 * The store runs on its own sessions (``_store_session_factory``), never the request session.
+* The adapter rows (``_raw_rows``) and the engine bars with the block lines (``_assemble``) are
+  built on a worker thread, one hop each per series/request (CF-26-83, P6b). A thread does not
+  remove the collector's full passes, which hold the GIL (CF-26-93).
 
 Evidence rule (DoD 6, CF-26-19, CF-26-66, QR-26P5-R2-03; applied in WP2.8): a run is
 reproducible evidence only with ``mode = "require"``, ``store = "ok"``, every series
@@ -75,6 +78,10 @@ def _ms(moment: datetime) -> int:
     return (_as_utc(moment) - _EPOCH) // _MS
 
 
+def _raw_rows(bars: list[OHLCVBar]) -> list[oc.RawRow]:
+    return [oc.RawRow(_ms(b.timestamp), (b.open, b.high, b.low, b.close, b.volume)) for b in bars]
+
+
 class _Upstream:
     """``RangeUpstream`` over ``CCXTMarketDataService`` for ONE timeframe, in integer ms."""
 
@@ -92,10 +99,7 @@ class _Upstream:
     ) -> oc.UpstreamRange:
         start, end = (_EPOCH + timedelta(milliseconds=ms) for ms in (start_ms, end_ms))
         got = await self._svc.fetch_ohlcv_range_ex(symbol, self._tf, start, end)
-        rows = [
-            oc.RawRow(_ms(b.timestamp), (b.open, b.high, b.low, b.close, b.volume))
-            for b in got.bars
-        ]
+        rows = await asyncio.to_thread(_raw_rows, got.bars)  # CF-26-83
         return oc.UpstreamRange(rows, got.complete)
 
 
@@ -173,6 +177,13 @@ async def _cached(
     ok = [r.store == "ok" for r in got]
     store = "ok" if all(ok) else ("partial" if any(ok) else "unavailable")
     reason = next((r.store_reason for r in got if r.store != "ok"), "none")
+    bars, lines, rounded, divergent = await asyncio.to_thread(_assemble, got, order, timeframe)
+    return bars, lines, (data_hash, store, reason, rounded, divergent)
+
+
+def _assemble(
+    got: list[oc.HistoryResult], order: list[str], timeframe: TimeFrame
+) -> tuple[dict[str, list[OHLCVBar]], _Series, int, int]:
     bars = {
         s: [
             OHLCVBar(
@@ -200,7 +211,7 @@ async def _cached(
         for s, r in zip(order, got, strict=True)
     ]
     rounded, divergent = sum(r.rounded_values for r in got), sum(r.divergent_bars for r in got)
-    return bars, lines, (data_hash, store, reason, rounded, divergent)
+    return bars, lines, rounded, divergent
 
 
 async def _bypass(

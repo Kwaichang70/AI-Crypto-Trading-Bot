@@ -245,3 +245,61 @@ async def test_check_series_runs_the_same_validation_without_a_request() -> None
         with pytest.raises(cmd.DataNotAvailableError):
             svc.check_series(*bad)
     ex.fetch_ohlcv.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# P6b (CF-26-63): a cancelled or timed-out delegate releases the semaphore and the inner call
+# ---------------------------------------------------------------------------
+asyncio = cmd.asyncio  # the module under test's asyncio (the header imports stay untouched)
+
+
+class _BlockEx(_Ex):
+    """Serves every page, but call number ``block_at`` never returns (until it is cancelled)."""
+
+    def __init__(self, block_at: int) -> None:
+        super().__init__({"slots": _ALL})
+        self.block_at, self.started, self.cancelled = block_at, asyncio.Event(), False
+
+    async def _fetch(self, symbol: str, timeframe: str, since: int, limit: int) -> Any:
+        if self.n == self.block_at:
+            self.n += 1
+            self.started.set()
+            try:
+                await asyncio.get_running_loop().create_future()
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
+        return await super()._fetch(symbol, timeframe, since, limit)
+
+
+@pytest.mark.parametrize(
+    ("block_at", "timeout"), [(2, None), (1, 0.05)], ids=["cancel_p3", "wait_for_p2"]
+)
+async def test_the_delegate_releases_the_semaphore_when_cancelled_or_timed_out(
+    block_at: int, timeout: float | None
+) -> None:
+    ex, clock = _BlockEx(block_at), [1000.0]
+
+    async def sleep(seconds: float) -> None:
+        clock[0] += seconds
+
+    fake_time = SimpleNamespace(monotonic=lambda: clock[0], time=lambda: NOW / 1000)
+    with patch.object(cmd, "_now_ms", lambda: NOW), patch.object(cmd, "time", fake_time):
+        with patch.object(cmd.asyncio, "sleep", sleep):
+            svc = cmd.CCXTMarketDataService("binance", cache_ttl_seconds=0)
+            svc._exchange = ex
+            await svc.connect()
+            free = svc._semaphore._value
+            start, end = (datetime.fromtimestamp((T0 + i * H) / 1000, UTC) for i in (0, 900))
+            call = svc.fetch_ohlcv_range(SYMBOL, TimeFrame.ONE_HOUR, start, end)  # the delegate
+            if timeout is not None:
+                with pytest.raises(TimeoutError):
+                    await asyncio.wait_for(call, timeout)
+            else:
+                task = asyncio.ensure_future(call)
+                await ex.started.wait()
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+    assert ex.cancelled and ex.n == block_at + 1  # the blocked request was cancelled, no retry
+    assert svc._semaphore._value == free and not svc._semaphore._waiters
