@@ -328,6 +328,12 @@ class PortfolioAccounting:
         self._equity_curve: list[tuple[datetime, Decimal]] = [
             (self._now(), initial_cash),
         ]
+        # CF-26-97: lazy left-fold cursor of ``get_max_drawdown`` (written only there).
+        self._mdd_ref: list[tuple[datetime, Decimal]] | None = None
+        self._mdd_n = 0
+        self._mdd_peak = Decimal("0")
+        self._mdd_max = Decimal("0")
+        self._mdd_last: tuple[datetime, Decimal] | None = None
 
         # Completed trade history
         self._trade_history: list[TradeResult] = []
@@ -874,8 +880,10 @@ class PortfolioAccounting:
         """
         Calculate the maximum drawdown from the equity curve.
 
-        Iterates through the entire equity curve to find the worst
-        peak-to-trough decline.
+        Folds the equity curve left to right to find the worst peak-to-trough
+        decline.  A private cursor (``_mdd_*``) remembers the fold of the points
+        already seen, so each call scans only the points appended since the last
+        one (CF-26-97); a replaced or truncated list, or a replaced last point, restarts the fold.
 
         Returns
         -------
@@ -885,16 +893,30 @@ class PortfolioAccounting:
         if len(self._equity_curve) < 2:
             return 0.0
 
-        peak = Decimal("0")
-        max_dd = Decimal("0")
+        curve = self._equity_curve
+        n = self._mdd_n
+        if (
+            curve is not self._mdd_ref
+            or len(curve) < n
+            or (n and curve[n - 1] is not self._mdd_last)
+        ):
+            self._mdd_ref, self._mdd_n, self._mdd_last = curve, 0, None
+            self._mdd_peak = self._mdd_max = Decimal("0")
+            n = 0
+        peak = self._mdd_peak
+        max_dd = self._mdd_max
 
-        for _, equity in self._equity_curve:
+        for i in range(n, len(curve)):
+            point = curve[i]
+            _, equity = point
             if equity > peak:
                 peak = equity
             if peak > Decimal("0"):
                 dd = (peak - equity) / peak
                 if dd > max_dd:
                     max_dd = dd
+            self._mdd_n, self._mdd_last = i + 1, point
+            self._mdd_peak, self._mdd_max = peak, max_dd
 
         return float(max_dd)
 

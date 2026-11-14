@@ -60,6 +60,15 @@ Core trading engine containing the heart of the system.
   or the latch; `risk_snapshot()` / `get_daily_pnl()` / `get_summary()` are
   pure (test-pinned, WP15-T-19). Engines and risk managers are stateless
   readers of `RiskSnapshot`; never read `get_summary()` string keys.
+- CF-26-97: pure means observationally pure: no read changes a field in WP15-T-19's
+  `_state` or any return value. The only private state a read writes is the `_mdd_*`
+  fold cursor of `get_max_drawdown`; it is never read outside `get_max_drawdown` and never
+  enters `RiskSnapshot`, a breaker or risk decision, or persistence; `get_max_drawdown` /
+  `get_summary` are called on the event-loop thread only (AST-pinned: thread offload sites
+  are inventoried, and there is no event subscription and no sync `def` route handler in
+  `packages`/`apps`; adding any of them needs a risk review first). The cursor relies on an
+  append-only curve (no interior edit) and an unchanged Decimal context (no `getcontext` /
+  `setcontext`, no `localcontext(...)` with arguments); both are AST-pinned (T-97P2-04/05).
 - Day roll (SYN-01 / Option B): the roll sets `_nav_day_start` provisionally to
   the pre-roll NAV and arms `_day_start_pending`; the first NAV observation of
   the day (`_record_nav`) raises the start if higher, once, before folding into
