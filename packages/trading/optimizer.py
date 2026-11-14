@@ -15,6 +15,7 @@ Design principles:
 
 from __future__ import annotations
 
+import asyncio
 import itertools
 import time
 from dataclasses import dataclass, field
@@ -503,6 +504,7 @@ class ParameterOptimizer:
         failed = 0
 
         for idx, combo_values in enumerate(self._combinations):
+            await asyncio.sleep(0)
             combo_params = dict(zip(self._param_names, combo_values))
 
             self._log.debug(
@@ -595,6 +597,7 @@ class ParameterOptimizer:
         failed = 0
 
         for idx, combo_values in enumerate(self._combinations):
+            await asyncio.sleep(0)
             combo_params = dict(zip(self._param_names, combo_values))
 
             try:
@@ -611,6 +614,7 @@ class ParameterOptimizer:
                 fold_returns: list[float] = []
                 fold_drawdowns: list[float] = []
                 for fold in folds:
+                    await asyncio.sleep(0)
                     fold_result = await self._run_single_backtest(
                         combo_params=combo_params,
                         strategy_id=f"opt-{idx}-fold{fold.index}",

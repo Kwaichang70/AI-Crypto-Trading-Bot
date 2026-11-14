@@ -438,6 +438,11 @@ class _EngineLot:
     add_order_ids: set[UUID] = field(default_factory=set)
 
 
+async def _yield_to_loop() -> None:
+    """CF-26-97: one cooperative suspension per backtest bar step (K = 1)."""
+    await asyncio.sleep(0)
+
+
 class StrategyEngine:
     """
     Central orchestrator for a trading run.
@@ -1387,6 +1392,7 @@ class StrategyEngine:
                 self._clock = bar_clock
             # Walk forward bar by bar
             for bar_idx in range(num_bars):
+                await _yield_to_loop()
                 if self._stop_event.is_set():
                     self._log.info(
                         "engine.backtest_stopped_early",
