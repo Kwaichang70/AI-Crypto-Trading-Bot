@@ -23,11 +23,11 @@ Design notes
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal
-from typing import Any
+from typing import Any, Self
 from uuid import UUID, uuid4
 
 import structlog
@@ -35,7 +35,7 @@ import structlog
 from common.types import OrderSide, OrderStatus, OrderType, SignalDirection
 from trading.clock import Clock
 from trading.costs import DEFAULT_COST_PROFILE, CostProfile
-from trading.execution import BaseExecutionEngine
+from trading.execution import ORDER_STATE_MACHINE, BaseExecutionEngine
 from trading.models import Fill, Order, Position, Signal
 from trading.recovery import replay_sort_key
 from trading.risk import BaseRiskManager
@@ -64,6 +64,86 @@ class _RiskGateInputs:
     daily_pnl: Decimal
     peak_equity: Decimal
     daily_loss_basis: Decimal | None
+
+
+_TERMINAL = frozenset(s for s, targets in ORDER_STATE_MACHINE.items() if not targets)
+
+
+def _is_terminal(order: Order) -> bool:
+    try:
+        return bool(order.status in _TERMINAL)
+    except Exception:  # a foreign value stays a candidate and raises at read time, as in the base
+        return False
+
+_Items = Mapping[UUID, Order] | Iterable[tuple[UUID, Order]]
+
+
+class _OrderRegistry(dict[UUID, Order]):
+    """CF-26-97: ``dict[UUID, Order]`` with an insertion-ordered index of the non-terminal keys.
+
+    ``open_orders()`` returns exactly what ``BaseExecutionEngine.get_open_orders`` returns (the
+    same objects, in the same dict order) without scanning terminal orders.  Every mutator keeps
+    the index in step; a stale terminal -> open write rebuilds it in dict order.
+    """
+
+    def __init__(self, items: _Items = ()) -> None:
+        self._open: dict[UUID, None] = {}
+        super().__init__()
+        self.update(items)
+
+    def _rebuild(self) -> None:
+        self._open = dict.fromkeys(k for k, v in self.items() if not _is_terminal(v))
+
+    def __setitem__(self, key: UUID, value: Order) -> None:
+        known = key in self
+        super().__setitem__(key, value)
+        if _is_terminal(value):
+            self._open.pop(key, None)
+        elif key not in self._open:
+            if known:
+                self._rebuild()
+            else:
+                self._open[key] = None
+
+    def __delitem__(self, key: UUID) -> None:
+        super().__delitem__(key)
+        self._open.pop(key, None)
+
+    def pop(self, key: UUID, *default: Order | None) -> Order | None:  # type: ignore[override]  # typeshed overloads
+        value = super().pop(key, *default)
+        self._open.pop(key, None)
+        return value
+
+    def clear(self) -> None:
+        super().clear()
+        self._open.clear()
+
+    def popitem(self) -> tuple[UUID, Order]:
+        item = super().popitem()
+        self._rebuild()
+        return item
+
+    def setdefault(self, key: UUID, default: Order) -> Order:
+        value = super().setdefault(key, default)
+        self._rebuild()
+        return value
+
+    def update(self, items: _Items = (), /) -> None:  # type: ignore[override]  # typeshed overloads
+        super().update(items)
+        self._rebuild()
+
+    def __ior__(self, other: _Items) -> Self:  # type: ignore[override,misc]  # typeshed overloads
+        super().__ior__(other)
+        self._rebuild()
+        return self
+
+    def __reduce__(self) -> tuple[type[Self], tuple[dict[UUID, Order]]]:
+        # pickle and deepcopy would call __setitem__ before __dict__ exists
+        return (type(self), (dict(self),))
+
+    def open_orders(self) -> list[Order]:
+        keys = (dict.__getitem__(self, k) for k in self._open)
+        return [o for o in keys if o.status not in _TERMINAL]
 
 
 class PaperExecutionEngine(BaseExecutionEngine):
@@ -114,6 +194,7 @@ class PaperExecutionEngine(BaseExecutionEngine):
         clock: Clock | None = None,
     ) -> None:
         super().__init__(run_id=run_id, config=config)
+        self._orders = _OrderRegistry()
         if clock is not None:
             self._clock = self._validated_clock(clock)
         self._risk_manager = risk_manager
@@ -892,6 +973,12 @@ class PaperExecutionEngine(BaseExecutionEngine):
         """
         fills = self._fills.get(order_id, [])
         return sorted(fills, key=lambda f: f.executed_at)
+
+    def get_open_orders(self) -> list[Order]:
+        """Non-terminal orders: the index for an ``_OrderRegistry`` store, else the base filter."""
+        if type(self._orders) is _OrderRegistry:
+            return self._orders.open_orders()
+        return super().get_open_orders()
 
     def get_all_fills(self) -> list[Fill]:
         """Return all fills across all orders, sorted by executed_at."""
