@@ -1136,7 +1136,8 @@ async def run_paper_engine(
             api_key=api_key,
             api_secret=api_secret,
             api_passphrase=api_passphrase,
-            cache_ttl_seconds=60,
+            # CF-97-15: no L1 cache (TTL 60 on a 1m poll served the previous bar every other poll)
+            cache_ttl_seconds=0,
         )
         risk_manager = DefaultRiskManager(run_id=run_id_str)
         # WP1.6 (C2): the run's circuit breaker, built from THIS run's risk
@@ -1669,7 +1670,8 @@ async def run_live_engine(
             api_key=api_key,
             api_secret=api_secret,
             api_passphrase=api_passphrase,
-            cache_ttl_seconds=60,
+            # CF-97-15: no L1 cache (TTL 60 on a 1m poll served the previous bar every other poll)
+            cache_ttl_seconds=0,
         )
         # R-02 (WP1.5): the single live risk-manager construction site -- fresh,
         # promoted and resumed live runs all reach it.  Live drawdown limit 20%;
