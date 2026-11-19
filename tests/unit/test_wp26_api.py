@@ -858,3 +858,150 @@ async def test_the_rebuild_runs_on_a_thread_and_keeps_the_canonical_decimals(
         for c in canon(world.series[SYM])
     ]
     assert sorted(hops) == ["_assemble", "_raw_rows"] and got == want
+
+
+# ---------------------------------------------------------------------------
+# CF-26-89 (CF-97-03 P7c): X06, the cache-path 502 and survivors F-02..F-09, appended
+# ---------------------------------------------------------------------------
+class LevelLog:
+    def __init__(self) -> None:
+        self.events: list[tuple[str, str]] = []
+
+    def info(self, event: str, **_f: Any) -> None:
+        self.events.append(("info", event))
+
+    def warning(self, event: str, **_f: Any) -> None:
+        self.events.append(("warning", event))
+
+    def error(self, event: str, **_f: Any) -> None:
+        self.events.append(("error", event))
+
+
+async def test_a_rejected_request_is_logged_as_a_warning_and_at_no_other_level(
+    world: World,
+) -> None:
+    world.log = LevelLog()  # type: ignore[assignment]
+    world.series = {SYM: mk(SYM, 5)}
+    with pytest.raises(HTTPException):
+        await world.fetch("read_through", [SYM], end=T0 + timedelta(microseconds=500))
+    assert [lv for lv, ev in world.log.events if ev == LOG] == ["warning"]  # type: ignore[attr-defined]
+
+
+async def test_a_market_data_error_on_the_cache_path_is_a_502_and_the_service_is_closed(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from data.market_data import MarketDataError
+
+    class Failing:
+        def __init__(self, *_a: object, **_k: object) -> None: ...
+
+        async def connect(self) -> None: ...
+
+        async def get_ranges(self, *_a: object) -> list[Any]:
+            raise MarketDataError("exchange down")
+
+    monkeypatch.setattr(oc, "HistoricalBarSource", Failing)
+    world.series = {SYM: mk(SYM, 5)}
+    with pytest.raises(HTTPException) as info:
+        await world.fetch("read_through", [SYM], end=T0 + 5 * H)
+    assert info.value.status_code == 502 and world.events[-1] == "close"
+    assert world.log.events[-1][0] == "runs.backtest_market_data_error"
+
+
+async def test_the_upstream_passes_its_own_timeframe_to_the_check_and_the_fetch() -> None:
+    from unittest.mock import MagicMock
+
+    svc = SimpleNamespace(
+        check_series=MagicMock(),
+        fetch_ohlcv_range_ex=AsyncMock(return_value=RangeFetch([], True, "stop", 1, 0)),
+    )
+    up = hist._Upstream(svc, TimeFrame.FIFTEEN_MINUTES)  # type: ignore[arg-type]
+    up.check_series(SYM, 900)
+    await up.fetch_range(SYM, 900, ms(T0), ms(T0 + H))
+    svc.check_series.assert_called_once_with(SYM, TimeFrame.FIFTEEN_MINUTES)
+    svc.fetch_ohlcv_range_ex.assert_awaited_once_with(SYM, TimeFrame.FIFTEEN_MINUTES, T0, T0 + H)
+
+
+async def test_the_block_records_the_mode_and_the_volatile_tail_of_the_run(world: World) -> None:
+    base = datetime(2026, 3, 10, 9, tzinfo=UTC)  # NOW is in slot 12: slot 11 is the volatile tail
+    bars = [b.model_copy(update={"timestamp": base + i * H}) for i, b in enumerate(mk(SYM, 3))]
+    world.series = {SYM: bars}
+    out = await world.fetch("require", [SYM], start=base, end=base + 10 * H)
+    block = world.block(out)
+    assert block["mode"] == "require"  # F-02
+    line = block["series"][0]
+    assert (line["n_bars"], line["volatile_tail_bars"]) == (3, 1)  # F-03
+
+
+async def test_rounding_and_divergence_are_summed_over_two_series_not_maximised(
+    world: World,
+) -> None:
+    odd = Decimal("1.0000000000005")  # over the stored scale: rounded once per series
+    world.series = {s: mk(s, 450) for s in (SYM, ETH)}
+    for s in (SYM, ETH):
+        world.series[s][3] = world.series[s][3].model_copy(update={"volume": odd})
+    cold = await world.fetch("read_through", [SYM, ETH], end=T0 + 400 * H)
+    assert world.block(cold)["rounded_values"] == 2  # F-04
+    for s in (SYM, ETH):  # the exchange revises the probe bar (slot 399) of both series
+        world.series[s][399] = world.series[s][399].model_copy(update={"volume": Decimal("11")})
+    warm = await world.fetch("read_through", [SYM, ETH], end=T0 + 450 * H)
+    assert world.block(warm)["divergent_bars"] == 2
+
+
+async def test_every_bar_carries_the_symbol_of_its_own_series(world: World) -> None:
+    world.series = {SYM: mk(SYM, 5), ETH: mk(ETH, 5)}
+    out = await world.fetch("read_through", [ETH, SYM], end=T0 + 5 * H)
+    assert {s: {b.symbol for b in bars} for s, bars in out.items()} == {SYM: {SYM}, ETH: {ETH}}
+
+
+async def test_the_store_is_built_on_the_session_factory_seam(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sentinel, seen = object(), []
+    monkeypatch.setattr(hist, "_store_session_factory", lambda: sentinel)
+
+    def build(sessions: object) -> oc.InMemoryOhlcvStore:
+        seen.append(sessions)
+        return world.store
+
+    monkeypatch.setattr(hist, "SqlOhlcvStore", build)
+    world.series = {SYM: mk(SYM, 5)}
+    await world.fetch("read_through", [SYM], end=T0 + 5 * H)
+    assert seen == [sentinel]  # F-07
+
+
+async def test_the_default_clock_argument_is_none_so_the_cache_is_not_used(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def boom(*_a: object, **_k: object) -> None:
+        raise AssertionError("the cache path needs a clock")
+
+    monkeypatch.setattr(oc, "HistoricalBarSource", boom)
+    world.series = {SYM: mk(SYM, 5)}
+    ns = SimpleNamespace(
+        exchange_api_key=None,
+        exchange_api_secret=None,
+        exchange_api_passphrase=None,
+        exchange_id=EXCH,
+        ohlcv_cache_mode="read_through",
+    )
+    monkeypatch.setattr("api.config.get_settings", lambda: ns)
+    out = await runs._fetch_bars_for_backtest([SYM], TimeFrame.ONE_HOUR, T0, T0 + 5 * H, world.log)
+    assert getattr(out, "ohlcv_data", None) is None and len(out[SYM]) == 5  # F-08
+
+
+async def test_the_cache_path_logs_exactly_two_events_and_the_mode_sets_are_exact(
+    world: World,
+) -> None:
+    from typing import get_args
+
+    world.series = {SYM: mk(SYM, 5)}
+    await world.fetch("read_through", [SYM], end=T0 + 5 * H)
+    events = [e for e, _ in world.log.events]
+    assert events == ["runs.backtest_fetching_bars", "runs.backtest_ohlcv_data"]
+    assert get_args(hist._Mode) == ("read_through", "require")
+    assert get_args(Settings.model_fields["ohlcv_cache_mode"].annotation) == (
+        "off",
+        "read_through",
+        "require",
+    )  # F-09

@@ -792,3 +792,68 @@ async def test_one_incomplete_span_marks_the_result_and_the_epoch_is_a_valid_sta
     await get(source(Up(), store), 100, T0 + 200 * H)
     assert (await get(source(up, store), 50, T0 + 300 * H)).fetch_complete is False  # N07
     assert (await source(Up(0), Rec()).get_range(SYM, 3600, 0, 10 * H)).from_ms == 0  # N05
+
+
+# ---------------------------------------------------------------------------
+# CF-26-79 and CF-26-91 (CF-97-03 P7c): survivor pins, appended
+# ---------------------------------------------------------------------------
+async def test_require_refuses_a_late_plan_that_has_no_gap_and_read_through_bypasses_it() -> None:
+    store, later = Rec(), NOW + 3 * H
+    await HistoricalBarSource(Up(1200), store, exchange="coinbase", now_ms=later).get_range(
+        SYM, 3600, T0 + 1000 * H, T0 + 1002 * H
+    )  # coverage that starts after this NOW's settle
+    wide = (100, T0 + 990 * H)  # gap 10 <= own span 890: only the late rule can refuse
+    with pytest.raises(OhlcvRequireError) as err:
+        await get(source(Up(1200), store, mode="require"), *wide)
+    assert err.value.code == "ohlcv_store_unavailable"
+    assert (await get(source(Up(1200), store), *wide)).bypass_disjoint  # read_through serves it
+
+
+async def test_a_request_starting_at_the_closed_end_makes_no_upstream_call() -> None:
+    up = Up()
+    res = await get(source(up, Rec()), 1000)  # slot 1000 opens at F: nothing is closed yet
+    assert up.calls == [] and res.bars == ()  # 108
+
+
+@pytest.mark.parametrize(("start", "end", "want"), [(50, 101, (50, 101)), (100, 150, (100, 150))])
+async def test_extending_a_one_bar_coverage_probes_that_bar_on_the_extended_side(
+    start: int, end: int, want: tuple[int, int]
+) -> None:
+    store = Rec()
+    await get(source(Up(), store), 100, T0 + 101 * H)  # coverage = the single bar 100
+    up = Up()
+    await get(source(up, store), start, T0 + end * H)  # 175 (left), 186 (right)
+    assert up.calls == [(T0 + want[0] * H, T0 + want[1] * H)]
+
+
+async def test_require_refuses_an_incomplete_fetch_with_the_store_unavailable_code() -> None:
+    with pytest.raises(OhlcvRequireError) as err:
+        await get(source(Up(complete=False), Rec(), mode="require"))
+    assert err.value.code == "ohlcv_store_unavailable"  # 216: P6 maps by .code
+
+
+async def test_a_retry_after_coverage_disjoint_runs_when_the_coverage_touches_the_span() -> None:
+    store = Rec()
+    await get(source(Up(), store), 100, T0 + 200 * H)
+    store.race_cover = Coverage(T0 + 100 * H, T0 + 199 * H)  # a writer: coverage ends at the span
+    store.fail["extend"] = [OhlcvStoreError("coverage_disjoint")]
+    res = await get(source(Up(), store), 100, T0 + 300 * H)  # the right span starts at slot 199
+    assert (len(store.of("extend")), res.store) == (3, "ok")  # 287: 1 + the retry's 2
+    assert cover(store) == Coverage(T0 + 100 * H, T0 + 300 * H)
+
+
+def test_the_inline_row_threshold_is_pinned() -> None:
+    assert INLINE_MAX_ROWS == 8_000  # SY-26-33; the offload test imports the constant itself
+
+
+async def test_the_combined_cold_bound_applies_only_to_a_gap_not_to_cold_or_contiguous_series() -> (
+    None
+):
+    store = Rec()
+    await HistoricalBarSource(Up(), store, exchange="coinbase", now_ms=NOW).get_range(
+        "B/EUR", 3600, T0, T0 + 100 * H
+    )
+    for order, end in ((["C/EUR", "D/EUR"], 100), (["A/EUR", "B/EUR"], 140)):
+        src = HistoricalBarSource(Up(), store, exchange="coinbase", now_ms=NOW, cap_bars=150)
+        got = await src.get_ranges(order, 3600, T0, T0 + end * H)  # 100 + 100, 140 + 41 > 150
+        assert [r.bypass_disjoint for r in got] == [False, False]  # 198/199, SY-26-98
