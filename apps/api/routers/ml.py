@@ -27,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.db import get_db
 from api.schemas import ModelVersionListResponse, ModelVersionResponse
+from api.services import admission
 from trading.costs import CostProfile, default_cost_profile
 from trading.metrics import METRICS_VERSION
 from trading.safety import BACKTEST_CIRCUIT_BREAKER_DEFAULT
@@ -126,8 +127,11 @@ async def train_model(
 
     settings = get_settings()
 
-    try:
-        trained: _TrainedModel = await asyncio.to_thread(
+    # CF-97-03 (P7a): the slot is held until the THREAD ends, not until this request does: a
+    # cancelled ``to_thread`` await leaves the thread running (done-callback release).
+    lease = admission.try_acquire("ml_train")
+    inner = asyncio.ensure_future(
+        asyncio.to_thread(
             _train_model_with_wf_sync,
             symbol=symbol,
             exchange=exchange,
@@ -139,6 +143,10 @@ async def train_model(
             num_wf_folds=num_wf_folds,
             min_trades_per_fold=settings.min_trades_per_fold,
         )
+    )
+    lease.bind_thread(inner)
+    try:
+        trained: _TrainedModel = await asyncio.shield(inner)
     except ImportError as exc:
         log.error("ml.missing_dependency", error=str(exc))
         raise HTTPException(
@@ -740,15 +748,17 @@ async def manual_retrain(
             ),
         )
 
+    lease = admission.try_acquire("ml_retrain")  # CF-97-03 (P7a): 429 while research is running
     log.info("ml.manual_retrain_requested")
 
     # Fire-and-forget: not tracked for cancellation on shutdown (MVP scope).
     # _do_retrain catches all exceptions internally; the DB row is only written
     # after training succeeds, so mid-flight abandonment on shutdown is safe.
-    asyncio.create_task(
+    task = asyncio.create_task(
         retraining_service.manual_retrain(symbol=symbol, timeframe=timeframe),
         name=f"manual_retrain_{symbol}_{timeframe}",
     )
+    lease.bind_thread(task)
 
     return {
         "status": "accepted",

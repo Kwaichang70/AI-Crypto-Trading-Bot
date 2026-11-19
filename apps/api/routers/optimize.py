@@ -30,6 +30,7 @@ from sqlalchemy.orm import selectinload
 from api.db import get_db
 from api.db.models import OptimizationEntryORM, OptimizationRunORM
 from api.schemas import CostProfileSummary
+from api.services import admission
 from api.services.cost_profiles import (
     bar_alignment_http_error,
     check_backtest_request_bounds,
@@ -489,162 +490,168 @@ async def run_optimization(
         n_symbols=len(body.symbols),
     )
 
-    # WP2.3 (SY-23-14, SEC-01): read ``now`` ONCE, BEFORE the fetch (see create_run).
-    bar_window_now = _runs_router._window_now()
-
-    # Step 1: Fetch OHLCV data ONCE
-    bars_by_symbol = await _fetch_bars_for_backtest(
-        symbols=body.symbols,
-        timeframe=timeframe,
-        start=body.backtest_start,
-        end=body.backtest_end,
-        log=log,
-        now=bar_window_now,
-    )
-
-    # Step 2: Build and run optimizer
+    # CF-97-03 (P7a): one research slot per process (refuse-only); no claim exists here.
+    lease = admission.try_acquire("optimize")
     try:
-        optimizer = ParameterOptimizer(
-            strategy_cls=strategy_cls,
+        # WP2.3 (SY-23-14, SEC-01): read ``now`` ONCE, BEFORE the fetch (see create_run).
+        bar_window_now = _runs_router._window_now()
+
+        # Step 1: Fetch OHLCV data ONCE
+        bars_by_symbol = await _fetch_bars_for_backtest(
             symbols=body.symbols,
             timeframe=timeframe,
-            param_grid=body.param_grid,
-            initial_capital=Decimal(body.initial_capital),
+            start=body.backtest_start,
+            end=body.backtest_end,
+            log=log,
+            now=bar_window_now,
+        )
+
+        # Step 2: Build and run optimizer
+        try:
+            optimizer = ParameterOptimizer(
+                strategy_cls=strategy_cls,
+                symbols=body.symbols,
+                timeframe=timeframe,
+                param_grid=body.param_grid,
+                initial_capital=Decimal(body.initial_capital),
+                rank_by=body.rank_by,
+                top_n=body.top_n,
+                max_combinations=body.max_combinations,
+                cost_profile=cost_profile,
+                # WP2.1c (SY-21-13, GAP-05): every combination runs with the breaker;
+                # persisted below as ``run_metadata.engine_semantics``.  No API toggle.
+                enable_circuit_breaker=BACKTEST_CIRCUIT_BREAKER_DEFAULT,
+            )
+        except ExitConfigError as exc:
+            # Defence in depth: ParameterOptimizer.__init__ also validates.
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=_optimize_exit_config_error_detail(exc),
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(exc),
+            ) from exc
+
+        log.info(
+            "optimize.starting",
+            total_combinations=optimizer.total_combinations,
             rank_by=body.rank_by,
-            top_n=body.top_n,
-            max_combinations=body.max_combinations,
-            cost_profile=cost_profile,
-            # WP2.1c (SY-21-13, GAP-05): every combination runs with the breaker;
-            # persisted below as ``run_metadata.engine_semantics``.  No API toggle.
-            enable_circuit_breaker=BACKTEST_CIRCUIT_BREAKER_DEFAULT,
         )
-    except ExitConfigError as exc:
-        # Defence in depth: ParameterOptimizer.__init__ also validates.
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=_optimize_exit_config_error_detail(exc),
-        ) from exc
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(exc),
-        ) from exc
 
-    log.info(
-        "optimize.starting",
-        total_combinations=optimizer.total_combinations,
-        rank_by=body.rank_by,
-    )
+        # WP2.3 (SY-23-08/14/18): the requested window (``now`` read here, in the router,
+        # through the same seam as backtest) and a 422 for a rejected alignment.  The
+        # ``BarAlignmentError`` branch is the only one: the optimizer never swallows it into
+        # ``failed_combinations``, and no ``str(exc)`` reaches the log or the response.
+        try:
+            result = await optimizer.run(
+                bars_by_symbol,
+                requested_window=requested_bar_window(
+                    body.backtest_start,
+                    body.backtest_end,
+                    timeframe,
+                    bar_window_now,
+                ),
+            )
+        except BarAlignmentError as exc:
+            log.warning(
+                "optimize.bar_alignment_rejected",
+                code=exc.code,
+                error_type="BarAlignmentError",
+            )
+            raise bar_alignment_http_error(exc) from exc
 
-    # WP2.3 (SY-23-08/14/18): the requested window (``now`` read here, in the router,
-    # through the same seam as backtest) and a 422 for a rejected alignment.  The
-    # ``BarAlignmentError`` branch is the only one: the optimizer never swallows it into
-    # ``failed_combinations``, and no ``str(exc)`` reaches the log or the response.
-    try:
-        result = await optimizer.run(
-            bars_by_symbol,
-            requested_window=requested_bar_window(
-                body.backtest_start,
-                body.backtest_end,
-                timeframe,
-                bar_window_now,
-            ),
-        )
-    except BarAlignmentError as exc:
-        log.warning(
-            "optimize.bar_alignment_rejected",
-            code=exc.code,
-            error_type="BarAlignmentError",
-        )
-        raise bar_alignment_http_error(exc) from exc
-
-    # Step 3: Build response entry list
-    entries = [
-        OptimizeEntryResponse(
-            rank=e.rank,
-            params=e.params,
-            metrics=_scrub_non_finite(e.metrics),
-        )
-        for e in result.entries
-    ]
-
-    # Step 4: Persist optimization run + entries to DB
-    # WP2.1b (SY-21-08): freeze the cost model next to the ranking, so an optimizer
-    # result stays attributable to the profile that produced it.  Same two keys and
-    # the same writer as a backtest run's ``config`` (``stamp_cost_config``).
-    effective_profile = result.cost_profile if result.cost_profile is not None else cost_profile
-    run_metadata: dict[str, Any] = {}
-    stamp_cost_config(
-        run_metadata,
-        effective_profile,
-        mode="optimize",
-        backtest_circuit_breaker=optimizer.circuit_breaker_enabled,
-    )
-    # WP2.3 (SY-23-16): the alignment report of the whole run (aligned once, SY-23-18).
-    # Compare runs by ``presence_digest``, not ``fingerprint`` (warm-up 0 in the optimizer).
-    if optimizer.last_alignment is not None:
-        run_metadata["bar_alignment"] = optimizer.last_alignment.to_metadata()
-    # WP2.4 (SY-24-07): the run-level MTF-context report (one selection per run, not per
-    # combination).  Built from the run's bars and the source it was given -- none in Phase A,
-    # so ``source == "unavailable"`` -- never from the request.
-    if optimizer.last_mtf_context is not None:
-        run_metadata["mtf_context"] = optimizer.last_mtf_context.to_metadata()
-    # WP2.6 (SY-26-10/16): the data block of the cache path (see create_run); never a request field.
-    if isinstance(ohlcv_block := getattr(bars_by_symbol, "ohlcv_data", None), dict):
-        run_metadata["ohlcv_data"] = ohlcv_block
-
-    orm_run = OptimizationRunORM(
-        id=uuid.uuid4(),
-        strategy_name=result.strategy_name,
-        symbols=result.symbols,
-        timeframe=result.timeframe,
-        rank_by=result.rank_by,
-        total_combinations=result.total_combinations,
-        completed_combinations=result.completed_combinations,
-        failed_combinations=result.failed_combinations,
-        elapsed_seconds=float(result.elapsed_seconds),
-        run_metadata=run_metadata,
-    )
-    db.add(orm_run)
-    await db.flush()  # Assign PK before inserting child rows
-
-    for e in result.entries:
-        db.add(
-            OptimizationEntryORM(
-                id=uuid.uuid4(),
-                optimization_run_id=orm_run.id,
+        # Step 3: Build response entry list
+        entries = [
+            OptimizeEntryResponse(
                 rank=e.rank,
                 params=e.params,
                 metrics=_scrub_non_finite(e.metrics),
             )
+            for e in result.entries
+        ]
+
+        # Step 4: Persist optimization run + entries to DB
+        # WP2.1b (SY-21-08): freeze the cost model next to the ranking, so an optimizer
+        # result stays attributable to the profile that produced it.  Same two keys and
+        # the same writer as a backtest run's ``config`` (``stamp_cost_config``).
+        effective_profile = result.cost_profile if result.cost_profile is not None else cost_profile
+        run_metadata: dict[str, Any] = {}
+        stamp_cost_config(
+            run_metadata,
+            effective_profile,
+            mode="optimize",
+            backtest_circuit_breaker=optimizer.circuit_breaker_enabled,
+        )
+        # WP2.3 (SY-23-16): the alignment report of the whole run (aligned once, SY-23-18).
+        # Compare runs by ``presence_digest``, not ``fingerprint`` (warm-up 0 in the optimizer).
+        if optimizer.last_alignment is not None:
+            run_metadata["bar_alignment"] = optimizer.last_alignment.to_metadata()
+        # WP2.4 (SY-24-07): the run-level MTF-context report (one selection per run, not per
+        # combination).  Built from the run's bars and the source it was given -- none in Phase A,
+        # so ``source == "unavailable"`` -- never from the request.
+        if optimizer.last_mtf_context is not None:
+            run_metadata["mtf_context"] = optimizer.last_mtf_context.to_metadata()
+        # WP2.6 (SY-26-10/16): the data block of the cache path (see create_run); never a
+        # request field.
+        if isinstance(ohlcv_block := getattr(bars_by_symbol, "ohlcv_data", None), dict):
+            run_metadata["ohlcv_data"] = ohlcv_block
+
+        orm_run = OptimizationRunORM(
+            id=uuid.uuid4(),
+            strategy_name=result.strategy_name,
+            symbols=result.symbols,
+            timeframe=result.timeframe,
+            rank_by=result.rank_by,
+            total_combinations=result.total_combinations,
+            completed_combinations=result.completed_combinations,
+            failed_combinations=result.failed_combinations,
+            elapsed_seconds=float(result.elapsed_seconds),
+            run_metadata=run_metadata,
+        )
+        db.add(orm_run)
+        await db.flush()  # Assign PK before inserting child rows
+
+        for e in result.entries:
+            db.add(
+                OptimizationEntryORM(
+                    id=uuid.uuid4(),
+                    optimization_run_id=orm_run.id,
+                    rank=e.rank,
+                    params=e.params,
+                    metrics=_scrub_non_finite(e.metrics),
+                )
+            )
+
+        await db.commit()
+
+        log.info(
+            "optimize.persisted",
+            optimization_run_id=str(orm_run.id),
+            entries=len(result.entries),
         )
 
-    await db.commit()
+        return OptimizeResponse(
+            optimization_run_id=orm_run.id,
+            strategy_name=result.strategy_name,
+            symbols=result.symbols,
+            timeframe=result.timeframe,
+            rank_by=result.rank_by,
+            total_combinations=result.total_combinations,
+            completed_combinations=result.completed_combinations,
+            failed_combinations=result.failed_combinations,
+            elapsed_seconds=result.elapsed_seconds,
+            entries=entries,
+            # POST and GET share one code path: what is returned here is exactly what a
+            # later GET /optimize/{id} derives from the persisted ``run_metadata``.
+            **cost_response_fields(run_metadata, "optimize"),
+            **metrics_response_fields(run_metadata, "optimize"),
+            **mtf_context_response_fields(run_metadata, "optimize", orm_run.strategy_name),
+        )
 
-    log.info(
-        "optimize.persisted",
-        optimization_run_id=str(orm_run.id),
-        entries=len(result.entries),
-    )
-
-    return OptimizeResponse(
-        optimization_run_id=orm_run.id,
-        strategy_name=result.strategy_name,
-        symbols=result.symbols,
-        timeframe=result.timeframe,
-        rank_by=result.rank_by,
-        total_combinations=result.total_combinations,
-        completed_combinations=result.completed_combinations,
-        failed_combinations=result.failed_combinations,
-        elapsed_seconds=result.elapsed_seconds,
-        entries=entries,
-        # POST and GET share one code path: what is returned here is exactly what a
-        # later GET /optimize/{id} derives from the persisted ``run_metadata``.
-        **cost_response_fields(run_metadata, "optimize"),
-        **metrics_response_fields(run_metadata, "optimize"),
-        **mtf_context_response_fields(run_metadata, "optimize", orm_run.strategy_name),
-    )
-
+    finally:
+        lease.release()
 
 # ---------------------------------------------------------------------------
 # GET /api/v1/optimize — list all past optimization runs

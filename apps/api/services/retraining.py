@@ -45,6 +45,7 @@ from typing import Any
 
 import structlog
 
+from api.services import admission
 from common.logging import exc_log_fields
 
 __all__ = ["RetrainingService"]
@@ -236,7 +237,18 @@ class RetrainingService:
                 timeframe=timeframe,
                 trade_count=trade_count,
             )
-            await self._do_retrain(symbol=symbol, timeframe=timeframe, trigger="auto")
+            # CF-97-03 (P7a): a busy server skips this cycle (never waits); the job holds the slot
+            # until its pipeline ends, even if this loop is cancelled meanwhile.
+            try:
+                lease = admission.try_acquire("ml_retrain")
+            except admission.AdmissionRefused:
+                self._log.info("admission.skipped_busy", symbol=symbol, timeframe=timeframe)
+                return
+            job = asyncio.ensure_future(
+                self._do_retrain(symbol=symbol, timeframe=timeframe, trigger="auto")
+            )
+            lease.bind_thread(job)
+            await asyncio.shield(job)
 
     # ------------------------------------------------------------------ #
     # Retraining pipeline

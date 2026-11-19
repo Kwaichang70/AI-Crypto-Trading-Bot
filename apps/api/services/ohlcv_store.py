@@ -37,6 +37,7 @@ import structlog
 from sqlalchemy import DateTime, Numeric, bindparam, text
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.sql.elements import BindParameter
 
@@ -174,7 +175,7 @@ def store_error_code(exc: BaseException) -> StoreCode:
     state = _sqlstate(exc)
     if state in _SQLSTATE_CODE:
         return _SQLSTATE_CODE[state]
-    if isinstance(exc, TimeoutError):
+    if isinstance(exc, TimeoutError | PoolTimeoutError):  # CF-26-86: the pool's own, too
         return "timeout"
     if (
         isinstance(exc, OSError)
@@ -229,6 +230,8 @@ class SqlOhlcvStore:
         if isinstance(exc, OhlcvStoreError | OhlcvDataError):
             return exc  # already closed-vocabulary
         code = store_error_code(exc)
+        if isinstance(exc, PoolTimeoutError):
+            metrics.increment("ohlcv_store_pool_timeout_total")
         logger.warning("ohlcv_store_failed", op=op, code=code, **exc_log_fields(exc))
         return OhlcvStoreError(code)
 

@@ -32,6 +32,7 @@ MVP notes
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
 from collections.abc import Mapping
 from datetime import UTC, datetime
@@ -54,6 +55,7 @@ from api.db.models import (
 )
 from api.db.session import get_db
 from api.deps import require_admin
+from api.services import admission
 from api.services.idempotency import (
     CREATE_ENDPOINT,
     PROMOTE_ENDPOINT,
@@ -110,6 +112,7 @@ from api.services.run_persistence import (
     run_orm_to_response as _run_orm_to_response,
 )
 from common.logging import exc_log_fields
+from common.metrics import metrics
 from common.types import OrderSide, RunMode, TimeFrame
 from data.bar_alignment import BarAlignmentError
 from trading.costs import (
@@ -542,6 +545,7 @@ async def _fetch_bars_for_backtest(
         end=end.isoformat(),
     )
 
+    t_fetch = time.monotonic()  # CF-26-21: the fetch-latency histogram
     try:
         if now is not None and settings.ohlcv_cache_mode != "off":
             from api.services.ohlcv_history import fetch_history_bars
@@ -595,6 +599,9 @@ async def _fetch_bars_for_backtest(
             detail=f"Exchange error fetching historical data: {exc}",
         ) from exc
     finally:
+        elapsed = time.monotonic() - t_fetch
+        fetch_mode: str = "off" if now is None else settings.ohlcv_cache_mode
+        metrics.observe("history_fetch_seconds", elapsed, {"mode": fetch_mode})
         await service.close()
 
 
@@ -1199,6 +1206,17 @@ async def create_run(
     # the except BaseException branch below.
     _completed_before_commit = False
 
+    # CF-97-03 (P7a): one research slot per process; the replay above never gets here.  A refusal
+    # marks the claim failed (a retry reclaims it) and nothing else has happened yet.
+    lease: admission.Releasable
+    if is_backtest:
+        try:
+            lease = admission.try_acquire("backtest")
+        except admission.AdmissionRefused:
+            await store.fail(key=_idempotency_key, claimed_run_id=run_id)
+            raise
+    else:
+        lease = admission.NO_LEASE
     try:
         db.add(run_orm)
         await db.flush()  # Assign the PK within the transaction without committing
@@ -1575,6 +1593,8 @@ async def create_run(
             # do here; fall through to re-raising the original exception.
             pass
         raise
+    finally:
+        lease.release()
 
     # NOTE: named result_response (not "response") -- the FastAPI-injected
     # ``response: Response`` header-mutation parameter above must not be
