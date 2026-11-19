@@ -339,7 +339,10 @@ services:
   #
   # Add Prometheus as a data source (URL: http://prometheus:9090) and import
   # community dashboards for Node.js/FastAPI or build custom ones.
-  # Default login: admin / ${GRAFANA_PASSWORD:-admin}  (change in production!)
+  # Admin login: user `admin`, password from GRAFANA_PASSWORD, which is REQUIRED
+  # (no default: the file fails to load while it is unset or empty; CF-97-34,
+  # SE-9734-04). The variable only applies when the grafana_data volume is first
+  # created; see docs/runbooks/grafana-admin-password.md for an existing instance.
   # Access: http://localhost:3001
   # --------------------------------------------------------------------------
   grafana:
@@ -349,7 +352,7 @@ services:
       - backend
       - frontend
     environment:
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:?GRAFANA_PASSWORD must be set}
       GF_USERS_ALLOW_SIGN_UP: "false"
       # Serve behind a sub-path if needed: GF_SERVER_ROOT_URL=http://host/grafana/
     healthcheck:

@@ -161,6 +161,7 @@ Compare `.env` on the server against `.env.example` from the deployed tree. Requ
 | `POSTGRES_PASSWORD`, `NEXTAUTH_SECRET`, `NEXTAUTH_URL`, `ADMIN_EMAILS`, `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET` | Already required on `origin/main`. |
 | **`ADMIN_API_KEY`** (api) | **New requirement.** Was in `.env.example` but never passed to the container. |
 | **`INTERNAL_ADMIN_API_KEY`** (ui) | **New requirement.** Server-side only; must equal `ADMIN_API_KEY`. Never prefix with `NEXT_PUBLIC_`. |
+| **`GRAFANA_PASSWORD`** (grafana) | **New requirement (CF-97-34).** It had the default `admin`; now an unset or empty value makes Compose refuse to load the whole file, so every `$DC` command fails. Add it to `.env` with the stdin helper **before** the new compose file reaches the host; right after updating the files and **before** any `down`/`up`/`stop`, run `$DC config --quiet` and require exit code 0 (section 3.4); only then deploy. An existing Grafana volume keeps its old password: `docs/runbooks/grafana-admin-password.md`. |
 
 - [ ] `NEXTAUTH_URL` is exactly the public origin, `https://<FQDN>`. The UI admin proxy's same-origin guard checks it first; a wrong value gives 403 to clients that do not send `Sec-Fetch-Site` (DC-10).
 - [ ] `ENABLE_LIVE_TRADING` is `false` or unset (compose default `false`).

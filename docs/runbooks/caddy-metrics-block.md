@@ -21,7 +21,7 @@ What it does **not** touch:
 
 - Prometheus scrapes `api:8000/metrics` (the Prometheus text endpoint, a different route) directly on the backend network (`infra/prometheus.yml`). Monitoring is unaffected.
 - `/metrics` at the site root is not routed to the API by Caddy: the catch-all block sends it to the UI. The text endpoint is therefore not published through Caddy.
-- The Grafana site block on port 3001 is unchanged. It proxies everything to Grafana, which has its own login (`GRAFANA_PASSWORD`; the compose default is `admin`, change it in production).
+- The Grafana site block on port 3001 is unchanged. It proxies everything to Grafana, which has its own login (`GRAFANA_PASSWORD`, required by the compose file since CF-97-34; see `grafana-admin-password.md`).
 
 ## 2. Verify: validate, reload, live check
 
