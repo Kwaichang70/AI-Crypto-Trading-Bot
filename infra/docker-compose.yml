@@ -213,6 +213,16 @@ services:
     #            + 30 s (apps/api/main.py asyncio.wait on the run tasks) + 9.9 s margin (client
     #            closes, dispose_engine). Raise this, or lower the drain, with any of those terms.
     stop_grace_period: 75s
+    # CF-26-96 (RK-9703-52 item 2): no swap for the API container.  Docker treats
+    # memswap_limit as memory + swap, so a value EQUAL to the memory limit means
+    # zero swap: a process that outgrows the limit is OOM-killed (restart policy
+    # above, then recover_orphaned_runs) instead of thrashing swap and stalling
+    # the event loop that also runs live exits.  Compose v2 reads the memory limit
+    # from deploy.resources.limits.memory below and memswap_limit from this
+    # service-level key.  The two values MUST stay equal; pinned by
+    # tests/unit/test_cf2696_api_memory_infra.py.  See
+    # docs/runbooks/api-container-memory.md.  Do not add oom_kill_disable.
+    memswap_limit: 768m
     deploy:
       resources:
         limits:
