@@ -31,7 +31,7 @@ from __future__ import annotations
 import math
 import re
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import UTC, date, datetime, time
 from decimal import Decimal
 from typing import Any, Final, Literal
@@ -66,8 +66,9 @@ from api.services.cost_profiles import (
 )
 from common.types import OrderSide, OrderStatus, OrderType
 from trading.metrics import EquityCurvePoint
-from trading.models import Fill, Order
+from trading.models import Fill, Order, TradeResult
 from trading.recovery import ResumeRejected, ResumeSnapshot
+from trading.strategy_engine import _yield_to_loop
 
 __all__ = [
     "DUPLICATE_SYMBOLS_REASON",
@@ -85,6 +86,8 @@ logger = structlog.get_logger(__name__)
 
 #: Shape of ``CostProfile.fingerprint()``: a 16-hex digest of public economics.
 _FINGERPRINT_RE: Final = re.compile(r"[0-9a-f]{16}")
+# CF-97-02: rows per build, add_all, flush and yield step of persist_backtest_results.
+_PERSIST_CHUNK_ROWS: Final = 1000
 
 
 def _loggable_fingerprint(value: object) -> str:
@@ -580,6 +583,19 @@ def _final_bar_close(curve: Sequence[EquityCurvePoint]) -> datetime:
     return stamp
 
 
+async def _flush_in_chunks(
+    db: AsyncSession, items: Sequence[Any], make: Callable[[int, Any], Any]
+) -> None:
+    """Build, add and flush ``items`` in chunks; each chunk is released before the yield."""
+    for lo in range(0, len(items), _PERSIST_CHUNK_ROWS):
+        part = items[lo : lo + _PERSIST_CHUNK_ROWS]
+        chunk = [make(lo + i, item) for i, item in enumerate(part)]
+        db.add_all(chunk)
+        await db.flush()
+        del chunk
+        await _yield_to_loop()
+
+
 async def persist_backtest_results(
     db: AsyncSession,
     run_id: uuid.UUID,
@@ -619,9 +635,8 @@ async def persist_backtest_results(
     from sqlalchemy.orm.attributes import flag_modified  # noqa: E402
 
     # --- Persist trades ---
-    trade_orms: list[TradeORM] = []
-    for trade in result.trades:
-        trade_orm = TradeORM(
+    def _trade_row(_i: int, trade: TradeResult) -> TradeORM:
+        return TradeORM(
             id=trade.trade_id,
             run_id=run_id,
             symbol=trade.symbol,
@@ -641,16 +656,15 @@ async def persist_backtest_results(
             regime_at_entry=getattr(trade, "regime_at_entry", None),
             signal_context=getattr(trade, "signal_context", None),
         )
-        trade_orms.append(trade_orm)
 
-    if trade_orms:
-        db.add_all(trade_orms)
-        log.info("runs.backtest_trades_inserted", count=len(trade_orms))
+    n_trades = len(result.trades)
+    await _flush_in_chunks(db, result.trades, _trade_row)
+    if n_trades:
+        log.info("runs.backtest_trades_inserted", count=n_trades)
 
     # --- Persist equity curve ---
-    equity_orms: list[EquitySnapshotORM] = []
-    for bar_index, point in enumerate(result.equity_curve):
-        snapshot = EquitySnapshotORM(
+    def _equity_row(bar_index: int, point: EquityCurvePoint) -> EquitySnapshotORM:
+        return EquitySnapshotORM(
             run_id=run_id,
             equity=point.equity,
             # MVP approximation: cash and unrealised_pnl are not individually
@@ -664,66 +678,57 @@ async def persist_backtest_results(
             bar_index=bar_index,
             timestamp=point.timestamp,
         )
-        equity_orms.append(snapshot)
 
-    if equity_orms:
-        db.add_all(equity_orms)
-        log.info("runs.backtest_equity_snapshots_inserted", count=len(equity_orms))
+    n_equity = len(result.equity_curve)
+    await _flush_in_chunks(db, result.equity_curve, _equity_row)
+    if n_equity:
+        log.info("runs.backtest_equity_snapshots_inserted", count=n_equity)
 
-    # --- Persist orders and fills ---
-    order_orms: list[OrderORM] = []
-    fill_orms: list[FillORM] = []
+    # --- Persist orders and fills (all orders flushed before the first fill: FK order) ---
+    def _order_row(_i: int, order: Order) -> OrderORM:
+        return OrderORM(
+            id=order.order_id,
+            client_order_id=order.client_order_id,
+            run_id=run_id,
+            symbol=order.symbol,
+            side=order.side.value,
+            order_type=order.order_type.value,
+            quantity=order.quantity,
+            price=order.price,
+            status=order.status.value,
+            filled_quantity=order.filled_quantity,
+            average_fill_price=order.average_fill_price,
+            exchange_order_id=order.exchange_order_id,
+            created_at=order.created_at,
+            updated_at=order.updated_at,
+        )
 
-    if execution_engine is not None:
-        for order in execution_engine.get_all_orders():
-            order_orms.append(
-                OrderORM(
-                    id=order.order_id,
-                    client_order_id=order.client_order_id,
-                    run_id=run_id,
-                    symbol=order.symbol,
-                    side=order.side.value,
-                    order_type=order.order_type.value,
-                    quantity=order.quantity,
-                    price=order.price,
-                    status=order.status.value,
-                    filled_quantity=order.filled_quantity,
-                    average_fill_price=order.average_fill_price,
-                    exchange_order_id=order.exchange_order_id,
-                    created_at=order.created_at,
-                    updated_at=order.updated_at,
-                )
-            )
+    def _fill_row(_i: int, fill: Fill) -> FillORM:
+        return FillORM(
+            id=fill.fill_id,
+            order_id=fill.order_id,
+            symbol=fill.symbol,
+            side=fill.side.value,
+            quantity=fill.quantity,
+            price=fill.price,
+            fee=fill.fee,
+            fee_currency=fill.fee_currency,
+            is_maker=fill.is_maker,
+            executed_at=fill.executed_at,
+            # QT-009 (Sprint 42): execution-quality telemetry
+            expected_price=getattr(fill, "expected_price", None),
+            slippage_bps_realized=getattr(fill, "slippage_bps_realized", None),
+        )
 
-        for fill in execution_engine.get_all_fills():
-            fill_orms.append(
-                FillORM(
-                    id=fill.fill_id,
-                    order_id=fill.order_id,
-                    symbol=fill.symbol,
-                    side=fill.side.value,
-                    quantity=fill.quantity,
-                    price=fill.price,
-                    fee=fill.fee,
-                    fee_currency=fill.fee_currency,
-                    is_maker=fill.is_maker,
-                    executed_at=fill.executed_at,
-                    # QT-009 (Sprint 42): execution-quality telemetry
-                    expected_price=getattr(fill, "expected_price", None),
-                    slippage_bps_realized=getattr(fill, "slippage_bps_realized", None),
-                )
-            )
-
-    if order_orms:
-        db.add_all(order_orms)
-        await db.flush()
-    if fill_orms:
-        db.add_all(fill_orms)
-    if order_orms or fill_orms:
+    orders = list(execution_engine.get_all_orders()) if execution_engine is not None else []
+    fills = list(execution_engine.get_all_fills()) if execution_engine is not None else []
+    await _flush_in_chunks(db, orders, _order_row)
+    await _flush_in_chunks(db, fills, _fill_row)
+    if orders or fills:
         log.info(
             "runs.backtest_orders_fills_inserted",
-            orders=len(order_orms),
-            fills=len(fill_orms),
+            orders=len(orders),
+            fills=len(fills),
         )
 
     # --- Persist position snapshots ---
@@ -792,8 +797,8 @@ async def persist_backtest_results(
 
     log.info(
         "runs.backtest_results_persisted",
-        trades=len(trade_orms),
-        equity_points=len(equity_orms),
+        trades=n_trades,
+        equity_points=n_equity,
         total_return=f"{result.total_return_pct:.4%}",
         sharpe=f"{result.sharpe_ratio:.3f}",
     )

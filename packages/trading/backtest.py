@@ -107,6 +107,7 @@ from trading.strategy import BaseStrategy
 from trading.strategy_engine import (
     _TIMEFRAME_SECONDS,
     StrategyEngine,
+    _yield_to_loop,
 )
 
 __all__ = [
@@ -502,6 +503,10 @@ class BacktestRunner:
         """
         Execute a backtest over the provided historical bars.
 
+        Not re-entrant (CF-97-12): one runner must not run two backtests at once.  Since
+        CF-97-02 the post-loop steps also suspend (``_yield_to_loop``); ``last_*`` are set
+        only at the very end.
+
         Parameters
         ----------
         bars_by_symbol : dict[str, list[OHLCVBar]]
@@ -687,6 +692,7 @@ class BacktestRunner:
         finally:
             # 7. Stop engine (always, even on error)
             await engine.stop()
+        await _yield_to_loop()  # CF-97-02: the post-loop steps below are separate stretches
 
         # 8. Collect results
         raw_equity_curve = portfolio.get_equity_curve()
@@ -739,6 +745,7 @@ class BacktestRunner:
 
         # 9. Build equity curve points with drawdown annotation
         equity_curve = self._build_equity_curve(raw_equity_curve)
+        await _yield_to_loop()
 
         # 10. Compute total bars processed (WP2.3: timeline steps minus warmup; the
         # same denominator feeds the per-symbol exposure and compute_exposure)
@@ -777,6 +784,7 @@ class BacktestRunner:
         sample = sample_equity_per_bar(
             equity_curve, start_at=trading_start_at, timeframe_s=tf_s
         )
+        await _yield_to_loop()
         trading_end_at: datetime | None = (
             equity_curve[-1].timestamp if sample.stamps else None
         )
@@ -802,6 +810,7 @@ class BacktestRunner:
         max_dd = compute_max_drawdown(equity_curve)
         max_dd_duration = _max_dd_duration(sample.equity)
         calmar = compute_calmar(cagr, max_dd)
+        await _yield_to_loop()
 
         # Sprint 50 Cycle 6 / WP2.5 (SY-25-10): realized OOS Sharpe over the OOS
         # window, sliced BY TIME.  The window starts at the close before the first OOS
