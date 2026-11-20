@@ -277,6 +277,9 @@ services:
       # SR-004: Fail-fast — ADMIN_EMAILS must be explicitly set.
       # Use 'none@example.invalid' if you want zero admin accounts.
       ADMIN_EMAILS: ${ADMIN_EMAILS:?ADMIN_EMAILS must be set in .env (use 'none@example.invalid' if you want zero admins)}
+      # CF-97-37 (37-S): further Google accounts allowed to sign in as viewers.
+      # Empty = only ADMIN_EMAILS can sign in (the signIn callback fails closed).
+      VIEWER_EMAILS: ${VIEWER_EMAILS:-}
       # WP1.7b (C21): server-side-only key the Next.js admin proxy
       # routes (apps/ui/src/app/api/admin/*/route.ts) read after
       # getServerSession()+isAdmin() pass, and forward as X-Admin-Key to
