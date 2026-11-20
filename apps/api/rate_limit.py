@@ -104,7 +104,8 @@ def get_client_ip(request: Request, trusted_proxy_count: int = 0) -> str:
     specifically the entry at index ``max(0, len(parts) - trusted_proxy_count)``
     (Nth-from-right). This is the correct approach for reverse-proxy
     deployments: the rightmost proxy appends the client IP it received,
-    so "1 trusted proxy" means reading the second-from-right entry.
+    so "1 trusted proxy" means reading the RIGHTMOST entry (index len - 1);
+    entries to its left are client-supplied and ignored.
 
     SECURITY NOTE: Never set ``trusted_proxy_count`` higher than the actual
     number of proxy hops you control. Clients can inject arbitrary entries at
@@ -187,9 +188,8 @@ _EXEMPT_PATHS: frozenset[str] = frozenset({
     "/health",
     "/metrics",
     "/api/v1/metrics",
-    # The following paths only exist when DEBUG=true (docs_url/redoc_url/openapi_url
-    # are set to None in production). They are exempt here as a convenience for
-    # local development environments.
+    # The following paths exist unless ENVIRONMENT=production (docs_url/redoc_url/
+    # openapi_url are None there; CF-97-37). Exempt as a convenience for dev/test.
     "/docs",
     "/redoc",
     "/openapi.json",

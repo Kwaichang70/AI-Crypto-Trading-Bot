@@ -8,6 +8,8 @@ Environment variables always take priority over .env file values.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 from collections.abc import Mapping
 from functools import lru_cache
 from typing import Any, Literal
@@ -23,6 +25,16 @@ __all__ = [
     "register_settings_secrets",
     "warn_ignored_cost_profile_env",
 ]
+
+# CF-97-37: SHA-256 digests of well-known placeholder keys.  A hash cannot be
+# entropy-tested, so a denylist is the honest scope of production rule 3.
+_WEAK_API_KEY_HASHES: frozenset[str] = frozenset(
+    hashlib.sha256(k.encode()).hexdigest()
+    for k in (
+        "", "changeme", "password", "secret", "test", "dev",
+        "my-secret-api-key", "my-secret-key", "test-integration-api-key-2026",
+    )
+)
 
 
 class Settings(BaseSettings):
@@ -51,6 +63,14 @@ class Settings(BaseSettings):
     app_name: str = Field(default="AI Crypto Trading Bot", description="Human-readable app name")
     app_version: str = Field(default="0.1.0", description="Semantic version string")
     debug: bool = Field(default=False, description="Enable debug mode — never True in production")
+    environment: Literal["development", "test", "production"] = Field(
+        default="development",
+        description=(
+            "Deployment environment (env ENVIRONMENT). 'production' enforces the "
+            "posture checks in _validate_production_posture and switches off "
+            "?api_key= and the docs URLs. Compose feeds it from TRADING_ENVIRONMENT."
+        ),
+    )
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = Field(
         default="INFO", description="Structured log level"
     )
@@ -745,6 +765,38 @@ class Settings(BaseSettings):
                 "hashes — identical values defeat the purpose of a rotation "
                 "window (SEC-003)."
             )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_production_posture(self) -> Settings:
+        """CF-97-37: refuse to start in production with a weak auth posture.
+
+        Messages are fixed text and never include a value (hide_input_in_errors).
+        The weak-hash check is a denylist of well-known digests, not an entropy
+        test.  There is deliberately no flag that lets production run open.
+        """
+        if self.environment != "production":
+            return self
+        hashes = [h for h in (self.api_key_hash, self.api_key_hash_secondary) if h]
+        admin = self.admin_api_key.get_secret_value()
+        admin_hash = hashlib.sha256(admin.encode()).hexdigest() if admin else ""
+        problems = [
+            msg
+            for failed, msg in (
+                (not self.require_api_auth, "require_api_auth must be true"),
+                (not self.api_key_hash, "api_key_hash must be set"),
+                (any(h in _WEAK_API_KEY_HASHES for h in hashes), "an api key hash is weak"),
+                (
+                    bool(admin_hash) and any(hmac.compare_digest(admin_hash, h) for h in hashes),
+                    "admin_api_key must differ from the api key",
+                ),
+                (not self.rate_limit_enabled, "rate_limit_enabled must be true"),
+                (self.debug, "debug must be false"),
+            )
+            if failed
+        ]
+        if problems:
+            raise ValueError("environment=production refused: " + "; ".join(problems))
         return self
 
 

@@ -38,9 +38,11 @@ from typing import Optional
 import structlog
 from fastapi import Depends, HTTPException, Query, Request, status
 from fastapi.security import APIKeyHeader
+from prometheus_client import Counter
 
 from api.config import Settings, get_settings
-from api.rate_limit import check_auth_failure_rate
+from api.prometheus import PROMETHEUS_REGISTRY
+from api.rate_limit import check_auth_failure_rate, get_client_ip
 
 __all__ = ["require_api_key"]
 
@@ -57,6 +59,18 @@ _api_key_header = APIKeyHeader(
         "Pass via this header or as a ?api_key= query parameter."
     ),
 )
+
+
+# CF-97-37 shadow check: what auth WOULD decide while it is off.  Prometheus
+# registry only, never ``common.metrics`` (so it stays out of ``get_all()``).
+_AUTH_SHADOW = Counter(
+    "api_auth_shadow_total",
+    "Auth outcome on keyed routes while REQUIRE_API_AUTH is off",
+    ["result"],
+    registry=PROMETHEUS_REGISTRY,
+)
+for _result in ("ok", "reject", "missing"):
+    _AUTH_SHADOW.labels(result=_result)  # export each series at 0 from the start
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +133,44 @@ def verify_api_key(
     return primary_ok or secondary_ok
 
 
+def _origin(request: Request, settings: Settings) -> dict[str, str]:
+    """Log fields: ``peer`` (TCP) and ``client`` (proxy-aware, A-12).  Never the key."""
+    return {
+        "peer": request.client.host if request.client else "unknown",
+        "client": get_client_ip(request, settings.trusted_proxy_count),
+    }
+
+
+def _shadow_check(request: Request, settings: Settings, submitted_key: str | None) -> None:
+    """Count (and log) what auth would decide.  Called only while auth is off.
+
+    Never refuses a request and never raises: a monitoring fault must not take
+    the API down.  With no configured hash there is nothing to compare against.
+    """
+    if not settings.api_key_hash:
+        return
+    try:
+        if not submitted_key:
+            result = "missing"
+        elif verify_api_key(
+            submitted_key, settings.api_key_hash, settings.api_key_hash_secondary
+        ):
+            result = "ok"
+        else:
+            result = "reject"
+        _AUTH_SHADOW.labels(result=result).inc()
+        if result != "ok":
+            logger.warning(
+                "auth.would_reject",
+                reason=result,
+                path=request.url.path,
+                method=request.method,
+                **_origin(request, settings),
+            )
+    except Exception:  # shadow check must never affect a request
+        logger.debug("auth.shadow_check_failed")
+
+
 # ---------------------------------------------------------------------------
 # FastAPI dependency — wire this into protected routes
 # ---------------------------------------------------------------------------
@@ -173,8 +225,13 @@ async def require_api_key(
         When the client IP has exceeded the auth failure rate limit.
         Caught by the 429 handler registered in ``setup_rate_limiting``.
     """
-    # Dev mode: auth disabled
+    # CF-97-37: keys in URLs leak into proxy logs; production takes the header only.
+    if settings.environment == "production":
+        query_key = None
+
+    # Dev mode: auth disabled (shadow check only counts, it never refuses)
     if not settings.require_api_auth:
+        _shadow_check(request, settings, header_key or query_key)
         return None
 
     # Production mode: auth required — verify config is complete
@@ -193,12 +250,12 @@ async def require_api_key(
 
     # Determine authentication method for logging (never log the key itself)
     auth_method = "header" if header_key else ("query" if query_key else "none")
-    client_host = request.client.host if request.client else "unknown"
+    origin = _origin(request, settings)
 
     if not submitted_key:
         logger.warning(
             "auth.missing_key",
-            client=client_host,
+            **origin,
             path=request.url.path,
             method=request.method,
         )
@@ -220,7 +277,7 @@ async def require_api_key(
     ):
         logger.warning(
             "auth.invalid_key",
-            client=client_host,
+            **origin,
             path=request.url.path,
             method=request.method,
             auth_method=auth_method,
@@ -237,7 +294,7 @@ async def require_api_key(
     # Success — log at debug level to avoid flooding production logs
     logger.debug(
         "auth.success",
-        client=client_host,
+        **origin,
         path=request.url.path,
         auth_method=auth_method,
     )

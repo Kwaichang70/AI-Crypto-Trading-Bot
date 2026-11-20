@@ -171,13 +171,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log_level=settings.log_level,
         json_output=not settings.debug,
         service_name=settings.app_name,
-        environment="development" if settings.debug else "production",
+        environment=settings.environment,
     )
     # CF-36: register every configured secret for exact-match redaction BEFORE
     # the first application log line.
     register_settings_secrets(settings)
 
     log = structlog.get_logger(__name__)
+    if not settings.require_api_auth:
+        # CF-97-37: the validator makes this impossible in production.
+        log.warning("api.auth_disabled", environment=settings.environment)
     # WP2.1 (SY-21-02): a cost-profile env var is ignored -- say so (names only).
     warn_ignored_cost_profile_env()
     log.info(
@@ -728,6 +731,8 @@ async def _request_timing_middleware(request: Request, call_next: Any) -> Respon
 def create_app() -> FastAPI:
     """Application factory."""
     settings = get_settings()
+    # CF-97-37: the docs pages are unauthenticated, so production serves none.
+    docs_on = settings.environment != "production"
 
     application = FastAPI(
         title=settings.app_name,
@@ -736,9 +741,9 @@ def create_app() -> FastAPI:
             "AI Crypto Trading Bot API  -- "
             "backtesting, paper trading, and live trading via CCXT"
         ),
-        docs_url="/docs",
-        redoc_url="/redoc",
-        openapi_url="/openapi.json",
+        docs_url="/docs" if docs_on else None,
+        redoc_url="/redoc" if docs_on else None,
+        openapi_url="/openapi.json" if docs_on else None,
         lifespan=lifespan,
     )
 
