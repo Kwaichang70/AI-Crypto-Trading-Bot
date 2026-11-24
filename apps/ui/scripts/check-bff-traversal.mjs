@@ -44,7 +44,7 @@ const freePort = () =>
     });
   });
 
-/** [label, method, raw target, role, expected status, expected upstream method+path or null]. */
+/** [label, method, raw target, role, expected status, expected upstream method+path or null, extra request headers (optional)]. */
 const CASES = [
   ["plain read", "GET", "/bff/api/v1/runs", "admin", 200, "GET /api/v1/runs"],
   ["%2e%2e collapsed by Next", "GET", "/bff/api/v1/runs/%2e%2e/emergency/kill-switch", "admin", 200, "GET /api/v1/emergency/kill-switch"],
@@ -84,6 +84,9 @@ const CASES = [
   ["admin stop", "DELETE", `/bff/api/v1/runs/${UUID}?flatten=true`, "admin", 200, `DELETE /api/v1/runs/${UUID}?flatten=true`],
   ["unlisted address (valid JWT)", "GET", "/bff/api/v1/runs", "outsider", 401, null],
   ["no cookie", "GET", "/bff/api/v1/runs", "none", 401, null],
+  // GHSA-xmf8-cvqr-rfgj: next-auth <= 4.24.14 answered a malformed Bearer value with 500.
+  ["malformed Bearer on /bff/*", "GET", "/bff/api/v1/runs", "none", 401, null, { authorization: "Bearer %E0%A4%A" }],
+  ["malformed Bearer on a page", "GET", "/runs", "none", 307, null, { authorization: "Bearer %E0%A4%A" }],
 ];
 
 // Anything the upstream receives that matches one of these is a failure,
@@ -134,9 +137,9 @@ async function main() {
     },
   });
 
-  const send = (method, target, cookie) =>
+  const send = (method, target, cookie, extra = {}) =>
     new Promise((resolve) => {
-      const headers = { "content-type": "application/json", "sec-fetch-site": "same-origin" };
+      const headers = { "content-type": "application/json", "sec-fetch-site": "same-origin", ...extra };
       if (cookie) headers.cookie = cookie;
       const req = http.request({ host: "127.0.0.1", port, method, path: target, headers }, (res) => {
         res.resume();
@@ -151,9 +154,9 @@ async function main() {
   let adminReached = 0;
   try {
     for (let i = 0; i < 100 && (await send("GET", "/api/auth/session")) === 0; i += 1) await new Promise((r) => setTimeout(r, 300));
-    for (const [label, method, target, role, status, expected] of CASES) {
+    for (const [label, method, target, role, status, expected, extra] of CASES) {
       const before = seen.length;
-      const got = await send(method, target, cookies[role]);
+      const got = await send(method, target, cookies[role], extra);
       await new Promise((r) => setTimeout(r, 60));
       const calls = seen.slice(before);
       const wantCalls = expected ? 1 : 0;
