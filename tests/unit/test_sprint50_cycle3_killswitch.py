@@ -19,6 +19,7 @@ Tests:
   TestAdminApiKeyValidator — 6 validator cases (§Fix-H)
 """
 
+import secrets
 import uuid
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -397,6 +398,6 @@ class TestAdminApiKeyValidator:
 
     def test_valid_hex_key_accepted(self) -> None:
         """A valid 64-char hex key (openssl rand -hex 32 output) must pass."""
-        valid_key = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2"
+        valid_key = secrets.token_hex(32)  # 64 chars, built per run (PR-HYG-01)
         s = self._make_settings_with_key(valid_key)
         assert s.admin_api_key.get_secret_value() == valid_key

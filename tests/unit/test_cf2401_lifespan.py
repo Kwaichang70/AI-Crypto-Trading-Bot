@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import secrets
 import time
 from pathlib import Path
 from typing import Any
@@ -152,7 +153,7 @@ def _env(monkeypatch: pytest.MonkeyPatch) -> None:
         "PROMETHEUS_ENABLED": "false",
         "DEBUG": "false",
         "ML_AUTO_RETRAIN": "false",
-        "ADMIN_API_KEY": "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4",
+        "ADMIN_API_KEY": secrets.token_hex(20),  # 40 chars, built per run (PR-HYG-01)
         "DATABASE_URL": "postgresql+asyncpg://test:pw@localhost:5432/test",
         "REDIS_URL": "redis://localhost:6379/0",
         "FRED_API_KEY": SENTINEL_KEY + "F",
