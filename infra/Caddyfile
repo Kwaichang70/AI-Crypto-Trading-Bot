@@ -127,6 +127,18 @@
         respond 404
     }
 
+    # CF-97-40-A (37-C2): the Next.js Image Optimizer answers on /_next/image and the UI
+    # middleware matcher excludes _next/*, so it is reachable without a session while
+    # advisories are open for it in the locked `next` version. The dashboard uses no
+    # next/image and sets no `images:` option (pinned by tests/unit/test_cf9740a_next_image_block.py),
+    # so the edge answers 404 for it without contacting the UI. The prefix `*` also covers
+    # the trailing-slash form. It does NOT match /_next/static/* or any other /_next/ path.
+    # Order: the matchers are disjoint, but keep it before the catch-all (first match wins).
+    # See docs/runbooks/caddy-metrics-block.md section 5.
+    handle /_next/image* {
+        respond 404
+    }
+
     # All other /api/* routes go to the FastAPI backend.
     # handle /api/* preserves the full /api/v1/... prefix (NOT handle_path).
     #

@@ -82,3 +82,51 @@ The next normal deploy of the repository Caddyfile carries the same block, so th
 
 - Anyone who can reach the API container directly (another container on the backend network) can still read the route.
 - If port 443 of the host is reachable from outside Tailscale, the rest of the stack is exposed too. The Hetzner firewall rule that `infra/Caddyfile` requires (443 and 3001 only from `100.64.0.0/10`) is a host fact this repository cannot show; confirm it.
+
+## 5. Second edge block: `/_next/image*` (CF-97-40-A, 37-C2)
+
+**Why here:** this runbook already owns the validate, reload and live-check steps for 404 blocks in the primary site block of `infra/Caddyfile`, and its section 2 is the procedure to follow. The deploy runbook is long and release-specific, and `api-key-auth-switch.md` is about the key switch.
+
+The Next.js Image Optimizer (`/_next/image`) is reachable without a session because the UI middleware matcher excludes `_next/static` and `_next/image`, and the dashboard does not use it. The Caddyfile now has, above the catch-all:
+
+```
+handle /_next/image* {
+    respond 404
+}
+```
+
+It matches only paths starting with `/_next/image`. `/_next/static/*` (the JavaScript and CSS the pages need) and every other `/_next/` path still reach the UI.
+
+Position: Caddy sorts `handle` blocks that have a single path by the length of that path and runs the catch-all `handle {` (no matcher) last, so the position inside the primary site block does not change which block answers. The repository file keeps every edge block above the catch-all for readability. If you insert the block by hand into the deployed file (the section 3 procedure), put it in the primary site block directly below the `/api/v1/metrics*` block.
+
+Do section 2 step 1 (validate) and step 2 (reload) as written, and record the Caddy version with the check results (the image tag floats):
+
+```bash
+$DC exec -T caddy caddy version
+```
+
+Then run this live check. Each line prints only a status code:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' 'https://<host>/_next/image?url=%2Fx&w=64&q=75'
+curl -s -o /dev/null -w '%{http_code}\n' 'https://<host>/'
+```
+
+Expected: `404` for the first line; `400` there means the optimizer answered (the block missed). For the second line `200` or a redirect (`302`, `303`, `307`), **not** `404`: a `404` there means the block is too wide or the page is broken, so revert the Caddyfile and reload. Then open the dashboard in a browser and confirm that it loads styled (that proves `/_next/static/*` is still served).
+
+Then every spelling. This step is mandatory. `--path-as-is` keeps curl from tidying the path, as in section 2 step 3. Each line prints the path, the status code and the number of body bytes, never the body:
+
+```bash
+for p in '/_next/image' '/_next/image/' '/_NEXT/IMAGE' '/_next/%69mage' '/_next%2Fimage' \
+         '//_next/image' '/_next//image' '/_next/static/../image' '/_next/image%3Fx'; do
+  printf '%s ' "$p"; curl -s --path-as-is -o /dev/null -w '%{http_code} %{size_download}\n' "https://<host>$p?url=%2Fx&w=64&q=75"
+done
+```
+
+Expected: `404` on every line. Anything else is a failure: `400` means the optimizer answered (the block missed that spelling); `308` means Caddy did not match and Next redirected. On a failure in this loop keep the block (it still covers the other spellings), record the line and the Caddy version, and report it for review. A byte count of `0` shows that the `404` came from Caddy; a `404` with a larger byte count came from the UI: the optimizer was not reached, but Caddy did not match that spelling, so record and report that line too.
+
+Optional control check (not tested): from the host, `$DC exec -T caddy wget -q -O /dev/null 'http://ui:3000/_next/image?url=%2Fx&w=64&q=75'` should fail with HTTP 400. That shows the optimizer still answers inside the compose network, so the loop above can see a miss.
+
+The reviewers read the source of Caddy and of `next` 14.2.35: Next sends only the raw paths `/_next/image` and `/_next/image/` to the optimizer, and Caddy lowercases, decodes and cleans the path before matching, so it matches both however they are spelled. The loop above is the evidence on the deployed Caddy version.
+
+Not verified when this was written: no `caddy` binary was available, so the syntax was not validated and the block was not run. `caddy validate` and the live checks above are the evidence. This block hides the route at the edge only; it does not change the `next` version (that is CF-97-44; CF-97-40-B is the `next-auth` bump), and anything that reaches `ui:3000` directly can still use the optimizer.
