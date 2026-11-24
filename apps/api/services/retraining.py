@@ -45,7 +45,7 @@ from typing import Any
 
 import structlog
 
-from api.services import admission
+from api.services import admission, egress_budget
 from common.logging import exc_log_fields
 
 __all__ = ["RetrainingService"]
@@ -248,7 +248,10 @@ class RetrainingService:
                 self._do_retrain(symbol=symbol, timeframe=timeframe, trigger="auto")
             )
             lease.bind_thread(job)
-            await asyncio.shield(job)
+            try:
+                await asyncio.shield(job)
+            finally:
+                lease.release()  # CF-97-26: the scheduler task's research flag is reset here
 
     # ------------------------------------------------------------------ #
     # Retraining pipeline
@@ -475,6 +478,7 @@ class RetrainingService:
 
         exc_instance = exchange_cls({"enableRateLimit": True})
         try:
+            egress_budget.reserve_history_blocking(self._exchange_id)  # CF-97-03 P7b
             raw: list[list[Any]] = exc_instance.fetch_ohlcv(
                 symbol=symbol,
                 timeframe=timeframe,

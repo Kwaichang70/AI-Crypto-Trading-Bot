@@ -49,6 +49,7 @@ class Lease:
 
     def __init__(self, kind: Kind, task: asyncio.Task[Any] | None) -> None:
         self.kind, self.task, self.t0, self.open = kind, task, time.monotonic(), True
+        self.token: contextvars.Token[bool] | None = None
         self.thread: asyncio.Future[Any] | None = None
         loop = asyncio.get_running_loop()
         self.timer = loop.call_later(HOLD_LONG_S, self._long) if task else None
@@ -66,6 +67,10 @@ class Lease:
         self._free()
 
     def release(self) -> None:
+        if self.token is not None:  # CF-97-26: reset in the acquiring context, never a callback's
+            with contextlib.suppress(ValueError):
+                _IN_RESEARCH.reset(self.token)
+            self.token = None
         if self.thread is None:
             self._free()
 
@@ -78,7 +83,6 @@ class Lease:
             self.timer.cancel()
         if _held is self:
             _held = None
-            _IN_RESEARCH.set(False)
             metrics.gauge("admission_slot_held", 0.0)
             metrics.observe(
                 "admission_hold_seconds", time.monotonic() - self.t0, {"kind": self.kind}
@@ -150,10 +154,11 @@ def try_acquire(kind: Kind) -> Lease:
         _refuse(kind)
     if not _pool_ready:
         _install_pool_timing()
-    _held = Lease(kind, asyncio.current_task())
-    _IN_RESEARCH.set(True)
-    metrics.gauge("admission_slot_held", 1.0)
-    return _held
+    metrics.gauge("admission_slot_held", 1.0)  # CF-97-31: before the slot, so a failure leaks none
+    lease = Lease(kind, asyncio.current_task())
+    lease.token = _IN_RESEARCH.set(True)
+    _held = lease
+    return lease
 
 
 def _refuse(kind: Kind) -> NoReturn:

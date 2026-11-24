@@ -27,7 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.db import get_db
 from api.schemas import ModelVersionListResponse, ModelVersionResponse
-from api.services import admission
+from api.services import admission, egress_budget
 from trading.costs import CostProfile, default_cost_profile
 from trading.metrics import METRICS_VERSION
 from trading.safety import BACKTEST_CIRCUIT_BREAKER_DEFAULT
@@ -147,6 +147,10 @@ async def train_model(
     lease.bind_thread(inner)
     try:
         trained: _TrainedModel = await asyncio.shield(inner)
+    except egress_budget.HistoryBudgetExhausted:  # fixed text, closed body
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS, {"code": "history_fetch_busy"}, {"Retry-After": "60"}
+        ) from None
     except ImportError as exc:
         log.error("ml.missing_dependency", error=str(exc))
         raise HTTPException(
@@ -269,6 +273,7 @@ def _train_model_sync(
 
     exc_instance = exchange_cls({"enableRateLimit": True})
     try:
+        egress_budget.reserve_history_blocking(exchange)  # CF-97-03 P7b: paced in this thread
         raw: list[list[Any]] = exc_instance.fetch_ohlcv(
             symbol=symbol, timeframe=timeframe, limit=bars,
         )
@@ -390,6 +395,7 @@ def _train_model_with_wf_sync(
 
     exc_instance = exchange_cls({"enableRateLimit": True})
     try:
+        egress_budget.reserve_history_blocking(exchange)  # CF-97-03 P7b: paced in this thread
         raw: list[list[Any]] = exc_instance.fetch_ohlcv(
             symbol=symbol, timeframe=timeframe, limit=bars,
         )

@@ -55,7 +55,7 @@ from api.db.models import (
 )
 from api.db.session import get_db
 from api.deps import require_admin
-from api.services import admission
+from api.services import admission, egress_budget, spawn_hooks
 from api.services.idempotency import (
     CREATE_ENDPOINT,
     PROMOTE_ENDPOINT,
@@ -512,7 +512,7 @@ async def _fetch_bars_for_backtest(
         When a symbol is not supported by the configured exchange.
     """
     from api.config import get_settings
-    from data.market_data import DataNotAvailableError, MarketDataError
+    from data.market_data import DataNotAvailableError, MarketDataError, RateLimitError
     from data.services.ccxt_market_data import CCXTMarketDataService
 
     settings = get_settings()
@@ -547,6 +547,7 @@ async def _fetch_bars_for_backtest(
 
     t_fetch = time.monotonic()  # CF-26-21: the fetch-latency histogram
     try:
+        egress_budget.history_check(settings.exchange_id)  # CF-97-03 P7b: the cooldown consumer
         if now is not None and settings.ohlcv_cache_mode != "off":
             from api.services.ohlcv_history import fetch_history_bars
 
@@ -584,6 +585,12 @@ async def _fetch_bars_for_backtest(
 
         return bars_by_symbol
 
+    except egress_budget.HistoryBudgetExhausted:  # fixed text; mapped before any generic handler
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            {"code": "history_fetch_busy"},
+            {"Retry-After": "60"},
+        ) from None
     except DataNotAvailableError as exc:
         # CF-36 F-13: type/status/location only in the log; the (fixed-text, post
         # F-09) message stays in the client-facing ``detail`` below.
@@ -593,6 +600,8 @@ async def _fetch_bars_for_backtest(
             detail=f"Data not available for the requested range: {exc}",
         ) from exc
     except MarketDataError as exc:
+        if isinstance(exc, RateLimitError):  # after the frozen retries: cool the exchange down
+            egress_budget.suspend_history(settings.exchange_id, exc.retry_after)
         log.error("runs.backtest_market_data_error", **exc_log_fields(exc))
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
@@ -1122,6 +1131,13 @@ async def create_run(
                 },
             )
 
+    # CF-97-03 P7b: the egress cap of a NEW paper/live run (after Owned; the claim is failed first).
+    if body.mode in ("paper", "live") and not egress_budget.reserve_new_run(
+        _claim.claimed_run_id, str(body.mode), body.symbols, body.timeframe
+    ):
+        await store.fail(key=_idempotency_key, claimed_run_id=_claim.claimed_run_id)
+        raise HTTPException(status.HTTP_409_CONFLICT, {"code": "egress_budget_exceeded"})
+
     # SY-70-12: use the claimed id, not a fresh uuid4() -- I4 requires
     # RunORM.id == idempotency_keys.claimed_run_id for this request.
     run_id: uuid.UUID = _claim.claimed_run_id
@@ -1470,6 +1486,7 @@ async def create_run(
             # and registration (a bare boolean assignment cannot raise),
             # so the task is never orphaned from _RUN_TASKS either.
             _completed_before_commit = False
+            spawn_hooks.on_run_spawned(run_id, "paper", body.symbols, body.timeframe, task)
             _RUN_TASKS[str(run_id)] = task
             log.info("runs.paper_engine_task_created", run_id=str(run_id))
 
@@ -1498,6 +1515,7 @@ async def create_run(
             # WP7.0 round 3 (WP70-S-R2-01): see the identical paper-mode
             # comment above -- same rationale, same ordering.
             _completed_before_commit = False
+            spawn_hooks.on_run_spawned(run_id, "live", body.symbols, body.timeframe, task)
             _RUN_TASKS[str(run_id)] = task
             log.info("runs.live_engine_task_created", run_id=str(run_id))
 
@@ -3124,6 +3142,15 @@ async def promote_to_live(
         log.info("runs.idempotency_replayed", run_id=str(_claim.run_id))
         return _run_orm_to_detail_response(_replayed_run)
 
+    # CF-97-03 P7b: a promote starts a NEW live engine, so it counts against the egress cap.
+    _egress_symbols = source_run.config.get("symbols", [])  # one value for the check AND the hook
+    _egress_timeframe = source_run.config.get("timeframe")  # no default: unresolved -> refused
+    if not egress_budget.reserve_new_run(
+        _claim.claimed_run_id, "live", _egress_symbols, _egress_timeframe
+    ):
+        await store.fail(key=_idempotency_key, claimed_run_id=_claim.claimed_run_id)
+        raise HTTPException(status.HTTP_409_CONFLICT, {"code": "egress_budget_exceeded"})
+
     # SY-70-12: use the claimed id, not a fresh uuid4().
     new_run_id = _claim.claimed_run_id
     response.headers["Idempotency-Key"] = str(_idempotency_key)
@@ -3251,6 +3278,7 @@ async def promote_to_live(
         # call, and register the task as the VERY NEXT statement after
         # create_task() so it is never orphaned from _RUN_TASKS.
         _completed_before_commit = False
+        spawn_hooks.on_run_spawned(new_run_id, "live", _egress_symbols, _egress_timeframe, task)
         _RUN_TASKS[str(new_run_id)] = task
 
         log.info(
@@ -4017,6 +4045,7 @@ async def resume_run(
             ),
             name=f"live-engine-resumed-{run_id}",
         )
+        spawn_hooks.on_run_spawned(run_id, "live", symbols, timeframe, task)
         _RUN_TASKS[str(run_id)] = task
     except Exception as exc:
         # WP1.8a-round2 (C-03/S-03): the row already committed 'running' --
@@ -4638,6 +4667,7 @@ async def recover_orphaned_runs() -> int:
                     ),
                     name=f"recovery-paper-{run_id_str[:8]}",
                 )
+                spawn_hooks.on_run_spawned(run_id_str, "paper", symbols, timeframe, task)
                 _RUN_TASKS[run_id_str] = task
 
                 log.info(

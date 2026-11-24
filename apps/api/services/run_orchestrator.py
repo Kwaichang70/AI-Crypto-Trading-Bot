@@ -48,6 +48,7 @@ from api.db.models import (
     PositionSnapshotORM,
     TradeORM,
 )
+from api.services import spawn_hooks
 from api.services.audit_log import record_audit_event
 from common.types import TimeFrame
 from trading.clock import WALL_CLOCK, ambient_clock
@@ -939,6 +940,7 @@ async def _auto_retry_paper_run(
             ),
             name=f"paper-engine-retry-{new_run_id}",
         )
+        spawn_hooks.on_run_spawned(new_run_id, "paper", symbols, timeframe, task)
         _RUN_TASKS[str(new_run_id)] = task
         log.info(
             "runs.auto_retry_started",

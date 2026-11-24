@@ -62,6 +62,7 @@ from api.body_size_limit import BodySizeLimitMiddleware
 from api.config import get_settings, register_settings_secrets, warn_ignored_cost_profile_env
 from api.prometheus import setup_prometheus
 from api.rate_limit import setup_rate_limiting
+from api.services import egress_budget
 from common.logging import configure_logging, exc_log_fields
 from common.metrics import metrics
 
@@ -173,6 +174,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         service_name=settings.app_name,
         environment=settings.environment,
     )
+    egress_budget.install_log_processor()  # CF-97-03 P7b: live 429s cool the history down
     # CF-36: register every configured secret for exact-match redaction BEFORE
     # the first application log line.
     register_settings_secrets(settings)
