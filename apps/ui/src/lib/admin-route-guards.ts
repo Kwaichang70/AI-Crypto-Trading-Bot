@@ -98,7 +98,10 @@ function expectedAdminHost(request: Request): string | null {
  * Returns a `Response` to return immediately on failure, or `null` to
  * continue processing the request.
  */
-export function checkSameOriginJsonRequest(request: Request): Response | null {
+export function checkSameOriginJsonRequest(
+  request: Request,
+  opts: { bodyless?: boolean } = {},
+): Response | null {
   // WP17b-S-R2-03 (round 3): compare only the media type -- a crafted
   // `Content-Type: text/plain; x=application/json` would otherwise pass
   // `.includes("application/json")` while still being a CORS-safelisted
@@ -107,7 +110,10 @@ export function checkSameOriginJsonRequest(request: Request): Response | null {
     .split(";")[0]
     .trim()
     .toLowerCase();
-  if (contentType !== "application/json") {
+  // CF-97-37: the BFF also carries bodiless writes (DELETE, PATCH archive); with
+  // `bodyless` a request with no Content-Type AND no body passes this check.
+  const hasBody = (request.headers.get("content-length") ?? "0") !== "0" || request.headers.has("transfer-encoding");
+  if (contentType !== "application/json" && !(opts.bodyless && contentType === "" && !hasBody)) {
     return Response.json(
       { error: "Content-Type must be application/json" },
       { status: 415 },

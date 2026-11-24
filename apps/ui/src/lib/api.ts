@@ -5,9 +5,10 @@
  * so callers never have to catch raw errors — they always receive either
  * { ok: true; data: T } or { ok: false; error: ApiError }.
  *
- * Base URL is read from NEXT_PUBLIC_API_URL at build time (Next.js inlines it).
- * The fallback "/api" works with the proxy rewrite in next.config.ts so the
- * browser never makes cross-origin requests during development.
+ * Browser-only: every call goes to the same-origin BFF (`/bff/api/v1/...`,
+ * apps/ui/src/app/bff), which checks the login session and adds the server-side
+ * API key. This module never reads or sends that key; server components use
+ * `./api-server` instead.
  */
 
 import type {
@@ -38,20 +39,9 @@ import type {
 // Configuration
 // ---------------------------------------------------------------------------
 
-// Sprint 50 cycle 2 fix: paths in this module all start with /api/v1/...
-// (already include the /api prefix). BASE_URL must therefore be EITHER:
-//   - a full URL like "http://api:8000" (server-side SSR, prepended to /api/v1/...)
-//   - empty string "" (browser, makes URLs same-origin relative; Caddy proxies /api/v1/*)
-// The previous fallback `|| "/api"` caused double-prefix /api/api/v1/... in browser
-// when NEXT_PUBLIC_API_URL was set to "/api" or empty.
-const BASE_URL =
-  typeof window === "undefined"
-    ? (
-        process.env.INTERNAL_API_URL ??
-        process.env.NEXT_PUBLIC_API_URL ??
-        "http://api:8000"
-      ).replace(/\/$/, "")
-    : (process.env.NEXT_PUBLIC_API_URL ?? "").replace(/\/$/, "");
+// Paths in this module start with /api/v1/...; the browser reaches them through
+// the same-origin BFF prefix, so the final URL is /bff/api/v1/... (DR-9737-01).
+const BASE_URL = "/bff";
 
 // ---------------------------------------------------------------------------
 // Shared response types
@@ -95,7 +85,7 @@ export interface HealthResponse {
 // requests must allow >= 60s -- flatten can take up to ~30s server-side plus
 // a 5s outer margin. Admin-proxy-route timeouts of the same shape live in
 // ./admin-fetch (kill-switch press/clear, resume, entries-latch clear); these
-// two are for the direct (non-admin, X-API-Key-only) backend calls below.
+// two are for the plain (non-admin) BFF calls below.
 // ---------------------------------------------------------------------------
 
 /** DELETE /api/v1/runs/{id} — a flatten pass can take up to ~35s server-side. */
@@ -122,15 +112,22 @@ export const PROMOTE_TIMEOUT_MS = 120_000;
  *
  * @template T - The expected shape of a successful JSON response body.
  */
-async function apiFetch<T>(
+function apiFetch<T>(
   path: string,
+  init?: RequestInit,
+  timeoutMs: number = 10_000,
+): Promise<ApiResult<T>> {
+  return requestJson<T>(`${BASE_URL}${path}`, init, timeoutMs);
+}
+
+/** Shared by `apiFetch` (browser, via the BFF) and `./api-server` (server components). */
+export async function requestJson<T>(
+  url: string,
   init?: RequestInit,
   timeoutMs: number = 10_000,
 ): Promise<ApiResult<T>> {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-
-  const url = `${BASE_URL}${path}`;
 
   try {
     const response = await fetch(url, {
@@ -153,11 +150,16 @@ async function apiFetch<T>(
         detail = await response.text().catch(() => undefined);
       }
 
+      // The BFF answers 502 {"error":"upstream_auth_failed"} when the server-side
+      // API key is rejected; say so instead of "the API is unreachable" (RK-37B-03).
+      const keyRejected = response.status === 502 && (detail as { error?: unknown } | null)?.error === "upstream_auth_failed";
       return {
         ok: false,
         error: {
           status: response.status,
-          message: httpStatusMessage(response.status),
+          message: keyRejected
+            ? "The dashboard's API key was rejected. Use the operator fallback (runbook: dashboard cannot stop a run)."
+            : httpStatusMessage(response.status),
           detail,
         },
       };
@@ -224,15 +226,6 @@ export function apiDelete<T>(
   init?: Omit<RequestInit, "method">,
 ) {
   return apiFetch<T>(path, { ...init, method: "DELETE" });
-}
-
-// ---------------------------------------------------------------------------
-// Health
-// ---------------------------------------------------------------------------
-
-/** GET /health — lightweight liveness probe used by the dashboard. */
-export async function fetchHealth(): Promise<ApiResult<HealthResponse>> {
-  return apiGet<HealthResponse>("/health", { cache: "no-store" });
 }
 
 // ---------------------------------------------------------------------------
@@ -418,7 +411,7 @@ export async function emergencyStop(
 
 /**
  * GET /api/v1/emergency/kill-switch — read-only global latch status for the
- * S13 sidebar badge. Requires only X-API-Key (not admin) — called directly,
+ * S13 sidebar badge. Needs only the regular API key (not admin) — called through the BFF,
  * never through an /api/admin/* proxy (SY-11: only admin-key-gated
  * endpoints get a proxy; this one doesn't need one).
  */

@@ -99,8 +99,8 @@ export const authOptions: NextAuthOptions = {
 
   session: {
     strategy: "jwt",
-    // 24-hour sessions. Trade-off: server-side revocation not possible within
-    // the window, but acceptable for a single-admin internal dashboard.
+    // 24-hour sliding sessions; revocation takes effect at the next session read
+    // (jwt re-check, 37-S).
     maxAge: 60 * 60 * 24,
   },
 

@@ -19,7 +19,26 @@
  *   /*.png etc.    — public static assets
  */
 
-export { default } from "next-auth/middleware";
+import { withAuth } from "next-auth/middleware";
+import { NextResponse } from "next/server";
+
+// CF-97-37 (DR-9737-18): `/bff/*` stays matched, but an unauthenticated browser
+// call gets a JSON 401 (no sign-in redirect that fetch would follow into HTML);
+// every other path keeps the redirect. The handler checks the session again with
+// `getServerSession`. This file reads no allow-list env (it is build-time baked).
+export default withAuth(
+  function middleware(req) {
+    if (req.nextUrl.pathname.startsWith("/bff/") && !req.nextauth.token) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+    return NextResponse.next();
+  },
+  {
+    callbacks: {
+      authorized: ({ req, token }) => req.nextUrl.pathname.startsWith("/bff/") || !!token,
+    },
+  },
+);
 
 export const config = {
   matcher: [

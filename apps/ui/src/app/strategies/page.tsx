@@ -4,7 +4,7 @@
  */
 
 import type { Metadata } from "next";
-import { fetchStrategies } from "@/lib/api";
+import { fetchStrategies } from "@/lib/api-server";
 import { Header } from "@/components/layout/header";
 import { StrategyCard } from "@/components/strategies/strategy-card";
 

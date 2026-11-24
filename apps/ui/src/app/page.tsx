@@ -7,7 +7,8 @@
 
 import type { Metadata } from "next";
 import Link from "next/link";
-import { fetchHealth, fetchRuns, fetchAggregatePortfolio, formatCurrency, formatPct } from "@/lib/api";
+import { formatCurrency, formatPct } from "@/lib/api";
+import { fetchHealth, fetchRuns, fetchAggregatePortfolio } from "@/lib/api-server";
 import type { HealthResponse } from "@/lib/api";
 import type { Run, AggregatePortfolio } from "@/lib/types";
 import { StatCard } from "@/components/ui/stat-card";
