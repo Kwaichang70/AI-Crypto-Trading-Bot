@@ -143,6 +143,16 @@
         reverse_proxy api:8000
     }
 
+    # CF-97-37 R2 (inert until the BFF ships): the dashboard's API calls will reach the UI
+    # server under /bff/api/v1/*, which adds the API key. The catch-all below has no body
+    # cap, so this block carries the same 1MB cap as /api/* (the Node handler buffers bodies).
+    handle /bff/* {
+        request_body {
+            max_size 1MB
+        }
+        reverse_proxy ui:3000
+    }
+
     # Catch-all: everything else goes to the Next.js frontend.
     handle {
         reverse_proxy ui:3000

@@ -171,7 +171,9 @@ services:
       ALLOWED_ORIGINS:     ${ALLOWED_ORIGINS:-http://localhost:3000}
       # -- Authentication --
       REQUIRE_API_AUTH:    ${REQUIRE_API_AUTH:-false}
-      API_KEY_HASH:        ${API_KEY_HASH:-}
+      # CF-97-37 R2: required (SHA-256 of the ui's API_KEY) so the shadow check can run;
+      # it has no effect while REQUIRE_API_AUTH is false.
+      API_KEY_HASH:        ${API_KEY_HASH:?API_KEY_HASH must be set in .env (SHA-256 hex of API_KEY)}
       # -- Admin operations (WP1.7b, C21): validated via hmac.compare_digest
       # in apps/api/deps.py:require_admin. Must equal ui's
       # INTERNAL_ADMIN_API_KEY below. Reached only via Caddy's
@@ -223,6 +225,13 @@ services:
     # tests/unit/test_cf2696_api_memory_infra.py.  See
     # docs/runbooks/api-container-memory.md.  Do not add oom_kill_disable.
     memswap_limit: 768m
+    # CF-97-37 (SE-37A-03): bounded json-file logs; with API_KEY_HASH set and auth off, every
+    # keyless request logs one auth.would_reject WARNING until the BFF ships.
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
     deploy:
       resources:
         limits:
@@ -288,6 +297,10 @@ services:
       # handlers at request time, never by Edge middleware.ts, so it
       # must stay in environment: only (no Dockerfile.ui build-arg).
       INTERNAL_ADMIN_API_KEY: ${INTERNAL_ADMIN_API_KEY:?INTERNAL_ADMIN_API_KEY must be set in .env (must equal backend ADMIN_API_KEY)}
+      # CF-97-37 R2: the raw key the ui server code sends as X-API-Key. Runtime environment only:
+      # never a build arg or ENV in Dockerfile.ui, never NEXT_PUBLIC_*. Must hash to API_KEY_HASH
+      # and differ from ADMIN_API_KEY.
+      API_KEY: ${API_KEY:?API_KEY must be set in .env (raw key; its SHA-256 must equal API_KEY_HASH)}
     healthcheck:
       test: ["CMD-SHELL",
              "wget -qO- http://localhost:3000/api/health 2>/dev/null || curl -f http://localhost:3000 || exit 1"]
@@ -296,6 +309,11 @@ services:
       retries: 5
       start_period: 60s
     stop_grace_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
     deploy:
       resources:
         limits:
