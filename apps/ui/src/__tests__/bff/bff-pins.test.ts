@@ -209,4 +209,16 @@ describe("the traversal check is tied to the locked Next version", () => {
     expect(measured).toBeDefined();
     expect(lock.packages["node_modules/next"].version).toBe(measured);
   });
+
+  it("main() refuses (returns 1) before the build check when the installed next differs from MEASURED_NEXT_VERSION (CF-97-43)", () => {
+    const script = read(UI, "scripts/check-bff-traversal.mjs");
+    const body = script.slice(script.indexOf("async function main()"));
+    const guard =
+      /const installed = require\(path\.join\(UI_ROOT, "node_modules\/next\/package\.json"\)\)\.version;\s*if \(installed !== MEASURED_NEXT_VERSION\) \{\s*console\.log\([^\n]*\);\s*return 1;\s*\}/;
+    const at = body.search(guard);
+    expect(at).toBeGreaterThanOrEqual(0);
+    expect(at).toBeLessThan(body.indexOf(".next/standalone/server.js"));
+    expect(body.indexOf("const installed")).toBe(at);
+    expect(script).toMatch(/main\(\)\.then\(\(code\) => process\.exit\(code\)\)/);
+  });
 });

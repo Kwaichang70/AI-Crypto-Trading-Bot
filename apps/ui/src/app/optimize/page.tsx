@@ -18,6 +18,7 @@ import type {
   OptimizationRunSummary,
 } from "@/lib/types";
 import { Header } from "@/components/layout/header";
+import { AdminOnly, AdminOnlyNotice } from "@/components/admin-only";
 import { DataTable } from "@/components/ui/data-table";
 import { ParamGridEditor } from "./param-grid-editor";
 import type { ParamGridRow } from "./param-grid-editor";
@@ -665,13 +666,15 @@ export default function OptimizePage() {
 
         {/* Submit */}
         <div className="flex items-center gap-4">
-          <button
-            type="submit"
-            disabled={isLoading || !selectedStrategy || symbols.length === 0}
-            className="rounded-lg bg-indigo-600 px-6 py-2.5 text-sm font-semibold text-white hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            {isLoading ? "Running optimization…" : "Run Optimization"}
-          </button>
+          <AdminOnly fallback={<AdminOnlyNotice />}>
+            <button
+              type="submit"
+              disabled={isLoading || !selectedStrategy || symbols.length === 0}
+              className="rounded-lg bg-indigo-600 px-6 py-2.5 text-sm font-semibold text-white hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {isLoading ? "Running optimization…" : "Run Optimization"}
+            </button>
+          </AdminOnly>
           {isLoading && (
             <p className="text-xs text-slate-500">
               Running up to {maxCombinations} combinations — may take ~{estimatedSeconds}s

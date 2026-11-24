@@ -153,13 +153,17 @@ export async function requestJson<T>(
       // The BFF answers 502 {"error":"upstream_auth_failed"} when the server-side
       // API key is rejected; say so instead of "the API is unreachable" (RK-37B-03).
       const keyRejected = response.status === 502 && (detail as { error?: unknown } | null)?.error === "upstream_auth_failed";
+      // The BFF answers 403 {"error":"forbidden"} to every non-GET from a viewer (CF-97-43).
+      const viewerForbidden = response.status === 403 && (detail as { error?: unknown } | null)?.error === "forbidden";
       return {
         ok: false,
         error: {
           status: response.status,
           message: keyRejected
             ? "The dashboard's API key was rejected. Use the operator fallback (runbook: dashboard cannot stop a run)."
-            : httpStatusMessage(response.status),
+            : viewerForbidden
+              ? "Your account is read-only (viewer). Ask an admin, or use the operator fallback (runbook: dashboard cannot stop a run)."
+              : httpStatusMessage(response.status),
           detail,
         },
       };

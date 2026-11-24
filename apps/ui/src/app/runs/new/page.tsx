@@ -11,6 +11,7 @@ import {
 import type { Strategy, JsonSchemaProperty, RunMode, RunCreateRequest } from "@/lib/types";
 import { Header } from "@/components/layout/header";
 import { useToast } from "@/components/ui/toast";
+import { AdminOnly, AdminOnlyNotice } from "@/components/admin-only";
 import { LiveBanner } from "@/components/live-banner";
 import { LiveConfirmDialog } from "@/components/live-confirm-dialog";
 import { ExitConfigErrorPanel } from "@/components/exit-config-error-panel";
@@ -894,13 +895,15 @@ function NewRunInner() {
           <ExitConfigErrorPanel detail={submitErrorDetail} fallbackMessage={submitError} />
         )}
 
-        <button
-          type="submit"
-          disabled={isSubmitting || isLoadingStrategies}
-          className="w-full rounded-lg bg-indigo-600 py-3 text-sm font-semibold text-white transition-colors hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500"
-        >
-          {isSubmitting ? "Starting run…" : mode === "live" ? "Start Run…" : "Start Run"}
-        </button>
+        <AdminOnly fallback={<AdminOnlyNotice />}>
+          <button
+            type="submit"
+            disabled={isSubmitting || isLoadingStrategies}
+            className="w-full rounded-lg bg-indigo-600 py-3 text-sm font-semibold text-white transition-colors hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500"
+          >
+            {isSubmitting ? "Starting run…" : mode === "live" ? "Start Run…" : "Start Run"}
+          </button>
+        </AdminOnly>
       </form>
 
       <LiveConfirmDialog

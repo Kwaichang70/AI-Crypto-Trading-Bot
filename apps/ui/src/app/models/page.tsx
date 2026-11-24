@@ -17,6 +17,7 @@ import { fetchModelVersions, retrainModel, trainModel, activateModelVersion } fr
 import type { ModelVersion } from "@/lib/types";
 import { DataTable, type Column } from "@/components/ui/data-table";
 import { Header } from "@/components/layout/header";
+import { AdminOnly, AdminOnlyNotice } from "@/components/admin-only";
 import { useToast } from "@/components/ui/toast";
 
 // ---------------------------------------------------------------------------
@@ -154,19 +155,21 @@ function buildColumns(
       key: "actions",
       header: "Actions",
       render: (m) => (
-        <button
-          onClick={() => void onActivate(m.id)}
-          disabled={m.isActive || activatingId === m.id}
-          className={[
-            "rounded px-2 py-1 text-xs font-medium transition-colors",
-            m.isActive || activatingId === m.id
-              ? "cursor-not-allowed bg-slate-200 text-slate-400 dark:bg-slate-700 dark:text-slate-500"
-              : "bg-indigo-700 text-white hover:bg-indigo-600 active:bg-indigo-800",
-          ].join(" ")}
-          aria-label={m.isActive ? "Already active" : `Activate model ${m.id.slice(0, 8)}`}
-        >
-          {activatingId === m.id ? "Activating\u2026" : "Activate"}
-        </button>
+        <AdminOnly fallback={<AdminOnlyNotice />}>
+          <button
+            onClick={() => void onActivate(m.id)}
+            disabled={m.isActive || activatingId === m.id}
+            className={[
+              "rounded px-2 py-1 text-xs font-medium transition-colors",
+              m.isActive || activatingId === m.id
+                ? "cursor-not-allowed bg-slate-200 text-slate-400 dark:bg-slate-700 dark:text-slate-500"
+                : "bg-indigo-700 text-white hover:bg-indigo-600 active:bg-indigo-800",
+            ].join(" ")}
+            aria-label={m.isActive ? "Already active" : `Activate model ${m.id.slice(0, 8)}`}
+          >
+            {activatingId === m.id ? "Activating\u2026" : "Activate"}
+          </button>
+        </AdminOnly>
       ),
     },
   ];
@@ -371,33 +374,35 @@ export default function ModelsPage() {
           </select>
         </div>
 
-        <button
-          onClick={() => void handleTrain()}
-          disabled={isTraining || isRetraining || !retrainSymbol.trim()}
-          className={[
-            "self-end rounded-lg px-4 py-2 text-xs font-medium transition-colors",
-            isTraining || !retrainSymbol.trim()
-              ? "cursor-not-allowed bg-slate-200 text-slate-400 dark:bg-slate-700 dark:text-slate-500"
-              : "bg-indigo-600 text-white hover:bg-indigo-500 active:bg-indigo-700",
-          ].join(" ")}
-          title="Train a new model from historical OHLCV data (always works)"
-        >
-          {isTraining ? "Training\u2026" : "Train"}
-        </button>
+        <AdminOnly fallback={<AdminOnlyNotice />}>
+          <button
+            onClick={() => void handleTrain()}
+            disabled={isTraining || isRetraining || !retrainSymbol.trim()}
+            className={[
+              "self-end rounded-lg px-4 py-2 text-xs font-medium transition-colors",
+              isTraining || !retrainSymbol.trim()
+                ? "cursor-not-allowed bg-slate-200 text-slate-400 dark:bg-slate-700 dark:text-slate-500"
+                : "bg-indigo-600 text-white hover:bg-indigo-500 active:bg-indigo-700",
+            ].join(" ")}
+            title="Train a new model from historical OHLCV data (always works)"
+          >
+            {isTraining ? "Training\u2026" : "Train"}
+          </button>
 
-        <button
-          onClick={() => void handleRetrain()}
-          disabled={isRetraining || isTraining || !retrainSymbol.trim()}
-          className={[
-            "self-end rounded-lg px-4 py-2 text-xs font-medium transition-colors",
-            isRetraining || !retrainSymbol.trim()
-              ? "cursor-not-allowed bg-slate-200 text-slate-400 dark:bg-slate-700 dark:text-slate-500"
-              : "bg-slate-600 text-white hover:bg-slate-500 active:bg-slate-700",
-          ].join(" ")}
-          title="Retrain from trade outcomes (requires 50+ trades with model_strategy)"
-        >
-          {isRetraining ? "Retraining\u2026" : "Retrain"}
-        </button>
+          <button
+            onClick={() => void handleRetrain()}
+            disabled={isRetraining || isTraining || !retrainSymbol.trim()}
+            className={[
+              "self-end rounded-lg px-4 py-2 text-xs font-medium transition-colors",
+              isRetraining || !retrainSymbol.trim()
+                ? "cursor-not-allowed bg-slate-200 text-slate-400 dark:bg-slate-700 dark:text-slate-500"
+                : "bg-slate-600 text-white hover:bg-slate-500 active:bg-slate-700",
+            ].join(" ")}
+            title="Retrain from trade outcomes (requires 50+ trades with model_strategy)"
+          >
+            {isRetraining ? "Retraining\u2026" : "Retrain"}
+          </button>
+        </AdminOnly>
       </div>
 
       {/* General error banner */}

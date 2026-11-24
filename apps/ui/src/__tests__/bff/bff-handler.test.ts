@@ -421,6 +421,28 @@ describe("response size cap (FI-9737-I)", () => {
     expect(logged).not.toContain("AAAA");
   }, 30_000);
 
+  it("the upstream_too_large log object carries the route label only: no URL, path, id or query (CF-97-43)", async () => {
+    (console.warn as jest.Mock).mockClear();
+    reply = (_req, res) => {
+      res.writeHead(200, { "content-type": "application/octet-stream" });
+      const chunk = Buffer.alloc(1024 * 1024, 0x41);
+      for (let i = 0; i < 64; i += 1) res.write(chunk);
+      res.end("B");
+    };
+    const res = await call("GET", ["runs", UUID], { search: "?marker=queryvalue-7731" });
+    expect(res.status).toBe(502);
+    const calls = (console.warn as jest.Mock).mock.calls.filter((c) => c[0] === "bff.upstream_too_large");
+    expect(calls).toHaveLength(1);
+    const fields = calls[0].slice(1);
+    expect(fields).toHaveLength(1);
+    expect(Object.keys(fields[0])).toEqual(["route"]);
+    expect(fields[0].route).toMatch(/^GET [A-Za-z{}/_-]+$/);
+    const logged = JSON.stringify(calls);
+    for (const leak of [UUID, "queryvalue-7731", "marker", "127.0.0.1", String(process.env.INTERNAL_API_URL), "/api/v1", "http"]) {
+      expect(logged).not.toContain(leak);
+    }
+  }, 30_000);
+
   it("a body just under the cap still passes", async () => {
     reply = (_req, res) => {
       res.writeHead(200, { "content-type": "application/octet-stream" });

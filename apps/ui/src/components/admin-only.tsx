@@ -26,6 +26,15 @@ interface AdminOnlyProps {
   fallback?: ReactNode;
 }
 
+/** Fallback for controls that stay visible to viewers: a disabled "admin only" button. */
+export function AdminOnlyNotice() {
+  return (
+    <button type="button" disabled className="cursor-not-allowed rounded-lg border border-slate-300 px-4 py-2 text-sm text-slate-500 opacity-60 dark:border-slate-700">
+      admin only
+    </button>
+  );
+}
+
 export function AdminOnly({ children, fallback = null }: AdminOnlyProps) {
   const { data: session, status } = useSession();
 

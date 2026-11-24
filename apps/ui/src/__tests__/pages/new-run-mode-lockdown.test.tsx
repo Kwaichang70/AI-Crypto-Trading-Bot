@@ -29,6 +29,8 @@ import type { Strategy, StrategyListResponse } from "@/lib/types";
 const mockPush = jest.fn();
 const mockSearchGet = jest.fn(() => null);
 
+// CF-97-43: write controls sit behind <AdminOnly>; these suites exercise the admin path.
+jest.mock("next-auth/react", () => ({ useSession: () => ({ data: { user: { role: "admin" } }, status: "authenticated" }) }));
 jest.mock("next/navigation", () => ({
   useRouter: () => ({ push: mockPush }),
   useSearchParams: () => ({ get: mockSearchGet }),

@@ -657,12 +657,14 @@ export default function RunDetailPage() {
         actions={
           <div className="flex items-center gap-2">
             {(run.status === "running" || run.status === "orphaned" || run.status === "resuming") && (
-              <button
-                onClick={() => setStopDialogOpen(true)}
-                className="rounded-lg border border-red-300 bg-red-50 px-4 py-2 text-sm font-medium text-red-600 transition-colors hover:bg-red-100 dark:border-red-700 dark:bg-red-900/20 dark:text-red-400 dark:hover:bg-red-900/40 disabled:opacity-50"
-              >
-                Stop Run
-              </button>
+              <AdminOnly>
+                <button
+                  onClick={() => setStopDialogOpen(true)}
+                  className="rounded-lg border border-red-300 bg-red-50 px-4 py-2 text-sm font-medium text-red-600 transition-colors hover:bg-red-100 dark:border-red-700 dark:bg-red-900/20 dark:text-red-400 dark:hover:bg-red-900/40 disabled:opacity-50"
+                >
+                  Stop Run
+                </button>
+              </AdminOnly>
             )}
             {run.runMode === "live" && run.status === "orphaned" && (
               <AdminOnly>
@@ -699,12 +701,14 @@ export default function RunDetailPage() {
               </button>
             )}
             {isDone && run.status !== "archived" && (
-              <button
-                onClick={() => void handleArchive()}
-                className="rounded-lg border border-slate-300 dark:border-slate-700 px-4 py-2 text-sm font-medium text-slate-500 dark:text-slate-400 transition-colors hover:border-red-400 hover:text-red-500 dark:hover:border-red-500 dark:hover:text-red-400"
-              >
-                Archive
-              </button>
+              <AdminOnly>
+                <button
+                  onClick={() => void handleArchive()}
+                  className="rounded-lg border border-slate-300 dark:border-slate-700 px-4 py-2 text-sm font-medium text-slate-500 dark:text-slate-400 transition-colors hover:border-red-400 hover:text-red-500 dark:hover:border-red-500 dark:hover:text-red-400"
+                >
+                  Archive
+                </button>
+              </AdminOnly>
             )}
           </div>
         }

@@ -11,6 +11,8 @@ import type { Strategy, StrategyListResponse, OptimizeResponse } from "@/lib/typ
 import { ADV1, STRESS80, LEGACY_BT, LEGACY_RT } from "../helpers/cost-profile-fixtures";
 
 const mockPush = jest.fn();
+// CF-97-43: write controls sit behind <AdminOnly>; these suites exercise the admin path.
+jest.mock("next-auth/react", () => ({ useSession: () => ({ data: { user: { role: "admin" } }, status: "authenticated" }) }));
 jest.mock("next/navigation", () => ({
   useRouter: () => ({ push: mockPush }),
   useParams: () => ({ id: "22222222-2222-4222-8222-222222222222" }),

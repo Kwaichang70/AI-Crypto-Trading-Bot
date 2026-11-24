@@ -8,6 +8,7 @@
  * identical column definitions without duplication.
  */
 
+import { AdminOnly, AdminOnlyNotice } from "@/components/admin-only";
 import type { Column } from "@/components/ui/data-table";
 import type { OptimizeEntry } from "@/lib/types";
 
@@ -124,13 +125,15 @@ export function buildResultColumns(
       key: "actions",
       header: "",
       render: (e) => (
-        <button
-          onClick={() => onLaunch(e)}
-          disabled={launchingRank === e.rank}
-          className="rounded-lg bg-indigo-600 px-3 py-1 text-xs font-medium text-white hover:bg-indigo-500 disabled:opacity-50"
-        >
-          {launchingRank === e.rank ? "Starting…" : "Launch Run"}
-        </button>
+        <AdminOnly fallback={<AdminOnlyNotice />}>
+          <button
+            onClick={() => onLaunch(e)}
+            disabled={launchingRank === e.rank}
+            className="rounded-lg bg-indigo-600 px-3 py-1 text-xs font-medium text-white hover:bg-indigo-500 disabled:opacity-50"
+          >
+            {launchingRank === e.rank ? "Starting…" : "Launch Run"}
+          </button>
+        </AdminOnly>
       ),
     },
   ];

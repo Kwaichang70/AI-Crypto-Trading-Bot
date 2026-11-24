@@ -105,3 +105,37 @@ describe("the dashboard's message for a rejected server key (RK-37B-03)", () => 
     expect(result.ok).toBe(false);
   });
 });
+
+describe("the dashboard's message for a viewer's refused write (CF-97-43)", () => {
+  const respond = (status: number, body: unknown) =>
+    ({ ok: false, status, headers: { get: () => "application/json" }, json: async () => body }) as unknown as Response;
+  const READ_ONLY = "Your account is read-only (viewer). Ask an admin, or use the operator fallback (runbook: dashboard cannot stop a run).";
+
+  it("a 403 {error: forbidden} gets the read-only message, for a write call", async () => {
+    global.fetch = jest.fn().mockResolvedValue(respond(403, { error: "forbidden" })) as unknown as typeof fetch;
+    const result = await api.stopRun(ID, { flatten: true });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error.status).toBe(403);
+      expect(result.error.message).toBe(READ_ONLY);
+    }
+  });
+
+  it.each([
+    [403, { error: "csrf" }],
+    [403, { detail: "Forbidden" }],
+    [403, "plain text"],
+    [403, null],
+    [401, { error: "forbidden" }],
+    [502, { error: "forbidden" }],
+  ])("%i %j keeps the generic text", async (status, body) => {
+    global.fetch = jest.fn().mockResolvedValue(respond(status, body)) as unknown as typeof fetch;
+    const result = await api.fetchRuns();
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error.status).toBe(status);
+      expect(result.error.message).not.toBe(READ_ONLY);
+      expect(result.error.message).not.toMatch(/read-only/);
+    }
+  });
+});
