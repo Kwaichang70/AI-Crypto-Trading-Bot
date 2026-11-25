@@ -7,15 +7,31 @@
 import { spawnSync } from "child_process";
 import { randomBytes } from "crypto";
 import fs from "fs";
+import os from "os";
 import path from "path";
 
 const SCRIPT = path.resolve(__dirname, "../../../scripts/check-bff-key-leak.mjs");
 
+// A fake `npx` first on PATH: if the argument check ever regresses, the script reaches
+// `spawnSync("npx", ...)`, which runs this stub (it records a marker and exits 9) instead
+// of a real `next build`.
+let stubDir: string;
+beforeAll(() => {
+  stubDir = fs.mkdtempSync(path.join(os.tmpdir(), "leak-fake-npx-"));
+  fs.writeFileSync(path.join(stubDir, "npx"), `#!/bin/sh\ntouch "${path.join(stubDir, "npx-was-run")}"\nexit 9\n`, { mode: 0o755 });
+});
+afterAll(() => fs.rmSync(stubDir, { recursive: true, force: true }));
+
 describe("arguments", () => {
   it.each([["--no-build"], ["--bogus"], ["x", "y"]])("%s exits 2 with the fixed usage line and starts nothing", (...args) => {
-    const res = spawnSync(process.execPath, [SCRIPT, ...args], { encoding: "utf8", timeout: 20_000 });
+    const res = spawnSync(process.execPath, [SCRIPT, ...args], {
+      encoding: "utf8",
+      timeout: 20_000,
+      env: { ...process.env, PATH: `${stubDir}${path.delimiter}${process.env.PATH ?? ""}` },
+    });
     expect(res.status).toBe(2);
     expect(res.stdout).toBe("usage: check-bff-key-leak.mjs (takes no arguments)\n");
+    expect(fs.existsSync(path.join(stubDir, "npx-was-run"))).toBe(false);
   });
 
   it("the flag is gone from the script", () => {
@@ -60,6 +76,14 @@ describe("the build environment is an allow-list (buildEnv)", () => {
     expect(out.sentinelsOk).toBe(true);
   });
 
+  it("ENV_ALLOW is exactly the reviewed list (CR-9739B-05)", () => {
+    expect(probe({ PATH: process.env.PATH ?? "" }).allow).toEqual([
+      "PATH", "HOME", "TMPDIR", "LANG", "NODE_ENV",
+      "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy",
+      "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE",
+    ]);
+  });
+
   it("the proxy and CA variables pass when set, and only the allow-list plus the fixed names exist", () => {
     const parent = {
       PATH: process.env.PATH ?? "",
@@ -92,5 +116,20 @@ describe("main() order", () => {
     expect(at("selfTest()")).toBeLessThan(at("spawnSync("));
     expect(main).toContain("env: buildEnv(process.env)");
     expect(main).not.toMatch(/\.\.\.process\.env/);
+  });
+});
+
+describe("selfTest() (SE-9739B-06)", () => {
+  it("uses its own random value, not the run's sentinels, and still passes", () => {
+    const text = fs.readFileSync(SCRIPT, "utf8");
+    const body = text.slice(text.indexOf("export function selfTest()"), text.indexOf("/** Parent variables"));
+    expect(body).toContain("randomValue()");
+    expect(body).not.toContain("SENTINELS");
+    const res = spawnSync(
+      process.execPath,
+      ["--input-type=module", "-e", "const m = await import(process.env.LEAK_SCRIPT); console.log(m.selfTest());"],
+      { encoding: "utf8", env: { ...process.env, LEAK_SCRIPT: SCRIPT } },
+    );
+    expect(res.stdout.trim()).toBe("true");
   });
 });

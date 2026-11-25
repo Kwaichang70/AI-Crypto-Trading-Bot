@@ -15,8 +15,9 @@
  * Takes no arguments; any argument exits 2. Never type real secrets on a command
  * line. Checking a production image for real secrets is a separate procedure
  * (CF-97-38). The build child gets an explicit allow-listed environment
- * (`buildEnv`), not the parent's. `selfTest()` uses its own random value and
- * runs before anything else.
+ * (`buildEnv`), not the parent's. `selfTest()` plants and scans for its own
+ * random value (never one of the run's sentinels or any supplied value) and runs
+ * before the build.
  *
  * Output: file paths, counts and names only; a sentinel or any other value is never printed.
  * Exit 0 = clean, 1 = a hit or a vacuous scan, 2 = build/usage error.
@@ -107,13 +108,14 @@ export function selfTest() {
   fs.mkdirSync(clean);
   fs.mkdirSync(path.join(planted, ".hidden"), { recursive: true });
   fs.writeFileSync(path.join(clean, "a.js"), "console.log('no secrets here');");
-  const value = SENTINELS.API_KEY;
+  const own = { SELFTEST: randomValue() };
+  const value = own.SELFTEST;
   const plantedForms = forms(value);
   plantedForms.forEach((form, i) =>
     fs.writeFileSync(path.join(planted, i % 2 ? ".hidden" : ".", `p${i}.txt`), `xx${form}xx`),
   );
-  const cleanResult = scan([clean], SENTINELS);
-  const plantedResult = scan([planted], SENTINELS);
+  const cleanResult = scan([clean], own);
+  const plantedResult = scan([planted], own);
   fs.rmSync(dir, { recursive: true, force: true });
   return cleanResult.hits.length === 0 && plantedResult.hits.length >= plantedForms.length;
 }
