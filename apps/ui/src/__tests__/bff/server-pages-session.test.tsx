@@ -18,6 +18,9 @@ jest.mock("next/link", () => ({ __esModule: true, default: ({ children }: { chil
 import { authOptions } from "@/lib/auth-options";
 import DashboardPage from "@/app/page";
 import StrategiesPage from "@/app/strategies/page";
+import { dummySecret } from "@/__tests__/helpers/dummy-secrets";
+
+const KEY = dummySecret("dummy-api-key");
 
 const fetchMock = jest.fn();
 const okJson = (body: unknown) => ({
@@ -48,7 +51,7 @@ beforeEach(() => {
   mockRedirect.mockClear();
   process.env.ADMIN_EMAILS = "admin@example.com";
   process.env.VIEWER_EMAILS = "viewer@example.com";
-  process.env.API_KEY = "dummy-api-key-0123456789";
+  process.env.API_KEY = KEY;
   process.env.INTERNAL_API_URL = "http://api.internal:8000";
 });
 
@@ -84,7 +87,7 @@ describe("a listed token on the server pages", () => {
       "http://api.internal:8000/health",
     ]);
     for (const [, init] of fetchMock.mock.calls) {
-      expect((init as RequestInit).headers).toMatchObject({ "X-API-Key": "dummy-api-key-0123456789" });
+      expect((init as RequestInit).headers).toMatchObject({ "X-API-Key": KEY });
       expect((init as RequestInit).cache).toBe("no-store");
     }
   });

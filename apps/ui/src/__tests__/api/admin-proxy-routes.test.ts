@@ -31,6 +31,7 @@
 
 import { getServerSession } from "next-auth";
 import { isAdmin } from "@/lib/auth";
+import { dummySecret } from "@/__tests__/helpers/dummy-secrets";
 
 jest.mock("next-auth", () => ({ getServerSession: jest.fn() }));
 jest.mock("@/lib/auth-options", () => ({ authOptions: {} }));
@@ -39,7 +40,7 @@ jest.mock("@/lib/auth", () => ({ isAdmin: jest.fn() }));
 const mockGetServerSession = getServerSession as jest.Mock;
 const mockIsAdmin = isAdmin as jest.Mock;
 
-const ADMIN_KEY = "test-internal-admin-key-value";
+const ADMIN_KEY = dummySecret("dummy-admin-key");
 const VALID_ID = "11111111-1111-1111-1111-111111111111";
 
 const ORIGINAL_ENV = process.env;

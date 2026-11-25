@@ -3,11 +3,12 @@
  * `/bff/api/v1/...` for EVERY exported call, and each of those calls is
  * admitted by the BFF's own default-deny table.
  */
+import { randomUUID } from "crypto";
 import * as api from "@/lib/api";
 import { matchBff } from "@/lib/bff-routes";
 
 const ID = "123e4567-e89b-42d3-a456-426614174000";
-const OPTS = { idempotencyKey: "123e4567-e89b-42d3-a456-426614174111" } as const;
+const OPTS = { idempotencyKey: randomUUID() } as const;
 
 const CALLS: [string, () => Promise<unknown>][] = [
   ["fetchRuns", () => api.fetchRuns({ limit: 5, status: "stopped" })],

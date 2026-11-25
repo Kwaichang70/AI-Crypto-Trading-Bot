@@ -8,8 +8,9 @@ import { NextRequest } from "next/server";
 import { encode } from "next-auth/jwt";
 import fs from "fs";
 import path from "path";
+import { dummySecret } from "@/__tests__/helpers/dummy-secrets";
 
-const SECRET = "dummy-secret-for-tests-0123456789abcdefXYZ";
+const SECRET = dummySecret("dummy-session-secret");
 
 beforeAll(() => {
   process.env.NEXTAUTH_SECRET = SECRET;

@@ -26,6 +26,9 @@ jest.mock("undici", () => {
 });
 
 import { proxyBff } from "@/lib/bff-proxy";
+import { dummySecret } from "@/__tests__/helpers/dummy-secrets";
+
+const KEY = dummySecret("dummy-api-key");
 
 let server: http.Server;
 let hits: string[] = [];
@@ -46,7 +49,7 @@ afterAll(() => new Promise((r) => server.close(r)));
 beforeEach(() => {
   hits = [];
   delayMs = 0;
-  process.env.API_KEY = "dummy-api-key-0123456789";
+  process.env.API_KEY = KEY;
   jest.spyOn(console, "warn").mockImplementation(() => undefined);
 });
 

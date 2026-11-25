@@ -13,8 +13,9 @@ const redirect = jest.fn((to: string) => {
 jest.mock("next/navigation", () => ({ redirect: (to: string) => redirect(to) }));
 
 import * as server from "@/lib/api-server";
+import { dummySecret } from "@/__tests__/helpers/dummy-secrets";
 
-const KEY = "dummy-api-key-0123456789";
+const KEY = dummySecret("dummy-api-key");
 const fetchMock = jest.fn();
 
 beforeEach(() => {

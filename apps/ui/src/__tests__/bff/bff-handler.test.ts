@@ -13,9 +13,10 @@ jest.mock("@/lib/auth-options", () => ({ authOptions: {} }));
 
 import * as route from "@/app/bff/api/v1/[...path]/route";
 import * as api from "@/lib/api";
+import { dummySecret } from "@/__tests__/helpers/dummy-secrets";
 
 interface Seen { method: string; url: string; headers: http.IncomingHttpHeaders; body: string }
-const KEY = "dummy-api-key-0123456789";
+const KEY = dummySecret("dummy-api-key");
 const UUID = "123e4567-e89b-42d3-a456-426614174000";
 const SESSION = { user: { email: "admin@example.com", role: "admin" } };
 

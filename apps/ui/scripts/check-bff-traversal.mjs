@@ -20,6 +20,7 @@
  */
 
 import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 import net from "node:net";
@@ -31,8 +32,9 @@ export const MEASURED_NEXT_VERSION = "14.2.35";
 
 const UI_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const require = createRequire(import.meta.url);
-const SECRET = "TraversalCheckSecretK3m9Qw5Zx1Vb7Nc2Lp8Rt4Yu6Hj0Fd";
-const KEY = "TraversalCheckApiKeyA4s8Df2Gh6Jk1Lz5Xc9Vb3Nm7Qw0Er";
+// PR-HYG-01: random per run, passed to the server through its environment only.
+const SECRET = randomBytes(32).toString("hex");
+const KEY = randomBytes(32).toString("hex");
 const UUID = "123e4567-e89b-42d3-a456-426614174000";
 
 const freePort = () =>

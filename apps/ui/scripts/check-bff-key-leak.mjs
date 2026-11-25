@@ -4,21 +4,28 @@
  * ----------------------------------------
  * CF-97-37 (37-B, DR-9737-25): build-output leak scan for server-only secrets.
  *
- * Runs `next build` with FIXED, alphanumeric sentinel values for the server
+ * Runs `next build` with RANDOM (per run), alphanumeric sentinel values for the server
  * secrets (passed through the child's environment, never argv), then scans the
  * build output for each sentinel in four forms: raw, URL-encoded, JSON-escaped
  * and base64 (three alignments). It also fails on any *.body, *.html or *.rsc
  * file under .next/server/app/bff (a prerendered BFF route would bake data).
  *
- *   node apps/ui/scripts/check-bff-key-leak.mjs [--no-build]
+ *   node apps/ui/scripts/check-bff-key-leak.mjs
  *
- * Output: file paths and counts only; sentinel values are never printed.
+ * Takes no arguments; any argument exits 2. Never type real secrets on a command
+ * line. Checking a production image for real secrets is a separate procedure
+ * (CF-97-38). The build child gets an explicit allow-listed environment
+ * (`buildEnv`), not the parent's. `selfTest()` uses its own random value and
+ * runs before anything else.
+ *
+ * Output: file paths, counts and names only; a sentinel or any other value is never printed.
  * Exit 0 = clean, 1 = a hit or a vacuous scan, 2 = build/usage error.
  * NEXTAUTH_SECRET is baked into the Edge middleware by design (CF-97-38): it
  * is counted and reported but does not fail the scan.
  */
 
 import { spawnSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -26,12 +33,15 @@ import { fileURLToPath } from "node:url";
 
 const UI_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
+// PR-HYG-01: the sentinels are random per run (hex, so alphanumeric) and are never
+// committed. The same objects are what the build receives and what the scan searches.
+const randomValue = () => randomBytes(24).toString("hex");
 export const SENTINELS = {
-  API_KEY: "SentinelApiKeyZ9q4Xv7Lm2Wk8Tn5Bd3Hc6Rj1Fa0Ue",
-  INTERNAL_ADMIN_API_KEY: "SentinelAdminKeyP8s3Gy6Nw1Qz5Dm9Vb2Lx7Kc4Ta0Jh",
-  GOOGLE_OAUTH_CLIENT_SECRET: "SentinelOauthSecretE7r2Ht5Yu9Io3Pl6Ka1Sd4Fg8Zx0Cv",
+  API_KEY: randomValue(),
+  INTERNAL_ADMIN_API_KEY: randomValue(),
+  GOOGLE_OAUTH_CLIENT_SECRET: randomValue(),
 };
-const BAKED_BY_DESIGN = { NEXTAUTH_SECRET: "SentinelNextauthSecretM3n8Bv5Cx1Zq7Lk4Jh9Gf2Ds6Aw0Tr" };
+const BAKED_BY_DESIGN = { NEXTAUTH_SECRET: randomValue() };
 
 /** Minimum file counts so a scan of an empty or missing tree cannot pass. */
 export const MIN_FILES = { ".next/static": 5, ".next/server": 20, ".next/standalone": 50 };
@@ -108,27 +118,47 @@ export function selfTest() {
   return cleanResult.hits.length === 0 && plantedResult.hits.length >= plantedForms.length;
 }
 
+/** Parent variables the build may see besides the sentinels: nothing else leaks into it. */
+export const ENV_ALLOW = [
+  "PATH", "HOME", "TMPDIR", "LANG", "NODE_ENV",
+  "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy",
+  "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE",
+];
+
+/** The environment of the `next build` child: an allow-list of the parent plus the sentinels. */
+export function buildEnv(parent, sentinels = SENTINELS, baked = BAKED_BY_DESIGN) {
+  const env = {};
+  for (const name of ENV_ALLOW) if (parent[name] !== undefined) env[name] = parent[name];
+  return {
+    ...env,
+    ...sentinels,
+    ...baked,
+    NODE_ENV: "production",
+    NEXT_TELEMETRY_DISABLED: "1",
+    NEXTAUTH_URL: "https://localhost:3100",
+    GOOGLE_OAUTH_CLIENT_ID: "dummy-client-id",
+    ADMIN_EMAILS: "admin@example.invalid",
+  };
+}
+
 function main() {
+  if (process.argv.length > 2) {
+    console.log("usage: check-bff-key-leak.mjs (takes no arguments)");
+    return 2;
+  }
   if (!selfTest()) {
     console.log("self-test FAILED: the scanner did not find a planted sentinel");
     return 1;
   }
   console.log("self-test ok");
-  if (!process.argv.includes("--no-build")) {
-    const env = {
-      ...process.env,
-      ...SENTINELS,
-      ...BAKED_BY_DESIGN,
-      NEXT_TELEMETRY_DISABLED: "1",
-      NEXTAUTH_URL: "https://localhost:3100",
-      GOOGLE_OAUTH_CLIENT_ID: "dummy-client-id",
-      ADMIN_EMAILS: "admin@example.invalid",
-    };
-    const build = spawnSync("npx", ["next", "build"], { cwd: UI_ROOT, env, stdio: ["ignore", "ignore", "inherit"] });
-    if (build.status !== 0) {
-      console.log(`build failed (exit ${build.status})`);
-      return 2;
-    }
+  const build = spawnSync("npx", ["next", "build"], {
+    cwd: UI_ROOT,
+    env: buildEnv(process.env),
+    stdio: ["ignore", "ignore", "inherit"],
+  });
+  if (build.status !== 0) {
+    console.log(`build failed (exit ${build.status})`);
+    return 2;
   }
   let failed = false;
   for (const [tree, min] of Object.entries(MIN_FILES)) {
