@@ -72,7 +72,7 @@ Expected: value `1`. The query returns metric names only, no secrets.
 
 ## 3. Hand-applied interim form (cannot deploy yet)
 
-The deployed `/opt/trading-bot/infra/Caddyfile` differs from the repository file: `infra/caddy-config.sh` replaced `{{TAILSCALE_FQDN}}` in place. So do not copy the repository file over it. Insert the block from section 1 by hand into the primary site block, **above** the line `handle /api/* {` (order matters: Caddy takes the first matching block). Then run steps 1 to 4 of section 2, in that order.
+The deployed `/opt/trading-bot/infra/Caddyfile` differs from the repository file: `infra/caddy-config.sh` replaced `{{TAILSCALE_FQDN}}` in place. So do not copy the repository file over it. Insert the block from section 1 by hand into the primary site block, **above** the line `handle /api/* {` (Caddy sorts single-path `handle` blocks by path length and runs the catch-all last, so the position does not change which block answers; the repository file keeps the blocks in this order for readability). Then run steps 1 to 4 of section 2, in that order.
 
 If the reload does not take effect, the file was probably replaced instead of edited in place, and a single-file bind mount keeps pointing at the old file; recreate the container as described in step 3. This behaviour is expected from how Docker bind mounts work and was not tested here.
 
@@ -123,9 +123,9 @@ for p in '/_next/image' '/_next/image/' '/_NEXT/IMAGE' '/_next/%69mage' '/_next%
 done
 ```
 
-Expected: `404` on every line. Anything else is a failure: `400` means the optimizer answered (the block missed that spelling); `308` means Caddy did not match and Next redirected. On a failure in this loop keep the block (it still covers the other spellings), record the line and the Caddy version, and report it for review. A byte count of `0` shows that the `404` came from Caddy; a `404` with a larger byte count came from the UI: the optimizer was not reached, but Caddy did not match that spelling, so record and report that line too.
+Expected: `404` on every line. Anything else is a failure: `400` means the optimizer answered (the block missed that spelling); `308` means Caddy did not match and Next redirected; `307` means Caddy did not match and the UI's sign-in redirect answered. On a failure in this loop keep the block (it still covers the other spellings), record the line and the Caddy version, and report it for review. A byte count of `0` shows that the `404` came from Caddy; a `404` with a larger byte count came from the UI: the optimizer was not reached, but Caddy did not match that spelling, so record and report that line too.
 
-Optional control check (not tested): from the host, `$DC exec -T caddy wget -q -O /dev/null 'http://ui:3000/_next/image?url=%2Fx&w=64&q=75'` should fail with HTTP 400. That shows the optimizer still answers inside the compose network, so the loop above can see a miss.
+Optional control check (not tested): from the host, `$DC exec -T caddy wget -q -O /dev/null 'http://ui:3000/_next/image?url=%2Fx&w=64&q=75'; echo "rc=$?"` should fail with HTTP 400 and print a non-zero `rc`. That shows the optimizer still answers inside the compose network, so the loop above can see a miss.
 
 The reviewers read the source of Caddy and of `next` 14.2.35: Next sends only the raw paths `/_next/image` and `/_next/image/` to the optimizer, and Caddy lowercases, decodes and cleans the path before matching, so it matches both however they are spelled. The loop above is the evidence on the deployed Caddy version.
 

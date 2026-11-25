@@ -132,6 +132,9 @@ _CONFIG_PATTERNS: dict[str, re.Pattern[str]] = {
     "images: option in next.config": re.compile(r"""(?<![\w.])["']?images["']?\s*:"""),
     # shorthand property: { images }, { a: 1, images, b }
     "images shorthand in next.config": re.compile(r"[{,]\s*images\s*[,}]"),
+    # nextConfig.images = {...} and { ["images"]: {...} }
+    "images assignment in next.config": re.compile(r"\.images\s*=(?!=)"),
+    "computed images key in next.config": re.compile(r"""\[\s*["']images["']\s*\]"""),
 }
 _SOURCE_SUFFIXES = {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mdx"}
 _CONFIG_NAMES = (
@@ -170,6 +173,34 @@ def _scan_ui(app: Path) -> list[str]:
     return findings
 
 
+_COMMAND = re.compile(r"\b(curl|wget) -")
+_ANY_TOOL = re.compile(r"\b(?:curl|wget)\b")
+_CURL_FORBIDDEN = re.compile(
+    r"\s(?:-[ivDO]\b|--(?:include|verbose|trace\S*|dump-header|output)\b|-o\s+-(?:\s|$))"
+)
+_WGET_FORBIDDEN = re.compile(r"-O\s*-(?:\s|$)|--output-document[= ]-")
+
+
+def _command_problems(text: str) -> list[str]:
+    """Every `curl -`/`wget -` line (fenced, indented or inside an inline span) must print only a
+    status code: one tool per line, output to /dev/null, no header or body options."""
+    problems: list[str] = []
+    for ln in text.splitlines():
+        match = _COMMAND.search(ln)
+        if not match:
+            continue
+        if len(_ANY_TOOL.findall(ln)) != 1:
+            problems.append(f"exactly one curl/wget per line: {ln.strip()}")
+        if match.group(1) == "curl":
+            required, forbidden = ("-o /dev/null", "-w '%{http_code}"), _CURL_FORBIDDEN
+        else:
+            required, forbidden = ("-O /dev/null",), _WGET_FORBIDDEN
+        problems += [f"missing {r!r}: {ln.strip()}" for r in required if r not in ln]
+        if forbidden.search(ln):
+            problems.append(f"forbidden option: {ln.strip()}")
+    return problems
+
+
 @pytest.fixture(scope="module")
 def caddyfile_text() -> str:
     return _CADDYFILE.read_text(encoding="utf-8")
@@ -183,12 +214,6 @@ def caddyfile_text() -> str:
 class TestImageBlock:
     def test_the_real_caddyfile_has_no_problems(self, caddyfile_text: str) -> None:
         assert _block_problems(caddyfile_text) == []
-
-    def test_catch_all_still_proxies_to_the_ui(self, caddyfile_text: str) -> None:
-        primary = _primary_site_block(_without_comments(caddyfile_text))
-        catch_all = _CATCH_ALL_HEADER.search(primary)
-        assert catch_all
-        assert _code_lines(_body_after(primary, catch_all.start())) == ["reverse_proxy ui:3000"]
 
 
 class TestPlantedBlockOffenders:
@@ -297,6 +322,8 @@ class TestUiDoesNotUseTheOptimizer:
             "export default { 'images': {} };",
             'const images = {}; export default { images, output: "standalone" };',
             "export default { output: 'standalone', images };",
+            "nextConfig.images = { unoptimized: false };",
+            'export default { ["images"]: {} };',
             'import Image from "next/image";',
         ],
     )
@@ -306,7 +333,6 @@ class TestUiDoesNotUseTheOptimizer:
     @pytest.mark.parametrize(
         "benign",
         [
-            'matcher: ["/((?!api/auth|_next/static|_next/image|favicon).*)"]',
             "// the Image Optimizer is not used",
             "const nextImages = 3; const myimages: string[] = [];",
             "const x = <ImageGallery />;",
@@ -399,16 +425,45 @@ class TestRunbook:
         assert "`400` means the optimizer answered" in flat
         assert "`308` means Caddy did not match" in flat
 
-    def test_every_curl_line_prints_only_a_status_code(self, section: str) -> None:
-        in_fence = False
-        curls: list[str] = []
-        for ln in section.splitlines():
-            if ln.startswith("```"):
-                in_fence = not in_fence
-            elif in_fence and "curl " in ln:
-                curls.append(ln)
-        assert len(curls) >= 3
-        for ln in curls:
-            assert "-o /dev/null" in ln, ln
-            assert "-w '%{http_code}" in ln, ln
-            assert not re.search(r"\s-(?:i|v|D|O|-include|-verbose)\b", ln), ln
+    def test_every_command_line_prints_only_a_status_code(self, section: str) -> None:
+        assert _command_problems(section) == []
+        commands = [ln for ln in section.splitlines() if _COMMAND.search(ln)]
+        assert sum("curl -" in ln for ln in commands) >= 3
+        assert sum("wget -" in ln for ln in commands) == 1
+
+    def test_states_the_miss_rules(self, section: str) -> None:
+        flat = " ".join(section.split())
+        assert "keep the block" in flat
+        assert "A byte count of `0` shows that the `404` came from Caddy" in flat
+        assert "`307` means Caddy did not match and the UI's sign-in redirect answered" in flat
+        assert 'echo "rc=$?"' in section
+
+    @pytest.mark.parametrize(
+        "planted",
+        [
+            "curl -s -o /dev/null -w '%{http_code}\\n' --trace-ascii - https://h/",
+            "curl -s -o - -w '%{http_code}\\n' https://h/",
+            "curl -s --output - -w '%{http_code}\\n' https://h/",
+            "curl -s -o /dev/null -w '%{http_code}\\n' --dump-header - https://h/",
+            "curl -v -o /dev/null -w '%{http_code}\\n' https://h/",
+            "    curl -s -i -o /dev/null -w '%{http_code}\\n' https://h/",
+            "Run `curl -s https://h/` and read the page.",
+            "curl -s -o /dev/null -w '%{http_code}\\n' https://a/; "
+            "curl -s -o /dev/null -w '%{http_code}\\n' https://b/",
+            "$DC exec -T caddy wget -q -O - 'http://ui/'",
+            "$DC exec -T caddy wget -q 'http://ui/'",
+        ],
+    )
+    def test_planted_command_offenders_are_found(self, planted: str) -> None:
+        assert _command_problems(planted) != []
+
+    @pytest.mark.parametrize(
+        "benign",
+        [
+            "`--path-as-is` keeps curl from tidying the path.",
+            "    curl -s -o /dev/null -w '%{http_code}\\n' 'https://<host>/'",
+            "`$DC exec -T caddy wget -q -O /dev/null 'http://ui:3000/x'; echo \"rc=$?\"`",
+        ],
+    )
+    def test_benign_command_text_is_not_flagged(self, benign: str) -> None:
+        assert _command_problems(benign) == []

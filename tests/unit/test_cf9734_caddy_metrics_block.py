@@ -10,8 +10,9 @@ tests/unit/test_wp17b_infra_config.py, which are not edited by this change.
 
 What is pinned:
   - the block exists in the primary site block (not the Grafana block);
-  - it precedes the generic ``handle /api/*`` proxy block (Caddy takes the first
-    matching block in source order) and the other /api blocks keep their order;
+  - it sits above the generic ``handle /api/*`` proxy block and the other /api blocks keep
+    their order (a style rule: Caddy sorts single-path handle blocks by path length and runs
+    the catch-all last, so this is not a routing claim);
   - it is a prefix match (trailing ``*``), answers 404 and does not proxy;
   - Prometheus still scrapes ``api:8000`` directly at ``/metrics`` (the other,
     Prometheus-text route), so the block cannot break monitoring;
@@ -96,7 +97,9 @@ class TestMetricsBlock:
         metrics_idx = _METRICS_HEADER.search(primary).start()  # type: ignore[union-attr]
         generic_idx = primary.index("handle /api/* {")
         assert metrics_idx < generic_idx, (
-            "the metrics block must come BEFORE `handle /api/*` (first match wins)"
+            "style: the metrics block must sit above `handle /api/*` (Caddy sorts "
+            "single-path handle blocks itself; this keeps the layout readable and is not a "
+            "routing fault)"
         )
 
     def test_block_is_before_the_catch_all(self, primary: str) -> None:
