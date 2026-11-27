@@ -173,12 +173,22 @@ def _scan_ui(app: Path) -> list[str]:
     return findings
 
 
-_COMMAND = re.compile(r"\b(curl|wget) -")
-_ANY_TOOL = re.compile(r"\b(?:curl|wget)\b")
+_COMMAND = re.compile(r"\b(curl|wget) -", re.IGNORECASE)
+_ANY_TOOL = re.compile(r"\b(?:curl|wget)\b", re.IGNORECASE)
+# A short-flag cluster is `-` + letters (`-s`, `-sv`, `-sD`); long options start with `--`.
 _CURL_FORBIDDEN = re.compile(
-    r"\s(?:-[ivDO]\b|--(?:include|verbose|trace\S*|dump-header|output)\b|-o\s+-(?:\s|$))"
+    r"(?<!\S)(?:-(?!-)[A-Za-z]*[ivDO][A-Za-z]*(?![\w-])"  # -i -v -D -O alone or in a cluster
+    r"|-(?!-)[A-Za-z]*o\s*-(?:\s|$)"  # -o - and -so -
+    r"|--(?:include|verbose|trace\S*|dump-header|output)(?![\w-])"
+    r"|-w\s*@)"  # format read from a file or stdin
 )
-_WGET_FORBIDDEN = re.compile(r"-O\s*-(?:\s|$)|--output-document[= ]-")
+_WGET_FORBIDDEN = re.compile(
+    r"(?<!\S)(?:-(?!-)[A-Za-z]*S[A-Za-z]*(?![\w-])"  # -S alone or in a cluster
+    r"|-(?!-)[A-Za-z]*O\s*-(?:\s|$)"  # -O - and -qO -
+    r"|--server-response(?![\w-])|--output-document[= ]-)"
+)
+_WRITE_OUT_VARIABLE = re.compile(r"%[a-z_]*\{(?:[^}]*\})?")  # %{x}, %header{x}, %output{x}
+_ALLOWED_WRITE_OUT = {"%{http_code}", "%{size_download}"}
 
 
 def _command_problems(text: str) -> list[str]:
@@ -191,8 +201,10 @@ def _command_problems(text: str) -> list[str]:
             continue
         if len(_ANY_TOOL.findall(ln)) != 1:
             problems.append(f"exactly one curl/wget per line: {ln.strip()}")
-        if match.group(1) == "curl":
+        if match.group(1).lower() == "curl":
             required, forbidden = ("-o /dev/null", "-w '%{http_code}"), _CURL_FORBIDDEN
+            extra = [v for v in _WRITE_OUT_VARIABLE.findall(ln) if v not in _ALLOWED_WRITE_OUT]
+            problems += [f"-w variable {v!r} not allowed: {ln.strip()}" for v in extra]
         else:
             required, forbidden = ("-O /dev/null",), _WGET_FORBIDDEN
         problems += [f"missing {r!r}: {ln.strip()}" for r in required if r not in ln]
@@ -452,6 +464,24 @@ class TestRunbook:
             "curl -s -o /dev/null -w '%{http_code}\\n' https://b/",
             "$DC exec -T caddy wget -q -O - 'http://ui/'",
             "$DC exec -T caddy wget -q 'http://ui/'",
+            # SE-37C2-12: each line meets the `required` options, so only the new rule can flag it
+            "curl -sv -o /dev/null -w '%{http_code}\\n' https://h/",
+            "curl -sD - -o /dev/null -w '%{http_code}\\n' https://h/",
+            "curl -so - -o /dev/null -w '%{http_code}\\n' https://h/",
+            "curl -s -o /dev/null -w '%{http_code} %{header_json}\\n' https://h/",
+            "curl -s -o /dev/null -w '%{http_code} %header{set-cookie}\\n' https://h/",
+            "curl -s -o /dev/null -w '%{http_code} %{json}\\n' https://h/",
+            "curl -s -o /dev/null -w '%{http_code}\\n' -w @- https://h/",
+            "CURL -v -o /dev/null -w '%{http_code}\\n' https://h/",
+            "`Curl -s https://h/`",
+            "curl -s -o /dev/null -w '%{http_code}\\n' https://a/; "
+            "CURL -s -o /dev/null -w '%{http_code}\\n' https://b/",
+            "CURL -s -o /dev/null -w '%{http_code}\\n' -O /dev/null https://h/",
+            "$DC exec -T caddy wget -S -O /dev/null 'http://ui/'",
+            "$DC exec -T caddy wget -qS -O /dev/null 'http://ui/'",
+            "$DC exec -T caddy wget --server-response -O /dev/null 'http://ui/'",
+            "$DC exec -T caddy wget -qO - -O /dev/null 'http://ui/'",
+            "$DC exec -T caddy WGET -S -O /dev/null 'http://ui/'",
         ],
     )
     def test_planted_command_offenders_are_found(self, planted: str) -> None:
@@ -463,6 +493,7 @@ class TestRunbook:
             "`--path-as-is` keeps curl from tidying the path.",
             "    curl -s -o /dev/null -w '%{http_code}\\n' 'https://<host>/'",
             "`$DC exec -T caddy wget -q -O /dev/null 'http://ui:3000/x'; echo \"rc=$?\"`",
+            "curl -sS --path-as-is -o /dev/null -w '%{http_code} %{size_download}\\n' 'https://h/%2Fx'",
         ],
     )
     def test_benign_command_text_is_not_flagged(self, benign: str) -> None:

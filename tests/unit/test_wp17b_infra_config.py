@@ -97,17 +97,21 @@ def test_caddyfile_has_admin_and_generic_api_handle_blocks(primary_block: str) -
 def test_caddyfile_admin_block_ordered_before_generic_api_block(
     primary_block: str,
 ) -> None:
-    """WP17-D-01 / C21: Caddy v2 evaluates `handle` in source order and stops
-    at the first match, so `/api/admin/*` MUST be textually before the
-    catch-all `/api/*` block or every admin call would be swallowed by the
-    generic FastAPI proxy instead of reaching the Next.js admin routes that
-    inject X-Admin-Key server-side."""
+    """WP17-D-01 / C21: layout rule, not a routing claim. Caddy sorts `handle`
+    blocks that have a single path matcher by path length (the longer
+    `/api/admin/*` runs before `/api/*`), so the source order does not decide
+    which block answers. `/api/admin/*` is kept textually before the generic
+    `/api/*` block for readability, and so that the file stays correct if the
+    blocks are ever wrapped in `route` (which keeps source order). Admin calls
+    must reach the Next.js admin routes that inject X-Admin-Key server-side,
+    not the generic FastAPI proxy."""
     admin_idx = primary_block.index("handle /api/admin/* {")
     generic_idx = primary_block.index("handle /api/* {")
     assert admin_idx < generic_idx, (
-        "handle /api/admin/* must appear before the generic handle /api/* "
-        "block in infra/Caddyfile (Caddy matches handle blocks in source "
-        "order and stops at the first match)"
+        "style: handle /api/admin/* must stay above the generic handle /api/* "
+        "block in infra/Caddyfile (Caddy sorts single-path handle blocks "
+        "itself; the layout rule keeps the file readable and correct under a "
+        "`route` wrapper)"
     )
 
 

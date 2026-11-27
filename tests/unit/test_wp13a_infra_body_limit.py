@@ -35,7 +35,8 @@ _RUNBOOK = _REPO_ROOT / "infra" / "CADDY-RUNBOOK.md"
 _COMPOSE = _REPO_ROOT / "infra" / "docker-compose.yml"
 
 # Every proxied /api handle block that must carry the cap, in the exact
-# source order they are required to appear in (WP1.7b ordering invariant).
+# source order the repository keeps them in (WP1.7b layout rule: Caddy sorts
+# single-path handle blocks itself, so this is style, not routing).
 _PROXIED_API_HANDLES = (
     "handle /api/auth/* {",
     "handle /api/admin/* {",

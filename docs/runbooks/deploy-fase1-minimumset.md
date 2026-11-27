@@ -208,7 +208,7 @@ Compare `.env` on the server against `.env.example` from the deployed tree. Requ
   grep -cE '^[[:space:]]*request_body \{' $DEPLOY_DIR/infra/Caddyfile      # expected: 3
   grep -nE '^[[:space:]]*handle /api/(auth/|admin/)?\*[[:space:]]*\{' $DEPLOY_DIR/infra/Caddyfile
   ```
-  The anchored patterns ignore comment lines. The second command must print exactly three lines, in the order `/api/auth/*`, `/api/admin/*`, `/api/*` (Caddy takes the first match; `/api/admin/*` must precede `/api/*`). `request_body` must stay in block form; an inline `request_body max_size 1MB` is silently ignored.
+  The anchored patterns ignore comment lines. The second command must print exactly three lines, in the order `/api/auth/*`, `/api/admin/*`, `/api/*` (the repository layout, kept by the order pins: Caddy sorts single-path `handle` blocks by path length and runs the catch-all last, so `/api/admin/*` is chosen over `/api/*` whatever the order). `request_body` must stay in block form; an inline `request_body max_size 1MB` is silently ignored.
 
 ### 3.6 Build images and run the exit-config precheck (DC-13a-1)
 
