@@ -104,6 +104,7 @@ ALLOW_RE = re.compile(
     rf"secret-scan:\s*allow\s*\(\s*([A-Za-z][^)\n]{{{MIN_REASON - 1},{MAX_REASON - 1}}})\)"
 )
 COMMENT_OPEN_RE = re.compile(r"#|//|/\*|<!--")
+QUOTE_RE = re.compile(r"""(?<!\\)["'`]""")
 # Pieces, so that this file holds no credential-shaped text of its own.
 PEM = "-" * 5 + r"BEGIN(?: [A-Z0-9]+)* PRIVATE KEY"
 PREFIX_RULES = (
@@ -220,16 +221,30 @@ def is_candidate(
     return shannon_entropy(value) >= min_entropy
 
 
-def _in_comment(text: str, marker_start: int) -> bool:
-    for opener in COMMENT_OPEN_RE.finditer(text, 0, marker_start):
-        before = text[: opener.start()]
-        if all(len(re.findall(r"(?<!\\)" + q, before)) % 2 == 0 for q in ('"', "'", "`")):
-            return True
-    return False
+def _first_comment_end(text: str) -> int | None:
+    """End of the first comment opener that sits outside any quoted text, in one linear pass.
+
+    A quote character counts unless a backslash precedes it; an opener is outside quoted text when
+    the ``"``, ``'`` and backtick counts before it are all even.
+    """
+    quotes = QUOTE_RE.finditer(text)
+    odd = {'"': False, "'": False, "`": False}
+    pending = next(quotes, None)
+    for opener in COMMENT_OPEN_RE.finditer(text):
+        while pending is not None and pending.start() < opener.start():
+            odd[pending.group()] = not odd[pending.group()]
+            pending = next(quotes, None)
+        if not any(odd.values()):
+            return opener.end()
+    return None
 
 
 def _allow_marker(text: str) -> bool:
-    return any(_in_comment(text, m.start()) for m in ALLOW_RE.finditer(text))
+    markers = [m.start() for m in ALLOW_RE.finditer(text)]
+    if not markers:
+        return False
+    comment_end = _first_comment_end(text)
+    return comment_end is not None and any(start >= comment_end for start in markers)
 
 
 def _assigned(text: str, config: bool, md: bool, docker: bool) -> Iterator[tuple[str, str]]:
