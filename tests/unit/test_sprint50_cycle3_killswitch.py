@@ -366,10 +366,12 @@ async def test_kill_switch_audit_written_before_latch() -> None:
 class TestAdminApiKeyValidator:
     """Tests for the _validate_admin_api_key field_validator in Settings."""
 
-    def _make_settings_with_key(self, key: str) -> Settings:
-        import os
+    @pytest.fixture(autouse=True)
+    def _database_url(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Scoped to the test: a process-global write leaked into test_cf36_dsn.py (CF-97-59).
+        monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://test:test@localhost/test")
 
-        os.environ["DATABASE_URL"] = "postgresql+asyncpg://test:test@localhost/test"
+    def _make_settings_with_key(self, key: str) -> Settings:
         return Settings(admin_api_key=key)  # type: ignore[arg-type]
 
     def test_empty_sentinel_allowed(self) -> None:

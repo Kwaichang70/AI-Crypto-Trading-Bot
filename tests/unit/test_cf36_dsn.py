@@ -83,8 +83,10 @@ def test_sec07_plain_passwords_keep_the_same_dsn(pw: str) -> None:
 
 def test_sec07_an_explicit_database_url_is_left_untouched() -> None:
     explicit = f"postgresql+asyncpg://u:{_RAW_SLASH_PW}@h:5432/db"
-    settings = _settings(database_url=explicit, postgres_password=secrets.token_hex(8))
+    ignored = secrets.token_hex(8)
+    settings = _settings(database_url=explicit, postgres_password=ignored)
     assert settings.database_url.get_secret_value() == explicit
+    assert ignored not in settings.database_url.get_secret_value()  # the field really is ignored
 
 
 def test_sec07_direct_dsn_with_a_raw_slash_is_registered_as_sqlalchemy_parses_it() -> None:
