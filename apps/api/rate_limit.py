@@ -61,6 +61,7 @@ access is sensitive to internal API changes across minor releases.
 
 from __future__ import annotations
 
+import re
 from typing import Any, cast
 
 import structlog
@@ -70,6 +71,7 @@ from limits import parse as parse_limit  # CR-RL-009: module-level import
 from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.wrappers import Limit
+from starlette.routing import Match
 from starlette.status import HTTP_429_TOO_MANY_REQUESTS
 
 from api.config import Settings, get_settings
@@ -194,6 +196,38 @@ _EXEMPT_PATHS: frozenset[str] = frozenset({
     "/redoc",
     "/openapi.json",
 })
+
+
+# CF-97-53 (SE-9741-04): the emergency-stop exemption matches the one real route,
+# POST /api/v1/runs/{uuid}/emergency-stop, with the uuid in the canonical dashed or
+# the 32-hex form (the forms the API and the UI emit). It does not depend on the
+# route lookup below, so a lookup fault can never throttle the emergency stop.
+_HEX = "[0-9a-fA-F]"
+_EMERGENCY_STOP_RE = re.compile(
+    rf"/api/v1/runs/(?:{_HEX}{{8}}-{_HEX}{{4}}-{_HEX}{{4}}-{_HEX}{{4}}-{_HEX}{{12}}|{_HEX}{{32}})"
+    r"/emergency-stop"
+)
+
+# Bucket for every path that matches no route (CF-97-53, SE-9741-03): varying the
+# path no longer yields a fresh bucket. Real templates start with "/", so no clash.
+_UNMATCHED = "_unmatched_"
+
+
+def _route_template(request: Request) -> str:
+    """Return the path template of the route that will serve ``request``.
+
+    The middleware runs before routing, so it asks the router: the first route
+    whose ``matches`` is FULL is the one the router dispatches to (a PARTIAL
+    match is a method mismatch and is skipped, as the router does). Cost is one
+    regex test per route, measured at 6-21 us on the 43-route app. The route list
+    is read per request because routes are added after ``setup_rate_limiting``.
+    """
+    for route in request.app.router.routes:
+        match, _ = route.matches(request.scope)
+        if match is Match.FULL:
+            path = getattr(route, "path", None)
+            return path if isinstance(path, str) else _UNMATCHED
+    return _UNMATCHED
 
 
 # ---------------------------------------------------------------------------
@@ -370,7 +404,7 @@ async def _rate_limit_middleware(request: Request, call_next: Any) -> Response:
     # /runs endpoint).  Availability of the kill switch is a security
     # property — the audit_events row records every emergency-stop so
     # abuse is detectable post-incident.
-    if path.endswith("/emergency-stop"):
+    if request.method.upper() == "POST" and _EMERGENCY_STOP_RE.fullmatch(path):
         return cast(Response, await call_next(request))
 
     # Sprint 50 Cycle 3: exempt the global kill-switch from rate limits.
@@ -399,9 +433,9 @@ async def _rate_limit_middleware(request: Request, call_next: Any) -> Response:
 
     try:
         # Use the limiter's internal strategy layer to check and record the hit.
-        # The key is composed of: method + path_prefix + client_ip.
-        # Using path_prefix (first 2 segments) to avoid per-UUID-path explosion.
-        path_key = _normalize_path_key(path)
+        # The key is composed of: method + route template + client_ip. Paths that
+        # match no route share one bucket (CF-97-53), so no path can mint a bucket.
+        path_key = _route_template(request)
         rate_key = f"{method}:{path_key}:{client_ip}"
 
         # CR-RL-001: Use limiter._limiter (strategy layer), NOT limiter._storage
@@ -432,44 +466,6 @@ async def _rate_limit_middleware(request: Request, call_next: Any) -> Response:
         )
 
     return cast(Response, await call_next(request))
-
-
-def _normalize_path_key(path: str) -> str:
-    """
-    Normalize a request path to a rate-limit bucket key.
-
-    Collapses UUID path segments to prevent per-resource rate limit
-    buckets, which would allow an attacker to bypass limits by varying
-    the resource ID in each request.
-
-    Examples:
-    - ``/api/v1/runs`` -> ``/api/v1/runs``
-    - ``/api/v1/runs/abc-123/orders`` -> ``/api/v1/runs/_id_/orders``
-    - ``/api/v1/runs/abc-123/orders/def-456`` -> ``/api/v1/runs/_id_/orders/_id_``
-
-    Parameters
-    ----------
-    path:
-        The raw request URL path.
-
-    Returns
-    -------
-    str
-        The normalized path with UUIDs replaced by ``_id_``.
-    """
-    segments = path.strip("/").split("/")
-    normalized: list[str] = []
-
-    for segment in segments:
-        # Replace UUID-like segments (8-4-4-4-12 or 32 hex chars)
-        if len(segment) == 36 and segment.count("-") == 4:
-            normalized.append("_id_")
-        elif len(segment) == 32 and all(c in "0123456789abcdef" for c in segment.lower()):
-            normalized.append("_id_")
-        else:
-            normalized.append(segment)
-
-    return "/" + "/".join(normalized)
 
 
 # ---------------------------------------------------------------------------

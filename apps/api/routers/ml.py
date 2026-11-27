@@ -19,10 +19,11 @@ import os
 import statistics as _statistics_stdlib  # avoid shadowing trading._statistics
 import tempfile
 import uuid
-from typing import Any, NamedTuple
+from typing import Annotated, Any, NamedTuple
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import Path as PathParam
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.db import get_db
@@ -725,6 +726,12 @@ async def list_model_versions(
 # New endpoint: POST /retrain/{symbol} — manual PnL-labeled retrain
 # ---------------------------------------------------------------------------
 
+# CF-97-53 (SE-9741-03): the route takes ``{symbol:path}`` so "BTC/USDT" fits, which
+# also matches every deeper path. Accept only CCXT spot BASE/QUOTE (letters and
+# digits, e.g. "1INCH/EUR"), so anything else is a cheap 422 before any work.
+_RETRAIN_SYMBOL_PATTERN = r"^[A-Za-z0-9]{1,20}/[A-Za-z0-9]{1,20}$"
+
+
 @router.post(
     "/retrain/{symbol:path}",
     summary="Manually trigger PnL-labeled model retraining",
@@ -737,7 +744,7 @@ async def list_model_versions(
     status_code=status.HTTP_202_ACCEPTED,
 )
 async def manual_retrain(
-    symbol: str,
+    symbol: Annotated[str, PathParam(pattern=_RETRAIN_SYMBOL_PATTERN, max_length=41)],
     request: Request,
     timeframe: str = Query(default="1h", description="Candle timeframe for OHLCV fetch"),
 ) -> dict[str, str]:

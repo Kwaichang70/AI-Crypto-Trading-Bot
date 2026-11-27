@@ -8,7 +8,6 @@ Tests cover:
 - 429 response includes Retry-After header and structured body
 - Exempt paths (/health, /api/v1/metrics) are never rate-limited
 - Rate limiting disabled mode passes all requests
-- Path normalization collapses UUID segments
 """
 
 from __future__ import annotations
@@ -17,7 +16,6 @@ import pytest
 from fastapi.testclient import TestClient
 
 from api.config import get_settings
-from api.rate_limit import _normalize_path_key
 
 
 @pytest.fixture()
@@ -116,32 +114,3 @@ class TestRateLimitDisabled:
         for _ in range(100):
             resp = client_dev.get("/health")
             assert resp.status_code == 200
-
-
-@pytest.mark.integration
-class TestPathNormalization:
-    """UUID path segment normalization for rate limit buckets."""
-
-    def test_uuid_segments_collapsed(self) -> None:
-        """UUID path segments should be replaced with _id_."""
-        path = "/api/v1/runs/550e8400-e29b-41d4-a716-446655440000/orders"
-        normalized = _normalize_path_key(path)
-        assert normalized == "/api/v1/runs/_id_/orders"
-
-    def test_hex_uuid_collapsed(self) -> None:
-        """32-char hex UUIDs should also be collapsed."""
-        path = "/api/v1/runs/550e8400e29b41d4a716446655440000/orders"
-        normalized = _normalize_path_key(path)
-        assert normalized == "/api/v1/runs/_id_/orders"
-
-    def test_non_uuid_segments_preserved(self) -> None:
-        """Non-UUID path segments should remain unchanged."""
-        path = "/api/v1/runs"
-        normalized = _normalize_path_key(path)
-        assert normalized == "/api/v1/runs"
-
-    def test_multiple_uuids_collapsed(self) -> None:
-        """Multiple UUID segments in one path should all be collapsed."""
-        path = "/api/v1/runs/550e8400-e29b-41d4-a716-446655440000/orders/660e8400-e29b-41d4-a716-446655440001"
-        normalized = _normalize_path_key(path)
-        assert normalized == "/api/v1/runs/_id_/orders/_id_"

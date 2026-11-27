@@ -27,7 +27,7 @@ def client(monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
     for k, v in {
         "REQUIRE_API_AUTH": "false",
         "RATE_LIMIT_ENABLED": "true",
-        "RATE_LIMIT_READ": "2/minute",
+        "RATE_LIMIT_READ": "3/minute",
         "RATE_LIMIT_WRITE": "2/minute",
         "TRUSTED_PROXY_COUNT": "1",
     }.items():
@@ -51,7 +51,7 @@ def _codes(c: TestClient, method: str, path: str, n: int, ip: str = "10.0.0.1") 
 
 
 def test_stop_bucket_is_separate_from_get_and_post(client: TestClient) -> None:
-    assert _codes(client, "GET", RUN, 3) == [200, 200, 429]
+    assert _codes(client, "GET", RUN, 4) == [200, 200, 200, 429]
     assert _codes(client, "POST", RUN, 3) == [200, 200, 429]
     assert _codes(client, "DELETE", OTHER, 3) == [200, 200, 429]
     assert _codes(client, "DELETE", f"{RUN}/{uuid.uuid4()}", 3) == [200, 200, 429]
@@ -59,7 +59,7 @@ def test_stop_bucket_is_separate_from_get_and_post(client: TestClient) -> None:
 
 def test_stop_calls_do_not_consume_get_or_post(client: TestClient) -> None:
     assert _codes(client, "DELETE", f"{RUN}/{uuid.uuid4()}", 3) == [200, 200, 429]
-    assert _codes(client, "GET", RUN, 2) == [200, 200]
+    assert _codes(client, "GET", RUN, 3) == [200, 200, 200]
     assert _codes(client, "POST", RUN, 2) == [200, 200]
 
 
@@ -75,4 +75,4 @@ def test_emergency_stop_and_kill_switch_post_are_exempt(client: TestClient) -> N
 
 
 def test_kill_switch_get_is_not_exempt(client: TestClient) -> None:
-    assert _codes(client, "GET", KILL, 3) == [200, 200, 429]
+    assert _codes(client, "GET", KILL, 4) == [200, 200, 200, 429]
