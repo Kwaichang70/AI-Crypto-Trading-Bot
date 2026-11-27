@@ -11,7 +11,8 @@ Gate contract: the executor runs it on ``<parent>..<commit>`` in the throwaway w
 local commit and before the fast-forward; the gate tester repeats it on the pushed commit. Callers
 must block on any non-zero exit and record the summary line. Never use the staged default as a
 gate: an intent-to-add file is not in it. Pass ``--allow-empty`` only after
-``git diff --numstat <range>`` shows 0 added lines.
+``git diff --numstat <range>`` shows 0 added text lines (column 1 is ``0`` or ``-`` for every
+file).
 
 Only lines the diff ADDS are read (git run with ``--text``, bytes, split on the newline byte only).
 Rules, per added line of every non-binary file:
@@ -26,22 +27,29 @@ Rules, per added line of every non-binary file:
   per character assigned to a name with a KEY, SECRET, TOKEN, PASSWORD, PASSPHRASE, HASH, DSN,
   PASSWD, PWD, CREDENTIAL or BEARER word (``NAME = "..."``, ``NAME := "..."``, ``NAME: "..."``,
   ``name="..."``, ``"X-Api-Key": "..."``, ``os.environ["NAME"] = "..."``,
-  ``setenv("NAME", "...")``). Config-like files (.json .yaml .yml .toml .ini .cfg .conf .sh .env*
+  ``setenv("NAME", "...")``, ``os.getenv("NAME", "...")``, ``cfg.get("NAME", "...")``).
+  Config-like files (.json .yaml .yml .toml .ini .cfg .conf .sh .env*
   Dockerfile* *.example) and .md files also get the unquoted ``NAME=value`` and ``NAME: value``
   forms; .md gets nothing else.
   Skipped: whitespace or braces, whole ``$NAME`` / ``${NAME}`` / ``$(...)`` references, paths, URLs
   without credentials, e-mail addresses, UUIDs, word-segmented placeholders. ``${NAME:-default}``
   is judged by its default.
 
-A same-line comment ``secret-scan: allow (<reason, 8+ characters, starts with a letter>)`` exempts
-the exemptible rules and is reported on stderr. Output: ``path:line: WORD [rule]`` where WORD is a
-canonical name word or ``-``. No value, identifier, line text or git message is ever printed.
+A same-line comment ``secret-scan: allow (<reason: 8 to 201 characters, first a letter>)``
+exempts the exemptible rules and is reported on stderr. Output: ``path:line: WORD [rule]`` where
+WORD is a canonical name word or ``-``. No value, identifier, line text or git message is
+ever printed.
 
 Exit: 0 scanned, no hit. 1 hits. 2 usage error, git failure, not a repository, or nothing scanned.
 
+Nothing scanned: "0 added text lines" means numstat column 1 is ``0`` or ``-`` for every file. A
+deletion-only or binary-only range therefore exits 2 unless ``--allow-empty`` is given; a new key
+container in a binary-only range is still reported by ``secret-file`` (exit 1).
+
 Accepted gaps (second line of defence: GitGuardian on the pull request): multi-line assignments,
-implicit concatenation, values with whitespace, diceware passphrases, a value on another line than
-its name, vendor prefixes this repository does not use. Standard library only.
+implicit concatenation, values with whitespace (so ``"Bearer <value>"``), comparisons against a
+literal (``==``, ``===``), a value placed before its name, diceware passphrases, a value on another
+line than its name, vendor prefixes this repository does not use. Standard library only.
 """
 
 from __future__ import annotations
@@ -61,6 +69,7 @@ MIN_ENTROPY = 3.5
 MIN_URL_PASSWORD = 12
 MIN_URL_ENTROPY = 3.0
 MIN_REASON = 8
+MAX_REASON = 201
 NAME_WORDS = tuple(
     "KEY SECRET TOKEN PASSWORD PASSPHRASE HASH DSN PASSWD PWD CREDENTIAL BEARER".split()
 )
@@ -86,12 +95,14 @@ NAME = r"(?<![\w.\-])(\w[\w.\-]*)"
 ASSIGN_RE = re.compile(NAME + r"""["'`]?\]?\s*(?::=|=|:)\s*[A-Za-z]{0,2}(?=["'`])""")
 TYPED_RE = re.compile(NAME + r"""\s*:\s*[\w.\[\], |]{1,40}=\s*[A-Za-z]{0,2}(?=["'`])""")
 SETENV_RE = re.compile(
-    r"""\b(?:setenv|getenv)\(\s*(["'`])([^"'`]{1,64})\1\s*,\s*[A-Za-z]{0,2}(?=["'`])"""
+    r"""\b(?:setenv|getenv|get)\(\s*(["'`])([^"'`]{1,64})\1\s*,\s*[A-Za-z]{0,2}(?=["'`])"""
 )
 UNQUOTED_RE = re.compile(NAME + r"""\s*[:=]\s*([^\s"'`#,;]{20,})""")
 DOCKER_RE = re.compile(r"^\s*(?:ENV|ARG)\s+([A-Za-z_]\w*)\s+(\S{20,})", re.IGNORECASE)
 URL_CRED_RE = re.compile(r"""://([^\s/:@"'`]{0,64}):([^\s/@"'`]{1,200})@""")
-ALLOW_RE = re.compile(rf"secret-scan:\s*allow\s*\(\s*([A-Za-z][^)]{{{MIN_REASON - 1},}})\)")
+ALLOW_RE = re.compile(
+    rf"secret-scan:\s*allow\s*\(\s*([A-Za-z][^)\n]{{{MIN_REASON - 1},{MAX_REASON - 1}}})\)"
+)
 COMMENT_OPEN_RE = re.compile(r"#|//|/\*|<!--")
 # Pieces, so that this file holds no credential-shaped text of its own.
 PEM = "-" * 5 + r"BEGIN(?: [A-Z0-9]+)* PRIVATE KEY"

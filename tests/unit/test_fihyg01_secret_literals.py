@@ -847,8 +847,60 @@ def test_r16_the_docstring_states_the_gate_contract() -> None:
     doc = scan.__doc__
     assert "<parent>..<commit>" in doc and "block on any non-zero exit" in doc
     assert "never use the staged default as a" in " ".join(doc.lower().split())
+    flat = " ".join(doc.split())
     for gap in ("multi-line assignments", "implicit concatenation", "diceware", "GitGuardian"):
-        assert gap in " ".join(doc.split())
+        assert gap in flat
+    for gap in ("comparisons against a literal", "Bearer <value>", "before its name"):
+        assert gap in flat  # CF-97-55
+    assert "0 added text lines" in flat and "``0`` or ``-``" in flat
+    assert "deletion-only or binary-only range" in flat and "--allow-empty" in flat
+
+
+# ---------------------------------------------------------------------------
+# CF-97-55: bounded marker reason, the .get(NAME, default) form, docstring gaps
+# ---------------------------------------------------------------------------
+def test_cf9755_the_marker_reason_is_bounded_and_fast() -> None:
+    line = f'API_KEY = "{rand()}"  # ' + "secret-scan: allow (" * 20000 + "(" * 20000
+    with deadline(2.0):
+        hits, allowed = scan.scan_line("a.py", 1, line)
+    assert [h.word for h in hits] == ["KEY"] and allowed == []
+    ok, too_long = "r" * 201, "r" * 202  # the reason is 8 to 201 characters in total
+    for reason, exempt in ((ok, True), (too_long, False)):
+        got = hits_for("a.py", f'API_KEY = "{rand()}"  # secret-scan: allow ({reason})')
+        assert (got == []) is exempt
+
+
+@pytest.mark.parametrize(
+    ("form", "word"),
+    [
+        ('os.environ.get("API_KEY", "{v}")', "KEY"),
+        ('cfg.get("password", "{v}")', "PASSWORD"),
+        ("settings.get('client_secret', '{v}')", "SECRET"),
+        ('config.get( "db_dsn" , "{v}" )', "DSN"),
+        ('const t = cfg.get("authToken", `{v}`)', "TOKEN"),
+    ],
+)
+def test_cf9755_get_with_a_literal_default_is_found(form: str, word: str) -> None:
+    assert [h[1:] for h in hits_for("a.py", form.format(v=rand()))] == [(word, "entropy")]
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        'os.environ.get("API_KEY")',
+        'cfg.get("password", other_value)',
+        'cfg.get("username", "{v}")',
+        'cfg.get("api_key", "/srv/{v}")',
+        'cfg.get("api_key", "' + LOW + '")',
+        'cfg.get("api_key", "{v} {v}")',
+        'budget("API_KEY", "{v}")',
+        'cfg.get("{v}", "API_KEY")',
+        'API_KEY == "{v}"',  # accepted gaps: a comparison, a value before its name
+        'if (x === "{v}") // API_KEY',
+    ],
+)
+def test_cf9755_get_negatives_and_accepted_gaps(line: str) -> None:
+    assert hits_for("a.py", line.format(v=rand())) == []
 
 
 # ---------------------------------------------------------------------------
