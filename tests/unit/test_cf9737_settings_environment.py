@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import secrets
 from pathlib import Path
 from typing import Any
 
@@ -13,7 +14,7 @@ from pydantic import ValidationError
 from api.config import Settings
 
 ROOT = Path(__file__).resolve().parents[2]
-GOOD_HASH = hashlib.sha256(b"CF9737-dummy-api-key-0001").hexdigest()
+GOOD_HASH = hashlib.sha256(secrets.token_bytes(32)).hexdigest()  # a valid digest, built per run
 ADMIN = "CF9737-dummy-admin-key-0000000000000001"
 
 
@@ -223,12 +224,15 @@ def test_no_module_in_apps_reads_validation_errors_with_input() -> None:
 
 @pytest.mark.parametrize("slot", ["api_key_hash", "api_key_hash_secondary"])
 @pytest.mark.parametrize(
-    "bad", [GOOD_HASH[:63], GOOD_HASH + "a", "g" + GOOD_HASH[1:], " " + GOOD_HASH[1:]]
+    "bad",
+    [GOOD_HASH[:63], GOOD_HASH + "a", "g" + GOOD_HASH[1:], " " + GOOD_HASH[1:]],
+    ids=["short", "long", "not-hex", "space"],  # fixed ids: the values change every run
 )
 def test_production_refuses_a_malformed_hash(slot: str, bad: str) -> None:
     over: dict[str, Any] = {slot: bad}
     if slot == "api_key_hash_secondary":
-        over["api_key_hash"] = hashlib.sha256(b"CF9737-dummy-other-0002").hexdigest()
+        # another valid digest, never equal to GOOD_HASH
+        over["api_key_hash"] = hashlib.sha256(GOOD_HASH.encode()).hexdigest()
     with pytest.raises(ValidationError) as exc:
         _prod(**over)
     assert bad not in str(exc.value)

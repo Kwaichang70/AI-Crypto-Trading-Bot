@@ -33,7 +33,7 @@ from tests._cf36_logging import isolated_logging_state
 
 ROOT = Path(__file__).resolve().parents[2]
 MAIN = ROOT / "apps/api/main.py"
-SENTINEL_KEY = "CF2401LIFESPANKEY0123456789"
+SENTINEL_KEY = "CF2401LIFESPANKEY" + secrets.token_hex(8)  # recognisable prefix, random tail
 
 
 def _lifespan_tree() -> ast.AsyncFunctionDef:

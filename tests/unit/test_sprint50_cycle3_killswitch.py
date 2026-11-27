@@ -91,7 +91,7 @@ async def test_require_admin_absent_header_returns_401() -> None:
 
 @pytest.mark.asyncio
 async def test_require_admin_wrong_key_returns_403() -> None:
-    settings = _make_settings(admin_key="correct-key-with-numbers-12345678901")
+    settings = _make_settings(admin_key=secrets.token_hex(16))
     with pytest.raises(HTTPException) as exc_info:
         await require_admin(
             request=_make_request(),
@@ -116,11 +116,12 @@ async def test_require_admin_not_configured_returns_401() -> None:
 
 @pytest.mark.asyncio
 async def test_require_admin_correct_key_passes() -> None:
-    settings = _make_settings(admin_key="secret-key-with-numbers-12345678901")
+    key = secrets.token_hex(16)
+    settings = _make_settings(admin_key=key)
     # Should not raise
     result = await require_admin(
         request=_make_request(),
-        header_key="secret-key-with-numbers-12345678901",
+        header_key=key,
         settings=settings,
     )
     assert result is None  # dependency returns None on success

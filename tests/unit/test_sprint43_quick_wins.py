@@ -15,6 +15,7 @@ QT-011   Exposure bar-count fix — overlapping trade spans no longer
 
 from __future__ import annotations
 
+import secrets
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -40,12 +41,13 @@ class TestSEC001SecretStr:
         assert s.fred_api_key.get_secret_value() == "super-secret-fred-key"
 
     def test_whale_alert_api_key_is_secretstr(self) -> None:
+        key = secrets.token_hex(16)
         s = Settings(
             database_url="postgresql+asyncpg://u:p@h:5432/d",
-            whale_alert_api_key="super-secret-whale-key",
+            whale_alert_api_key=key,
         )
         assert isinstance(s.whale_alert_api_key, SecretStr)
-        assert s.whale_alert_api_key.get_secret_value() == "super-secret-whale-key"
+        assert s.whale_alert_api_key.get_secret_value() == key
 
     def test_keys_redacted_in_model_dump(self) -> None:
         """model_dump() must NOT expose raw secret values — the whole point

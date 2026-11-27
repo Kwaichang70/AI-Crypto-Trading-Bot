@@ -15,6 +15,8 @@ All secrets are fake.
 
 from __future__ import annotations
 
+import secrets
+
 import pytest
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -81,7 +83,7 @@ def test_sec07_plain_passwords_keep_the_same_dsn(pw: str) -> None:
 
 def test_sec07_an_explicit_database_url_is_left_untouched() -> None:
     explicit = f"postgresql+asyncpg://u:{_RAW_SLASH_PW}@h:5432/db"
-    settings = _settings(database_url=explicit, postgres_password="ignored-because-explicit")  # noqa: S106
+    settings = _settings(database_url=explicit, postgres_password=secrets.token_hex(8))
     assert settings.database_url.get_secret_value() == explicit
 
 
