@@ -6,6 +6,7 @@ Usage::
     python -I scripts/check_secret_literals.py <parent>..<commit>   # the gate
     python -I scripts/check_secret_literals.py                      # staged diff (not a gate)
     python -I scripts/check_secret_literals.py <range> --allow-empty
+    python -I scripts/check_secret_literals.py --files [--] PATH [PATH ...]   # whole files
 
 Gate contract: the executor runs it on ``<parent>..<commit>`` in the throwaway worktree after the
 local commit and before the fast-forward; the gate tester repeats it on the pushed commit. Callers
@@ -46,17 +47,33 @@ Nothing scanned: "0 added text lines" means numstat column 1 is ``0`` or ``-`` f
 deletion-only or binary-only range therefore exits 2 unless ``--allow-empty`` is given; a new key
 container in a binary-only range is still reported by ``secret-file`` (exit 1).
 
+Whole-file mode (``--files PATH ...``, CF-97-49): for files that git does not track (the ignored
+``reports/`` tree). Every line of every given file, or of every file under a given directory
+(recursive, sorted, ``.git`` directories skipped), is read with the same rules, deny-list, binary
+test (a NUL in the first 8000 bytes), allow markers, output and exit codes. Differences: the line
+numbers are the file's; ``secret-file`` is decided by a file's own name and such a file is never
+read; ``.patch`` and ``.diff`` files are read after the diff prefix (``+``, ``-`` or a space is
+dropped), so removed lines are scanned too; symlinks (given or found) are not followed and are
+counted; a file that cannot be read, or is over 64 MiB, is reported by path, counted, and makes the
+exit 2 unless there are findings (exit 1); so is a directory that cannot be listed.
+``--files`` excludes a revision; ``--`` ends options;
+the summary says ``lines`` and adds the symlink and unreadable counts. The gate is not changed.
+
 Accepted gaps (second line of defence: GitGuardian on the pull request): multi-line assignments,
 implicit concatenation, values with whitespace (so ``"Bearer <value>"``), comparisons against a
 literal (``==``, ``===``), a value placed before its name, diceware passphrases, a value on another
-line than its name, vendor prefixes this repository does not use. Standard library only.
+line than its name, a line that starts with ``-NAME = "..."`` in a plain file (not a patch),
+command-line flag forms (``--api-key="<value>"``, ``--password=<value>``), vendor prefixes this
+repository does not use. Standard library only.
 """
 
 from __future__ import annotations
 
 import math
+import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 from collections import Counter
@@ -69,6 +86,9 @@ MIN_ENTROPY = 3.5
 MIN_URL_PASSWORD = 12
 MIN_URL_ENTROPY = 3.0
 MIN_REASON = 8
+MAX_FILE_BYTES = 64 * 1024 * 1024
+BINARY_PROBE = 8000
+PATCH_SUFFIXES = (".patch", ".diff")
 MAX_REASON = 201
 NAME_WORDS = tuple(
     "KEY SECRET TOKEN PASSWORD PASSPHRASE HASH DSN PASSWD PWD CREDENTIAL BEARER".split()
@@ -156,12 +176,21 @@ class Result:
     files: int = 0
     denied: int = 0
     binary: int = 0
+    symlinks: int = 0
+    unreadable: list[str] = field(default_factory=list)
+    whole_files: bool = False
 
     def summary(self) -> str:
+        what = "lines" if self.whole_files else "added lines"
+        extra = (
+            f", {self.symlinks} symlinks skipped, {len(self.unreadable)} unreadable"
+            if self.whole_files
+            else ""
+        )
         return (
-            f"secret-scan: scanned {self.lines} added lines in {self.files} files "
+            f"secret-scan: scanned {self.lines} {what} in {self.files} files "
             f"({len(self.allowed)} allowed, {self.denied} denied-type files, "
-            f"{self.binary} binary files)"
+            f"{self.binary} binary files{extra})"
         )
 
 
@@ -358,6 +387,24 @@ def is_secret_file(path: str) -> bool:
     )
 
 
+def _scan_lines(result: Result, shown: str, path: str, lines: Sequence[tuple[int, str]]) -> None:
+    """Apply the per-file rules (deny-list, config-like, markdown, Dockerfile) to ``lines``."""
+    name = PurePosixPath(path).name.lower()
+    suffix = PurePosixPath(name).suffix
+    denied = name == "package-lock.json" or name.endswith(DENY_ENDINGS)
+    config = (
+        suffix in CONFIG_SUFFIXES or suffix == ".example" or name.startswith((".env", "dockerfile"))
+    )
+    docker = name.startswith("dockerfile")
+    result.files += 1
+    result.denied += denied
+    result.lines += len(lines)
+    for number, text in lines:
+        hits, allowed = scan_line(shown, number, text, not denied, config, suffix == ".md", docker)
+        result.hits += hits
+        result.allowed += allowed
+
+
 def scan_diff(diff: bytes, binary_paths: Collection[str] = ()) -> Result:
     """Scan git diff bytes; ``binary_paths`` are numstat ``-`` paths (a NUL confirms binary)."""
     result = Result()
@@ -367,24 +414,88 @@ def scan_diff(diff: bytes, binary_paths: Collection[str] = ()) -> Result:
         if item.path in binary_paths and any("\x00" in text for _no, text in item.lines):
             result.binary += 1
             continue
-        name = PurePosixPath(item.path).name.lower()
-        suffix = PurePosixPath(name).suffix
-        denied = name == "package-lock.json" or name.endswith(DENY_ENDINGS)
-        config = (
-            suffix in CONFIG_SUFFIXES
-            or suffix == ".example"
-            or name.startswith((".env", "dockerfile"))
-        )
-        docker = name.startswith("dockerfile")
-        result.files += 1
-        result.denied += denied
-        result.lines += len(item.lines)
-        for number, text in item.lines:
-            hits, allowed = scan_line(
-                item.shown, number, text, not denied, config, suffix == ".md", docker
-            )
-            result.hits += hits
-            result.allowed += allowed
+        _scan_lines(result, item.shown, item.path, item.lines)
+    return result
+
+
+def quote_path(path: str) -> str:
+    """Render ``path`` as git does: C-quoted if it has a control, non-ASCII, quote or backslash."""
+    out, quoted = [], False
+    for byte in os.fsencode(path):
+        if byte in b'"\\':
+            out.append("\\" + chr(byte))
+            quoted = True
+        elif byte < 32 or byte >= 127:
+            out.append({9: "\\t", 10: "\\n"}.get(byte, f"\\{byte:03o}"))
+            quoted = True
+        else:
+            out.append(chr(byte))
+    text = "".join(out)
+    return f'"{text}"' if quoted else text
+
+
+def _walk(root: str, result: Result) -> Iterator[str]:
+    """Regular files under ``root`` (or ``root`` itself), never following a symlink."""
+    if os.path.islink(root):
+        result.symlinks += 1
+    elif os.path.isdir(root):
+
+        def unlistable(error: OSError) -> None:  # os.walk would skip the directory silently
+            result.unreadable.append(quote_path(os.path.normpath(str(error.filename or root))))
+
+        for dirpath, dirnames, filenames in os.walk(root, onerror=unlistable, followlinks=False):
+            dirnames[:] = sorted(d for d in dirnames if d != ".git")
+            result.symlinks += sum(os.path.islink(os.path.join(dirpath, d)) for d in dirnames)
+            for name in sorted(filenames):
+                path = os.path.join(dirpath, name)
+                if os.path.islink(path):
+                    result.symlinks += 1
+                else:
+                    yield path
+    elif os.path.exists(root):
+        yield root
+    else:
+        raise RuntimeError("a given path does not exist")
+
+
+def _file_lines(path: str) -> list[tuple[int, str]] | None:
+    """Numbered lines of a text file, or None for a binary one. OSError if unreadable or huge."""
+    info = os.stat(path)
+    if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_FILE_BYTES:
+        raise OSError("not a regular file, or too large")
+    with open(path, "rb") as handle:
+        data = handle.read()
+    if b"\x00" in data[:BINARY_PROBE]:
+        return None
+    rows = data.split(b"\n")
+    if rows and rows[-1] == b"":
+        rows.pop()
+    patch = path.lower().endswith(PATCH_SUFFIXES)
+    lines = []
+    for number, raw in enumerate(rows, 1):
+        text = raw.decode("utf-8", "replace")
+        lines.append((number, text[1:] if patch and text[:1] in ("+", "-", " ") else text))
+    return lines
+
+
+def scan_files(roots: Sequence[str]) -> Result:
+    """Scan every line of the given files and directories (whole-file mode)."""
+    result = Result(whole_files=True)
+    for root in roots:
+        for path in _walk(root, result):
+            shown = quote_path(os.path.normpath(path))
+            if is_secret_file(path):
+                result.hits.append(Hit(shown, 0, "-", "secret-file"))
+                continue  # never read it
+            try:
+                lines = _file_lines(path)
+            except OSError:
+                result.unreadable.append(shown)
+                continue
+            if lines is None:
+                result.binary += 1
+            else:
+                _scan_lines(result, shown, path, lines)
     return result
 
 
@@ -411,21 +522,52 @@ def get_diff(rev: str | None) -> tuple[bytes, set[str]]:
     return outputs[0], binary
 
 
+USAGE = (
+    "secret-scan: usage: check_secret_literals.py [<A..B> | --files [--] PATH ...] [--allow-empty]"
+)
+
+
+def _file_roots(args: list[str]) -> list[str] | None:
+    """Paths after ``--files`` (``--`` ends options); None if the arguments are invalid."""
+    index = args.index("--files")
+    if any(arg != "--allow-empty" for arg in args[:index]):
+        return None  # a revision cannot be combined with --files
+    roots, options = [], True
+    for arg in args[index + 1 :]:
+        if options and arg == "--":
+            options = False
+        elif options and arg == "--allow-empty":
+            continue
+        elif options and arg.startswith("-"):
+            return None
+        else:
+            roots.append(arg)
+    return roots or None
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     allow_empty = "--allow-empty" in args
     revs = [a for a in args if a != "--allow-empty"]
-    if len(revs) > 1 or (revs and not REV_RE.fullmatch(revs[0])):
-        print(
-            "secret-scan: usage: check_secret_literals.py [<A..B>] [--allow-empty]", file=sys.stderr
-        )
+    roots = _file_roots(args) if "--files" in args else None
+    if "--files" in args:
+        if roots is None:
+            print(USAGE, file=sys.stderr)
+            return 2
+    elif len(revs) > 1 or (revs and not REV_RE.fullmatch(revs[0])):
+        print(USAGE, file=sys.stderr)
         return 2
     try:
-        diff, binary = get_diff(revs[0] if revs else None)
+        if roots is not None:
+            result = scan_files(roots)
+        else:
+            diff, binary = get_diff(revs[0] if revs else None)
+            result = scan_diff(diff, binary)
     except RuntimeError as exc:
         print(f"secret-scan: {exc}", file=sys.stderr)
         return 2
-    result = scan_diff(diff, binary)
+    for path in result.unreadable:
+        print(f"{path}: unreadable or too large", file=sys.stderr)
     for hit in result.hits:
         print(hit.render())
     for hit in result.allowed:
@@ -434,6 +576,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if result.hits:
         print(f"secret-scan: {len(result.hits)} finding(s); see the docstring.", file=sys.stderr)
         return 1
+    if result.unreadable:
+        print("secret-scan: some files could not be read; refusing to pass.", file=sys.stderr)
+        return 2
     if result.lines == 0 and not allow_empty:
         print("secret-scan: nothing was scanned; refusing to pass.", file=sys.stderr)
         return 2
