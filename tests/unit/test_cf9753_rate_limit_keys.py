@@ -8,12 +8,14 @@ from __future__ import annotations
 import types
 import uuid
 from collections.abc import Iterator
+from typing import NoReturn
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from slowapi import Limiter
 from starlette.requests import Request
+from structlog.testing import capture_logs
 
 from api import rate_limit
 from api.config import get_settings
@@ -168,3 +170,55 @@ def test_stop_bucket_is_separate_from_other_write_methods_on_the_same_template(
     assert _codes(client, "POST", path, 3) == [200, 200, 429]
     assert _codes(client, "PUT", path, 1) == [405]  # PUT is a write method too
     assert _codes(client, "DELETE", path, 3) == [200, 200, 429]
+
+
+def _raw(c: TestClient, method: str, path: str, n: int = 1) -> list[int]:
+    """Like _codes, but a redirect is reported, not followed (it would hit the canonical path)."""
+    return [
+        c.request(
+            method, path, headers={"X-Forwarded-For": "10.0.0.1"}, follow_redirects=False
+        ).status_code
+        for _ in range(n)
+    ]
+
+
+def _boom(*_: object, **__: object) -> NoReturn:
+    raise RuntimeError("limiter fault")
+
+
+@pytest.mark.parametrize("fault", ["lookup", "storage"])
+def test_limiter_fault_fails_open_and_is_logged(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    if fault == "lookup":
+        monkeypatch.setattr(rate_limit, "_route_template", _boom)
+    else:
+        monkeypatch.setattr(rate_limit.limiter._limiter, "hit", _boom)
+    with capture_logs() as logs:
+        assert set(_codes(client, "GET", RUN, 5)) == {200}  # read limit is 3: nothing is counted
+        assert set(_codes(client, "DELETE", f"{RUN}/{uuid.uuid4()}", 5)) == {200}
+    failed = [e for e in logs if e["event"] == "rate_limit.check_failed"]
+    assert len(failed) == 10
+
+
+def test_emergency_paths_never_reach_the_lookup(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(rate_limit, "_route_template", _boom)
+    with capture_logs() as logs:
+        assert set(_codes(client, "POST", f"{RUN}/{uuid.uuid4()}/emergency-stop", 5)) == {200}
+        assert set(_codes(client, "POST", KILL, 5)) == {200}
+    assert not [e for e in logs if e["event"] == "rate_limit.check_failed"]
+
+
+def test_slash_form_stop_calls_do_not_use_up_the_canonical_stop_bucket(client: TestClient) -> None:
+    path = f"{RUN}/{uuid.uuid4()}"
+    assert _raw(client, "DELETE", path + "/", 3) == [307, 307, 429]  # unmatched bucket, limit 2
+    assert _codes(client, "DELETE", path, 3) == [200, 200, 429]
+
+
+def test_kill_switch_slash_form_is_limited_while_the_canonical_path_stays_exempt(
+    client: TestClient,
+) -> None:
+    assert _raw(client, "POST", KILL + "/", 3) == [307, 307, 429]
+    assert set(_codes(client, "POST", KILL, 6)) == {200}
