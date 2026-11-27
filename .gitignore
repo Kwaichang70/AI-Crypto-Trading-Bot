@@ -272,6 +272,9 @@ $RECYCLE.BIN/
 *.pt
 *.pth
 models/
+# The UI route directory apps/ui/src/app/models/ is source code, not an artefact directory
+# (the artefacts live in the repo-root models/ that compose mounts at /app/models).
+!apps/ui/src/app/models/
 model_artifacts/
 
 # Data files downloaded at runtime
