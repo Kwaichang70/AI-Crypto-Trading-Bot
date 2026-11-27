@@ -17,6 +17,7 @@ from typing import Any, ClassVar
 import pytest
 
 from common.types import RunMode
+from trading.costs import get_cost_profile
 from trading.exit_config import (
     ExitConfigError,
     ExitCostModel,
@@ -31,8 +32,10 @@ from trading.exit_config import (
 )
 from trading.strategy import BaseStrategy
 
-_COST = ExitCostModel.from_risk_parameters()
-_C_SIDE = _COST.c_side  # 0.0065 with code defaults
+# WP2.1: this module's boundary maths is calibrated on the pre-WP2.1 runtime cost
+# model (taker 60 + slippage 5 bps -> side cost 0.0065), pinned explicitly.
+_COST = ExitCostModel.from_cost_profile(get_cost_profile("legacy_runtime_v0"))
+_C_SIDE = _COST.c_side  # 0.0065
 _C_RT = _COST.c_rt  # 0.013
 
 

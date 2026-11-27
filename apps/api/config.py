@@ -8,6 +8,9 @@ Environment variables always take priority over .env file values.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+from collections.abc import Mapping
 from functools import lru_cache
 from typing import Any, Literal
 from urllib.parse import quote
@@ -20,7 +23,18 @@ __all__ = [
     "get_settings",
     "iter_settings_secrets",
     "register_settings_secrets",
+    "warn_ignored_cost_profile_env",
 ]
+
+# CF-97-37: SHA-256 digests of well-known placeholder keys.  A hash cannot be
+# entropy-tested, so a denylist is the honest scope of production rule 3.
+_WEAK_API_KEY_HASHES: frozenset[str] = frozenset(
+    hashlib.sha256(k.encode()).hexdigest()
+    for k in (
+        "", "changeme", "password", "secret", "test", "dev",
+        "my-secret-api-key", "my-secret-key", "test-integration-api-key-2026",
+    )
+)
 
 
 class Settings(BaseSettings):
@@ -49,6 +63,14 @@ class Settings(BaseSettings):
     app_name: str = Field(default="AI Crypto Trading Bot", description="Human-readable app name")
     app_version: str = Field(default="0.1.0", description="Semantic version string")
     debug: bool = Field(default=False, description="Enable debug mode — never True in production")
+    environment: Literal["development", "test", "production"] = Field(
+        default="development",
+        description=(
+            "Deployment environment (env ENVIRONMENT). 'production' enforces the "
+            "posture checks in _validate_production_posture and switches off "
+            "?api_key= and the docs URLs. Compose feeds it from TRADING_ENVIRONMENT."
+        ),
+    )
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = Field(
         default="INFO", description="Structured log level"
     )
@@ -285,6 +307,15 @@ class Settings(BaseSettings):
         description="Exchange API passphrase (e.g. Coinbase legacy keys) — never logged",
     )
 
+    ohlcv_cache_mode: Literal["off", "read_through", "require"] = Field(
+        default="off",
+        description=(
+            "History cache for backtest/optimize bars (WP2.6): off = exchange only; "
+            "read_through = cache, falls back to the exchange; require = fail closed (503 "
+            "ohlcv_store_unavailable, also for a request far from the cached range: widen it)"
+        ),
+    )
+
     # ------------------------------------------------------------------
     # Live trading safety gates (all three must be satisfied)
     # ------------------------------------------------------------------
@@ -442,8 +473,12 @@ class Settings(BaseSettings):
         default=90,
         ge=1,
         le=365,
-        description="Days to keep raw equity snapshots before pruning. "
-                    "Snapshots older than this are deleted daily at UTC midnight.",
+        description="Days to keep raw equity snapshots before pruning "
+                    "(checked daily). paper/live runs: snapshots whose timestamp "
+                    "is older than this are deleted. backtest runs: ALL of a "
+                    "run's snapshots are deleted once the run's created_at is "
+                    "older than this (simulated snapshot timestamps are ignored). "
+                    "Any other run mode is never pruned.",
     )
     idempotency_key_ttl_hours: int = Field(
         default=24,
@@ -531,16 +566,17 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     # Walk-Forward OOS Model Activation Gate (Sprint 50 Cycle 6)
     # The gate metric is now a REALIZED out-of-sample trading Sharpe computed by
-    # a per-fold BacktestRunner mini-backtest (net Coinbase 60/40 bps fees +
-    # Sprint-42 slippage). It REPLACES the Cycle-5 directional z-score proxy.
+    # a per-fold BacktestRunner mini-backtest (net of the platform default
+    # trading.costs.CostProfile fees + slippage, WP2.1). It REPLACES the Cycle-5
+    # directional z-score proxy.
     # ------------------------------------------------------------------
     min_oos_skill_score: float = Field(
         default=1.0,
         ge=0.0,
         le=5.0,
         description=(
-            "Minimum median realized OOS trading Sharpe (net Coinbase 60/40 bps "
-            "fees + Sprint-42 slippage) across walk-forward folds required to "
+            "Minimum median realized OOS trading Sharpe (net of the default "
+            "CostProfile fees + slippage, WP2.1) across walk-forward folds required to "
             "activate a model version via PUT /ml/models/{id}/activate.  "
             "Default 1.0 -- a realized annualised Sharpe of 1.0 on the "
             "out-of-sample window is a conventional floor for a deployable "
@@ -731,6 +767,38 @@ class Settings(BaseSettings):
             )
         return self
 
+    @model_validator(mode="after")
+    def _validate_production_posture(self) -> Settings:
+        """CF-97-37: refuse to start in production with a weak auth posture.
+
+        Messages are fixed text and never include a value (hide_input_in_errors).
+        The weak-hash check is a denylist of well-known digests, not an entropy
+        test.  There is deliberately no flag that lets production run open.
+        """
+        if self.environment != "production":
+            return self
+        hashes = [h for h in (self.api_key_hash, self.api_key_hash_secondary) if h]
+        admin = self.admin_api_key.get_secret_value()
+        admin_hash = hashlib.sha256(admin.encode()).hexdigest() if admin else ""
+        problems = [
+            msg
+            for failed, msg in (
+                (not self.require_api_auth, "require_api_auth must be true"),
+                (not self.api_key_hash, "api_key_hash must be set"),
+                (any(h in _WEAK_API_KEY_HASHES for h in hashes), "an api key hash is weak"),
+                (
+                    bool(admin_hash) and any(hmac.compare_digest(admin_hash, h) for h in hashes),
+                    "admin_api_key must differ from the api key",
+                ),
+                (not self.rate_limit_enabled, "rate_limit_enabled must be true"),
+                (self.debug, "debug must be false"),
+            )
+            if failed
+        ]
+        if problems:
+            raise ValueError("environment=production refused: " + "; ".join(problems))
+        return self
+
 
 
 @lru_cache(maxsize=1)
@@ -840,3 +908,31 @@ def register_settings_secrets(settings: Settings) -> int:
     for name, reason in sorted(skipped):
         log.warning("log_redaction.secret_not_registered", field=name, reason=reason)
     return total
+
+
+def warn_ignored_cost_profile_env(environ: Mapping[str, str] | None = None) -> list[str]:
+    """WP2.1 (SY-21-02): warn that a cost-profile environment variable is IGNORED.
+
+    The default cost profile is the reviewed code constant
+    ``trading.costs.DEFAULT_COST_PROFILE_ID``; no environment variable (not
+    ``DEFAULT_COST_PROFILE``, not any name containing ``COST_PROFILE``) can
+    change it, so an operator must not believe one does.  Logs ONE warning
+    ``cost_profile.env_ignored`` carrying the variable NAMES only (never a
+    value) and returns the names.  ``Settings`` deliberately has no cost field.
+    """
+    import os
+
+    import structlog
+
+    source: Mapping[str, str] = os.environ if environ is None else environ
+    names = sorted(name for name in source if "COST_PROFILE" in name.upper())
+    if names:
+        structlog.get_logger(__name__).warning(
+            "cost_profile.env_ignored",
+            names=names,
+            msg=(
+                "Cost-profile environment variables are ignored: the default is a "
+                "reviewed code constant (trading.costs.DEFAULT_COST_PROFILE_ID)."
+            ),
+        )
+    return names

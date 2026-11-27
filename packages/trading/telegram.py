@@ -96,11 +96,12 @@ class TelegramNotifier:
             ) as resp:
                 if resp.status == 200:
                     return True
-                body = await resp.text()
+                # CF-2401-110: the HTTP status only.  The response body is neither
+                # read nor logged (Bot API error JSON can carry chat ids and other
+                # provider text).
                 logger.warning(
                     "telegram.send_failed",
                     status=resp.status,
-                    body=body[:200],
                 )
                 return False
         except Exception as exc:

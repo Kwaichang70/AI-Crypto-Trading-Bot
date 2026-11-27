@@ -29,6 +29,8 @@ import type { Strategy, StrategyListResponse } from "@/lib/types";
 const mockPush = jest.fn();
 const mockSearchGet = jest.fn(() => null);
 
+// CF-97-43: write controls sit behind <AdminOnly>; these suites exercise the admin path.
+jest.mock("next-auth/react", () => ({ useSession: () => ({ data: { user: { role: "admin" } }, status: "authenticated" }) }));
 jest.mock("next/navigation", () => ({
   useRouter: () => ({ push: mockPush }),
   useSearchParams: () => ({ get: mockSearchGet }),
@@ -157,7 +159,9 @@ describe("NewRunPage — auto-correct mode", () => {
     expect(mode("paper")).toBeChecked();
 
     // Switch strategy to the demoted one via the dropdown.
-    const select = screen.getByRole("combobox") as HTMLSelectElement;
+    // WP2.1b: the form now also has a "Cost profile" <select>, so the strategy
+    // dropdown is queried by its accessible name, never by position (CR-13).
+    const select = screen.getByRole("combobox", { name: "Strategy" }) as HTMLSelectElement;
     fireEvent.change(select, { target: { value: "ma_crossover" } });
 
     // The auto-correct effect must flip the mode back to backtest.

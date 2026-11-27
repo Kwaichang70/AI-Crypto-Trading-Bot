@@ -21,6 +21,16 @@ Usage
     python scripts/wp13a_exit_config_precheck.py
     python scripts/wp13a_exit_config_precheck.py --run-id <UUID>
     python scripts/wp13a_exit_config_precheck.py --json
+    python scripts/wp13a_exit_config_precheck.py --cost-profile coinbase_advanced_1
+
+WP2.1 (X-7): each run is validated at ITS OWN cost profile (the resume/boot
+basis -- a legacy run resolves to ``legacy_runtime_v0``, 0.0065 side cost).
+``--cost-profile <id>`` additionally re-validates every run at the PROMOTE
+basis of that profile (the stricter of the platform default and ``<id>``) and
+lists the ones that would be rejected as ``would_fail_at_promote`` -- e.g. a
+persisted fixed SL/TP in (0.0065, 0.0130] under ``coinbase_advanced_1``.  That
+is informational only (it does NOT change the exit code): such a run still
+resumes, it just cannot be created or promoted afresh.
 
 Exit codes
 ----------
@@ -55,7 +65,11 @@ _NON_TERMINAL_STATUSES = ("running", "orphaned", "resuming")
 
 
 def _check_one_run(
-    run_id: uuid.UUID, run_mode: str, status_value: str, config: dict[str, Any]
+    run_id: uuid.UUID,
+    run_mode: str,
+    status_value: str,
+    config: dict[str, Any],
+    promote_profile_id: str | None = None,
 ) -> dict[str, Any]:
     """Run the shared validator against one run's persisted config.
 
@@ -63,7 +77,13 @@ def _check_one_run(
     raises; every failure mode is captured in the returned dict.
     """
     from common.types import RunMode
-    from trading.exit_config import ExitConfigError, validate_run_exit_config
+    from trading.costs import get_cost_profile, resolve_run_cost_profile
+    from trading.exit_config import (
+        ExitConfigError,
+        ExitCostModel,
+        policy_cost_model,
+        validate_run_exit_config,
+    )
     from trading.strategy_availability import get_availability, is_mode_allowed
 
     entry: dict[str, Any] = {
@@ -75,6 +95,8 @@ def _check_one_run(
         "codes": [],
         "warnings": [],
         "note": None,
+        "would_fail_at_promote": False,
+        "promote_codes": [],
     }
 
     strategy_name_raw = str(config.get("strategy_name", ""))
@@ -104,6 +126,10 @@ def _check_one_run(
 
     strategy_params: dict[str, Any] = config.get("strategy_params") or {}
     bracket_config: dict[str, Any] = config.get("bracket_config") or {}
+    # WP2.1: the resume/boot basis is the run's OWN resolved profile (read-only).
+    own_profile = resolve_run_cost_profile(
+        config, mode="live" if run_mode == "live" else "paper", log_invalid=False
+    ).profile
     try:
         verdict = validate_run_exit_config(
             strategy_cls,
@@ -112,6 +138,7 @@ def _check_one_run(
             mode=run_mode_enum,
             allow_pyramiding=config.get("allow_pyramiding"),
             timeframe=str(config.get("timeframe", "1h")),
+            cost=ExitCostModel.from_cost_profile(own_profile),
         )
     except ExitConfigError as exc:
         entry["valid"] = False
@@ -124,10 +151,28 @@ def _check_one_run(
 
     entry["valid"] = True
     entry["warnings"] = [w.code for w in verdict.warnings]
+
+    if promote_profile_id is not None:
+        # WP2.1 (X-7): would a fresh create / promote under that profile reject it?
+        try:
+            validate_run_exit_config(
+                strategy_cls,
+                bracket=bracket_config,
+                trailing_stop_pct=strategy_params.get("trailing_stop_pct"),
+                mode=run_mode_enum,
+                allow_pyramiding=config.get("allow_pyramiding"),
+                timeframe=str(config.get("timeframe", "1h")),
+                cost=policy_cost_model(get_cost_profile(promote_profile_id)),
+            )
+        except ExitConfigError as exc:
+            entry["would_fail_at_promote"] = True
+            entry["promote_codes"] = [i.reason for i in exc.issues] or [exc.code]
     return entry
 
 
-async def _run(run_id_filter: uuid.UUID | None) -> list[dict[str, Any]]:
+async def _run(
+    run_id_filter: uuid.UUID | None, promote_profile_id: str | None = None
+) -> list[dict[str, Any]]:
     from sqlalchemy import select
 
     from api.db.models import RunORM
@@ -156,7 +201,9 @@ async def _run(run_id_filter: uuid.UUID | None) -> list[dict[str, Any]]:
 
     for run in runs:
         config = dict(run.config or {})
-        entry = _check_one_run(run.id, run.run_mode, run.status, config)
+        entry = _check_one_run(
+            run.id, run.run_mode, run.status, config, promote_profile_id=promote_profile_id
+        )
         results.append(entry)
 
     return results
@@ -178,15 +225,19 @@ def _print_report(results: list[dict[str, Any]], *, as_json: bool) -> int:
                 line += f" codes={entry['codes']}"
             if entry["warnings"]:
                 line += f" warnings={entry['warnings']}"
+            if entry.get("would_fail_at_promote"):
+                line += f" would_fail_at_promote codes={entry['promote_codes']}"
             if entry["note"]:
                 line += f" note={entry['note']!r}"
             print(line)
 
     total = len(results)
     invalid = [e for e in results if not e["valid"]]
+    promote_blocked = [e for e in results if e.get("would_fail_at_promote")]
     print(
-        f"wp13a-precheck: {total} run(s) checked, {len(invalid)} invalid. "
-        "No writes were made."
+        f"wp13a-precheck: {total} run(s) checked, {len(invalid)} invalid"
+        + (f", {len(promote_blocked)} would fail at promote" if promote_blocked else "")
+        + ". No writes were made."
     )
     return 1 if invalid else 0
 
@@ -204,7 +255,25 @@ def main() -> int:
         action="store_true",
         help="Emit machine-readable JSON instead of the human-readable report.",
     )
+    parser.add_argument(
+        "--cost-profile",
+        type=str,
+        default=None,
+        help=(
+            "WP2.1: also list runs that would fail a fresh create/PROMOTE under this "
+            "cost-profile registry id (informational; e.g. coinbase_advanced_1)."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.cost_profile is not None:
+        from trading.costs import CostProfileError, get_cost_profile
+
+        try:
+            get_cost_profile(args.cost_profile)
+        except CostProfileError:
+            print("wp13a-precheck: unknown --cost-profile id", file=sys.stderr)
+            return 2
 
     run_id_filter: uuid.UUID | None = None
     if args.run_id is not None:
@@ -215,7 +284,7 @@ def main() -> int:
             return 2
 
     try:
-        results = asyncio.run(_run(run_id_filter))
+        results = asyncio.run(_run(run_id_filter, args.cost_profile))
     except Exception as exc:
         print(f"wp13a-precheck: fatal error: {exc}", file=sys.stderr)
         return 2

@@ -19,6 +19,7 @@ Tests:
   TestAdminApiKeyValidator — 6 validator cases (§Fix-H)
 """
 
+import secrets
 import uuid
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -90,7 +91,7 @@ async def test_require_admin_absent_header_returns_401() -> None:
 
 @pytest.mark.asyncio
 async def test_require_admin_wrong_key_returns_403() -> None:
-    settings = _make_settings(admin_key="correct-key-with-numbers-12345678901")
+    settings = _make_settings(admin_key=secrets.token_hex(16))
     with pytest.raises(HTTPException) as exc_info:
         await require_admin(
             request=_make_request(),
@@ -115,11 +116,12 @@ async def test_require_admin_not_configured_returns_401() -> None:
 
 @pytest.mark.asyncio
 async def test_require_admin_correct_key_passes() -> None:
-    settings = _make_settings(admin_key="secret-key-with-numbers-12345678901")
+    key = secrets.token_hex(16)
+    settings = _make_settings(admin_key=key)
     # Should not raise
     result = await require_admin(
         request=_make_request(),
-        header_key="secret-key-with-numbers-12345678901",
+        header_key=key,
         settings=settings,
     )
     assert result is None  # dependency returns None on success
@@ -364,10 +366,12 @@ async def test_kill_switch_audit_written_before_latch() -> None:
 class TestAdminApiKeyValidator:
     """Tests for the _validate_admin_api_key field_validator in Settings."""
 
-    def _make_settings_with_key(self, key: str) -> Settings:
-        import os
+    @pytest.fixture(autouse=True)
+    def _database_url(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Scoped to the test: a process-global write leaked into test_cf36_dsn.py (CF-97-59).
+        monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://test:test@localhost/test")
 
-        os.environ["DATABASE_URL"] = "postgresql+asyncpg://test:test@localhost/test"
+    def _make_settings_with_key(self, key: str) -> Settings:
         return Settings(admin_api_key=key)  # type: ignore[arg-type]
 
     def test_empty_sentinel_allowed(self) -> None:
@@ -397,6 +401,6 @@ class TestAdminApiKeyValidator:
 
     def test_valid_hex_key_accepted(self) -> None:
         """A valid 64-char hex key (openssl rand -hex 32 output) must pass."""
-        valid_key = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2"
+        valid_key = secrets.token_hex(32)  # 64 chars, built per run (PR-HYG-01)
         s = self._make_settings_with_key(valid_key)
         assert s.admin_api_key.get_secret_value() == valid_key

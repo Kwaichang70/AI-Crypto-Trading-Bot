@@ -48,14 +48,18 @@ from api.db.models import (
     PositionSnapshotORM,
     TradeORM,
 )
+from api.services import spawn_hooks
 from api.services.audit_log import record_audit_event
 from common.types import TimeFrame
-from trading.exit_config import ExitConfigError, resolve_run_exit_check
+from trading.clock import WALL_CLOCK, ambient_clock
+from trading.costs import CostProfile
+from trading.exit_config import ExitConfigError, ExitCostModel, resolve_run_exit_check
 from trading.recovery import ResumeSnapshot
 from trading.safety import (
     CircuitBreakerResponse,
     CircuitBreakerTransition,
     build_run_circuit_breaker,
+    live_context_consumer_refusal,
 )
 from trading.smoke_guard import SMOKE_STRATEGY_NAMES, SmokeGuardError, validate_smoke_run
 
@@ -815,9 +819,15 @@ async def _auto_retry_paper_run(
     bracket_config: dict[str, object] | None,
     enable_adaptive_learning: bool,
     auto_apply_learning: bool,
+    cost_profile: CostProfile,
     allow_pyramiding: bool = False,
 ) -> None:
     """Recreate a crashed paper run after a backoff (bounded attempts).
+
+    WP2.1 (AG-04): the crashed run's RESOLVED ``cost_profile`` is COPIED onto
+    the new run (a legacy run stays legacy: ``legacy_runtime_v0`` metadata with
+    ``source="legacy_inferred"``), so a retry never silently re-prices a run
+    under today's default.
 
     ``auto_retry_attempt`` is the attempt counter of the CRASHED run (0 for
     an original run); the new run carries ``auto_retry_attempt + 1``.
@@ -896,6 +906,8 @@ async def _auto_retry_paper_run(
             # at its call site; nothing else consumes it (CR-006).
             new_config["auto_retry_attempt"] = next_attempt
             new_config["auto_retried_from"] = crashed_run_id
+            # WP2.1: copy the crashed run's resolved profile (paper => model fees).
+            new_config["cost_profile"] = cost_profile.to_metadata(fee_source="model")
             now = datetime.now(tz=UTC)
             db.add(
                 RunORM(
@@ -924,9 +936,11 @@ async def _auto_retry_paper_run(
                 auto_apply_learning=auto_apply_learning,
                 auto_retry_attempt=next_attempt,
                 allow_pyramiding=allow_pyramiding,
+                cost_profile=cost_profile,
             ),
             name=f"paper-engine-retry-{new_run_id}",
         )
+        spawn_hooks.on_run_spawned(new_run_id, "paper", symbols, timeframe, task)
         _RUN_TASKS[str(new_run_id)] = task
         log.info(
             "runs.auto_retry_started",
@@ -956,6 +970,7 @@ async def run_paper_engine(
     elapsed_seconds: float = 0.0,
     entries_latch_reason: str | None = None,
     allow_pyramiding: bool = False,
+    cost_profile: CostProfile,
 ) -> None:
     """
     Background coroutine that runs a paper trading engine for a single run.
@@ -1018,6 +1033,12 @@ async def run_paper_engine(
         recovering/resuming a run that has one. ``None`` for a fresh run
         (``create_run`` never sets one -- a brand-new row has no history to
         latch on).
+    cost_profile:
+        WP2.1 (SY-21-14): the run's resolved :class:`~trading.costs.CostProfile`.
+        REQUIRED (keyword), so a start site that forgets it fails mypy / at
+        call time instead of silently pricing the run at the default.  Reaches
+        both ``PaperExecutionEngine`` (fees, slippage) and ``StrategyEngine``
+        (exit-cost floor / stop-cost log).
     """
     from api.config import get_settings
     from api.db.models import RunORM
@@ -1066,6 +1087,15 @@ async def run_paper_engine(
     auto_stop_task: asyncio.Task[None] | None = None
 
     try:
+        # WP2.2 R6 (SY-22-R2-05): fail-closed entry tripwire -- a paper/live
+        # run must never execute under a simulated ambient clock.  Inside the
+        # ``try`` so the existing teardown marks the run errored.
+        if ambient_clock() is not WALL_CLOCK:
+            # WP22-P2B-SEC-06: deterministic, so the auto-retry (which would
+            # inherit the same ambient context) must not respawn the run.
+            _skip_auto_retry = True
+            raise RuntimeError("paper run started under a non-wall ambient clock")
+
         # WP-SMOKE (synthesis-spec.md section 7, G-13): defence in depth --
         # a no-op for every strategy except smoke_roundtrip. create_run
         # already rejects a violating config before this coroutine is ever
@@ -1108,7 +1138,8 @@ async def run_paper_engine(
             api_key=api_key,
             api_secret=api_secret,
             api_passphrase=api_passphrase,
-            cache_ttl_seconds=60,
+            # CF-97-15: no L1 cache (TTL 60 on a 1m poll served the previous bar every other poll)
+            cache_ttl_seconds=0,
         )
         risk_manager = DefaultRiskManager(run_id=run_id_str)
         # WP1.6 (C2): the run's circuit breaker, built from THIS run's risk
@@ -1118,6 +1149,7 @@ async def run_paper_engine(
         execution = PaperExecutionEngine(
             run_id=run_id_str,
             risk_manager=risk_manager,
+            cost_profile=cost_profile,
             initial_cash=capital,
         )
         if resume is not None:
@@ -1189,6 +1221,7 @@ async def run_paper_engine(
             run_mode=RunMode.PAPER,
             config=engine_config,
             circuit_breaker=circuit_breaker,
+            cost_profile=cost_profile,
         )
 
         _RUN_ENGINES[run_id_str] = engine
@@ -1437,6 +1470,7 @@ async def run_paper_engine(
                     enable_adaptive_learning=enable_adaptive_learning,
                     auto_apply_learning=auto_apply_learning,
                     allow_pyramiding=allow_pyramiding,
+                    cost_profile=cost_profile,
                 ),
                 name=f"auto-retry-{run_id_str[:8]}",
             )
@@ -1460,6 +1494,7 @@ async def run_live_engine(
     entries_latch_reason: str | None = None,
     allow_pyramiding: bool = False,
     exit_config_waived: bool = False,
+    cost_profile: CostProfile,
 ) -> None:
     """
     Background coroutine that runs a live trading engine for a single run.
@@ -1495,6 +1530,10 @@ async def run_live_engine(
         (0.0 for a fresh run) -- see ``run_paper_engine``.
     entries_latch_reason:
         WP1.7a (SY-02) -- see ``run_paper_engine``.
+    cost_profile:
+        WP2.1 (SY-21-14): REQUIRED keyword.  In live this is an ESTIMATE (the
+        ledger always uses the exchange's real fees): it feeds the exit-cost
+        floor, the stop-cost log and the two log-only drift checks.
     """
     from api.config import get_settings
     from api.db.models import RunORM
@@ -1529,6 +1568,12 @@ async def run_live_engine(
     auto_stop_task: asyncio.Task[None] | None = None
 
     try:
+        # WP2.2 R6 (SY-22-R2-05): fail-closed entry tripwire -- a paper/live
+        # run must never execute under a simulated ambient clock.  Inside the
+        # ``try`` so the existing teardown marks the run errored.
+        if ambient_clock() is not WALL_CLOCK:
+            raise RuntimeError("live run started under a non-wall ambient clock")
+
         if resume is not None:
             # WP1.8a-round2 (C-01/S-01 item 5): backstop against the
             # resume-vs-stop/kill-switch race.  This task is spawned right
@@ -1589,6 +1634,16 @@ async def run_live_engine(
                 allow_pyramiding=allow_pyramiding,
                 enable_adaptive_learning=enable_adaptive_learning,
             )
+            # CF-24-01 (SY-01-05, G-11): defence in depth for the live context-consumer
+            # gate, in the same block as the smoke guard so a mode=protective resume
+            # (which drops every entry and must stay able to exit) is exempt.  The
+            # router already answers 422 before this task is spawned; this holds the line
+            # for a caller that bypasses it.  Fail-closed (a missing or unreadable class
+            # is refused), BEFORE settings and the exchange build.  The message is the
+            # closed code only.
+            _refusal = live_context_consumer_refusal(strategy_name, strategy_cls)
+            if _refusal is not None:
+                raise RuntimeError(_refusal)
 
         settings = get_settings()
         capital = Decimal(initial_capital)
@@ -1617,7 +1672,8 @@ async def run_live_engine(
             api_key=api_key,
             api_secret=api_secret,
             api_passphrase=api_passphrase,
-            cache_ttl_seconds=60,
+            # CF-97-15: no L1 cache (TTL 60 on a 1m poll served the previous bar every other poll)
+            cache_ttl_seconds=0,
         )
         # R-02 (WP1.5): the single live risk-manager construction site -- fresh,
         # promoted and resumed live runs all reach it.  Live drawdown limit 20%;
@@ -1641,6 +1697,7 @@ async def run_live_engine(
             exchange=exchange,
             # Gate already enforced by LiveTradingGate in POST handler
             enable_live_trading=True,
+            cost_profile=cost_profile,
         )
         if resume is not None:
             # WP1.8a S6: rebuild the portfolio from persisted fills instead
@@ -1720,6 +1777,9 @@ async def run_live_engine(
             bracket=bracket_config,
             trailing_stop_pct=trailing_stop_pct,
             exit_config_waived=exit_config_waived,
+            # WP21A-CR-01/SEC-01: the SAME basis as the StrategyEngine parse
+            # below (the run's own profile), never the module default.
+            cost=ExitCostModel.from_cost_profile(cost_profile),
         )
         if _exit_check.interval_s is not None:
             live_engine_config["exit_check_interval_s"] = _exit_check.interval_s
@@ -1739,6 +1799,7 @@ async def run_live_engine(
             config=live_engine_config,
             protective_mode=protective_mode,
             circuit_breaker=circuit_breaker,
+            cost_profile=cost_profile,
         )
 
         _RUN_ENGINES[run_id_str] = engine

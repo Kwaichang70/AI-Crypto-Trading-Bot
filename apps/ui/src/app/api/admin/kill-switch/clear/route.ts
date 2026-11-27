@@ -18,6 +18,7 @@
 
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth-options";
+import { apiKeyHeader, retryAfterHeaders } from "@/lib/api-server";
 import { isAdmin } from "@/lib/auth";
 import { checkSameOriginJsonRequest } from "@/lib/admin-route-guards";
 
@@ -70,7 +71,10 @@ export async function POST(request: Request): Promise<Response> {
   }
 
   const apiBase = (process.env.INTERNAL_API_URL ?? "http://api:8000").replace(/\/$/, "");
-  const apiKey = process.env.API_KEY;
+  const keyHeader = apiKeyHeader();
+  if (!keyHeader) {
+    return Response.json({ error: "API key not configured on server" }, { status: 503 });
+  }
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
@@ -82,7 +86,7 @@ export async function POST(request: Request): Promise<Response> {
       headers: {
         "Content-Type": "application/json",
         "X-Admin-Key": adminKey,
-        ...(apiKey ? { "X-API-Key": apiKey } : {}),
+        ...keyHeader,
       },
       body: JSON.stringify({ reason: sanitisedReason }),
       signal: controller.signal,
@@ -97,7 +101,7 @@ export async function POST(request: Request): Promise<Response> {
   if (!upstream.ok) {
     return Response.json(
       { error: `Upstream returned HTTP ${upstream.status}`, status: upstream.status },
-      { status: upstream.status },
+      { status: upstream.status, headers: retryAfterHeaders(upstream) },
     );
   }
 

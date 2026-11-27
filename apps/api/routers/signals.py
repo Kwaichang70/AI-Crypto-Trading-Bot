@@ -4,8 +4,8 @@ apps/api/routers/signals.py
 GET /api/v1/signals/current — current cached values for all market signal sources.
 
 This endpoint is intentionally unauthenticated (no API key required) because
-it returns read-only, publicly-sourced market data that was already fetched by
-the background startup tasks.  It never touches the database and never
+it returns read-only, publicly-sourced market data that the context poller (CF-24-01)
+already validated and cached.  It never touches the database and never
 triggers a new outbound HTTP request — it only reads in-process cache values.
 
 Signal sources
@@ -15,7 +15,7 @@ Signal sources
 - FRED macro data          — data.macro_data.FREDClient
 - Whale Alert on-chain     — data.whale_tracker.WhaleAlertClient
 
-All four clients are started at API boot time (see apps/api/main.py lifespan).
+All four clients are built at API boot (see apps/api/main.py lifespan), refreshed by the poller.
 Each field in the response is ``null`` when the corresponding client is not
 configured, when no cache has been populated yet, or when the upstream API
 was unreachable on the last refresh attempt.

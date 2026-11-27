@@ -8,7 +8,7 @@ Database persistence models live in apps/api/db/models.py (to be created).
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime
 from decimal import Decimal
 from typing import Any
 from uuid import UUID, uuid4
@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from common.models import OHLCVBar as OHLCVBar  # noqa: F401
 from common.types import OrderSide, OrderStatus, OrderType, SignalDirection, TimeFrame
+from trading.clock import utc_now
 
 __all__ = [
     "Signal",
@@ -55,7 +56,7 @@ class Signal(BaseModel):
         description="Strategy confidence in this signal, used for fractional sizing",
     )
     generated_at: datetime = Field(
-        default_factory=lambda: datetime.now(tz=UTC),
+        default_factory=utc_now,
         description="UTC timestamp when the signal was generated",
     )
     metadata: dict[str, Any] = Field(
@@ -119,8 +120,8 @@ class Order(BaseModel):
         default=None,
         description="Exchange-assigned order ID. None until acknowledged.",
     )
-    created_at: datetime = Field(default_factory=lambda: datetime.now(tz=UTC))
-    updated_at: datetime = Field(default_factory=lambda: datetime.now(tz=UTC))
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
 
     @model_validator(mode="after")
     def validate_order_constraints(self) -> Order:
@@ -154,7 +155,7 @@ class Fill(BaseModel):
         default=False,
         description="True if this fill earned maker fee (resting limit order)",
     )
-    executed_at: datetime = Field(default_factory=lambda: datetime.now(tz=UTC))
+    executed_at: datetime = Field(default_factory=utc_now)
     # QT-009 (Sprint 42): execution-quality telemetry — when the engine
     # had a pre-execution price expectation, capture both the expected price
     # and the realised slippage so downstream reports can answer:
@@ -203,8 +204,8 @@ class Position(BaseModel):
     realised_pnl: Decimal = Field(default=Decimal(0), description="Cumulative realised PnL in quote")
     unrealised_pnl: Decimal = Field(default=Decimal(0), description="Current unrealised PnL in quote")
     total_fees_paid: Decimal = Field(default=Decimal(0), ge=Decimal(0))
-    opened_at: datetime = Field(default_factory=lambda: datetime.now(tz=UTC))
-    updated_at: datetime = Field(default_factory=lambda: datetime.now(tz=UTC))
+    opened_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
 
     @property
     def notional_value(self) -> Decimal:
@@ -282,7 +283,7 @@ class SkippedTrade(BaseModel):
     signal_context: dict[str, Any] | None = Field(default=None)
     hypothetical_entry_price: Decimal | None = Field(default=None)
     hypothetical_outcome_pct: float | None = Field(default=None)
-    skipped_at: datetime = Field(default_factory=lambda: datetime.now(tz=UTC))
+    skipped_at: datetime = Field(default_factory=utc_now)
 
 
 class RiskCheckResult(BaseModel):
@@ -300,4 +301,4 @@ class RiskCheckResult(BaseModel):
     adjusted_quantity: Decimal = Field(ge=Decimal(0))
     rejection_reasons: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
-    checked_at: datetime = Field(default_factory=lambda: datetime.now(tz=UTC))
+    checked_at: datetime = Field(default_factory=utc_now)

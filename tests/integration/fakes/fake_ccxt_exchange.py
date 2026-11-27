@@ -169,8 +169,17 @@ class FakeCCXTExchange:
         price lookup, ``fetchOrderTrades`` fallback).
     taker_fee_pct:
         Fraction (e.g. ``Decimal("0.006")`` = 0.60%) deducted from every
-        fill, matching the production Coinbase Advanced taker tier used
-        elsewhere in the codebase (``trading.risk.RiskParameters.taker_fee_pct``).
+        fill (a Coinbase Advanced taker tier; WP2.1 moved the codebase's own
+        fee model to ``trading.costs.CostProfile``).
+    maker_fee_pct:
+        WP2.1: the maker rate advertised in ``markets[*]["maker"]`` when
+        ``advertise_market_fees`` is on (defaults to the taker rate).
+    advertise_market_fees:
+        WP2.1: when True, ``load_markets`` adds ``taker`` / ``maker`` (floats,
+        like real ccxt) to every market, from ``taker_fee_pct`` /
+        ``maker_fee_pct``.  Off by default: the engine's BUY-cap buffer reads
+        ``market["taker"]`` and falls back to 1% when it is absent, which every
+        pre-WP2.1 harness test is calibrated to.
     """
 
     def __init__(
@@ -179,6 +188,8 @@ class FakeCCXTExchange:
         exchange_id: str = "coinbase",
         taker_fee_pct: Decimal = Decimal("0.006"),
         balance_mode: str = "v3",
+        maker_fee_pct: Decimal | None = None,
+        advertise_market_fees: bool = False,
     ) -> None:
         self.id = exchange_id
         # WP1.11a: "v3" (default) mirrors this fake's pre-existing
@@ -202,6 +213,8 @@ class FakeCCXTExchange:
         }
 
         self._taker_fee_pct = taker_fee_pct
+        self._maker_fee_pct = taker_fee_pct if maker_fee_pct is None else maker_fee_pct
+        self._advertise_market_fees = advertise_market_fees
         self._market_defs: dict[str, dict[str, Any]] = {}
         self._balances: dict[str, Decimal] = {}
         # WP1.1 (R-23): currency -> amount locked in some *other* open
@@ -215,6 +228,8 @@ class FakeCCXTExchange:
         # ticker's `last` at fill time -- simulates slippage the fake's
         # otherwise-deterministic fill model doesn't produce on its own.
         self._fill_slippage_pct: dict[str, Decimal] = {}
+        # WP2.1: symbols whose slippage is also applied (adversely) to SELLs.
+        self._fill_slippage_symmetric: set[str] = set()
         # symbol -> list of [ts_ms, open, high, low, close, volume]
         self._closed_bars: dict[str, list[list[Any]]] = {}
         self._orders: dict[str, dict[str, Any]] = {}
@@ -342,15 +357,26 @@ class FakeCCXTExchange:
         """Return the current total balance for ``currency`` (test-side accessor)."""
         return self._balances.get(currency, Decimal("0"))
 
-    def set_fill_slippage_pct(self, symbol: str, pct: Decimal) -> None:
+    def set_fill_slippage_pct(
+        self, symbol: str, pct: Decimal, *, symmetric: bool = False
+    ) -> None:
         """WP1.4 (security round 2, probe PA): a market BUY for ``symbol``
         fills at ``last_price * (1 + pct)`` instead of exactly
         ``last_price`` -- proves the engine's affordability-cap slippage
         margin (``buy_cap_slippage_pct``) keeps run cash non-negative even
         when the exchange fills worse than the ticker quoted. BUY side
-        only (a real book's slippage always works against the taker).
+        only by default (a real book's slippage always works against the
+        taker).
+
+        WP2.1: ``symmetric=True`` also slips a market SELL, adversely, at
+        ``last_price * (1 - pct)`` -- the paper engine's own model, which the
+        fill-for-fill paper == live parity test needs.
         """
         self._fill_slippage_pct[symbol] = pct
+        if symmetric:
+            self._fill_slippage_symmetric.add(symbol)
+        else:
+            self._fill_slippage_symmetric.discard(symbol)
 
     def set_fee_currency(self, symbol: str, currency: str) -> None:
         """WP1.1 (R-23): charge the taker fee for ``symbol``'s fills in
@@ -677,6 +703,16 @@ class FakeCCXTExchange:
 
     async def load_markets(self, reload: bool = False) -> dict[str, Any]:
         self.markets = dict(self._market_defs)
+        if self._advertise_market_fees:
+            # WP2.1: real ccxt exposes the fee rates as floats on every market.
+            self.markets = {
+                sym: {
+                    **mkt,
+                    "taker": float(self._taker_fee_pct),
+                    "maker": float(self._maker_fee_pct),
+                }
+                for sym, mkt in self.markets.items()
+            }
         return self.markets
 
     async def close(self) -> None:
@@ -836,6 +872,12 @@ class FakeCCXTExchange:
             slippage = self._fill_slippage_pct.get(symbol)
             if slippage is not None:
                 fill_price = (fill_price * (Decimal("1") + slippage)).quantize(
+                    Decimal("0.00000001")
+                )
+        elif side == "sell" and symbol in self._fill_slippage_symmetric:
+            slippage = self._fill_slippage_pct.get(symbol)
+            if slippage is not None:
+                fill_price = (fill_price * (Decimal("1") - slippage)).quantize(
                     Decimal("0.00000001")
                 )
         notional = qty * fill_price

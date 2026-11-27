@@ -157,7 +157,7 @@ services:
       API_HOST:          ${API_HOST:-0.0.0.0}
       API_PORT:          ${API_PORT:-8000}
       LOG_LEVEL:         ${LOG_LEVEL:-info}
-      ENVIRONMENT:       ${ENVIRONMENT:-development}
+      ENVIRONMENT:       ${TRADING_ENVIRONMENT:-development}
       # -- Trading safety gates --
       ENABLE_LIVE_TRADING:        ${ENABLE_LIVE_TRADING:-false}
       EXCHANGE_ID:                ${EXCHANGE_ID:-binance}
@@ -171,7 +171,9 @@ services:
       ALLOWED_ORIGINS:     ${ALLOWED_ORIGINS:-http://localhost:3000}
       # -- Authentication --
       REQUIRE_API_AUTH:    ${REQUIRE_API_AUTH:-false}
-      API_KEY_HASH:        ${API_KEY_HASH:-}
+      # CF-97-37 R2: required (SHA-256 of the ui's API_KEY) so the shadow check can run;
+      # it has no effect while REQUIRE_API_AUTH is false.
+      API_KEY_HASH:        ${API_KEY_HASH:?API_KEY_HASH must be set in .env (SHA-256 hex of API_KEY)}
       # -- Admin operations (WP1.7b, C21): validated via hmac.compare_digest
       # in apps/api/deps.py:require_admin. Must equal ui's
       # INTERNAL_ADMIN_API_KEY below. Reached only via Caddy's
@@ -205,8 +207,31 @@ services:
       timeout: 5s
       retries: 5
       start_period: 60s
-    # Graceful shutdown — give FastAPI time to drain in-flight requests
-    stop_grace_period: 30s
+    # Graceful shutdown budget (CF-2401-123). SIGKILL lands at this value, so it must cover the
+    # whole shutdown path, in the worst case:
+    #   grace >= uvicorn drain + 0.1 s + recorder flush + background cancel + engine teardown + margin
+    #   75 s  >= 25 s ("--timeout-graceful-shutdown", Dockerfile.api)
+    #            + 0.1 s + 5 s (apps/api/main.py flush_sink) + 5 s (container.shutdown cancel)
+    #            + 30 s (apps/api/main.py asyncio.wait on the run tasks) + 9.9 s margin (client
+    #            closes, dispose_engine). Raise this, or lower the drain, with any of those terms.
+    stop_grace_period: 75s
+    # CF-26-96 (RK-9703-52 item 2): no swap for the API container.  Docker treats
+    # memswap_limit as memory + swap, so a value EQUAL to the memory limit means
+    # zero swap: a process that outgrows the limit is OOM-killed (restart policy
+    # above, then recover_orphaned_runs) instead of thrashing swap and stalling
+    # the event loop that also runs live exits.  Compose v2 reads the memory limit
+    # from deploy.resources.limits.memory below and memswap_limit from this
+    # service-level key.  The two values MUST stay equal; pinned by
+    # tests/unit/test_cf2696_api_memory_infra.py.  See
+    # docs/runbooks/api-container-memory.md.  Do not add oom_kill_disable.
+    memswap_limit: 768m
+    # CF-97-37 (SE-37A-03): bounded json-file logs; with API_KEY_HASH set and auth off, every
+    # keyless request logs one auth.would_reject WARNING until the BFF ships.
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
     deploy:
       resources:
         limits:
@@ -261,6 +286,9 @@ services:
       # SR-004: Fail-fast — ADMIN_EMAILS must be explicitly set.
       # Use 'none@example.invalid' if you want zero admin accounts.
       ADMIN_EMAILS: ${ADMIN_EMAILS:?ADMIN_EMAILS must be set in .env (use 'none@example.invalid' if you want zero admins)}
+      # CF-97-37 (37-S): further Google accounts allowed to sign in as viewers.
+      # Empty = only ADMIN_EMAILS can sign in (the signIn callback fails closed).
+      VIEWER_EMAILS: ${VIEWER_EMAILS:-}
       # WP1.7b (C21): server-side-only key the Next.js admin proxy
       # routes (apps/ui/src/app/api/admin/*/route.ts) read after
       # getServerSession()+isAdmin() pass, and forward as X-Admin-Key to
@@ -269,6 +297,10 @@ services:
       # handlers at request time, never by Edge middleware.ts, so it
       # must stay in environment: only (no Dockerfile.ui build-arg).
       INTERNAL_ADMIN_API_KEY: ${INTERNAL_ADMIN_API_KEY:?INTERNAL_ADMIN_API_KEY must be set in .env (must equal backend ADMIN_API_KEY)}
+      # CF-97-37 R2: the raw key the ui server code sends as X-API-Key. Runtime environment only:
+      # never a build arg or ENV in Dockerfile.ui, never NEXT_PUBLIC_*. Must hash to API_KEY_HASH
+      # and differ from ADMIN_API_KEY.
+      API_KEY: ${API_KEY:?API_KEY must be set in .env (raw key; its SHA-256 must equal API_KEY_HASH)}
     healthcheck:
       test: ["CMD-SHELL",
              "wget -qO- http://localhost:3000/api/health 2>/dev/null || curl -f http://localhost:3000 || exit 1"]
@@ -277,6 +309,11 @@ services:
       retries: 5
       start_period: 60s
     stop_grace_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
     deploy:
       resources:
         limits:
@@ -323,7 +360,10 @@ services:
   #
   # Add Prometheus as a data source (URL: http://prometheus:9090) and import
   # community dashboards for Node.js/FastAPI or build custom ones.
-  # Default login: admin / ${GRAFANA_PASSWORD:-admin}  (change in production!)
+  # Admin login: user `admin`, password from GRAFANA_PASSWORD, which is REQUIRED
+  # (no default: the file fails to load while it is unset or empty; CF-97-34,
+  # SE-9734-04). The variable only applies when the grafana_data volume is first
+  # created; see docs/runbooks/grafana-admin-password.md for an existing instance.
   # Access: http://localhost:3001
   # --------------------------------------------------------------------------
   grafana:
@@ -333,7 +373,7 @@ services:
       - backend
       - frontend
     environment:
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:?GRAFANA_PASSWORD must be set}
       GF_USERS_ALLOW_SIGN_UP: "false"
       # Serve behind a sub-path if needed: GF_SERVER_ROOT_URL=http://host/grafana/
     healthcheck:

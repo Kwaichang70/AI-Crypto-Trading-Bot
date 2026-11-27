@@ -14,6 +14,8 @@ import type { Strategy, StrategyListResponse } from "@/lib/types";
 const mockPush = jest.fn();
 const mockSearchGet = jest.fn(() => null);
 
+// CF-97-43: write controls sit behind <AdminOnly>; these suites exercise the admin path.
+jest.mock("next-auth/react", () => ({ useSession: () => ({ data: { user: { role: "admin" } }, status: "authenticated" }) }));
 jest.mock("next/navigation", () => ({
   useRouter: () => ({ push: mockPush }),
   useSearchParams: () => ({ get: mockSearchGet }),
@@ -56,6 +58,12 @@ async function renderAndReachStartButton() {
   mockFetchStrategies.mockResolvedValue(strategiesResult([GRID]));
   render(<NewRunPage />);
   await waitFor(() => expect(screen.getByRole("button", { name: "Start Run" })).toBeInTheDocument());
+  // De-flake (WP2.1b): the Start Run button renders before the strategy-load
+  // effects settle. grid_trading pyramids by design, so wait for the form to
+  // reach its final state (Allow Pyramiding seeded ON); otherwise the first
+  // click can snapshot a different body than the later ones and mint a new
+  // Idempotency-Key, failing the "keeps the key" assertions intermittently.
+  await waitFor(() => expect(screen.getByLabelText("Allow Pyramiding")).toBeChecked());
 }
 
 function keyOf(callIndex: number): string {

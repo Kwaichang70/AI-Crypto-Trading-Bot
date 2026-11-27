@@ -170,6 +170,20 @@ class TrailingStopManager:
             return None
         return peak * (Decimal("1") - self._trailing_stop_pct)
 
+    def close_lot(self, symbol: str) -> None:
+        """
+        End the lot for ``symbol`` (WP2.2 SY-22-07): the position was flattened.
+
+        Does exactly what the flat branch of :meth:`check` does -- drop the
+        high-water mark and the lot identity and clear the pending guard -- so
+        a lot reopened under an equal ``lot_key`` (same-bar SELL then BUY once
+        stamps are bar-time) starts fresh instead of merging into the closed
+        lot's mark.  Idempotent; touches no other symbol.
+        """
+        self._peak_prices.pop(symbol, None)
+        self._lots.pop(symbol, None)
+        self._clear_pending(symbol)
+
     def clear_pending(self, symbol: str) -> None:
         """Drop the pending-stop guard for ``symbol`` (R-04: exit not submitted)."""
         self._clear_pending(symbol)

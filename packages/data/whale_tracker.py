@@ -46,12 +46,24 @@ from __future__ import annotations
 
 import time
 from datetime import UTC, datetime
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
 import structlog
 from pydantic import BaseModel, Field
 
 from common.logging import exc_log_fields
+from data.provider_bands import (
+    WHALE_ABS_MAX,
+    WHALE_PAGE_LIMIT,
+    Reject,
+    in_band,
+    mapping,
+    require,
+    sequence,
+    to_decimal,
+)
+from data.provider_http import MAX_BYTES_WHALE, Err, Ok, fetch_json
 
 __all__ = [
     "WhaleFlowSnapshot",
@@ -363,4 +375,75 @@ class WhaleAlertClient:
             net_flow=round(inflow - outflow, 2),
             large_tx_count=count,
             timestamp=datetime.now(UTC),
+        )
+
+    # ------------------------------------------------------------------
+    # CF-24-01 P2: side-effect-free validated fetch + the only cache writer
+    # ------------------------------------------------------------------
+
+    async def fetch_validated(self, *, now_ms: int | None = None) -> Ok[WhaleFlowSnapshot] | Err:
+        """One strict 1h-window fetch. Never reads or writes a cache (SY-01-21b).
+
+        Needs ``result == "success"``, a ``transactions`` list shorter than the page limit
+        (a full page is ``truncated``) and finite banded amounts. The key stays in the query
+        string until header support is verified (CF-2401-16) and never leaves this method.
+        """
+        fetch_ms = now_ms if now_ms is not None else int(datetime.now(UTC).timestamp() * 1000)
+        try:
+            session = await self._get_session()
+            got = await fetch_json(
+                session,
+                _ENDPOINT,
+                params={
+                    "api_key": self._api_key,
+                    "min_value": str(self._min_value_usd),
+                    "start": str(fetch_ms // 1000 - _LOOKBACK_SECONDS),
+                    "limit": str(WHALE_PAGE_LIMIT),
+                },
+                max_bytes=MAX_BYTES_WHALE,
+            )
+            if isinstance(got, Err):
+                self._log.debug("whale_alert_client.fetch_validated_err", outcome=got.outcome)
+                return got
+            snapshot = self._aggregate_validated(got.value, fetch_ms)
+        except Reject as rej:
+            self._log.debug("whale_alert_client.fetch_validated_invalid", reason=rej.reason)
+            return Err("invalid_payload", rej.reason)
+        except Exception as exc:
+            self._log.warning("whale_alert_client.fetch_validated_error", **exc_log_fields(exc))
+            return Err("invalid_payload", "internal_error")
+        self._log.debug("whale_alert_client.fetch_validated_ok")
+        return Ok(snapshot)
+
+    def adopt_validated(self, snapshot: WhaleFlowSnapshot, *, now_mono: float) -> None:
+        """Sole writer of ``_latest_cache`` for validated snapshots (SY-01-21b)."""
+        self._latest_cache = (snapshot, now_mono)
+
+    def _aggregate_validated(self, payload: object, fetch_ms: int) -> WhaleFlowSnapshot:
+        body = mapping(payload)
+        if require(body, "result") != "success":
+            raise Reject("provider_error")
+        transactions = sequence(require(body, "transactions"))
+        if len(transactions) >= WHALE_PAGE_LIMIT:
+            raise Reject("truncated")
+        floor = Decimal(str(self._min_value_usd))
+        net, count = Decimal(0), 0
+        for item in transactions:
+            tx = mapping(item)
+            amount = in_band(to_decimal(require(tx, "amount_usd")), 0, WHALE_ABS_MAX)
+            to_end, from_end = tx.get("to"), tx.get("from")
+            if any(end is not None and not isinstance(end, dict) for end in (to_end, from_end)):
+                raise Reject("bad_shape")
+            if amount < floor:
+                continue
+            if self._is_exchange_address(to_end if isinstance(to_end, dict) else None):
+                net += amount
+            elif self._is_exchange_address(from_end if isinstance(from_end, dict) else None):
+                net -= amount
+            count += 1
+        flow = in_band(net.quantize(Decimal("0.01"), ROUND_HALF_UP), -WHALE_ABS_MAX, WHALE_ABS_MAX)
+        return WhaleFlowSnapshot(
+            net_flow=float(flow),
+            large_tx_count=count,
+            timestamp=datetime.fromtimestamp(fetch_ms / 1000, tz=UTC),
         )

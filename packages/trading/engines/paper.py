@@ -4,9 +4,9 @@ packages/trading/engines/paper.py
 Paper-trading execution engine with simulated fills.
 
 Provides realistic order execution simulation including:
-- Configurable slippage model (basis-point spread)
+- Slippage model (basis-point spread) and fee calculation, both read from ONE
+  ``trading.costs.CostProfile`` (WP2.1 -- no cost field on ``RiskParameters``)
 - Configurable fill latency (not enforced as real delay, but recorded)
-- Fee calculation using risk-manager fee parameters
 - Full order state-machine compliance
 - Position tracking keyed by symbol
 
@@ -23,17 +23,19 @@ Design notes
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal
-from typing import Any
+from typing import Any, Self
 from uuid import UUID, uuid4
 
 import structlog
 
 from common.types import OrderSide, OrderStatus, OrderType, SignalDirection
-from trading.execution import BaseExecutionEngine
+from trading.clock import Clock
+from trading.costs import DEFAULT_COST_PROFILE, CostProfile
+from trading.execution import ORDER_STATE_MACHINE, BaseExecutionEngine
 from trading.models import Fill, Order, Position, Signal
 from trading.recovery import replay_sort_key
 from trading.risk import BaseRiskManager
@@ -64,6 +66,86 @@ class _RiskGateInputs:
     daily_loss_basis: Decimal | None
 
 
+_TERMINAL = frozenset(s for s, targets in ORDER_STATE_MACHINE.items() if not targets)
+
+
+def _is_terminal(order: Order) -> bool:
+    try:
+        return bool(order.status in _TERMINAL)
+    except Exception:  # a foreign value stays a candidate and raises at read time, as in the base
+        return False
+
+_Items = Mapping[UUID, Order] | Iterable[tuple[UUID, Order]]
+
+
+class _OrderRegistry(dict[UUID, Order]):
+    """CF-26-97: ``dict[UUID, Order]`` with an insertion-ordered index of the non-terminal keys.
+
+    ``open_orders()`` returns exactly what ``BaseExecutionEngine.get_open_orders`` returns (the
+    same objects, in the same dict order) without scanning terminal orders.  Every mutator keeps
+    the index in step; a stale terminal -> open write rebuilds it in dict order.
+    """
+
+    def __init__(self, items: _Items = ()) -> None:
+        self._open: dict[UUID, None] = {}
+        super().__init__()
+        self.update(items)
+
+    def _rebuild(self) -> None:
+        self._open = dict.fromkeys(k for k, v in self.items() if not _is_terminal(v))
+
+    def __setitem__(self, key: UUID, value: Order) -> None:
+        known = key in self
+        super().__setitem__(key, value)
+        if _is_terminal(value):
+            self._open.pop(key, None)
+        elif key not in self._open:
+            if known:
+                self._rebuild()
+            else:
+                self._open[key] = None
+
+    def __delitem__(self, key: UUID) -> None:
+        super().__delitem__(key)
+        self._open.pop(key, None)
+
+    def pop(self, key: UUID, *default: Order | None) -> Order | None:  # type: ignore[override]  # typeshed overloads
+        value = super().pop(key, *default)
+        self._open.pop(key, None)
+        return value
+
+    def clear(self) -> None:
+        super().clear()
+        self._open.clear()
+
+    def popitem(self) -> tuple[UUID, Order]:
+        item = super().popitem()
+        self._rebuild()
+        return item
+
+    def setdefault(self, key: UUID, default: Order) -> Order:
+        value = super().setdefault(key, default)
+        self._rebuild()
+        return value
+
+    def update(self, items: _Items = (), /) -> None:  # type: ignore[override]  # typeshed overloads
+        super().update(items)
+        self._rebuild()
+
+    def __ior__(self, other: _Items) -> Self:  # type: ignore[override,misc]  # typeshed overloads
+        super().__ior__(other)
+        self._rebuild()
+        return self
+
+    def __reduce__(self) -> tuple[type[Self], tuple[dict[UUID, Order]]]:
+        # pickle and deepcopy would call __setitem__ before __dict__ exists
+        return (type(self), (dict(self),))
+
+    def open_orders(self) -> list[Order]:
+        keys = (dict.__getitem__(self, k) for k in self._open)
+        return [o for o in keys if o.status not in _TERMINAL]
+
+
 class PaperExecutionEngine(BaseExecutionEngine):
     """
     Simulated execution engine for backtesting and paper trading.
@@ -80,13 +162,24 @@ class PaperExecutionEngine(BaseExecutionEngine):
     fill_latency_ms:
         Simulated fill latency in milliseconds. Recorded on fills but does
         not introduce real async delay. Default 0.
-    slippage_bps:
-        Slippage in basis points applied to MARKET orders.
-        BUY: price * (1 + bps/10000). SELL: price * (1 - bps/10000).
-        Default 5 (0.05%).
+    cost_profile:
+        WP2.1: the run's :class:`~trading.costs.CostProfile`.  Its
+        ``slippage_bps`` is applied to MARKET orders (BUY: price * (1 + bps/10000),
+        SELL: price * (1 - bps/10000)), its ``impact_coefficient_bps`` adds the
+        optional sqrt-participation term (QT-001) and its maker / taker fee rates
+        price every fill.  Defaults to ``DEFAULT_COST_PROFILE``; every production
+        caller passes the run's resolved profile explicitly.
     initial_cash:
         Starting cash balance in quote currency. Used for portfolio
         equity tracking. Default 10000.
+    clock:
+        WP2.2: unit-test convenience only.  ``None`` keeps the class default
+        (:data:`~trading.clock.WALL_CLOCK`).  ``BacktestRunner`` must NOT use
+        it: the ``StrategyEngine`` attaches the run's ``BarClock`` through
+        ``attach_clock`` in BACKTEST mode (SY-22-03 Amendment B), so there is
+        one injection path.  This engine is mode-agnostic (it is also the
+        backtest engine); the paper/live guarantee comes from the
+        ``StrategyEngine`` allowlist (SY-22-R2-02).
     """
 
     def __init__(
@@ -95,26 +188,23 @@ class PaperExecutionEngine(BaseExecutionEngine):
         risk_manager: BaseRiskManager,
         *,
         fill_latency_ms: int = 0,
-        slippage_bps: int = 5,
+        cost_profile: CostProfile = DEFAULT_COST_PROFILE,
         initial_cash: Decimal = Decimal("10000"),
         config: dict[str, Any] | None = None,
-        impact_coefficient_bps: int = 0,
+        clock: Clock | None = None,
     ) -> None:
         super().__init__(run_id=run_id, config=config)
+        self._orders = _OrderRegistry()
+        if clock is not None:
+            self._clock = self._validated_clock(clock)
         self._risk_manager = risk_manager
         self._fill_latency_ms = fill_latency_ms
-        self._slippage_bps = slippage_bps
-        # QT-001 (Sprint 42): square-root market-impact coefficient.
-        # When > 0 the engine adds ``impact_coefficient_bps * sqrt(qty/volume)``
-        # to the base slippage_bps, modelling the price impact of taking
-        # liquidity proportional to bar volume.  Default 0 keeps legacy
-        # fixed-slippage behaviour for callers that have not yet calibrated
-        # an impact coefficient from QT-009 telemetry data.
-        if impact_coefficient_bps < 0:
-            raise ValueError(
-                f"impact_coefficient_bps must be >= 0, got {impact_coefficient_bps}"
-            )
-        self._impact_coefficient_bps = impact_coefficient_bps
+        # WP2.1: ONE cost source.  QT-001 (Sprint 42): when the profile's
+        # ``impact_coefficient_bps`` > 0 the engine adds
+        # ``impact_coefficient_bps * sqrt(qty/volume)`` to the base slippage
+        # (0 in every registry entry).  ``CostProfile`` already guarantees
+        # the coefficient is >= 0.
+        self._cost_profile = cost_profile
         self._initial_cash = initial_cash
         self._cash = initial_cash
 
@@ -135,8 +225,10 @@ class PaperExecutionEngine(BaseExecutionEngine):
 
         self._log = self._log.bind(
             engine="paper",
-            slippage_bps=slippage_bps,
-            impact_coefficient_bps=impact_coefficient_bps,
+            cost_profile_id=cost_profile.id,
+            cost_profile_fingerprint=cost_profile.fingerprint(),
+            slippage_bps=str(cost_profile.slippage_bps),
+            impact_coefficient_bps=str(cost_profile.impact_coefficient_bps),
             fill_latency_ms=fill_latency_ms,
         )
 
@@ -147,6 +239,11 @@ class PaperExecutionEngine(BaseExecutionEngine):
     @property
     def risk_manager(self) -> BaseRiskManager:
         return self._risk_manager
+
+    @property
+    def cost_profile(self) -> CostProfile:
+        """The cost profile every fill of this engine is priced with."""
+        return self._cost_profile
 
     @property
     def positions(self) -> dict[str, Position]:
@@ -224,11 +321,11 @@ class PaperExecutionEngine(BaseExecutionEngine):
         """
         Apply slippage to a market-order execution price.
 
-        Base slippage (Sprint 29 default 5 bps) is always applied; an
+        Base slippage (``cost_profile.slippage_bps``) is always applied; an
         additional volume-participation impact term (QT-001 Sprint 42)
         is layered on top when ALL of these are present:
 
-        * ``impact_coefficient_bps > 0`` on the engine
+        * ``cost_profile.impact_coefficient_bps > 0``
         * ``symbol`` and ``quantity`` supplied by the caller
         * ``self._last_volumes[symbol]`` was recorded via ``set_last_bar``
         * the recorded volume is strictly positive
@@ -244,10 +341,10 @@ class PaperExecutionEngine(BaseExecutionEngine):
         * BUY  → price * (1 + total_bps/10000)
         * SELL → price * (1 - total_bps/10000)
         """
-        total_bps = Decimal(self._slippage_bps)
+        total_bps = self._cost_profile.slippage_bps
 
         if (
-            self._impact_coefficient_bps > 0
+            self._cost_profile.impact_coefficient_bps > 0
             and symbol is not None
             and quantity is not None
             and quantity > Decimal("0")
@@ -262,7 +359,7 @@ class PaperExecutionEngine(BaseExecutionEngine):
 
                 ratio = float(quantity / bar_volume)
                 impact_bps = Decimal(
-                    str(self._impact_coefficient_bps * _sqrt(ratio))
+                    str(float(self._cost_profile.impact_coefficient_bps) * _sqrt(ratio))
                 )
                 total_bps += impact_bps
 
@@ -301,11 +398,7 @@ class PaperExecutionEngine(BaseExecutionEngine):
             Fee amount in quote currency.
         """
         notional = quantity * price
-        fee_rate = (
-            Decimal(str(self._risk_manager.params.maker_fee_pct))
-            if is_maker
-            else Decimal(str(self._risk_manager.params.taker_fee_pct))
-        )
+        fee_rate = self._cost_profile.fee_rate("maker" if is_maker else "taker")
         return (notional * fee_rate).quantize(_PRICE_PRECISION, rounding=ROUND_HALF_UP)
 
     # ------------------------------------------------------------------
@@ -363,7 +456,7 @@ class PaperExecutionEngine(BaseExecutionEngine):
             fee=fee,
             fee_currency=fee_currency,
             is_maker=is_maker,
-            executed_at=datetime.now(tz=UTC),
+            executed_at=self._clock.now(),
             expected_price=expected_price,
             slippage_bps_realized=slippage_bps_realized,
         )
@@ -444,8 +537,9 @@ class PaperExecutionEngine(BaseExecutionEngine):
             The fill event to process.
         at:
             Timestamp to stamp on the position's ``opened_at``/``updated_at``.
-            Defaults to ``datetime.now(tz=UTC)`` for a live fill during
-            normal processing; ``restore_from_fills`` (WP1.8a C-07) passes
+            Defaults to the engine clock (``self._clock``: wall time in
+            paper/live, bar close in a backtest) during normal processing;
+            ``restore_from_fills`` (WP1.8a C-07) passes
             ``fill.executed_at`` so a resumed run's own position cache is
             stamped with the real historical fill time, not the wall-clock
             time of the restart/rebuild.
@@ -454,7 +548,7 @@ class PaperExecutionEngine(BaseExecutionEngine):
         current_price = fill.price
 
         position = self._positions.get(symbol)
-        now = at if at is not None else datetime.now(tz=UTC)
+        now = at if at is not None else self._clock.now()
 
         if fill.side == OrderSide.BUY:
             # Decrease cash by (quantity * price + fee)
@@ -595,7 +689,7 @@ class PaperExecutionEngine(BaseExecutionEngine):
             order = order.model_copy(update={
                 "filled_quantity": order.quantity,
                 "average_fill_price": fill_price,
-                "updated_at": datetime.now(tz=UTC),
+                "updated_at": self._clock.now(),
             })
             self._orders[order.order_id] = order
 
@@ -633,7 +727,7 @@ class PaperExecutionEngine(BaseExecutionEngine):
                 order = order.model_copy(update={
                     "filled_quantity": order.quantity,
                     "average_fill_price": fill_price,
-                    "updated_at": datetime.now(tz=UTC),
+                    "updated_at": self._clock.now(),
                 })
                 self._orders[order.order_id] = order
 
@@ -798,6 +892,9 @@ class PaperExecutionEngine(BaseExecutionEngine):
         # ROUND_DOWN prevents overselling exchange-reported balances with >8dp
         # precision; BUY keeps ROUND_HALF_UP.
         rounding = ROUND_DOWN if side == OrderSide.SELL else ROUND_HALF_UP
+        # WP2.2 (SY-22-05 c): explicit stamp from ONE clock read (the ambient
+        # ``utc_now`` default is only a fallback), so created_at == updated_at.
+        order_stamp = self._clock.now()
         proposed_order = Order(
             client_order_id=client_order_id,
             run_id=self._run_id,
@@ -805,6 +902,8 @@ class PaperExecutionEngine(BaseExecutionEngine):
             side=side,
             order_type=OrderType.MARKET,
             quantity=quantity.quantize(_QTY_PRECISION, rounding=rounding),
+            created_at=order_stamp,
+            updated_at=order_stamp,
         )
 
         # Pre-trade risk check
@@ -875,6 +974,12 @@ class PaperExecutionEngine(BaseExecutionEngine):
         fills = self._fills.get(order_id, [])
         return sorted(fills, key=lambda f: f.executed_at)
 
+    def get_open_orders(self) -> list[Order]:
+        """Non-terminal orders: the index for an ``_OrderRegistry`` store, else the base filter."""
+        if type(self._orders) is _OrderRegistry:
+            return self._orders.open_orders()
+        return super().get_open_orders()
+
     def get_all_fills(self) -> list[Fill]:
         """Return all fills across all orders, sorted by executed_at."""
         all_fills: list[Fill] = []
@@ -938,7 +1043,7 @@ class PaperExecutionEngine(BaseExecutionEngine):
                 order = order.model_copy(update={
                     "filled_quantity": order.quantity,
                     "average_fill_price": fill_price,
-                    "updated_at": datetime.now(tz=UTC),
+                    "updated_at": self._clock.now(),
                 })
                 self._orders[order.order_id] = order
                 order = self._transition(order, OrderStatus.FILLED)
@@ -1067,7 +1172,8 @@ class PaperExecutionEngine(BaseExecutionEngine):
         self._log.info(
             "paper.engine_started",
             initial_cash=str(self._initial_cash),
-            slippage_bps=self._slippage_bps,
+            cost_profile_id=self._cost_profile.id,
+            slippage_bps=str(self._cost_profile.slippage_bps),
             fill_latency_ms=self._fill_latency_ms,
         )
 
@@ -1117,6 +1223,7 @@ class PaperExecutionEngine(BaseExecutionEngine):
         return (
             f"PaperExecutionEngine("
             f"run_id={self._run_id!r}, "
+            f"cost_profile={self._cost_profile.id!r}, "
             f"orders={len(self._orders)}, "
             f"cash={self._cash}, "
             f"positions={len(self._positions)})"

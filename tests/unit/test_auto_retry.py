@@ -26,6 +26,7 @@ from api.services.run_orchestrator import (
     _auto_retry_paper_run,
 )
 from common.types import TimeFrame
+from trading.costs import DEFAULT_COST_PROFILE
 
 
 @pytest.fixture(autouse=True)
@@ -58,6 +59,7 @@ def _retry_kwargs(**overrides: Any) -> dict[str, Any]:
         "bracket_config": {"bracket_mode": "atr", "bracket_atr_sl_multiplier": 2.0},
         "enable_adaptive_learning": False,
         "auto_apply_learning": False,
+        "cost_profile": DEFAULT_COST_PROFILE,  # WP2.1: required keyword
     }
     base.update(overrides)
     return base

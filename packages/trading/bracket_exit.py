@@ -885,6 +885,21 @@ class BracketExitManager:
         self._clear_pending(anchor.symbol)
         self._log_anchor(anchor)
 
+    def close_lot(self, symbol: str) -> None:
+        """
+        End the lot for ``symbol`` (WP2.2 SY-22-07): the position was flattened.
+
+        Does exactly what the flat branch of :meth:`check` does -- clear the
+        pending guard, discard both warn flags and drop the frozen anchor -- so
+        a skipped or failed open hook can never leave the closed lot's anchor
+        to be accepted for a new lot whose ``lot_key`` happens to be equal
+        (``_anchor_for``).  Idempotent; touches no other symbol.
+        """
+        self._clear_pending(symbol)
+        self._atr_warned_symbols.discard(symbol)
+        self._late_warned.discard(symbol)
+        self._anchors.pop(symbol, None)
+
     def clear_pending(self, symbol: str) -> None:
         """Drop the pending-exit guard for ``symbol`` (R-04).
 

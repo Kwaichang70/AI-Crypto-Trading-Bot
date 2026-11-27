@@ -607,7 +607,7 @@ class TestGetAllFills:
                 result.extend(await engine.get_fills(oid))
             return result
 
-        per_order_fills = asyncio.get_event_loop().run_until_complete(_collect_per_order())
+        per_order_fills = asyncio.run(_collect_per_order())
         all_fills = engine.get_all_fills()
 
         # Both collections must contain the same fill IDs

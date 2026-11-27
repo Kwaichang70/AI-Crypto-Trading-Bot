@@ -60,7 +60,7 @@ describe("NextAuth jwt callback — role assignment", () => {
     jest.resetModules();
     process.env = {
       ...originalEnv,
-      ADMIN_EMAILS: "de.lacombe@gmail.com,another-admin@example.com",
+      ADMIN_EMAILS: "admin-one@example.com,another-admin@example.com",
     };
   });
 
@@ -70,7 +70,7 @@ describe("NextAuth jwt callback — role assignment", () => {
 
   it("assigns role admin when email matches ADMIN_EMAILS", async () => {
     const token = makeToken();
-    const user = makeAdapterUser("de.lacombe@gmail.com");
+    const user = makeAdapterUser("admin-one@example.com");
     const params = { token, user, trigger: "signIn", account: null } as unknown as JwtCallbackParams;
     const result = await jwtCallback(params);
     expect(result.role).toBe("admin");
@@ -78,7 +78,7 @@ describe("NextAuth jwt callback — role assignment", () => {
 
   it("assigns role admin case-insensitively", async () => {
     const token = makeToken();
-    const user = makeAdapterUser("DE.LACOMBE@GMAIL.COM");
+    const user = makeAdapterUser("ADMIN-ONE@EXAMPLE.COM");
     const params = { token, user, trigger: "signIn", account: null } as unknown as JwtCallbackParams;
     const result = await jwtCallback(params);
     expect(result.role).toBe("admin");
@@ -100,8 +100,8 @@ describe("NextAuth jwt callback — role assignment", () => {
     expect(result.role).toBe("viewer");
   });
 
-  it("returns token unchanged when no user is present (token refresh path)", async () => {
-    const token = makeToken({ role: "admin" });
+  it("keeps a listed admin's role when no user is present (token refresh path)", async () => {
+    const token = makeToken({ role: "admin", email: "admin-one@example.com" });
     // CR-005: user: undefined — matches NextAuth's actual token refresh call shape.
     // Cast via unknown because NextAuth's TS union requires user but runtime omits it.
     const params = { token, user: undefined, trigger: "update", account: null } as unknown as JwtCallbackParams;

@@ -29,6 +29,7 @@ import pytest
 
 import api.services.run_orchestrator as orchestrator
 from common.types import TimeFrame
+from trading.costs import DEFAULT_COST_PROFILE
 from trading.risk import RiskParameters
 
 
@@ -153,6 +154,7 @@ class TestPaperEngineShutdownOrphaning:
                     symbols=["BTC/USD"],
                     timeframe=TimeFrame.ONE_HOUR,
                     initial_capital="10000",
+                    cost_profile=DEFAULT_COST_PROFILE,
                 )
 
         assert run_row.status == "orphaned"
@@ -188,6 +190,7 @@ class TestPaperEngineShutdownOrphaning:
                     symbols=["BTC/USD"],
                     timeframe=TimeFrame.ONE_HOUR,
                     initial_capital="10000",
+                    cost_profile=DEFAULT_COST_PROFILE,
                 )
 
         assert run_row.status == "stopped"
@@ -218,12 +221,13 @@ class TestLiveEngineShutdownOrphaning:
             with pytest.raises(asyncio.CancelledError):
                 await orchestrator.run_live_engine(
                     run_id_str=str(run_row.id),
-                    strategy_cls=MagicMock,
+                    strategy_cls=MagicMock(**{"mtf_signal_fields.return_value": frozenset()}),
                     strategy_name="grid_trading",
                     strategy_params={},
                     symbols=["BTC/USD"],
                     timeframe=TimeFrame.ONE_HOUR,
                     initial_capital="10000",
+                    cost_profile=DEFAULT_COST_PROFILE,
                 )
 
         assert run_row.status == "orphaned"

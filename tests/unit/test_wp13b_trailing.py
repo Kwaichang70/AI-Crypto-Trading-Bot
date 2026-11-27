@@ -22,6 +22,7 @@ from common.types import TimeFrame
 from tests.integration.fakes.bar_paths import scripted_path
 from tests.integration.fakes.scripted_strategy import ScriptedSequenceStrategy
 from trading.backtest import BacktestRunner
+from trading.costs import get_cost_profile
 from trading.models import Position
 from trading.trailing_stop import TrailingStopManager
 
@@ -55,7 +56,10 @@ async def test_t17_hwm0_is_the_gross_fill_not_the_signal_close() -> None:
         symbols=[SYM],
         timeframe=TimeFrame.ONE_HOUR,
         initial_capital=Decimal("10000"),
-        slippage_bps=50,
+        # 50 bps slippage on the legacy backtest fees (WP2.1: explicit cost model)
+        cost_profile=get_cost_profile("legacy_backtest_v0").with_overrides(
+            slippage_bps=Decimal(50)
+        ),
         seed=7,
         trailing_stop_pct=0.10,
     )

@@ -6,7 +6,10 @@ BacktestRunner -- high-level API for running deterministic backtests.
 This module provides a clean, self-contained entry point that:
 1. Wires together PaperExecutionEngine + DefaultRiskManager +
    PortfolioAccounting + StrategyEngine
-2. Validates input data (bar ordering, alignment, warm-up sufficiency)
+2. Validates input data (bar ordering, duplicates), aligns multi-symbol bars on
+   TIMESTAMP (WP2.3: union timeline + per-step present mask, tolerance check,
+   trimming to the first/last full row) and checks warm-up sufficiency on the
+   aligned timeline
 3. Runs the backtest via StrategyEngine.run_backtest()
 4. Collects the equity curve, trade log, and computes all metrics
 5. Returns a fully-populated BacktestResult
@@ -18,7 +21,8 @@ Design principles
 - **No look-ahead bias**: bars are fed chronologically; the growing
   window passed to strategies never includes future data.
 - **Strategy-agnostic**: works with any ``BaseStrategy`` subclass.
-- **Fee-aware**: all PnL metrics are net of trading fees.
+- **Cost-aware**: all PnL metrics are net of the run's ``CostProfile`` (fees and
+  slippage, WP2.1); without one the default profile applies.
 - **Decimal precision**: monetary values use ``Decimal``; statistical
   ratios use ``float``.
 
@@ -31,9 +35,7 @@ Usage
         symbols=["BTC/USDT"],
         timeframe=TimeFrame.ONE_HOUR,
         initial_capital=Decimal("10000"),
-        slippage_bps=5,
-        maker_fee_bps=5,
-        taker_fee_bps=10,
+        cost_profile=get_cost_profile("coinbase_advanced_d6"),  # trading.costs
     )
     result = await runner.run(bars_by_symbol)
     print(f"CAGR: {result.cagr:.2%}, Sharpe: {result.sharpe_ratio:.2f}")
@@ -44,49 +46,94 @@ from __future__ import annotations
 import math
 import random
 import uuid
-from datetime import UTC, datetime
+from collections.abc import Sequence
+from datetime import datetime, timedelta
 from decimal import Decimal
-from typing import Any
+from typing import Any, Protocol
 
 import numpy as np
 import structlog
 
+from common.metrics import metrics as _metrics
 from common.models import OHLCVBar
+from data.bar_alignment import (
+    DEFAULT_ALIGNMENT_TOLERANCE,
+    AlignmentReport,
+    AlignmentTolerance,
+    BarAlignmentError,
+    Step,
+    align_bars,
+    check_alignment,
+)
 from data.market_data import BaseMarketDataService
 from common.types import QuoteCurrency, RunMode, TimeFrame
+from trading.clock import BarClock
+from trading.costs import CostProfile, default_cost_profile
+from trading.equity_sampling import sample_equity_per_bar
 from trading.engines.paper import PaperExecutionEngine
 from trading.exit_config import (
+    ExitCostModel,
     parse_exit_config,
     require_exit_manager,
     resolve_allow_pyramiding,
 )
 from trading.metrics import (
+    METRICS_VERSION,
     BacktestResult,
     EquityCurvePoint,
     OpenPositionMTM,
     _derive_confidence_flag,  # noqa: PLC2701 - private helper, same-package call
-    compute_psr,
-    TIMEFRAME_PERIODS_PER_YEAR,
+    _max_dd_duration,
     compute_cagr,
     compute_calmar,
     compute_exposure,
     compute_max_drawdown,
-    compute_max_drawdown_duration,
-    compute_returns_from_equity,
-    compute_sharpe,
-    compute_sortino,
+    compute_return_metrics,
     compute_trade_statistics,
+    periods_per_year as _periods_per_year,
+)
+from trading.mtf_signals import (
+    BacktestSignalSource,
+    UNAVAILABLE,
+    MtfContextReport,
+    check_backtest_source,
+    select_mtf_signals,
 )
 from trading.portfolio import PortfolioAccounting
 from trading.risk import RiskParameters
 from trading.risk_manager import DefaultRiskManager
-from trading.safety import build_run_circuit_breaker
+from trading.safety import BACKTEST_CIRCUIT_BREAKER_DEFAULT, build_run_circuit_breaker
 from trading.strategy import BaseStrategy
-from trading.strategy_engine import StrategyEngine
+from trading.strategy_engine import (
+    _TIMEFRAME_SECONDS,
+    StrategyEngine,
+    _yield_to_loop,
+)
 
-__all__ = ["BacktestRunner"]
+__all__ = [
+    "BacktestRunner",
+    "record_bar_alignment",
+    "record_bar_alignment_outcome",
+]
 
 logger = structlog.get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# WP2.5 (SY-25-04): bar-close stamps of the metric sample
+# ---------------------------------------------------------------------------
+
+
+def _step_close(timeline: Sequence[Step], k: int, t0: datetime, tf_s: int) -> datetime:
+    """Equity-curve stamp after ``k`` processed timeline steps.
+
+    ``k == 0`` is the seed point ``t0`` (W = 0 has no previous step); otherwise it is the
+    close of step ``k - 1``, i.e. its bar-open stamp plus one timeframe.  ``k = W`` is the
+    first trading base point (``curve[W].timestamp``), ``k = oos_start_index`` the OOS one.
+    """
+    if k == 0:
+        return t0
+    return timeline[k - 1].ts + timedelta(seconds=tf_s)
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +195,128 @@ convergence.
 """
 
 
+# ---------------------------------------------------------------------------
+# WP2.3 (SY-23-15): bar-alignment telemetry
+# ---------------------------------------------------------------------------
+
+class _EventLog(Protocol):
+    """The slice of a structlog bound logger the alignment telemetry uses."""
+
+    def info(self, event: str, **kw: object) -> object: ...
+
+    def warning(self, event: str, **kw: object) -> object: ...
+
+    def debug(self, event: str, **kw: object) -> object: ...
+
+
+_GAP_LOG_SPANS: int = 5
+"""Number of gap spans carried by one ``backtest.bar_alignment_gaps`` event."""
+
+
+def _count(log: _EventLog, name: str, value: int, labels: dict[str, str]) -> None:
+    """Increment a counter on ``common.metrics`` directly; metrics never raise.
+
+    Deliberately NOT ``StrategyEngine._metric`` (that adds a ``run_id`` label and so
+    one series per run).  Every call of one metric name uses the same label keys
+    (the Prometheus bridge takes the label names from the first sample).
+    """
+    try:
+        _metrics.increment(name, value, labels=labels)
+    except Exception as exc:  # pragma: no cover - defensive; CF-36: no exception text
+        log.debug("backtest.bar_alignment_metric_failed", error_type=type(exc).__name__)
+
+
+def _is_gapped(report: AlignmentReport) -> bool:
+    return (
+        bool(report.warnings)
+        or report.all_absent_slots > 0
+        or any(s.missing > 0 or s.head > 0 or s.tail > 0 for s in report.per_symbol)
+    )
+
+
+def record_bar_alignment(
+    report: AlignmentReport, *, timeframe: str, enforced: bool, log: _EventLog
+) -> None:
+    """Log the alignment report and count missing bars (once per run; SY-23-15).
+
+    CF-36: names, numbers, symbols and ISO timestamps only; never exception text.
+    ``timeframe`` is the metric label value (``TimeFrame.value``).
+    """
+    log.info(
+        "backtest.bar_alignment",
+        version=report.version,
+        policy=report.policy,
+        window_requested=report.window_requested,
+        enforced=enforced,
+        expected=report.expected,
+        steps=report.steps,
+        all_present_steps=report.all_present_steps,
+        all_absent_slots=report.all_absent_slots,
+        warnings=len(report.warnings),
+        violations=len(report.violations),
+        presence_digest=report.presence_digest,
+    )
+    for sym in report.per_symbol:
+        if sym.missing <= 0 and not sym.gap_runs:
+            continue
+        spans = [
+            {"start": g.start_iso, "bars": g.bars, "kind": g.kind}
+            for g in sym.gap_runs[:_GAP_LOG_SPANS]
+        ]
+        log.warning(
+            "backtest.bar_alignment_gaps",
+            symbol=sym.symbol,
+            missing=sym.missing,
+            missing_ppm=sym.missing_ppm,
+            zero_volume=sym.zero_volume,
+            max_gap_bars=sym.max_gap_bars,
+            head=sym.head,
+            tail=sym.tail,
+            first_gap_at=sym.gap_runs[0].start_iso if sym.gap_runs else None,
+            gap_spans=spans,
+        )
+        if sym.missing >= 1:
+            _count(
+                log,
+                "bar_alignment_missing_bars_total",
+                sym.missing,
+                {"symbol": sym.symbol, "timeframe": timeframe},
+            )
+
+
+def record_bar_alignment_outcome(
+    report: AlignmentReport, *, log: _EventLog, rejected: BarAlignmentError | None = None
+) -> None:
+    """Count the run outcome (``ok`` / ``ok_with_gaps`` / ``rejected``) exactly once."""
+    if rejected is None:
+        outcome = "ok_with_gaps" if _is_gapped(report) else "ok"
+        _count(log, "bar_alignment_runs_total", 1, {"outcome": outcome})
+        return
+    first = rejected.violations[0] if rejected.violations else None
+    log.warning(
+        "backtest.bar_alignment_rejected",
+        code=rejected.code,
+        symbol=first.symbol if first is not None else None,
+        observed=first.observed if first is not None else None,
+        limit=first.limit if first is not None else None,
+        fold=first.fold if first is not None else None,
+    )
+    _count(log, "bar_alignment_runs_total", 1, {"outcome": "rejected"})
+    _count(log, "bar_alignment_rejected_total", 1, {"reason": rejected.code})
+
+
+def _total_slippage_cost(exec_engine: PaperExecutionEngine) -> Decimal:
+    """SY-21-15: sum over all fills of ``|fill price - expected price| * quantity``.
+
+    Fills without an expectation (none in the paper engine) contribute 0.
+    """
+    total = Decimal("0")
+    for fill in exec_engine.get_all_fills():
+        if fill.expected_price is not None:
+            total += abs(fill.price - fill.expected_price) * fill.quantity
+    return total
+
+
 class BacktestRunner:
     """
     High-level backtest orchestrator.
@@ -167,25 +336,35 @@ class BacktestRunner:
     initial_capital : Decimal
         Starting cash in quote currency.  Default 10000.
     risk_params : RiskParameters | None
-        Risk manager configuration.  If None, default parameters are
-        used.  Fee percentages in risk_params are overridden by the
-        explicit ``maker_fee_bps`` / ``taker_fee_bps`` arguments if
-        both are provided.
-    slippage_bps : int
-        Slippage in basis points applied to market orders.
-        Default 5 (0.05%).
-    maker_fee_bps : int
-        Maker fee in basis points.  Default 10 (0.10%).
-    taker_fee_bps : int
-        Taker fee in basis points.  Default 15 (0.15%).
+        Risk manager configuration, used UNCHANGED (C25: every field reaches
+        the risk manager).  If None, default parameters are used.  Costs are
+        not risk parameters (WP2.1).
+    cost_profile : CostProfile | None
+        WP2.1: the ONE cost model (fees, slippage, impact) for this run.
+        ``None`` -> the current default profile (``coinbase_advanced_1``).
+        Use ``get_cost_profile("legacy_backtest_v0")`` to reproduce pre-WP2.1
+        results (10/15 bps fees, 5 bps slippage).
     seed : int | None
         Random seed for deterministic backtests.  If provided, sets
         ``random.seed(seed)`` before execution.  Default None.
     enable_circuit_breaker : bool
-        WP1.6 / U-2: opt-in graduated circuit breaker (HALT / DAILY_LIMIT /
-        REDUCE from ``RiskSnapshot``, bar-close clock).  Default ``False`` --
-        a default backtest is byte-identical to pre-WP1.6.  WP2.1 turns it on
-        by default with a re-baseline (CF-26).
+        WP1.6 graduated circuit breaker (HALT / DAILY_LIMIT / REDUCE from
+        ``RiskSnapshot``, bar-close clock).  Default ``True`` since WP2.1c
+        (SY-21-13, closes CF-26): a backtest has the same circuit breaker as a
+        paper run.  ``False`` reproduces the pre-WP2.1c (WP1.6 opt-in, byte-identical to
+        pre-WP1.6) behaviour exactly -- the baseline-attribution path of the D13
+        re-baseline.  The value is NOT an API option; the API persists
+        ``engine_semantics.backtest_circuit_breaker`` next to it.
+    alignment_tolerance : AlignmentTolerance | None
+        WP2.3 (SY-23-03): tests and scripts only (never an API field).  ``None``
+        -> ``DEFAULT_ALIGNMENT_TOLERANCE``.
+    mtf_signals : BacktestSignalSource | None
+        WP2.4 (SY-24-02/05/07): the point-in-time signal source (scripts and tests; never an
+        API field in Phase A).  ``None`` -> ``UNAVAILABLE``: every result equals the pre-P2
+        one.  A ``PitSignals`` is reduced per run (:meth:`PitSignals.select`) to the fields
+        the run's strategies consume that reach the coverage floor; the outcome is
+        ``last_mtf_context``.  Anything but ``None`` or a real ``BacktestSignalSource``
+        raises ``ValueError`` here and again before the run id exists (CF-P1-01).
     """
 
     def __init__(
@@ -195,15 +374,16 @@ class BacktestRunner:
         timeframe: TimeFrame,
         initial_capital: Decimal = Decimal("10000"),
         risk_params: RiskParameters | None = None,
-        slippage_bps: int = 5,
-        maker_fee_bps: int = 10,
-        taker_fee_bps: int = 15,
         seed: int | None = None,
         trailing_stop_pct: float | None = None,
         bracket_config: dict[str, object] | None = None,
         allow_pyramiding: bool | None = None,
-        enable_circuit_breaker: bool = False,
+        enable_circuit_breaker: bool = BACKTEST_CIRCUIT_BREAKER_DEFAULT,
+        cost_profile: CostProfile | None = None,
+        alignment_tolerance: AlignmentTolerance | None = None,
+        mtf_signals: BacktestSignalSource | None = None,
     ) -> None:
+        check_backtest_source(mtf_signals)  # CF-P1-01: fail at construction, type name only
         if not strategies:
             raise ValueError("At least one strategy is required")
         if not symbols:
@@ -217,22 +397,34 @@ class BacktestRunner:
         self._symbols = list(symbols)
         self._timeframe = timeframe
         self._initial_capital = initial_capital
-        self._slippage_bps = slippage_bps
-        self._maker_fee_bps = maker_fee_bps
-        self._taker_fee_bps = taker_fee_bps
+        # WP2.1: one cost profile for the whole run (None -> current default).
+        self._cost_profile: CostProfile = (
+            cost_profile if cost_profile is not None else default_cost_profile()
+        )
         # M7 (Sprint 49 INF-9): auto-generate a reproducible seed when caller
         # omits one so every backtest can be replayed.  Use OS-seeded random
         # to produce a 32-bit integer (safe range for both Python and numpy).
         if seed is None:
             seed = random.randint(0, 2**31 - 1)
         self._seed: int = seed
+        self._alignment_tolerance: AlignmentTolerance = (
+            alignment_tolerance if alignment_tolerance is not None else DEFAULT_ALIGNMENT_TOLERANCE
+        )
         self._trailing_stop_pct = trailing_stop_pct
-        # WP1.6 (U-2): the circuit breaker is opt-in in backtests (default off).
+        # WP1.6 (U-2) opt-in, default ON since WP2.1c (SY-21-13).
         self._enable_circuit_breaker: bool = enable_circuit_breaker
         # Engine-level fixed/ATR stop-loss + take-profit bracket config
         # (stop_loss_pct, take_profit_pct, bracket_mode, atr_*_multiplier,
         # atr_period).  Passed verbatim into the StrategyEngine config.
         self._bracket_config: dict[str, object] = dict(bracket_config or {})
+
+        # C25 (WP2.1a-1/2): a caller-supplied ``RiskParameters`` is used
+        # UNCHANGED (every field -- sizing_mode, atr_risk_multiplier,
+        # max_cluster_exposure_pct, ... -- reaches the risk manager).  Costs
+        # are no longer risk parameters, so there is nothing to override.
+        self._risk_params: RiskParameters = (
+            risk_params if risk_params is not None else RiskParameters()
+        )
 
         # WP1.3a (SY-13a-01/17): validate eagerly at construction (defence
         # in depth -- create_run already validates before the bar fetch;
@@ -242,37 +434,16 @@ class BacktestRunner:
         # ``validate_run_exit_config``, which takes one strategy) so every
         # strategy in ``self._strategies`` is covered, matching the engine's
         # own ``require_exit_manager(self._strategies, ...)`` call.
+        # WP2.1 (SY-21-05): parse at the run's OWN cost profile.
         _parsed_cfg = parse_exit_config(
             bracket=self._bracket_config,
             trailing_stop_pct=self._trailing_stop_pct,
+            cost=ExitCostModel.from_cost_profile(self._cost_profile, self._risk_params),
         )
         require_exit_manager(self._strategies, _parsed_cfg)
         self._allow_pyramiding: bool = resolve_allow_pyramiding(
             allow_pyramiding, self._strategies
         )
-
-        # Build risk parameters with explicit fee overrides
-        if risk_params is not None:
-            self._risk_params = RiskParameters(
-                max_open_positions=risk_params.max_open_positions,
-                max_position_size_pct=risk_params.max_position_size_pct,
-                per_trade_risk_pct=risk_params.per_trade_risk_pct,
-                max_order_size_quote=risk_params.max_order_size_quote,
-                max_daily_loss_pct=risk_params.max_daily_loss_pct,
-                max_drawdown_pct=risk_params.max_drawdown_pct,
-                taker_fee_pct=taker_fee_bps / 10_000,
-                maker_fee_pct=maker_fee_bps / 10_000,
-                slippage_bps=slippage_bps,
-                cooldown_after_loss_streak=risk_params.cooldown_after_loss_streak,
-                loss_streak_count=risk_params.loss_streak_count,
-                max_portfolio_exposure_pct=risk_params.max_portfolio_exposure_pct,
-            )
-        else:
-            self._risk_params = RiskParameters(
-                taker_fee_pct=taker_fee_bps / 10_000,
-                maker_fee_pct=maker_fee_bps / 10_000,
-                slippage_bps=slippage_bps,
-            )
 
         # Compute warmup: max of all strategy requirements * multiplier
         max_min_bars = max(
@@ -291,10 +462,23 @@ class BacktestRunner:
 
         self._last_execution_engine: PaperExecutionEngine | None = None
         self._last_portfolio: PortfolioAccounting | None = None
+        self._last_alignment: AlignmentReport | None = None
+        self._mtf_signals: BacktestSignalSource | None = mtf_signals
+        self._last_mtf_context: MtfContextReport | None = None
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    @property
+    def cost_profile(self) -> CostProfile:
+        """The cost profile this runner simulates with (WP2.1)."""
+        return self._cost_profile
+
+    @property
+    def circuit_breaker_enabled(self) -> bool:
+        """Whether this runner builds a circuit breaker (WP2.1c, SY-21-13)."""
+        return self._enable_circuit_breaker
 
     @property
     def seed(self) -> int:
@@ -312,15 +496,25 @@ class BacktestRunner:
         htf_bars: dict[str, dict[str, list[OHLCVBar]]] | None = None,
         *,
         oos_start_index: int | None = None,
+        requested_window: tuple[datetime, datetime] | None = None,
+        record_alignment: bool = True,
+        select_mtf_context: bool = True,
     ) -> BacktestResult:
         """
         Execute a backtest over the provided historical bars.
+
+        Not re-entrant (CF-97-12): one runner must not run two backtests at once.  Since
+        CF-97-02 the post-loop steps also suspend (``_yield_to_loop``); ``last_*`` are set
+        only at the very end.
 
         Parameters
         ----------
         bars_by_symbol : dict[str, list[OHLCVBar]]
             Pre-fetched OHLCV bars keyed by symbol.  Each list must be
-            sorted by timestamp ascending and use the same timeframe.
+            sorted by timestamp ascending and use the same timeframe.  The
+            lists may differ in length: WP2.3 pairs bars by TIMESTAMP (union
+            timeline, absent symbols skipped per step) and trims the input to
+            the first/last row on which every symbol has a bar.
         htf_bars : dict[str, dict[str, list[OHLCVBar]]] | None
             Optional higher-timeframe bars keyed by timeframe string,
             then by symbol. Passed through to the strategy engine for
@@ -330,10 +524,27 @@ class BacktestRunner:
             out-of-sample trading Sharpe over bars [oos_start_index:] only and
             populate result.oos_sharpe / result.oos_n_returns. The warmup region
             and the in-sample (train) region are excluded. Must satisfy
-            self._warmup_bars <= oos_start_index < num_bars; out-of-range values
+            self._warmup_bars <= oos_start_index < len(timeline), an ordinal into
+            the ALIGNED timeline (WP2.3, SY-23-17); out-of-range values
             are logged and the OOS fields are left None (no crash). Default None
             (no OOS measurement — strictly zero behaviour change for all existing
             backtest/paper/optimizer call-sites).
+        requested_window : tuple[datetime, datetime] | None
+            WP2.3 (SY-23-02/14): the requested ``[start, end)`` of bar open
+            times.  Given (every API backtest): the grid is measured against it
+            and the tolerance is enforced even for ONE symbol.  ``None``
+            (library, scripts, ML gate): the union span, and a single-symbol
+            run is report-only (SY-23-05).
+        record_alignment : bool
+            ``False`` for the optimizer's inner runners (SY-23-18): trim and
+            build the timeline but skip telemetry and the tolerance check (the
+            optimizer already did both once).
+        select_mtf_context : bool
+            WP2.4 (SY-24-05, T-24): ``False`` for the optimizer's inner runners: the source
+            handed to the constructor was already selected once per optimizer run, so it is
+            used as is (no coverage, no report, ``last_mtf_context`` stays ``None``).
+            Optimizer-internal: pass ``False`` only with a source that was already selected;
+            ``False`` with a raw ``PitSignals`` bypasses G8, coverage and the report.
 
         Returns
         -------
@@ -343,9 +554,27 @@ class BacktestRunner:
         Raises
         ------
         ValueError
-            If bar data fails validation (unsorted, misaligned, or
-            insufficient for warm-up).
+            If bar data fails validation (unsorted, duplicate timestamps, or
+            fewer timeline steps than the warm-up needs).
+        BarAlignmentError
+            (a ``ValueError``) If the alignment is outside the tolerance.  Raised
+            BEFORE the run id and the engine exist (I-6); ``str(exc)`` is fixed
+            text, the closed ``.code`` identifies the reason.
+        PitError
+            WP2.4 (CF-P1-01): with a ``PitSignals`` source and a consuming strategy, a
+            naive bar timestamp (``pit_naive_time``) or an unknown consumed field
+            (``pit_unknown_series``).  Raised by the ONE selection before the run id and the
+            engine exist.  A ``ValueError``.
+        ValueError
+            WP2.4: ``mtf_signals`` is a ``BacktestSignalSource`` subclass other than
+            ``UnavailableSignals`` / ``PitSignals`` (type name only).  Raised before the run
+            id and the engine exist.
         """
+        # 0a. WP2.3 CR-04: never leave the previous run's report behind, whatever
+        # fails first (validation, an unsupported timeframe, a rejection).
+        self._last_alignment = None
+        self._last_mtf_context = None  # WP2.4: never leave the previous run's report behind
+
         # 0. Deterministic seed — always non-None after M7 __init__ guard.
         # Seeds both Python random and numpy.random so sklearn PRNG (used by
         # ModelStrategy) and any future stochastic elements are reproducible.
@@ -353,22 +582,93 @@ class BacktestRunner:
         np.random.seed(self._seed)
         self._log.info("backtest.seed_set", seed=self._seed)
 
-        # 1. Validate input bars
+        # 1. Validate input bars (presence, order, duplicates)
         self._validate_bars(bars_by_symbol)
+
+        # 1b. WP2.3 (SY-23-11): align on timestamp -> telemetry -> tolerance check
+        # -> warm-up check on the TIMELINE -> rebind to the aligned dict.  All of
+        # it happens before ``run_id`` and the engine exist (I-6).
+        aligned = align_bars(
+            bars_by_symbol,
+            self._symbols,
+            self._timeframe_seconds(),
+            window=requested_window,
+            tolerance=self._alignment_tolerance,
+            warmup_bars=self._warmup_bars,
+        )
+        report = aligned.report
+        timeline = aligned.timeline
+        self._last_alignment = report
+        if record_alignment:
+            self._record_and_check_alignment(
+                report, enforce=self._enforce_alignment(requested_window)
+            )
+        elif not timeline and len(set(self._symbols)) > 1:
+            check_alignment(report)  # structural: off_grid / no_common_row, never swallowed
+        if len(timeline) <= self._warmup_bars:
+            raise ValueError(
+                f"Insufficient bars for warm-up. The aligned timeline has "
+                f"{len(timeline)} steps but warm-up requires {self._warmup_bars}. "
+                f"Provide at least {self._warmup_bars + 1} common bars."
+            )
+        # Every later read (t0, terminal MTM, start/end/duration, total_bars, the
+        # exposure denominators, the OOS range) sees the aligned window E, never
+        # the raw dict.
+        bars_by_symbol = aligned.bars_by_symbol
+
+        # 1c. WP2.5 (SY-25-07): resolve the annualisation factor ONCE, before the
+        # simulation, so an unsupported timeframe fails fast (strict, no daily fallback).
+        tf_s = self._timeframe_seconds()
+        ann_factor = _periods_per_year(self._timeframe)
+
+        # 1d. WP2.4 (SY-24-05/07, CF-P1-01): choose the run's signal source ONCE, before
+        # ``run_id`` and the engine exist.  The decisions are the trading steps' bar closes
+        # ``close_k`` (k in [W, N)), computed from the BARS exactly like the engine's
+        # ``close_i`` (latest present bar timestamp + one timeframe), not from the timeline
+        # stamps (those are always aware, which would hide a naive bar).  A naive timestamp
+        # or a bad source fails HERE, so the bar loop cannot raise.  The decisions are only
+        # iterated when a ``PitSignals`` is offered: with no source this costs nothing.
+        mtf_source: BacktestSignalSource | None = self._mtf_signals
+        if select_mtf_context:
+            step = timedelta(seconds=tf_s)
+            consumed: frozenset[str] = frozenset()
+            for strategy in self._strategies:
+                consumed |= strategy.mtf_signal_fields()
+            mtf_source, mtf_report = select_mtf_signals(
+                self._mtf_signals,
+                (
+                    max(bars_by_symbol[sym][idx].timestamp for sym, idx in timeline[k].present)
+                    + step
+                    for k in range(self._warmup_bars, len(timeline))
+                ),
+                consumed,
+            )
+            self._last_mtf_context = mtf_report
 
         # 2. Generate run ID
         run_id = f"bt-{uuid.uuid4().hex[:12]}"
 
+        # 2b. WP2.2 (SY-22-02/03): the run's simulated clock, created ONCE here
+        # (the only creation site for a production backtest).  ``t0`` is the
+        # bar-0 open under the same max rule as the WP1.5 risk clock, so the
+        # equity seed point sits exactly one timeframe before the first mark.
+        t0 = max(bars_by_symbol[symbol][0].timestamp for symbol in self._symbols)
+        bar_clock = BarClock(start=t0)
+
         # 3. Build engine components
-        engine, portfolio, risk_manager, exec_engine = self._build_engine(run_id)
+        engine, portfolio, risk_manager, exec_engine = self._build_engine(
+            run_id, clock=bar_clock, mtf_signals=mtf_source
+        )
 
         self._log.info(
             "backtest.starting",
             run_id=run_id,
             initial_capital=str(self._initial_capital),
-            slippage_bps=self._slippage_bps,
-            maker_fee_bps=self._maker_fee_bps,
-            taker_fee_bps=self._taker_fee_bps,
+            cost_profile_id=self._cost_profile.id,
+            cost_profile_fingerprint=self._cost_profile.fingerprint(),
+            slippage_bps=str(self._cost_profile.slippage_bps),
+            maker_fee_bps=str(self._cost_profile.maker_fee_bps),
+            taker_fee_bps=str(self._cost_profile.taker_fee_bps),
         )
 
         # 4. Start engine
@@ -392,6 +692,7 @@ class BacktestRunner:
         finally:
             # 7. Stop engine (always, even on error)
             await engine.stop()
+        await _yield_to_loop()  # CF-97-02: the post-loop steps below are separate stretches
 
         # 8. Collect results
         raw_equity_curve = portfolio.get_equity_curve()
@@ -436,19 +737,19 @@ class BacktestRunner:
             start_date = min(b.timestamp for b in all_bars)
             end_date = max(b.timestamp for b in all_bars)
         else:
-            start_date = datetime.now(tz=UTC)
-            end_date = start_date
+            # WP2.2 (AD-17): unreachable (``_validate_bars`` guarantees bars);
+            # never fall back to the wall clock in a backtest.
+            raise ValueError("backtest has no bars to derive a date range from")
 
         duration_days = max(1, (end_date - start_date).days)
 
         # 9. Build equity curve points with drawdown annotation
         equity_curve = self._build_equity_curve(raw_equity_curve)
+        await _yield_to_loop()
 
-        # 10. Compute total bars processed (shortest symbol series minus warmup)
-        num_bars_per_symbol = min(
-            len(bars_by_symbol[s]) for s in self._symbols
-        )
-        total_bars_processed = max(0, num_bars_per_symbol - self._warmup_bars)
+        # 10. Compute total bars processed (WP2.3: timeline steps minus warmup; the
+        # same denominator feeds the per-symbol exposure and compute_exposure)
+        total_bars_processed = max(0, len(timeline) - self._warmup_bars)
 
         # 11. M2 (Sprint 49): read authoritative exposure counters from the engine
         # summary dict.  These were populated by run_backtest()'s per-bar tracker
@@ -472,34 +773,56 @@ class BacktestRunner:
             (final_equity - self._initial_capital) / self._initial_capital
         ) if self._initial_capital > Decimal("0") else 0.0
 
-        cagr = compute_cagr(self._initial_capital, final_equity, duration_days)
-
-        # 14. Compute risk metrics
-        max_dd = compute_max_drawdown(equity_curve)
-        max_dd_duration = compute_max_drawdown_duration(equity_curve)
-
-        periods_per_year = TIMEFRAME_PERIODS_PER_YEAR.get(
-            self._timeframe, 365.25
+        # 14. WP2.5 (SY-25-04/05/06/08/10): ONE equity value per bar, from the first
+        # trading base point on (``curve[W].timestamp``), sampled AFTER the run from
+        # the curve (engine, portfolio and curve are untouched).  Every return metric,
+        # the drawdown duration and the CAGR read this sample; ``max_drawdown_pct``
+        # stays on all curve points so it agrees with every point's ``drawdown_pct``.
+        # The mode is never passed: the automatic off-grid fallback is the only way
+        # to ``present_steps`` (library single-symbol runs).
+        trading_start_at = _step_close(timeline, self._warmup_bars, t0, tf_s)
+        sample = sample_equity_per_bar(
+            equity_curve, start_at=trading_start_at, timeframe_s=tf_s
         )
-        per_period_returns = compute_returns_from_equity(equity_curve)
+        await _yield_to_loop()
+        trading_end_at: datetime | None = (
+            equity_curve[-1].timestamp if sample.stamps else None
+        )
+        if sample.stamps and sample.mode == "present_steps":
+            self._log.warning(
+                "backtest.metric_sampling_fallback",
+                metric_sampling=sample.mode,
+                n_returns=sample.n_returns,
+            )
 
-        sharpe = compute_sharpe(per_period_returns, periods_per_year)
-        sortino = compute_sortino(per_period_returns, periods_per_year)
+        full_metrics = compute_return_metrics(sample.returns(), ann_factor)
+        sharpe = full_metrics.sharpe
+        sortino = full_metrics.sortino
+
+        if trading_end_at is not None:
+            span_days = max(
+                1.0, (trading_end_at - trading_start_at).total_seconds() / 86400
+            )
+            cagr = compute_cagr(sample.equity[0], final_equity, span_days)
+        else:
+            cagr = 0.0
+
+        max_dd = compute_max_drawdown(equity_curve)
+        max_dd_duration = _max_dd_duration(sample.equity)
         calmar = compute_calmar(cagr, max_dd)
+        await _yield_to_loop()
 
-        # Sprint 50 Cycle 6 (IMPL-C6-003): realized OOS Sharpe over the OOS window.
-        # The equity curve is NOT 1:1 with bars (every fill appends an extra
-        # point), so we do NOT compute an offset from oos_start_index. Instead we
-        # read the boundary the engine captured (the LIVE equity-curve length at
-        # the moment processing crossed into the first OOS bar) and slice the
-        # equity curve there. Returns into the OOS window = compute_returns over
-        # equity_curve[boundary-1:] (the return INTO the first OOS point belongs
-        # to the OOS window; boundary-1 includes the prior point as the return base).
+        # Sprint 50 Cycle 6 / WP2.5 (SY-25-10): realized OOS Sharpe over the OOS
+        # window, sliced BY TIME.  The window starts at the close before the first OOS
+        # bar (``close_{oos-1}``), so fill points inside the window never add returns:
+        # ``oos_n_returns == N - oos_start_index``.  The engine's point offset is read
+        # only to detect "the loop never reached the OOS bar" (and logged).
         oos_sharpe: float | None = None
         oos_n_returns: int | None = None
+        oos_start_at: datetime | None = None
         if oos_start_index is not None:
             oos_offset = engine_summary.get("oos_equity_curve_offset")
-            n_bars_total = min(len(bars_by_symbol[s]) for s in self._symbols)
+            n_bars_total = len(timeline)
             if oos_start_index < self._warmup_bars or oos_start_index >= n_bars_total:
                 self._log.warning(
                     "backtest.oos_start_index_out_of_range",
@@ -521,15 +844,12 @@ class BacktestRunner:
                     ),
                 )
             else:
-                # boundary is the curve length BEFORE the first OOS bar appended
-                # any point. The return INTO the first OOS point uses the point at
-                # index (boundary-1) as its base, so slice the curve from
-                # (boundary-1) to capture that first OOS return. Clamp at 0.
-                slice_start = max(0, int(oos_offset) - 1)
-                oos_curve = equity_curve[slice_start:]
-                oos_returns = compute_returns_from_equity(oos_curve)
-                oos_n_returns = len(oos_returns)
-                oos_sharpe = compute_sharpe(oos_returns, periods_per_year)
+                oos_start_at = _step_close(timeline, oos_start_index, t0, tf_s)
+                oos_metrics = compute_return_metrics(
+                    sample.from_stamp(oos_start_at).returns(), ann_factor
+                )
+                oos_sharpe = oos_metrics.sharpe
+                oos_n_returns = oos_metrics.n
                 self._log.info(
                     "backtest.oos_sharpe_computed",
                     oos_start_index=oos_start_index,
@@ -539,35 +859,11 @@ class BacktestRunner:
                     full_curve_len=len(equity_curve),
                 )
 
-        # M4 (Sprint 49): PSR + statistical confidence fields
-        n_obs = len(per_period_returns)
-        # De-annualise Sharpe for PSR — Bailey's formula uses per-period Sharpe.
-        # per_period_sharpe = annual_sharpe / sqrt(periods_per_year)
-        per_period_sharpe = (
-            sharpe / math.sqrt(periods_per_year)
-            if periods_per_year > 0
-            else sharpe
-        )
-        # Compute population skewness and kurtosis from per-period returns
-        psr_skew = 0.0
-        psr_kurtosis = 3.0  # normal distribution default
-        if n_obs >= 4:
-            _mean = sum(per_period_returns) / n_obs
-            _var = sum((r - _mean) ** 2 for r in per_period_returns) / n_obs  # population
-            _std = math.sqrt(_var)
-            if _std > 0.0:
-                psr_skew = sum(
-                    (r - _mean) ** 3 for r in per_period_returns
-                ) / (n_obs * _std ** 3)
-                psr_kurtosis = sum(
-                    (r - _mean) ** 4 for r in per_period_returns
-                ) / (n_obs * _std ** 4)
-        psr = compute_psr(
-            per_period_sharpe,
-            n_obs,
-            skew=psr_skew,
-            kurtosis=psr_kurtosis,
-        )
+        # M4 (Sprint 49): PSR + statistical confidence fields, from the same
+        # return series as the Sharpe above (``compute_return_metrics``); n counts
+        # per-bar returns after warm-up (WP2.5).
+        n_obs = full_metrics.n
+        psr = full_metrics.psr
 
         # 15. Compute trade statistics
         trade_stats = compute_trade_statistics(trade_history)
@@ -638,6 +934,10 @@ class BacktestRunner:
             open_positions_mtm=open_positions_mtm,
             # Fees
             total_fees_paid=portfolio.total_fees_paid,
+            # WP2.1 (SY-21-15): the cost model behind the numbers above
+            cost_profile_id=self._cost_profile.id,
+            cost_profile_fingerprint=self._cost_profile.fingerprint(),
+            total_slippage_cost=_total_slippage_cost(exec_engine),
             # M4 (Sprint 49): PSR + statistical significance
             psr=psr,
             n_observations=n_obs,
@@ -651,6 +951,14 @@ class BacktestRunner:
             # oos_start_index was supplied).
             oos_sharpe=oos_sharpe,
             oos_n_returns=oos_n_returns,
+            # WP2.5 (SY-25-11): the sampling that produced the curve-derived numbers
+            metrics_version=METRICS_VERSION,
+            trading_start_at=trading_start_at,
+            trading_end_at=trading_end_at,
+            periods_per_year=ann_factor,
+            metric_sampling=sample.mode,
+            carried_slots=sample.carried_slots,
+            oos_start_at=oos_start_at,
         )
 
         self._log.info(
@@ -676,6 +984,8 @@ class BacktestRunner:
             total_fees=str(portfolio.total_fees_paid),
             psr=f"{psr:.4f}" if psr is not None else "n/a",
             confidence_flag=confidence_flag or "n/a",
+            n_returns=n_obs,
+            metric_sampling=sample.mode,
         )
 
         self._last_execution_engine = exec_engine
@@ -685,6 +995,34 @@ class BacktestRunner:
     # ------------------------------------------------------------------
     # Engine wiring
     # ------------------------------------------------------------------
+
+    def _timeframe_seconds(self) -> int:
+        try:
+            return _TIMEFRAME_SECONDS[self._timeframe]
+        except KeyError:
+            raise ValueError("unsupported timeframe for bar alignment") from None
+
+    def _enforce_alignment(self, requested_window: tuple[datetime, datetime] | None) -> bool:
+        """SY-23-05: enforce for several symbols or whenever a window was requested."""
+        return len(set(self._symbols)) > 1 or requested_window is not None
+
+    def _record_and_check_alignment(self, report: AlignmentReport, *, enforce: bool) -> None:
+        """Telemetry first, then the tolerance check (raises ``BarAlignmentError``).
+
+        Not enforced (single symbol without a window): the report and its
+        violations are logged, nothing is raised, so every golden, script and the
+        ML gate keep their behaviour.
+        """
+        record_bar_alignment(
+            report, timeframe=self._timeframe.value, enforced=enforce, log=self._log
+        )
+        if enforce:
+            try:
+                check_alignment(report)
+            except BarAlignmentError as exc:
+                record_bar_alignment_outcome(report, log=self._log, rejected=exc)
+                raise
+        record_bar_alignment_outcome(report, log=self._log)
 
     def _build_engine_config(self) -> dict[str, object]:
         """Build the StrategyEngine config dict, including optional trailing
@@ -705,6 +1043,9 @@ class BacktestRunner:
     def _build_engine(
         self,
         run_id: str,
+        *,
+        clock: BarClock | None = None,
+        mtf_signals: BacktestSignalSource | None = None,
     ) -> tuple[StrategyEngine, PortfolioAccounting, DefaultRiskManager, PaperExecutionEngine]:
         """
         Wire up all trading core components for a backtest run.
@@ -713,6 +1054,18 @@ class BacktestRunner:
         ----------
         run_id : str
             Unique run identifier.
+        clock : BarClock | None
+            WP2.2: the run's simulated clock.  Injected into the portfolio
+            (``clock=clock.now``: the equity seed point and every stamp go
+            through its ``_now()`` seam) and into the ``StrategyEngine``, which
+            is the ONLY path to the execution engine (``attach_clock``;
+            Amendment B -- ``PaperExecutionEngine(clock=)`` is not used here).
+            ``None`` (tests calling ``_build_engine(run_id)`` directly): the
+            engine creates its own ``BarClock`` in ``run_backtest``; only the
+            portfolio's seed point then keeps a wall stamp.
+        mtf_signals : BacktestSignalSource | None
+            WP2.4: the run's already-selected source.  ``None`` -> the constructor's source
+            (``None`` there -> the engine's ``UNAVAILABLE``).
 
         Returns
         -------
@@ -733,13 +1086,14 @@ class BacktestRunner:
         execution_engine = PaperExecutionEngine(
             run_id=run_id,
             risk_manager=risk_manager,
-            slippage_bps=self._slippage_bps,
+            cost_profile=self._cost_profile,
             initial_cash=self._initial_capital,
         )
 
         portfolio = PortfolioAccounting(
             run_id=run_id,
             initial_cash=self._initial_capital,
+            clock=clock.now if clock is not None else None,
         )
 
         # The StrategyEngine requires a market data service for PAPER/LIVE
@@ -747,6 +1101,12 @@ class BacktestRunner:
         # still requires one.  We provide a stub.
         market_data_stub = _BacktestMarketDataStub()
 
+        # WP2.4: with no (or the no-op ``UNAVAILABLE``) source the constructor call is
+        # byte-identical to the pre-P2 one -- the engine's own default is ``UNAVAILABLE``.
+        source = mtf_signals if mtf_signals is not None else self._mtf_signals
+        source_kwargs: dict[str, Any] = (
+            {} if source is None or source is UNAVAILABLE else {"mtf_signals": source}
+        )
         engine = StrategyEngine(
             strategies=self._strategies,
             execution_engine=execution_engine,
@@ -762,6 +1122,9 @@ class BacktestRunner:
                 if self._enable_circuit_breaker
                 else None
             ),
+            cost_profile=self._cost_profile,
+            clock=clock,
+            **source_kwargs,
         )
 
         return engine, portfolio, risk_manager, execution_engine
@@ -770,6 +1133,20 @@ class BacktestRunner:
     def last_execution_engine(self) -> PaperExecutionEngine | None:
         """Return the execution engine from the most recent run, or None."""
         return self._last_execution_engine
+
+    @property
+    def last_alignment(self) -> AlignmentReport | None:
+        """The WP2.3 alignment report of the most recent run (even a rejected one)."""
+        return self._last_alignment
+
+    @property
+    def last_mtf_context(self) -> MtfContextReport | None:
+        """The WP2.4 MTF-context report of the most recent ``run`` (``None`` until selected).
+
+        Reset at every ``run`` entry.  ``None`` for an inner optimizer runner
+        (``select_mtf_context=False``): the optimizer holds the one report.
+        """
+        return self._last_mtf_context
 
     @property
     def last_portfolio(self) -> PortfolioAccounting | None:
@@ -791,9 +1168,11 @@ class BacktestRunner:
         ------
         1. All configured symbols have bar data.
         2. Each symbol's bars are sorted by timestamp ascending.
-        3. All symbols have the same number of bars (or at least
-           enough after truncation to the shortest series).
-        4. The shortest series has enough bars for the warm-up period.
+        3. No duplicate timestamps.
+
+        WP2.3: the series may differ in length (they are paired by timestamp in
+        ``align_bars``); the warm-up check moved to the aligned timeline in
+        :meth:`run`, and the ``bar_count_mismatch`` warning is retired.
 
         Parameters
         ----------
@@ -836,29 +1215,10 @@ class BacktestRunner:
                         f"deterministic bar processing."
                     )
 
-        # Check 3: sufficient bars for warm-up
-        min_bars = min(len(bars_by_symbol[s]) for s in self._symbols)
-        if min_bars <= self._warmup_bars:
-            raise ValueError(
-                f"Insufficient bars for warm-up. Shortest series has "
-                f"{min_bars} bars but warm-up requires {self._warmup_bars}. "
-                f"Provide at least {self._warmup_bars + 1} bars per symbol."
-            )
-
-        # Check 4: log alignment info
-        bar_counts = {s: len(bars_by_symbol[s]) for s in self._symbols}
-        if len(set(bar_counts.values())) > 1:
-            self._log.warning(
-                "backtest.bar_count_mismatch",
-                bar_counts=bar_counts,
-                note="Series will be truncated to shortest length",
-            )
-
         self._log.info(
             "backtest.bars_validated",
-            bar_counts=bar_counts,
+            bar_counts={s: len(bars_by_symbol[s]) for s in self._symbols},
             warmup_bars=self._warmup_bars,
-            effective_bars=min_bars - self._warmup_bars,
         )
 
     # ------------------------------------------------------------------

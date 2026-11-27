@@ -1,0 +1,187 @@
+[
+ {
+  "dependency": "key",
+  "method": "GET",
+  "path": "/api/v1/emergency/kill-switch"
+ },
+ {
+  "dependency": "admin",
+  "method": "POST",
+  "path": "/api/v1/emergency/kill-switch"
+ },
+ {
+  "dependency": "admin",
+  "method": "POST",
+  "path": "/api/v1/emergency/kill-switch/clear"
+ },
+ {
+  "dependency": "key",
+  "method": "GET",
+  "path": "/api/v1/health/background"
+ },
+ {
+  "dependency": "none",
+  "method": "GET",
+  "path": "/api/v1/metrics"
+ },
+ {
+  "dependency": "key",
+  "method": "GET",
+  "path": "/api/v1/ml/models"
+ },
+ {
+  "dependency": "key",
+  "method": "PUT",
+  "path": "/api/v1/ml/models/{model_id}/activate"
+ },
+ {
+  "dependency": "key",
+  "method": "POST",
+  "path": "/api/v1/ml/retrain/{symbol:path}"
+ },
+ {
+  "dependency": "key",
+  "method": "POST",
+  "path": "/api/v1/ml/train"
+ },
+ {
+  "dependency": "key",
+  "method": "GET",
+  "path": "/api/v1/optimize"
+ },
+ {
+  "dependency": "key",
+  "method": "POST",
+  "path": "/api/v1/optimize"
+ },
+ {
+  "dependency": "key",
+  "method": "GET",
+  "path": "/api/v1/optimize/{optimization_run_id}"
+ },
+ {
+  "dependency": "key",
+  "method": "GET",
+  "path": "/api/v1/portfolio/summary"
+ },
+ {
+  "dependency": "key",
+  "method": "GET",
+  "path": "/api/v1/runs"
+ },
+ {
+  "dependency": "key",
+  "method": "POST",
+  "path": "/api/v1/runs"
+ },
+ {
+  "dependency": "key",
+  "method": "DELETE",
+  "path": "/api/v1/runs/{run_id}"
+ },
+ {
+  "dependency": "key",
+  "method": "GET",
+  "path": "/api/v1/runs/{run_id}"
+ },
+ {
+  "dependency": "key",
+  "method": "PATCH",
+  "path": "/api/v1/runs/{run_id}/archive"
+ },
+ {
+  "dependency": "key",
+  "method": "GET",
+  "path": "/api/v1/runs/{run_id}/circuit-breaker"
+ },
+ {
+  "dependency": "key",
+  "method": "POST",
+  "path": "/api/v1/runs/{run_id}/circuit-breaker/reset"
+ },
+ {
+  "dependency": "key",
+  "method": "GET",
+  "path": "/api/v1/runs/{run_id}/diagnostics"
+ },
+ {
+  "dependency": "key",
+  "method": "POST",
+  "path": "/api/v1/runs/{run_id}/emergency-stop"
+ },
+ {
+  "dependency": "key+admin",
+  "method": "POST",
+  "path": "/api/v1/runs/{run_id}/entries-latch/clear"
+ },
+ {
+  "dependency": "key",
+  "method": "GET",
+  "path": "/api/v1/runs/{run_id}/equity-curve"
+ },
+ {
+  "dependency": "key",
+  "method": "GET",
+  "path": "/api/v1/runs/{run_id}/fills"
+ },
+ {
+  "dependency": "key",
+  "method": "GET",
+  "path": "/api/v1/runs/{run_id}/learning"
+ },
+ {
+  "dependency": "key",
+  "method": "GET",
+  "path": "/api/v1/runs/{run_id}/orders"
+ },
+ {
+  "dependency": "key",
+  "method": "GET",
+  "path": "/api/v1/runs/{run_id}/orders/{order_id}"
+ },
+ {
+  "dependency": "key",
+  "method": "GET",
+  "path": "/api/v1/runs/{run_id}/portfolio"
+ },
+ {
+  "dependency": "key",
+  "method": "GET",
+  "path": "/api/v1/runs/{run_id}/positions"
+ },
+ {
+  "dependency": "key",
+  "method": "POST",
+  "path": "/api/v1/runs/{run_id}/promote-to-live"
+ },
+ {
+  "dependency": "key",
+  "method": "GET",
+  "path": "/api/v1/runs/{run_id}/promotion-eligibility"
+ },
+ {
+  "dependency": "key+admin",
+  "method": "POST",
+  "path": "/api/v1/runs/{run_id}/resume"
+ },
+ {
+  "dependency": "key",
+  "method": "GET",
+  "path": "/api/v1/runs/{run_id}/trades"
+ },
+ {
+  "dependency": "none",
+  "method": "GET",
+  "path": "/api/v1/signals/current"
+ },
+ {
+  "dependency": "key",
+  "method": "GET",
+  "path": "/api/v1/strategies"
+ },
+ {
+  "dependency": "key",
+  "method": "GET",
+  "path": "/api/v1/strategies/{name}/schema"
+ }
+]

@@ -26,6 +26,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from common.types import TimeFrame
+from trading.costs import DEFAULT_COST_PROFILE
 from trading.portfolio import PortfolioAccounting
 from trading.recovery import ResumeDailySeed, ResumeSnapshot
 
@@ -95,12 +96,13 @@ async def _run_until_from_fills(
 
     common: dict[str, Any] = {
         "run_id_str": snapshot.run_id,
-        "strategy_cls": MagicMock(),
+        "strategy_cls": MagicMock(**{"mtf_signal_fields.return_value": frozenset()}),
         "strategy_name": "grid_trading",
         "strategy_params": {},
         "symbols": ["BTC/USD"],
         "timeframe": TimeFrame.ONE_HOUR,
         "initial_capital": "10000",
+        "cost_profile": DEFAULT_COST_PROFILE,  # WP2.1: required keyword
         "resume": snapshot,
     }
     patches = [

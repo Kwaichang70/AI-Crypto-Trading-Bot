@@ -10,7 +10,23 @@ Deployment configuration and database migrations.
 
 ### Contents
 - `docker-compose.yml` — Orchestrates: api + ui + postgres + redis
-- `migrations/` — Database migration scripts (Alembic)
+- `alembic/` — Alembic config (`alembic.ini`, `env.py`); migration scripts are in `alembic/versions/`
+  (head `022`). There is no `infra/migrations/` directory.
+- `alembic/versions/021_add_context_observations.py` — WP2.4 append-only `context_observations` table
+  (point-in-time context series; PK `series_id, observed_at, available_at`). No retention or purge by
+  design (a run's recorded digest must stay reproducible); `recorded` rows cannot be re-fetched, so
+  include the table in backups. The downgrade refuses while `recorded` rows exist unless run with
+  `-x allow_drop_context=1`.
+- `alembic/versions/022_add_ohlcv_cache.py` — WP2.6 OHLCV cache tables `ohlcv_bars` (PK `exchange, symbol,
+  timeframe, open_time`; first write wins) and `ohlcv_coverage` (one contiguous interval per series). CHECKs
+  cover identifier, timeframe whitelist (no `1w`), grid, closed bar and OHLC sanity.
+  Re-fetching does not guarantee identical rows, so include both tables in backups. The downgrade
+  refuses while EITHER table holds a row unless run with `-x allow_drop_ohlcv=1`; offline it needs
+  the flag. The api entrypoint runs `alembic upgrade head` on every start, so the tables exist
+  before the new image serves. An image older than 022 cannot start on a DB at 022 (unknown
+  revision): to roll back, stop api, `pg_dump` both tables, run the downgrade from the NEW image,
+  then deploy the old image without restarting the new one (its entrypoint upgrades again).
+  Targets PostgreSQL 16.
 - Dockerfile definitions for each service
 
 ### Requirements

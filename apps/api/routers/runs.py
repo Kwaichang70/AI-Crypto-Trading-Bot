@@ -32,6 +32,7 @@ MVP notes
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
 from collections.abc import Mapping
 from datetime import UTC, datetime
@@ -54,6 +55,7 @@ from api.db.models import (
 )
 from api.db.session import get_db
 from api.deps import require_admin
+from api.services import admission, egress_budget, spawn_hooks
 from api.services.idempotency import (
     CREATE_ENDPOINT,
     PROMOTE_ENDPOINT,
@@ -79,6 +81,13 @@ from api.schemas import (
     RunStopResponse,
     UnprotectedPositionResponse,
 )
+from api.services.cost_profiles import (
+    bar_alignment_http_error,
+    check_backtest_request_bounds,
+    new_run_cost_profile_or_422,
+    requested_bar_window,
+    stamp_cost_config,
+)
 from api.services.run_orchestrator import (
     _IncrementalFlushState,
     _LEARNING_INSTANCES,
@@ -94,6 +103,8 @@ from api.services.run_orchestrator import (
     run_paper_engine as _run_paper_engine,
 )
 from api.services.run_persistence import (
+    DUPLICATE_SYMBOLS_REASON,
+    has_duplicate_symbols,
     load_resume_snapshot as _load_resume_snapshot,
     persist_backtest_results as _persist_backtest_results,
     persist_paper_results as _persist_paper_results,
@@ -101,14 +112,23 @@ from api.services.run_persistence import (
     run_orm_to_response as _run_orm_to_response,
 )
 from common.logging import exc_log_fields
+from common.metrics import metrics
 from common.types import OrderSide, RunMode, TimeFrame
+from data.bar_alignment import BarAlignmentError
+from trading.costs import (
+    default_cost_profile,
+    resolve_run_cost_profile,
+)
 from trading.exit_config import (
     ExitConfigError,
+    ExitCostModel,
+    policy_cost_model,
     resolve_run_exit_check,
     strategy_requires_exit_manager,
     validate_run_exit_config,
 )
 from trading.recovery import ResumeRejected, check_fill_integrity, replay_sort_key
+from trading.safety import BACKTEST_CIRCUIT_BREAKER_DEFAULT, live_context_consumer_refusal
 from trading.smoke_guard import SMOKE_STRATEGY_NAMES, SmokeGuardError, validate_smoke_run
 from trading.strategy_availability import get_availability, is_mode_allowed
 from trading.strategy_engine import FlattenResult, build_synthetic_flatten_result
@@ -132,12 +152,17 @@ def _intrabar_exit_checks_effective(
     strategy_name: str,
     bracket: dict[str, object] | None,
     trailing_stop_pct: object,
+    cost: ExitCostModel,
 ) -> bool:
     """WP1.3b-b: will the live intra-bar exit check be effective for this run?
 
     Feeds the W8 gate of ``validate_run_exit_config``.  Any failure (settings not
     loadable, a bad value) answers ``False``: the "bar close only" warning is then
     shown, which is the safe direction.
+
+    ``cost`` is REQUIRED (WP21A-CR-01): pass the SAME model as the neighbouring
+    ``validate_run_exit_config(..., cost=...)`` call.  Then "validation passed"
+    implies "this parse passes" and W8 is never spurious.
     """
     try:
         from api.config import get_settings
@@ -150,6 +175,7 @@ def _intrabar_exit_checks_effective(
                 strategy_name=strategy_name,
                 bracket=bracket,
                 trailing_stop_pct=trailing_stop_pct,
+                cost=cost,
             ).interval_s
             is not None
         )
@@ -190,6 +216,21 @@ def _is_postgresql(db: AsyncSession) -> bool:
     except Exception:
         return False
 
+
+
+def _reject_live_context_consumer(strategy_name: str, strategy_cls: object, log: Any) -> None:  # noqa: ANN401
+    """CF-24-01 (SY-01-05): 422 for a LIVE run of a context-consuming strategy.
+
+    Fail-closed (an unknown strategy is refused too).  The detail is the closed code only:
+    no strategy name, no request field, no exception text.
+    """
+    code = live_context_consumer_refusal(strategy_name, strategy_cls)
+    if code is not None:
+        log.warning("runs.live_context_consumer_blocked")
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": code},
+        )
 
 
 def _get_strategy_registry() -> dict[str, Any]:
@@ -408,6 +449,20 @@ def _build_promoted_strategy_params(
 
 
 # ---------------------------------------------------------------------------
+# WP2.3 (SY-23-14): the ONE wall-clock read of the bar-alignment window
+# ---------------------------------------------------------------------------
+
+
+def _window_now() -> datetime:
+    """``now`` for :func:`~api.services.cost_profiles.requested_bar_window`.
+
+    The ROUTER reads the clock, never the runner, optimizer or engine (WP22-T-06); this
+    module-level seam is what tests patch.  ``optimize.py`` calls it through this module.
+    """
+    return datetime.now(tz=UTC)
+
+
+# ---------------------------------------------------------------------------
 # Helper: fetch historical bars via CCXTMarketDataService
 # ---------------------------------------------------------------------------
 
@@ -417,6 +472,8 @@ async def _fetch_bars_for_backtest(
     start: datetime,
     end: datetime,
     log: Any,
+    *,
+    now: datetime | None = None,
 ) -> dict[str, list[Any]]:
     """
     Fetch historical OHLCV bars for all symbols in the requested date range.
@@ -437,11 +494,15 @@ async def _fetch_bars_for_backtest(
         Exclusive end datetime (UTC).
     log:
         Bound structlog logger for contextual logging.
+    now:
+        The router's single clock read (WP2.6, SY-26-16).  With ``OHLCV_CACHE_MODE`` other than
+        ``off`` the bars come through the history cache; ``None`` or ``off`` is today's path.
 
     Returns
     -------
     dict[str, list[OHLCVBar]]
-        Bars keyed by symbol, sorted ascending by timestamp.
+        Bars keyed by symbol, sorted ascending by timestamp.  A ``HistoryBars`` (cache path)
+        also carries the ``ohlcv_data`` block.
 
     Raises
     ------
@@ -451,7 +512,7 @@ async def _fetch_bars_for_backtest(
         When a symbol is not supported by the configured exchange.
     """
     from api.config import get_settings
-    from data.market_data import DataNotAvailableError, MarketDataError
+    from data.market_data import DataNotAvailableError, MarketDataError, RateLimitError
     from data.services.ccxt_market_data import CCXTMarketDataService
 
     settings = get_settings()
@@ -484,7 +545,16 @@ async def _fetch_bars_for_backtest(
         end=end.isoformat(),
     )
 
+    t_fetch = time.monotonic()  # CF-26-21: the fetch-latency histogram
     try:
+        egress_budget.history_check(settings.exchange_id)  # CF-97-03 P7b: the cooldown consumer
+        if now is not None and settings.ohlcv_cache_mode != "off":
+            from api.services.ohlcv_history import fetch_history_bars
+
+            mode, window = settings.ohlcv_cache_mode, (start, end)
+            return await fetch_history_bars(
+                service, mode, settings.exchange_id, symbols, timeframe, window, now, log
+            )
         await service.connect()
 
         # Fetch all symbols concurrently using asyncio.gather.
@@ -515,6 +585,12 @@ async def _fetch_bars_for_backtest(
 
         return bars_by_symbol
 
+    except egress_budget.HistoryBudgetExhausted:  # fixed text; mapped before any generic handler
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            {"code": "history_fetch_busy"},
+            {"Retry-After": "60"},
+        ) from None
     except DataNotAvailableError as exc:
         # CF-36 F-13: type/status/location only in the log; the (fixed-text, post
         # F-09) message stays in the client-facing ``detail`` below.
@@ -524,12 +600,17 @@ async def _fetch_bars_for_backtest(
             detail=f"Data not available for the requested range: {exc}",
         ) from exc
     except MarketDataError as exc:
+        if isinstance(exc, RateLimitError):  # after the frozen retries: cool the exchange down
+            egress_budget.suspend_history(settings.exchange_id, exc.retry_after)
         log.error("runs.backtest_market_data_error", **exc_log_fields(exc))
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"Exchange error fetching historical data: {exc}",
         ) from exc
     finally:
+        elapsed = time.monotonic() - t_fetch
+        fetch_mode: str = "off" if now is None else settings.ohlcv_cache_mode
+        metrics.observe("history_fetch_seconds", elapsed, {"mode": fetch_mode})
         await service.close()
 
 
@@ -645,10 +726,19 @@ async def create_run(
     # (bracket keys popped, trailing_stop_pct rewritten) before the claim
     # point, and a fingerprint taken after that mutation would not match a
     # byte-identical retry.
+    #
+    # WP2.1 (SY-21-17): the new optional ``cost_profile`` request field adds a
+    # ``"cost_profile": null`` key to the dump.  A body that does not send it is
+    # EXCLUDED from the fingerprint, so a byte-identical retry that straddles the
+    # deploy keeps its pre-2.1a fingerprint (and still replays); a body that
+    # carries one is fingerprinted with it.
+    _fingerprint_exclude = {"confirm_token"}
+    if body.cost_profile is None:
+        _fingerprint_exclude.add("cost_profile")
     _idempotency_fingerprint = compute_fingerprint(
         CREATE_ENDPOINT,
         {},
-        body.model_dump(mode="json", exclude={"confirm_token"}),
+        body.model_dump(mode="json", exclude=_fingerprint_exclude),
     )
 
     log = logger.bind(
@@ -707,6 +797,15 @@ async def create_run(
                 f"Allowed: {sorted_modes}. {demotion_reason}".strip()
             ),
         )
+
+    # ------------------------------------------------------------------
+    # WP2.1 (U-2, SY-21-03): resolve the run's cost profile BEFORE the exit
+    # validation (its basis).  Backtest: any registry id; paper: live-
+    # equivalent ids only; live: no id at all.  422 carries a stable code and
+    # never echoes the requested value.  A failure here leaves no RunORM row
+    # and touches no idempotency store.
+    # ------------------------------------------------------------------
+    _cost_profile = new_run_cost_profile_or_422(body.cost_profile, mode=str(body.mode))
 
     # Extract trailing_stop_pct from strategy params BEFORE schema validation.
     # The UI may submit trailing_stop_pct as an empty string when the field is
@@ -773,7 +872,11 @@ async def create_run(
                 strategy_name=strategy_name,
                 bracket=_bracket_config,
                 trailing_stop_pct=_raw_trailing_stop_pct,
+                cost=policy_cost_model(_cost_profile),
             ),
+            # WP2.1 (SY-21-06): the stricter of the default and the run's own
+            # profile, so create-pass => engine-pass => promote-pass.
+            cost=policy_cost_model(_cost_profile),
         )
     except ExitConfigError as exc:
         log.warning(
@@ -831,6 +934,14 @@ async def create_run(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="backtest_start must be before backtest_end",
             )
+        # WP2.3 P0 SEC-02: fixed 422 codes for an oversized / pre-genesis / too-wide
+        # history request, BEFORE the idempotency claim and any bar fetch.
+        check_backtest_request_bounds(
+            start=body.backtest_start,
+            end=body.backtest_end,
+            timeframe=TimeFrame(str(body.timeframe)),
+            n_symbols=len(body.symbols),
+        )
 
     # ------------------------------------------------------------------
     # 3-Layer Live Trading Safety Gate (SEC-003)
@@ -934,6 +1045,12 @@ async def create_run(
                 ),
             )
 
+    # CF-24-01 (SY-01-05): live context-consumer gate.  Placed after every existing
+    # live rejection (live gate 403, kill switch 409, concurrency cap 503) so their
+    # order and codes are unchanged, and before the idempotency claim (no store touch).
+    if body.mode == "live":
+        _reject_live_context_consumer(strategy_name, strategy_cls, log)
+
     # ------------------------------------------------------------------
     # WP7.0 (SY-70-02): the idempotency claim point. Placed AFTER every
     # rejection above (pydantic 422, unknown-strategy 400, WP1.3a 422, the
@@ -1014,6 +1131,13 @@ async def create_run(
                 },
             )
 
+    # CF-97-03 P7b: the egress cap of a NEW paper/live run (after Owned; the claim is failed first).
+    if body.mode in ("paper", "live") and not egress_budget.reserve_new_run(
+        _claim.claimed_run_id, str(body.mode), body.symbols, body.timeframe
+    ):
+        await store.fail(key=_idempotency_key, claimed_run_id=_claim.claimed_run_id)
+        raise HTTPException(status.HTTP_409_CONFLICT, {"code": "egress_budget_exceeded"})
+
     # SY-70-12: use the claimed id, not a fresh uuid4() -- I4 requires
     # RunORM.id == idempotency_keys.claimed_run_id for this request.
     run_id: uuid.UUID = _claim.claimed_run_id
@@ -1037,6 +1161,17 @@ async def create_run(
     # WP1.3a (SY-13a-08/I8): the RESOLVED bool is always persisted so a
     # run's pyramiding behaviour is visible and stays fixed for its lifetime.
     config_snapshot["allow_pyramiding"] = _allow_pyramiding
+    # WP2.1 (AG-03/AG-06): freeze the run's cost profile + semantics versions.
+    # Live: the profile is only an estimate, the ledger uses exchange fills.
+    # WP2.1c (SEC-09): the stamp names the SAME constant the runner below receives (the
+    # stamp precedes the runner), instead of relying on the stamp's own default.
+    stamp_cost_config(
+        config_snapshot,
+        _cost_profile,
+        mode=str(body.mode),
+        fee_source="exchange_fills" if body.mode == "live" else "model",
+        backtest_circuit_breaker=BACKTEST_CIRCUIT_BREAKER_DEFAULT,
+    )
     if body.backtest_start is not None:
         config_snapshot["backtest_start"] = body.backtest_start.isoformat()
     if body.backtest_end is not None:
@@ -1087,6 +1222,17 @@ async def create_run(
     # the except BaseException branch below.
     _completed_before_commit = False
 
+    # CF-97-03 (P7a): one research slot per process; the replay above never gets here.  A refusal
+    # marks the claim failed (a retry reclaims it) and nothing else has happened yet.
+    lease: admission.Releasable
+    if is_backtest:
+        try:
+            lease = admission.try_acquire("backtest")
+        except admission.AdmissionRefused:
+            await store.fail(key=_idempotency_key, claimed_run_id=run_id)
+            raise
+    else:
+        lease = admission.NO_LEASE
     try:
         db.add(run_orm)
         await db.flush()  # Assign the PK within the transaction without committing
@@ -1112,6 +1258,11 @@ async def create_run(
         # ------------------------------------------------------------------
         if is_backtest:
             try:
+                # WP2.3 (SY-23-14, SEC-01): read ``now`` ONCE, BEFORE the fetch.  The pager
+                # stops at ``floor(its own now) + tf`` (later than this value), so every bar
+                # opening before ``floor(now)`` is already closed and the tail is covered;
+                # reading it after a slow fetch would admit the still-forming bar.
+                _bar_window_now = _window_now()
                 # Step 1: Fetch historical OHLCV bars
                 bars_by_symbol = await _fetch_bars_for_backtest(
                     symbols=body.symbols,
@@ -1119,6 +1270,7 @@ async def create_run(
                     start=body.backtest_start,  # type: ignore[arg-type]
                     end=body.backtest_end,       # type: ignore[arg-type]
                     log=log,
+                    now=_bar_window_now,
                 )
 
                 # Step 2: Instantiate strategy
@@ -1139,6 +1291,11 @@ async def create_run(
                     bracket_config=_bracket_config,
                     allow_pyramiding=_allow_pyramiding,
                     seed=body.seed,
+                    cost_profile=_cost_profile,
+                    # WP2.1c (SY-21-13): the breaker the run executes with is the one
+                    # ``stamp_cost_config`` persisted as
+                    # ``engine_semantics.backtest_circuit_breaker``.  No API toggle.
+                    enable_circuit_breaker=BACKTEST_CIRCUIT_BREAKER_DEFAULT,
                 )
                 # M7 (Sprint 49 INF-9): persist the resolved seed (auto-generated or
                 # caller-supplied) into the config dict.  Seed mutation here is captured
@@ -1148,7 +1305,31 @@ async def create_run(
                 config_snapshot["seed"] = runner.seed
 
                 log.info("runs.backtest_execution_starting", run_id=str(run_id))
-                result = await runner.run(bars_by_symbol)
+                # WP2.3 (SY-23-14): the requested window, with the still-forming bar
+                # clamped off.  ``now`` is read HERE (router), nowhere deeper.
+                result = await runner.run(
+                    bars_by_symbol,
+                    requested_window=requested_bar_window(
+                        body.backtest_start,  # type: ignore[arg-type]
+                        body.backtest_end,  # type: ignore[arg-type]
+                        timeframe,
+                        _bar_window_now,
+                    ),
+                )
+                # WP2.3 (SY-23-16): ints / strings / bools only; carried through
+                # ``_persist_backtest_results`` (it rebuilds config from ``run_orm.config``).
+                if runner.last_alignment is not None:
+                    config_snapshot["bar_alignment"] = runner.last_alignment.to_metadata()
+                # WP2.4 (SY-24-07): what the MTF context actually was.  Built by the engine's
+                # selection from the run's own bars and the source it was given (no source
+                # in Phase A, so ``source == "unavailable"``); never read from the request.
+                # Ints / strings / bools / ISO only; same carry path as ``bar_alignment``.
+                if runner.last_mtf_context is not None:
+                    config_snapshot["mtf_context"] = runner.last_mtf_context.to_metadata()
+                # WP2.6 (SY-26-10/16): the data block, only from the cache path (a plain dict
+                # from mode ``off`` or a patched fake has none).  Server-written, closed values.
+                if isinstance(ohlcv_block := getattr(bars_by_symbol, "ohlcv_data", None), dict):
+                    config_snapshot["ohlcv_data"] = ohlcv_block
 
                 # Step 4: Persist results (trades + equity curve + metrics in config)
                 await _persist_backtest_results(
@@ -1185,6 +1366,28 @@ async def create_run(
                 run_orm.updated_at = error_time
                 await db.flush()
                 raise
+
+            except BarAlignmentError as exc:
+                # WP2.3 (SY-23-08): MUST precede ``except ValueError`` (BarAlignmentError
+                # is a ValueError subclass; after it this would be a 400 that echoes
+                # ``str(exc)``).  422 with the closed code only; CF-36: the log carries
+                # the code and the type, never the exception text.  The row's ``error``
+                # status is in-flight only: the outer ``except BaseException`` rolls the
+                # session back like every other 4xx/5xx here, so nothing is persisted and
+                # the durable record of a rejection is the log line and the metric.
+                error_time = datetime.now(tz=UTC)
+                run_orm.status = "error"
+                run_orm.stopped_at = error_time
+                run_orm.updated_at = error_time
+                await db.flush()
+
+                log.warning(
+                    "runs.backtest_bar_alignment_rejected",
+                    run_id=str(run_id),
+                    code=exc.code,
+                    error_type="BarAlignmentError",
+                )
+                raise bar_alignment_http_error(exc) from exc
 
             except ValueError as exc:
                 # BacktestRunner._validate_bars raised a data-quality error
@@ -1266,6 +1469,7 @@ async def create_run(
                     enable_adaptive_learning=body.enable_adaptive_learning,
                     auto_apply_learning=body.auto_apply_learning,
                     allow_pyramiding=_allow_pyramiding,
+                    cost_profile=_cost_profile,
                 ),
                 name=f"paper-engine-{run_id}",
             )
@@ -1282,6 +1486,7 @@ async def create_run(
             # and registration (a bare boolean assignment cannot raise),
             # so the task is never orphaned from _RUN_TASKS either.
             _completed_before_commit = False
+            spawn_hooks.on_run_spawned(run_id, "paper", body.symbols, body.timeframe, task)
             _RUN_TASKS[str(run_id)] = task
             log.info("runs.paper_engine_task_created", run_id=str(run_id))
 
@@ -1303,12 +1508,14 @@ async def create_run(
                     bracket_config=_bracket_config,
                     enable_adaptive_learning=body.enable_adaptive_learning,
                     allow_pyramiding=_allow_pyramiding,
+                    cost_profile=_cost_profile,
                 ),
                 name=f"live-engine-{run_id}",
             )
             # WP7.0 round 3 (WP70-S-R2-01): see the identical paper-mode
             # comment above -- same rationale, same ordering.
             _completed_before_commit = False
+            spawn_hooks.on_run_spawned(run_id, "live", body.symbols, body.timeframe, task)
             _RUN_TASKS[str(run_id)] = task
             log.info("runs.live_engine_task_created", run_id=str(run_id))
 
@@ -1404,6 +1611,8 @@ async def create_run(
             # do here; fall through to re-raising the original exception.
             pass
         raise
+    finally:
+        lease.release()
 
     # NOTE: named result_response (not "response") -- the FastAPI-injected
     # ``response: Response`` header-mutation parameter above must not be
@@ -2796,7 +3005,19 @@ async def promote_to_live(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Strategy {promotion_strategy_name!r} from source run is no longer registered.",
         )
+    # WP2.3 (CF-23-20): a legacy paper config with a duplicated symbol must not become a
+    # live run (the engine would reject it after the audit row and the claim exist).
+    if has_duplicate_symbols(source_run.config.get("symbols")):
+        log.warning("runs.promote_duplicate_symbols", source_run_id=str(run_id))
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": DUPLICATE_SYMBOLS_REASON},
+        )
     _source_strategy_params: dict[str, Any] = source_run.config.get("strategy_params", {}) or {}
+    # WP2.1 (AG-04): a promoted live run is ALWAYS priced (estimated) with the
+    # current default -- never the paper source's profile -- and validated at
+    # the policy basis of that default, which create can never be stricter than.
+    _promote_cost_profile = default_cost_profile()
     try:
         _promote_verdict = validate_run_exit_config(
             promotion_strategy_cls,
@@ -2811,7 +3032,9 @@ async def promote_to_live(
                 strategy_name=promotion_strategy_name,
                 bracket=source_run.config.get("bracket_config") or {},
                 trailing_stop_pct=_source_strategy_params.get("trailing_stop_pct"),
+                cost=policy_cost_model(_promote_cost_profile),
             ),
+            cost=policy_cost_model(_promote_cost_profile),
         )
     except ExitConfigError as exc:
         log.warning(
@@ -2893,6 +3116,10 @@ async def promote_to_live(
             ),
         )
 
+    # CF-24-01 (SY-01-05): live context-consumer gate, after every existing promote
+    # rejection and before the claim.
+    _reject_live_context_consumer(promotion_strategy_name, promotion_strategy_cls, log)
+
     # ------------------------------------------------------------------
     # WP7.0 (SY-70-02): claim point -- after the 404 source-run lookup
     # above and every other rejection (availability 422, exit-config 422,
@@ -2914,6 +3141,15 @@ async def promote_to_live(
         response.headers["Idempotent-Replay"] = "true"
         log.info("runs.idempotency_replayed", run_id=str(_claim.run_id))
         return _run_orm_to_detail_response(_replayed_run)
+
+    # CF-97-03 P7b: a promote starts a NEW live engine, so it counts against the egress cap.
+    _egress_symbols = source_run.config.get("symbols", [])  # one value for the check AND the hook
+    _egress_timeframe = source_run.config.get("timeframe")  # no default: unresolved -> refused
+    if not egress_budget.reserve_new_run(
+        _claim.claimed_run_id, "live", _egress_symbols, _egress_timeframe
+    ):
+        await store.fail(key=_idempotency_key, claimed_run_id=_claim.claimed_run_id)
+        raise HTTPException(status.HTTP_409_CONFLICT, {"code": "egress_budget_exceeded"})
 
     # SY-70-12: use the claimed id, not a fresh uuid4().
     new_run_id = _claim.claimed_run_id
@@ -2954,7 +3190,9 @@ async def promote_to_live(
             "promoted_from_run_id": str(run_id),
         }
         # Remove backtest-specific keys that have no meaning for live mode.
-        for _key in ("backtest_start", "backtest_end", "seed", "backtest_metrics"):
+        # WP2.4: ``mtf_context`` is a backtest report; a live run never carries it (the
+        # ``engine_semantics`` marker is already re-stamped for mode "live" below).
+        for _key in ("backtest_start", "backtest_end", "seed", "backtest_metrics", "mtf_context"):
             promoted_config.pop(_key, None)
 
         # WP1.3a (I8): persist the NORMALISED bracket config and the RESOLVED
@@ -2965,6 +3203,11 @@ async def promote_to_live(
         else:
             promoted_config.pop("bracket_config", None)
         promoted_config["allow_pyramiding"] = _promote_verdict.allow_pyramiding
+        # WP2.1 (AG-04): OVERWRITE the inherited cost keys (the paper run's
+        # profile / engine semantics must not leak into the live run).
+        stamp_cost_config(
+            promoted_config, _promote_cost_profile, mode="live", fee_source="exchange_fills"
+        )
         # WP13a-S-07 (security round 2): mirror create_run -- persist the
         # NORMALISED trailing_stop_pct into strategy_params (or remove it when
         # unset), instead of leaving the raw source value in place while the
@@ -3025,6 +3268,7 @@ async def promote_to_live(
                 bracket_config=dict(_promote_verdict.config.bracket),
                 enable_adaptive_learning=False,
                 allow_pyramiding=_promote_verdict.allow_pyramiding,
+                cost_profile=_promote_cost_profile,
             ),
             name=f"live-engine-promoted-{new_run_id}",
         )
@@ -3034,6 +3278,7 @@ async def promote_to_live(
         # call, and register the task as the VERY NEXT statement after
         # create_task() so it is never orphaned from _RUN_TASKS.
         _completed_before_commit = False
+        spawn_hooks.on_run_spawned(new_run_id, "live", _egress_symbols, _egress_timeframe, task)
         _RUN_TASKS[str(new_run_id)] = task
 
         log.info(
@@ -3318,6 +3563,15 @@ async def resume_run(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"Run {run_id} has no configured symbols; cannot resume.",
         )
+    # WP2.3 (CF-23-20): a legacy config that lists a symbol twice cannot resume (the engine
+    # rejects duplicates).  Fail closed BEFORE the CAS with a distinct 422 reason; the run
+    # stays orphaned and untouched, and nothing is deduped.
+    if has_duplicate_symbols(symbols):
+        log.warning("runs.resume_duplicate_symbols", run_id=str(run_id))
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": DUPLICATE_SYMBOLS_REASON},
+        )
 
     try:
         timeframe = TimeFrame(str(orphan_config.get("timeframe", "1h")))
@@ -3354,6 +3608,11 @@ async def resume_run(
     # ------------------------------------------------------------------
     exit_config_waived_payload: dict[str, Any] | None = None
     exit_manager_missing: bool | None = None
+    # WP2.1 (AG-04, SY-21-05): resume resolves the run's OWN profile WITHOUT
+    # writing it (a legacy run -> legacy_runtime_v0), so no run becomes
+    # un-resumable and a later default switch never affects a resume.
+    _resume_cost_profile = resolve_run_cost_profile(orphan_config, mode="live").profile
+    _resume_cost_model = ExitCostModel.from_cost_profile(_resume_cost_profile)
     if mode == "normal":
         try:
             _resume_verdict = validate_run_exit_config(
@@ -3369,7 +3628,9 @@ async def resume_run(
                     strategy_name=strategy_name,
                     bracket=_bracket_config_raw,
                     trailing_stop_pct=_raw_trailing_for_validation,
+                    cost=_resume_cost_model,
                 ),
+                cost=_resume_cost_model,
             )
         except ExitConfigError as exc:
             log.warning(
@@ -3390,6 +3651,7 @@ async def resume_run(
         _salvaged_config, _salvage_issues = salvage_exit_config(
             bracket=_bracket_config_raw,
             trailing_stop_pct=_raw_trailing_for_validation,
+            cost=_resume_cost_model,
         )
         bracket_config = dict(_salvaged_config.bracket)
         trailing_pct = _salvaged_config.trailing_stop_pct
@@ -3466,6 +3728,14 @@ async def resume_run(
                 "Stop an existing run before resuming."
             ),
         )
+
+    # CF-24-01 (SY-01-05, G-11): live context-consumer gate for a mode=normal resume,
+    # after every existing pre-CAS resume rejection and immediately before the CAS (the
+    # run stays orphaned and untouched).  A mode=protective resume is exempt like the
+    # kill-switch and smoke gates: it drops every entry, and refusing it would strand
+    # the exits of an open position.
+    if mode == "normal":
+        _reject_live_context_consumer(strategy_name, strategy_cls, log)
 
     # Transaction (a): compare-and-set orphaned -> resuming, committed
     # IMMEDIATELY (WP18a-S2-01) -- 0 rows updated means either the run was
@@ -3771,9 +4041,11 @@ async def resume_run(
                 entries_latch_reason=run.entries_latch_reason,
                 allow_pyramiding=resolved_allow_pyramiding,
                 exit_config_waived=exit_config_waived_payload is not None,
+                cost_profile=_resume_cost_profile,
             ),
             name=f"live-engine-resumed-{run_id}",
         )
+        spawn_hooks.on_run_spawned(run_id, "live", symbols, timeframe, task)
         _RUN_TASKS[str(run_id)] = task
     except Exception as exc:
         # WP1.8a-round2 (C-03/S-03): the row already committed 'running' --
@@ -3868,7 +4140,9 @@ async def get_diagnostics(
     eq_result = await db.execute(
         select(EquitySnapshotORM)
         .where(EquitySnapshotORM.run_id == run_id)
-        .order_by(EquitySnapshotORM.timestamp.desc())
+        # WP2.2 (SY-22-16): bar-time stamps repeat within a bar (mark + fill points), so
+        # ``bar_index`` (the point ordinal) breaks the tie deterministically.
+        .order_by(EquitySnapshotORM.timestamp.desc(), EquitySnapshotORM.bar_index.desc())
         .limit(1)
     )
     latest_equity: EquitySnapshotORM | None = eq_result.scalar_one_or_none()
@@ -4210,6 +4484,10 @@ async def recover_orphaned_runs() -> int:
                             mode=RunMode.LIVE,
                             allow_pyramiding=run_config.get("allow_pyramiding"),
                             timeframe=str(run_config.get("timeframe", "1h")),
+                            # WP2.1: judged against the run's OWN (resolved) profile.
+                            cost=ExitCostModel.from_cost_profile(
+                                resolve_run_cost_profile(run_config, mode="live").profile
+                            ),
                         )
                 except ExitConfigError as exc:
                     log.error(
@@ -4245,6 +4523,11 @@ async def recover_orphaned_runs() -> int:
 
                 if not symbols:
                     await _mark_run_error(factory, run_id, log, reason="empty_symbols")
+                    continue
+
+                # WP2.3 (CF-23-20): fail closed with a distinct reason; no silent dedupe.
+                if has_duplicate_symbols(symbols):
+                    await _mark_run_error(factory, run_id, log, reason=DUPLICATE_SYMBOLS_REASON)
                     continue
 
                 try:
@@ -4307,6 +4590,11 @@ async def recover_orphaned_runs() -> int:
                 # was only logged by the outer except-block).  A failure
                 # here marks the run 'error' and moves on to the next
                 # candidate, never touching 'running'.
+                # WP2.1 (AG-04): boot recovery resolves the run's OWN profile and
+                # NEVER writes it (a legacy run -> legacy_runtime_v0).
+                recovery_cost_profile = resolve_run_cost_profile(
+                    run_config, mode="paper"
+                ).profile
                 try:
                     _recovery_verdict = validate_run_exit_config(
                         strategy_cls,
@@ -4315,6 +4603,7 @@ async def recover_orphaned_runs() -> int:
                         mode=RunMode.PAPER,
                         allow_pyramiding=run_config.get("allow_pyramiding"),
                         timeframe=timeframe_str,
+                        cost=ExitCostModel.from_cost_profile(recovery_cost_profile),
                     )
                 except ExitConfigError as exc:
                     log.warning(
@@ -4374,9 +4663,11 @@ async def recover_orphaned_runs() -> int:
                         elapsed_seconds=elapsed_seconds,
                         entries_latch_reason=entries_latch_reason,
                         allow_pyramiding=resolved_allow_pyramiding,
+                        cost_profile=recovery_cost_profile,
                     ),
                     name=f"recovery-paper-{run_id_str[:8]}",
                 )
+                spawn_hooks.on_run_spawned(run_id_str, "paper", symbols, timeframe, task)
                 _RUN_TASKS[run_id_str] = task
 
                 log.info(

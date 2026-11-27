@@ -60,6 +60,15 @@ Core trading engine containing the heart of the system.
   or the latch; `risk_snapshot()` / `get_daily_pnl()` / `get_summary()` are
   pure (test-pinned, WP15-T-19). Engines and risk managers are stateless
   readers of `RiskSnapshot`; never read `get_summary()` string keys.
+- CF-26-97: pure means observationally pure: no read changes a field in WP15-T-19's
+  `_state` or any return value. The only private state a read writes is the `_mdd_*`
+  fold cursor of `get_max_drawdown`; it is never read outside `get_max_drawdown` and never
+  enters `RiskSnapshot`, a breaker or risk decision, or persistence; `get_max_drawdown` /
+  `get_summary` are called on the event-loop thread only (AST-pinned: thread offload sites
+  are inventoried, and there is no event subscription and no sync `def` route handler in
+  `packages`/`apps`; adding any of them needs a risk review first). The cursor relies on an
+  append-only curve (no interior edit) and an unchanged Decimal context (no `getcontext` /
+  `setcontext`, no `localcontext(...)` with arguments); both are AST-pinned (T-97P2-04/05).
 - Day roll (SYN-01 / Option B): the roll sets `_nav_day_start` provisionally to
   the pre-roll NAV and arms `_day_start_pending`; the first NAV observation of
   the day (`_record_nav`) raises the start if higher, once, before folding into
@@ -100,8 +109,8 @@ Core trading engine containing the heart of the system.
   `trip`, `reset`) are unreachable from production (AST-pinned, WP16-T-25);
   removal is CF-29. Never read `get_summary()` keys for a decision.
 - Build a breaker ONLY via `build_run_circuit_breaker(run_id, risk_manager.params)`
-  (orchestrator paper + live, the integration harness, the `BacktestRunner`
-  opt-in). Never construct `CircuitBreaker` / `CircuitBreakerConfig` directly in
+  (orchestrator paper + live, the integration harness, the `BacktestRunner`,
+  default on since WP2.1c). Never construct `CircuitBreaker` / `CircuitBreakerConfig` directly in
   `apps/` or `backtest.py`.
 - Every effect is BUY-only (C23): one filter site, `_drop_entry_signals`, first
   matching reason wins (`kill_switch`, `protective_mode`,
@@ -116,7 +125,14 @@ Core trading engine containing the heart of the system.
   exits below 0.4 x limit for 3 bars; DAILY_LIMIT clears on the `snapshot.day`
   roll. `evaluate` is transactional (state commits only after every computation
   succeeded). Bands are `Decimal` derived from the run's `RiskParameters`.
-- Backtests: opt-in (`BacktestRunner(enable_circuit_breaker=True)`), default off (U-2).
+- Backtests: ON by default since WP2.1c (SY-21-13, closes CF-26): `BacktestRunner` and
+  `ParameterOptimizer` default `enable_circuit_breaker=BACKTEST_CIRCUIT_BREAKER_DEFAULT`
+  (`True`, `trading.safety`); the API backtest, the optimizer, the ML gate and the research
+  scripts all use it (scripts: `--no-circuit-breaker`). There is NO API toggle. An explicit
+  `enable_circuit_breaker=False` is the pre-2.1c path and stays byte-identical to the 2.1a
+  goldens (pin it in any test calibrated to the no-breaker numbers). The value is persisted as
+  `engine_semantics.backtest_circuit_breaker` on backtest runs and optimization `run_metadata`
+  (absent on paper/live; `false` on 2.1a/2.1b rows, never rewritten, never read as legacy).
 - Restart watch (CF-35, user decision): every new breaker enters HALT at
   `halt_exit` (0.9 x limit) while `_evaluations < N` and REDUCE at `reduce_exit`
   (0.4 x limit) while `_evaluations < 2N`; streaks start at 0; nothing is
@@ -155,8 +171,12 @@ Core trading engine containing the heart of the system.
   `resume_fallback_current_atr` (interim, non-final until the attempts are spent; error log
   `bracket_exit.resume_fallback_final` + `bracket_anchor_source_total{source,final}`) or
   `entry_deferred`. The trailing gap (bars missing between the anchor bar and the warmup window,
-  up to 1000) is fetched through the paginated `fetch_ohlcv_range` (at most 4 pages of 300);
-  a gap that cannot be fetched, or is longer, logs `trailing_stop.seed_partial`.
+  up to 1000) is fetched through the paginated `fetch_ohlcv_range`: 4 pages of 300 when dense;
+  with holes (since WP2.3 P0 a short page never ends the fetch) up to about 2·ceil(gap/page)+2
+  requests, all inside the same 40 s `wait_for` bound (WP23-P0-RISK-04). A timeout discards
+  every page already gathered, so on a slow exchange the seed can be looser than a partial
+  fetch would give (WP23-P0-RISK-03 / SEC-01, carry-forward: pager deadline). A gap that cannot
+  be fetched, or is longer, logs `trailing_stop.seed_partial`.
 - Trailing: HWM_0 = gross opening VWAP; ratchets only at bar closes with `bar_ts >
   anchor_bar_ts`; KEPT on a trigger and on a quantity change (no re-seed from the current price).
 - R-04: an exit that was not submitted (`[]`, every order terminal+unfilled, or
@@ -235,3 +255,308 @@ Core trading engine containing the heart of the system.
   and the `.exception` catch-alls (`engine.start_failed`, `runs.live_engine_error`).
 - See `reports/vp2-wp1.3b/synthesis-spec.md` section 5.3 and
   `docs/runbooks/circuit-breaker-halt.md`.
+
+### WP2.1a (one cost model: `trading/costs.py`)
+- `CostProfile` (frozen, Decimal-only, bps) is the ONLY cost source. `RiskParameters` has NO fee or
+  slippage field (do not add one: C25 was two cost sources). `costs.py` is a leaf: stdlib only,
+  reads no environment (AST-pinned, `tests/unit/test_wp21_costs.py`).
+- Registry `COST_PROFILES` is append-only; every fingerprint is pinned by a test. The default is the
+  code constant `DEFAULT_COST_PROFILE_ID` (one reviewed line; never env: a `*COST_PROFILE*` env var
+  is ignored and logged by name only as `cost_profile.env_ignored`). Docs name the default by id,
+  not by number.
+- Wiring: `BacktestRunner` / `ParameterOptimizer` / `PaperExecutionEngine` / `StrategyEngine` take
+  `cost_profile` (`None` -> the current default). `run_paper_engine` / `run_live_engine` take it as a
+  REQUIRED keyword. `LiveExecutionEngine(cost_profile=...)` is an ESTIMATE: the live ledger always
+  books the exchange's real fees; the profile only feeds the log-only `cost_profile.tier_mismatch`
+  (start) and `cost_profile.fill_fee_drift` (per real fill, 5 bps) checks.
+- The run's profile is frozen in `RunORM.config["cost_profile"]` (+ `engine_semantics`) at create;
+  promote overwrites it with the default; auto-retry copies it; resume / boot / salvage resolve it
+  WITHOUT writing (`resolve_run_cost_profile`; absent or invalid -> a legacy profile, never raises).
+- Exit-floor basis: the API validates at `policy_cost_model(run_profile)` = the stricter of the
+  default and the run's own profile; the engines and a resume use the run's own profile (API pass
+  implies engine pass).
+- Bracket levels sit on the all-in (fee-inclusive) basis (WP1.3b), so a higher taker moves every stop
+  closer to the market (X-15). Goldens calibrated on the old costs pin `legacy_backtest_v0`
+  explicitly; per-profile goldens are pinned per profile id with analytic per-fill checks.
+- See `reports/vp2-wp2.1/synthesis-spec.md`.
+
+### WP2.2 (bar-time clock: `trading/clock.py`)
+- A backtest stamps every fill, order, trade and equity point with BAR CLOSE time
+  (`close_i = max(ts) + timeframe`, the same value as the WP1.5 risk clock); the seed equity point is
+  `t0 = max(first bar open)`. Paper and live keep the wall clock (`datetime.now(tz=UTC)` through
+  `trading.clock._wall_now`). `runs.*` audit columns, logs, uuid4 ids and monotonic telemetry stay wall.
+- `clock.py` is a leaf (stdlib + structlog). `BacktestRunner.run` creates ONE `BarClock(t0)` and hands it
+  to `PortfolioAccounting(clock=bar_clock.now)` and `StrategyEngine(clock=bar_clock)`. The execution
+  engine gets it ONLY through `StrategyEngine.__init__ -> attach_clock` (BACKTEST only; never use
+  `PaperExecutionEngine(clock=)` in the runner). `run_backtest` computes `close_i` once and passes the
+  SAME object to `bar_clock.advance` and `portfolio.advance_clock`.
+  A direct `StrategyEngine` built without a clock gets a run-scoped fallback `BarClock`, installed INSIDE the
+  `run_backtest` `with` (attach to the execution engine first, then the engine's own clock) so a rejected attach
+  leaves nothing behind. On exit the scope undoes only what it installed: onto the execution engine captured at
+  entry, and only `if clock is bar_clock` (never a re-read or swapped engine). So one engine can run several
+  backtests; a concurrent second `run_backtest` on the same engine raises `RuntimeError` (type name only).
+- Guards (identity, never `isinstance(x, WallClock)` / `type(x) is`): BACKTEST `StrategyEngine` accepts
+  `None` or a `BarClock`; PAPER and LIVE accept `None` or `WALL_CLOCK`; `LiveExecutionEngine.attach_clock`
+  accepts only `WALL_CLOCK`; neither `BaseExecutionEngine` nor `LiveExecutionEngine` has a `clock=`
+  constructor parameter. Messages carry type names only. Fail-closed tripwires (`RuntimeError`):
+  `StrategyEngine.start` (not BACKTEST), `run_live_loop`, `LiveExecutionEngine.on_start`,
+  `run_paper_engine` / `run_live_engine`.
+- Ambient `ContextVar`: `use_clock` is entered ONLY in `StrategyEngine.run_backtest` (after an explicit
+  `isinstance(.., BarClock)` raise, never an `assert`), `utc_now` is used ONLY as a pydantic
+  `default_factory`, and every persisted field is still stamped explicitly. `ambient_clock()` is read only
+  at the tripwire sites, as an operand of `is` / `is not`. Do not wrap a `yield` in `use_clock`, spawn
+  tasks/threads inside `run_backtest`, or adopt Python 3.14 (`thread_inherit_context`) without
+  re-reviewing this (a test fails under that flag).
+- Test seam for paper/live time (S18 / WP4.8): monkeypatch `trading.clock._wall_now` and nothing else.
+  `trading.portfolio._utc_now` (the WP1.5 seam, kept by name so its monkeypatches still work) delegates to it
+  at call time, so the portfolio's seed / curve / position stamps follow the same patch. The `datetime.now`
+  literal in its docstring is load-bearing for `test_wp15a_contracts::test_wp15_t18` until that test is
+  retargeted at delegation (CF); do not reword it.
+  Never patch `WALL_CLOCK` or `WallClock.now`, never inject a fake clock into a paper/live engine
+  (the guards reject it by design), and wrap a `BarClock` instead of patching an instance (`__slots__`).
+- Same-bar events share a stamp; `(timestamp, bar_index)` totally orders equity points. At most one
+  `Fill` per `Order` (pinned): reopen the sequence-key decision (SY-22-06) if partial fills are added.
+- Lots are dropped on a full-flatten SELL (`close_lot` in both managers), so an equal bar-time `lot_key`
+  on a same-bar reopen can never revive the closed lot.
+- Known limit (WP2.4): the MTF context (C10) still reads wall time in API backtests. (The
+  multi-symbol index pairing, where a lagging symbol carried the leading symbol's close, is gone
+  since WP2.3; see below.)
+- See `reports/vp2-wp2.2/synthesis-spec.md` and `reports/vp2-wp2.2/synthesis-r2-guards.md`.
+
+### WP2.3 (multi-symbol bar alignment: `data/bar_alignment.py`)
+- BACKTEST only; paper/live are untouched (CF-23-01..03). Policy `union_present_mask`: multi-symbol
+  `run_backtest` walks the sorted union of observed bar timestamps (`build_timeline`, at the old
+  `min(len)` site). Per step only PRESENT symbols get `on_bar`, a mark, a bracket/trailing check, a
+  fill and a history step; an absent symbol keeps its last mark and, if held, still counts as
+  exposed. No synthetic bar, ever (no ffill).
+- Single symbol (`len(self._symbols) == 1`, a pinned literal): index walk, no `build_timeline`, no
+  validation, byte-identical to before. Multi-symbol full-row guard: `build_timeline` raises
+  `bar_alignment_off_grid` (phase mismatch, duplicate or non-increasing bar) or
+  `bar_alignment_not_trimmed` (first or last step not a full row) before any state change, so
+  `t0 = max(first opens) == timeline[0]`. The WP2.2 clock lines are textually unchanged and
+  `test_wp22_ast_pins.py` is unedited; the clock never reads `Step.ts`.
+- `BacktestRunner.run` order: `_validate_bars` -> `align_bars(window=requested_window)` ->
+  telemetry -> `check_alignment` -> warmup check on `len(timeline)` -> rebind `bars_by_symbol` to
+  the aligned dict -> the unchanged `t0` line -> `run_id` + engine. A rejection happens before
+  `run_id` and engine construction. Everything after the rebind sees the execution window: terminal
+  MTM, start/end/duration, `total_bars = len(timeline) - W`, exposure denominators, the OOS range
+  (`oos_start_index` is an ordinal into the timeline). Enforced for more than one distinct symbol
+  or whenever `requested_window` is given; a single symbol without a window (goldens, scripts, ML
+  gate) is report-only.
+- Tolerances are code constants (the `_TOL_*` block in the leaf, U-01 (a)); never env, never an
+  API field (`alignment_tolerance=` on the runner/optimizer is for tests and scripts). Abort when
+  missing > 1% of the grid (warn > 0.1%; zero-volume counts as missing); `max_gap_bars` > 4 (warn >= 2),
+  counted over absent OR zero-volume slots (QA-04); head > 0; tail > 1; any off-grid bar; per
+  walk-forward test fold missing > max(1, floor(2% * n)) or a run > 4.
+- `BarAlignmentError(ValueError)`: a closed set of 8 codes (`bar_alignment_` + `off_grid`,
+  `no_common_row`, `head_coverage`, `tail_coverage`, `missing_bars`, `gap_too_long`,
+  `fold_tolerance`, `not_trimmed`), fixed message `bar alignment check failed (<code>)`; precedence
+  is code order, then `self._symbols` order. Log from `.code` / `.violations`, never `str(exc)`. The
+  API maps it to 422 `{"code": <code>, "error_type": "BarAlignmentError"}`
+  (`bar_alignment_http_error`), before `except ValueError` in runs and around `optimizer.run`.
+- Optimizer: `ParameterOptimizer.run` aligns and checks ONCE (`_align_once`), including every
+  walk-forward test fold (`fold_check`), before any combination. Inner runners get
+  `record_alignment=False` (they trim and build the timeline: no tolerance check, no telemetry; only the
+  structural `off_grid` / `no_common_row` check still runs on an empty multi-symbol timeline), and
+  `except BarAlignmentError: raise` precedes every per-combination `except Exception`.
+- Walk-forward: `WalkForwardValidator.split` splits by TIME: fold boundaries are ordinals on the
+  union timeline, snapped to full rows at both edges (rolling `train_start` too), each symbol sliced
+  by `bisect`. Unequal bar counts are legal; a window without a full row raises `ValueError`. A single
+  symbol keeps the old index slices.
+- Duplicate symbols: `StrategyEngine.__init__` raises `ValueError("duplicate symbols are not
+  allowed")` in every mode. The API rejects them at the request edge (run create and optimize, 422)
+  and fails closed with `duplicate_symbols_in_config` at resume, paper boot recovery and promote
+  (CF-23-20). Never dedupe silently.
+- BACKTEST drops a signal whose symbol is absent at the step (`_drop_absent_symbol_signals`, log
+  `engine.signal_dropped_symbol_absent`), before the entry filter and the signal count; paper/live
+  keep it (test-pinned).
+- Report: `runner.last_alignment` / `optimizer.last_alignment` (reset at every `run`);
+  `BacktestResult` has NO alignment field. Persisted as `config["bar_alignment"] =
+  report.to_metadata()` (ints, strings, bools) on backtest config and optimize `run_metadata`.
+  Compare runs by `presence_digest` (sha256 over sorted `symbol|ts_ms` lines of the bars handed to
+  the engine), never by `fingerprint`: the optimizer computes `holes_*` with warmup 0, so its
+  fingerprint differs on identical data. The digest covers the execution window, so it depends on
+  the whole basket and the window, not on one symbol's data alone (QA-08).
+- Marker `engine_semantics.bar_alignment = "wp23-1"` on backtest and optimize only;
+  `timestamp_clock` stays `"wp22-1"`. `legacy_bar_alignment` (run responses,
+  `bar_alignment_response_fields`) is True iff backtest AND the symbol count is not exactly one AND
+  the marker is not in `KNOWN_BAR_ALIGNMENTS`; it never raises. Single-symbol legacy runs are not
+  flagged.
+- Telemetry: `bar_alignment_runs_total{outcome}`, `bar_alignment_missing_bars_total{symbol,timeframe}`,
+  `bar_alignment_rejected_total{reason}` via `common.metrics` directly (no `run_id` label); logs
+  `backtest.bar_alignment` / `_gaps` / `_rejected` carry numbers, symbols, ISO times and codes only.
+- Window: the API passes `requested_window = (start, min(end, floor_tf(now)))` and reads `now` once,
+  BEFORE the fetch (`runs._window_now`); runner and engine never read the wall clock. 1w caveat:
+  `floor_tf` is epoch-anchored (Thursday 00:00 UTC), so from Thursday to Sunday the forming weekly
+  bar is not trimmed (WP23-P4-CR-03, carry-forward).
+- API request bounds (WP23-P0-SEC-02, backtest create and optimize only; 422 `{"code": ...}` before any
+  idempotency claim or fetch, never an echo of the request): more than `MAX_BACKTEST_SYMBOLS` (20) symbols
+  `too_many_symbols`; a start before `MIN_BACKTEST_START` (2009-01-03) or an overflowing UTC conversion of
+  it `start_too_early`; `ceil((end - start) / tf) * symbols` above `MAX_BACKTEST_BARS` (500 000) or an
+  overflowing end `range_too_large` (`check_backtest_request_bounds`, `api/services/cost_profiles.py`).
+  Paper/live carry no symbol cap (WP23-P4-SEC-06, carry-forward).
+- See `reports/vp2-wp2.3/synthesis-spec.md` and `Documentation/WP2.3-register.md`.
+
+### WP2.5 (metric sampling: `trading/equity_sampling.py`, `trading/metrics.py`)
+- A backtest computes its return metrics from ONE equity value per bar, not from every curve point.
+  Before WP2.5 `n` counted warmup points, one point per bar and one extra point per fill (C13). The
+  sample is built AFTER the run from `result.equity_curve`; `strategy_engine.py`, `portfolio.py`, `engines/`
+  and `test_wp22_ast_pins.py` are untouched since 01d393d, and the curve, fills, trades, `EquitySnapshot`
+  rows and every golden digest are byte-identical.
+- `trading.equity_sampling` is a stdlib-only leaf (AST-pinned, `tests/unit/test_wp25_ast_pins.py`): no
+  `trading.*`/`common.*`/`data.*` import, no logging, env or wall clock. Points are duck-typed
+  (`.timestamp`, `.equity`). API: `sample_equity_per_bar(points, *, start_at, timeframe_s, mode=...) ->
+  BarSample`, `last_per_stamp`, `simple_returns`, `EquitySamplingError(ValueError)` with the closed codes
+  `equity_sampling_unordered` and `equity_sampling_no_base_point` (message `equity sampling failed (<code>)`).
+- Semantics: collapse to the last point per stamp (a decreasing stamp raises); keep stamps `>= start_at`
+  (none left = empty sample, n 0); the first kept stamp MUST equal `start_at` (the base point), else
+  `equity_sampling_no_base_point`. All kept stamps on `start_at + k*tf` = mode `calendar_asof`: slots
+  `k = 0..K` each take the equity of the last stamp `<=` the slot, and `carried_slots` /
+  `carried_stamps` list the slots `k >= 1` without an own point (a multi-symbol all-absent slot carries
+  the previous value). Otherwise mode `present_steps` (distinct stamps, `carried_slots = 0`).
+  `BarSample` (frozen) has `stamps`, `equity` (`n_returns + 1` values, or none when empty), `n_returns`,
+  `returns()` and `from_stamp(at)` (base = as-of value at `at`; in calendar mode `at` must be a grid stamp;
+  before the first stamp it fails closed; after the last it gives an empty sample). Grid stamps are bar
+  CLOSE times; an open-labelled benchmark series shifts +1 timeframe before a join.
+- `BacktestRunner.run`: `_step_close(timeline, k, t0, tf_s)` is `t0` for `k == 0`, else `timeline[k-1].ts + tf`.
+  `trading_start_at = _step_close(timeline, warmup_bars, ...)` (= `curve[W].timestamp`, also for W = 0);
+  `trading_end_at = equity_curve[-1].timestamp`, or `None` only when the sample is empty (the run
+  stopped before the base point). Production code NEVER passes `mode=` to the sampler (AST-pinned,
+  `**kwargs` counts); the automatic off-grid fallback to `present_steps` (single-symbol library runs only)
+  logs `backtest.metric_sampling_fallback` with `metric_sampling` and `n_returns` only.
+- `trading.metrics.compute_return_metrics(returns, periods_per_year) -> ReturnMetrics(n, sharpe, sortino, psr,
+  skew, kurtosis)` is the ONLY place where Sharpe, Sortino, PSR and n are derived (the full run and the OOS
+  window both call it, so SR and n cannot come from different samplings; AST-pinned: no inline moments in
+  `backtest.py`). `return_moments` = population skewness and NON-excess kurtosis, `(0.0, 3.0)` below 4
+  observations. PSR uses `n = len(returns)`; `_PSR_MIN_OBSERVATIONS = 30` now counts BARS, so fewer than
+  30 post-warmup returns give `psr = None` and `confidence_flag = None`. DSR is unchanged (no n input); the
+  real DSR is WP2.7.
+- `compute_sharpe` and `return_moments` treat `std == 0` or `std <= _ZERO_STD_REL_TOL * |mean|`
+  (`_ZERO_STD_REL_TOL = 1e-9`) as zero std (Sharpe 0.0). `compute_cagr(initial, final, days: float)` keeps
+  the HEAD arithmetic `ratio ** (365.25 / days) - 1`, returns `inf` on `OverflowError` and never raises.
+- `periods_per_year(tf)` (`metrics.py`) is strict: an unknown timeframe raises `ValueError("unknown timeframe
+  for annualisation")`. There is no fallback in the runner (AST-pinned: `backtest.py` does not use
+  `TIMEFRAME_PERIODS_PER_YEAR`), and the factor is resolved once, before the simulation. The table equals
+  `365.25 * 86400 / tf_seconds` for every `TimeFrame`. The legacy path of `scripts/backfill_metrics_v2.py`
+  still has its own `.get(tf, 8_766.0)` on purpose (rows without a marker must reproduce).
+- What reads the sample: Sharpe, Sortino, PSR, skew/kurtosis, `n_observations`, `confidence_flag`,
+  `max_drawdown_duration_bars` (`_max_dd_duration(sample.equity)`, in bars), `cagr` and `oos_sharpe` /
+  `oos_n_returns`. `cagr = compute_cagr(sample.equity[0], final_equity, span_days)` with
+  `span_days = max(1.0, (trading_end_at - trading_start_at) / 86400)` (an empty sample gives 0.0);
+  `calmar_ratio = compute_calmar(cagr, max_dd)`. `max_drawdown_pct` STAYS over all curve points (so it
+  agrees with every point's `drawdown_pct` and with the portfolio router). `start_date`, `end_date` and
+  `duration_days` are unchanged (bar-open based).
+- OOS is cut BY TIME: `oos_start_at = _step_close(timeline, oos_start_index, ...)`, then
+  `compute_return_metrics(sample.from_stamp(oos_start_at).returns(), P)`; `oos_sharpe` and `oos_n_returns`
+  come from that one result (gap-free: `oos_n_returns == N - oos_start_index`). The engine's
+  `oos_equity_curve_offset` stays in the summary, but the runner reads it only for the `is None` check and
+  the info log (AST-pinned).
+- 7 new `BacktestResult` fields, all defaulted: `metrics_version: str = ""` (the runner writes
+  `METRICS_VERSION`), `trading_start_at`, `trading_end_at` (`datetime | None`), `periods_per_year`
+  (`float | None`), `metric_sampling` (`"calendar_asof" | "present_steps" | None`), `carried_slots: int = 0`,
+  `oos_start_at` (`datetime | None`). In calendar mode `n_observations == total_bars + carried_slots`.
+- `METRICS_VERSION = "wp25-1"` and `KNOWN_METRICS_VERSIONS` live in `trading.metrics` (not in the leaf,
+  which `metrics.py` cannot be: it imports pydantic and structlog). Any later change to a persisted
+  curve-derived number bumps `METRICS_VERSION`; add the new value to `KNOWN_METRICS_VERSIONS` together with it
+  (the `scripts/backfill_metrics_v2.py` guard skips only KNOWN markers).
+- All-points returns (`compute_returns_from_equity`) may be called only at the allow-list
+  `scripts/wp21_rebaseline.py::_pre_wp25_sharpe` and `scripts/backfill_metrics_v2.py::_recompute_psr_from_snapshots`
+  (AST-pinned); never in `backtest.py`, `optimizer.py`, `walk_forward.py` or `apps/`. Future metrics
+  (ulcer, omega, CVaR, benchmark joins) must take `BarSample` returns.
+- CF-26 freeze (UD-4 (a)): `scripts/wp21_rebaseline.py` computes its `sharpe_pre_wp25` and `cagr` keys
+  with `_pre_wp25_sharpe` and `_pre_wp25_cagr` (the 117236f formulas: all points, bar-open `duration_days`),
+  so a CF-26 run on any later commit still reproduces the baseline PR #4 waits for.
+  `tests/integration/test_wp22_bar_clock.py::TestT16RebaselineUnaffected` (the 117236f digest) and
+  `test_wp21c_rebaseline.py` are unedited; feeding the new Sharpe or CAGR into the record makes T-16 fail.
+  Do not relabel the record to wp25-1.
+- API (`apps/api`): `engine_semantics.metrics = METRICS_VERSION` is stamped on backtest and optimize only
+  (`cost_profiles.engine_semantics`; `promote_to_live` re-stamps mode `live`, so it cannot leak);
+  `timestamp_clock` and `bar_alignment` keep their own versions. `metrics_response_fields(config, run_mode)`
+  returns `{"legacy_metrics": bool}`: True iff the mode is backtest or optimize AND the marker is not a `str`
+  in `KNOWN_METRICS_VERSIONS` (missing, unknown, non-string, a malformed `engine_semantics`, `config=None`).
+  There is NO single-symbol exemption (unlike `legacy_bar_alignment`), paper/live/unknown modes are never
+  flagged, and it neither raises nor logs. It is wired on run list and detail and on optimize POST,
+  GET-one and GET-list (wire name `legacyMetrics`).
+- Response fields on `BacktestMetricsResponse`: `trading_start_at`, `trading_end_at`, `periods_per_year`,
+  `metric_sampling`, `carried_slots`. NOT `oos_start_at` (engine-level; WP2.7) and NOT `metrics_version`.
+  Leaderboard: `leaderboard_eligible` adds `is_leaderboard_metrics_eligible` (known marker), and
+  `/portfolio/summary` counts the runs it excludes in `legacy_metrics_runs_excluded`. ML: `train_model` writes
+  `extra["walk_forward"]["metrics"]`; the activation gate warns (does not reject) when that label is not
+  known. Optimize persists and returns non-finite entry metrics as `None` (`_scrub_non_finite`; ranking
+  unchanged). Old rows are labelled, never recomputed. Paper/live are unchanged and carry no marker.
+- Carry-forwards: the "known marker" rule exists in four places (`schemas.py`, `cost_profiles.py`,
+  `backfill_metrics_v2.py`, `model_activation_gate.py`); keep them in step with `KNOWN_METRICS_VERSIONS`.
+  CAGR/Calmar over short windows are extrapolations, and the optimizer's `cagr`/`calmar` ranking now depends on
+  each trial's span (WP2.7).
+- See `reports/vp2-wp2.5/synthesis-spec.md` and `Documentation/WP2.5-register.md`.
+
+### WP2.4 (point-in-time MTF context: `trading/mtf_signals.py`, `data/point_in_time.py`)
+- Defect closed (C10): `main.py` calls `get_latest()` only at boot (lines 306, 469, 512, 538), so API backtests used to inject
+  boot-frozen FGI, BTC dominance, yield spread and whale flow (plus a wall-clock "7d ago") into every bar, while scripts got
+  `None`. Since WP2.4 Phase A (P0-P3, `a9459c3..b669894`) a BACKTEST `StrategyEngine` never touches a provider singleton or the
+  wall clock. The API passes no source in Phase A, so API backtests run with `UNAVAILABLE` (all nine fields `None`) = the old
+  "no clients" path = the script path. No golden constant changed. The store and migration 021 exist (WP2.4-P5) and the live recorder writes dominance and
+  whale (CF-24-01 P7); the backfill CLI and API PIT loading are NOT built (no script or API path loads `context_observations` for a backtest).
+- `trading.mtf_signals` (`MTF_CONTEXT_VERSION = "wp24-1"`, `KNOWN_MTF_CONTEXT_VERSIONS`): `SignalValues` (9 fields, `None`
+  default; `to_context_kwargs()` is the old non-None rule, FGI as `int`, the rest `float`), `BacktestSignalSource`
+  (`UnavailableSignals` / singleton `UNAVAILABLE`, `PitSignals`) and `LiveSignals` / `LIVE_SIGNALS`. `LiveSignals` is NOT a
+  `BacktestSignalSource`. Since CF-24-01 its `values_at(decision_at)` ignores `decision_at` and returns
+  `PitSignals(LIVE_BOOK.view(to_ms(WALL_CLOCK.now())), _LIVE_FIELDS).values_at(now)` with one `except Exception: return
+  _LIVE_READ_FAILED` (all `None`, no logging). `mtf_signals.py` references no provider singleton; the book is `data.live_context.LIVE_BOOK`,
+  filled by the API poller. The non-None rule is `to_context_kwargs`.
+- Engine guard (`StrategyEngine.__init__(..., mtf_signals=None)`): BACKTEST accepts `None` (= `UNAVAILABLE`) or an instance of a
+  REAL subclass of `BacktestSignalSource` (`register()` is not honoured; a `LiveSignals` never passes; checked via
+  `isinstance`, `not isinstance(.., LiveSignals)` and `BacktestSignalSource in type(x).__mro__`). PAPER/LIVE accept `None`
+  (= `LIVE_SIGNALS`) or `x is LIVE_SIGNALS`. Anything else is `ValueError` with the type name only. The orchestrator is not
+  edited. `check_backtest_source` applies the same rule in the runner and optimizer constructors, before any run id exists.
+- Wiring: `run_backtest` passes `decision_at=close_i` (the object that feeds `bar_clock.advance`) to `_process_bar`;
+  `_build_mtf_context(ts, *, decision_at=None)` calls `self._mtf_signals.values_at(decision_at).to_context_kwargs()`. The HTF
+  branch keeps its bar-open key (byte-identical; moving it to `close_i` is CF-24-12). Paper/live: see the CF-24-01 bullets below.
+- CF-24-01 (R1; `Documentation/CF-24-01-register.md`, runbook `docs/runbooks/cf2401-live-context.md`): `LIVE_CONTEXT_STAGE: Final =
+  "neutral_shadow"` in `mtf_signals.py` (one reviewed line, never env; P9 flips it to `"fresh"` after G-E). `StrategyEngine.__init__` sets
+  `_live_fields` (`live_served_fields`: the strategies' declared union that the book can serve, plus the now-partner of each 7d field) and
+  `_live_stage`, both only when the source `is LIVE_SIGNALS`. `_build_mtf_context` restricts the values to `_live_fields`; in
+  `neutral_shadow` a consumer gets `SignalValues()` and logs `engine.mtf_context_shadow` (`bar_ts_ms`, `values`, `states`); a non-consumer
+  (no declared fields) gets `SignalValues()` and logs nothing. A run with `_live_fields` logs `engine.live_context` once and registers in `LIVE_CONSUMERS`
+  (re-exported by `mtf_signals`; `strategy_engine.py` does not import `data.live_context`) before its first bar, released in the loop's `finally`.
+- `_drop_context_model_buys` is the last BUY filter: `BaseStrategy.context_trained()` (False; `ModelStrategy` = importance over the context
+  columns > 0, missing or unreadable = True, reset to True on every hot-swap until classified; ensemble = any) blocks BUYs in LIVE always
+  (`mtf_context_model_unverified`) and in PAPER while a consumed field is `None` (`mtf_context_model_input_missing`, so always in Stage 1). Exits and inert
+  models are never blocked. `safety.LIVE_CONTEXT_CONSUMER_ALLOWLIST` is empty: `live_context_consumer_refusal` gives 422 `live_context_consumer_blocked`.
+- `data.point_in_time` (stdlib-only, AST-pinned in `test_wp24_ast_pins.py`): `PIT_VERSION`, `PitSeries.asof(decision_ms, *,
+  max_age_ms)` and `coverage_ppm(...)` (neither takes a lag argument), `Observation` (`Decimal` value, integer ms),
+  `series_digest`, `parse_jsonl_lines`, `PitError` (closed codes, fixed messages). The lag is applied ONCE at ingestion into
+  `available_at` (`available_at_estimated`, `available_at_vintage`; both reject any input that is not 00:00 UTC); the join
+  never adds a lag. Visible iff `available_ms <= close_i`; staleness runs from the FIRST availability, inclusive; "7d ago" is
+  `asof(close_i - 7d)`. Constants: FGI +24h / max 48h, T10Y2Y vintage `realtime_start`+1d or +2 business days+1d / max 7d,
+  BTC dominance (6h) and whale (2h) `recorded` only, `MIN_COVERAGE_PPM = 990_000`. `FEDFUNDS`, `market_cap_change_24h` and
+  `total_volume_change_24h` are never served (`NOT_SERVED_FIELDS`).
+- Per run (`select_mtf_signals`, once in `BacktestRunner.run` and once in `ParameterOptimizer.run`; inner optimizer runs use
+  `select_mtf_context=False`): a field is ON iff its coverage over the trading decisions `close_k`, `k in [W, N)`, is
+  `>= 990_000` ppm (all-or-nothing per field). `last_mtf_context` (an `MtfContextReport`; `.to_metadata()` is the persisted
+  block) is reset at the start of each `run`. `BacktestResult` has NO new field. Status is derived over the consumed fields only:
+  `not_used` (none consumed; the source is forced to `UNAVAILABLE`), `unavailable`, `partial`, `pit`. `FieldStatus` is
+  `pit` / `no_source` / `insufficient_coverage` / `not_served`. `pit` means "passed coverage; served iff consumed, or the
+  now-partner of a served consumed 7d field"; `source == "pit"` iff `status` is `pit` or `partial`.
+- `BaseStrategy.consumes_mtf_signals: ClassVar[frozenset[str]]` (default: all nine fields, fail-closed) is declared explicitly
+  on every registry strategy. `rsi_mean_reversion` and `dca_rsi_hybrid`: `{fear_greed_index, btc_dominance,
+  yield_curve_spread, whale_net_flow}`; `model_strategy`: `{fear_greed_index, fear_greed_index_7d_ago, btc_dominance,
+  btc_dominance_7d_ago}`; `ma_crossover`, `breakout`, `grid_trading`, `sl_tp_reversion`, `momentum_breakout`,
+  `smoke_roundtrip`: `frozenset()`. `EnsembleStrategy.mtf_signal_fields()` is the union of its subs. A new strategy must declare
+  its set; `regime_at_entry` is computed for EVERY strategy, which is why `not_used` runs get `UNAVAILABLE`.
+- Measured at design time (synthetic GBM, `quant-design.md` QD-04): dca return x0.44..x1.17 under the frozen context in a bull regime (x0.16 in a flat regime), rsi
+  trades deleted or turned into buy-and-hold, 10-24% of decisions of a context-trained ML v2 changed, `momentum_breakout`
+  unaffected.
+- Pins to respect: `test_wp24_ast_pins.py` (leaf import whitelist and no-lag pins; name-reference allowlists that keep
+  `LIVE_SIGNALS` / `LiveSignals` / `BacktestSignalSource` inside `mtf_signals.py`, `strategy_engine.py`, `backtest.py` and
+  `optimizer.py`; no `.register(` on the source), `test_wp24_live_parity.py` (adapted: `decision_at` ignored; the frozen oracle and the moved-block hash were retired on purpose),
+  `_LIVE_BODY_SHA256` + `live_body_problems` (the whole `LiveSignals` class), `live_scope_problems` (inverted: no provider reference in
+  `mtf_signals.py`), `swallow_problems` (one handler), `engine_stage_problems` / `stage_source_problems` (stage branch fenced by `self._live_stage`),
+  `context_gate_problems` in `test_cf2401_context_trained.py` (the two reasons live only in `_drop_context_model_buys`: last, BUY-only,
+  fail-closed incl. the E05 `fields-fail-closed` facet, no backtest; limits: B1..B5 pass the pin but are killed behaviourally, B6 is label-only). `mtf_signals.py` must not contain the
+  substrings `logging`, `structlog`, `getLogger`, `print(`, `exc_log_fields`, comments included,
+  `test_wp22_ast_pins.py` (unedited). Do not add an `except` handler to `PitSignals.select` or coverage code without a
+  reviewed pin change.
+- Open: CF-24-03 (v2 training join is not PIT) and the P7 preconditions CF-P3-08..10. CF-24-01, -02 and -05 are solved in R1 (see
+  the register); until the R1 tag the boot-frozen behaviour applies. P1-P3 must ship in one release.
+- See `reports/vp2-wp2.4/synthesis-spec.md` and `Documentation/WP2.4-register.md`.

@@ -29,10 +29,12 @@ internal callers inside the router module keep working unchanged.
 from __future__ import annotations
 
 import math
+import re
 import uuid
+from collections.abc import Callable, Sequence
 from datetime import UTC, date, datetime, time
 from decimal import Decimal
-from typing import Any
+from typing import Any, Final, Literal
 
 import structlog
 from pydantic import ValidationError
@@ -50,18 +52,29 @@ from api.db.models import (
 )
 from api.schemas import (
     BacktestMetricsResponse,
-    LEADERBOARD_ELIGIBLE_FLAGS,
-    LEADERBOARD_MIN_CLOSED_TRADES,
     OpenPositionMTMResponse,
     RunDetailResponse,
     RunResponse,
+    leaderboard_eligible,
+)
+from api.services.cost_profiles import (
+    bar_alignment_response_fields,
+    cost_response_fields,
+    metrics_response_fields,
+    mtf_context_response_fields,
+    timestamp_response_fields,
 )
 from common.types import OrderSide, OrderStatus, OrderType
-from trading.models import Fill, Order
+from trading.metrics import EquityCurvePoint
+from trading.models import Fill, Order, TradeResult
 from trading.recovery import ResumeRejected, ResumeSnapshot
+from trading.strategy_engine import _yield_to_loop
 
 __all__ = [
+    "DUPLICATE_SYMBOLS_REASON",
+    "EmptyEquityCurveError",
     "build_backtest_metrics",
+    "has_duplicate_symbols",
     "load_resume_snapshot",
     "persist_backtest_results",
     "persist_paper_results",
@@ -70,6 +83,23 @@ __all__ = [
 ]
 
 logger = structlog.get_logger(__name__)
+
+#: Shape of ``CostProfile.fingerprint()``: a 16-hex digest of public economics.
+_FINGERPRINT_RE: Final = re.compile(r"[0-9a-f]{16}")
+# CF-97-02: rows per build, add_all, flush and yield step of persist_backtest_results.
+_PERSIST_CHUNK_ROWS: Final = 1000
+
+
+def _loggable_fingerprint(value: object) -> str:
+    """A STORED fingerprint, safe to log (WP2.1-H, SEC-03 / CF-36).
+
+    The value was read from ``RunORM.config`` and is only trusted as far as its
+    shape: a full ``[0-9a-f]{16}`` match is logged as is, anything else (a longer
+    string, control characters, a non-string) as the fixed ``"<malformed>"``.
+    """
+    if isinstance(value, str) and _FINGERPRINT_RE.fullmatch(value):
+        return value
+    return "<malformed>"
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +129,20 @@ def run_orm_to_response(run: RunORM) -> RunResponse:
     # n_closed_trades maps automatically (top-level column, field default=None).
     response = RunResponse.model_validate(run)
 
+    # WP2.1: the cost-model fields are computed BEFORE the no-metrics early
+    # return below, so a run without backtest_metrics (paper / live /
+    # errored) still carries its cost profile and legacy flags.  A malformed
+    # persisted value degrades to a legacy flag -- it never 500s a GET.
+    response = response.model_copy(update=cost_response_fields(run.config, run.run_mode))
+    # WP2.2 (SY-22-09): server-computed legacy-timestamp flag (runs only).
+    response = response.model_copy(update=timestamp_response_fields(run.config, run.run_mode))
+    # WP2.3 (SY-23-16): server-computed legacy bar-alignment flag (multi-symbol backtests).
+    response = response.model_copy(update=bar_alignment_response_fields(run.config, run.run_mode))
+    # WP2.5 (SY-25-13): server-computed legacy-metrics flag (every symbol count).
+    response = response.model_copy(update=metrics_response_fields(run.config, run.run_mode))
+    # WP2.4 (SY-24-08): legacy-MTF-context flag (consumer strategies) + the stored status.
+    response = response.model_copy(update=mtf_context_response_fields(run.config, run.run_mode))
+
     # Step 2: extract JSONB-resident leaderboard fields (confidence_flag, psr).
     # These are NOT top-level SQL columns; they live in config["backtest_metrics"].
     # Best-effort: a parse failure must not crash a list-runs GET.
@@ -126,13 +170,37 @@ def run_orm_to_response(run: RunORM) -> RunResponse:
     # a validate= parameter and does NOT re-trigger validators.
     final_flag = updates.get("confidence_flag", response.confidence_flag)
     final_n = response.n_closed_trades
-    updates["leaderboard_eligible"] = (
-        final_n is not None
-        and final_n >= LEADERBOARD_MIN_CLOSED_TRADES
-        and final_flag in LEADERBOARD_ELIGIBLE_FLAGS
-    )
+    # WP2.1: the ONE eligibility helper (also adds the cost-model gate).
+    updates["leaderboard_eligible"] = leaderboard_eligible(final_n, final_flag, run.config)
 
     return response.model_copy(update=updates)
+
+
+#: Distinct, closed reason for a legacy persisted paper / live config that lists a
+#: symbol twice (WP2.3 CF-23-20).  The engine rejects duplicates, so such a run can
+#: neither resume nor be rebuilt; it fails closed with this reason (never a silent
+#: dedupe, which would change the sizing the run was opened with).
+DUPLICATE_SYMBOLS_REASON = "duplicate_symbols_in_config"
+
+
+def has_duplicate_symbols(symbols: object) -> bool:
+    """True iff ``symbols`` is a list that names the same string symbol twice.
+
+    Never raises.  A non-string element is skipped, not a reason to stop scanning, so
+    ``["A", 1, "A"]`` is still flagged (fail closed on a corrupt mixed list); a value that
+    is not a list at all (missing, malformed) is ``False`` here and left to the caller's
+    existing empty / shape checks.
+    """
+    if not isinstance(symbols, list):
+        return False
+    seen: set[str] = set()
+    for symbol in symbols:
+        if not isinstance(symbol, str):
+            continue
+        if symbol in seen:
+            return True
+        seen.add(symbol)
+    return False
 
 
 def run_orm_to_detail_response(run: RunORM) -> RunDetailResponse:
@@ -151,6 +219,12 @@ def run_orm_to_detail_response(run: RunORM) -> RunDetailResponse:
         The extended API response model with optional backtest metrics.
     """
     base = RunDetailResponse.model_validate(run)
+    # WP2.1: cost-model transparency fields (see run_orm_to_response).
+    base = base.model_copy(update=cost_response_fields(run.config, run.run_mode))
+    base = base.model_copy(update=timestamp_response_fields(run.config, run.run_mode))
+    base = base.model_copy(update=bar_alignment_response_fields(run.config, run.run_mode))
+    base = base.model_copy(update=metrics_response_fields(run.config, run.run_mode))
+    base = base.model_copy(update=mtf_context_response_fields(run.config, run.run_mode))
 
     # Attempt to populate backtest_metrics from the JSONB config blob
     raw_metrics: dict[str, Any] | None = (run.config or {}).get("backtest_metrics")
@@ -159,11 +233,13 @@ def run_orm_to_detail_response(run: RunORM) -> RunDetailResponse:
             base = base.model_copy(
                 update={"backtest_metrics": BacktestMetricsResponse.model_validate(raw_metrics)}
             )
-        except Exception:  # noqa: BLE001  -- best-effort; never fail a GET on bad stored data
+        except Exception as exc:  # noqa: BLE001  -- best-effort; never fail a GET on bad stored data
+            # WP2.5 (SY-25-12): the type name only.  Pydantic's message (and so a traceback)
+            # embeds the offending stored value, which a tampered JSONB field could fill.
             logger.warning(
                 "runs.backtest_metrics_parse_error",
                 run_id=str(run.id),
-                exc_info=True,
+                error_type=type(exc).__name__,
             )
 
     return base
@@ -172,6 +248,42 @@ def run_orm_to_detail_response(run: RunORM) -> RunDetailResponse:
 # ---------------------------------------------------------------------------
 # Backtest result -> metrics response
 # ---------------------------------------------------------------------------
+
+
+def _datetime_attr(result: object, name: str) -> datetime | None:
+    """``result.<name>`` if it is a ``datetime``, else ``None`` (stub-safe, SY-25-12)."""
+    value = getattr(result, name, None)
+    return value if isinstance(value, datetime) else None
+
+
+def _finite_float_attr(result: object, name: str) -> float | None:
+    """``result.<name>`` if it is a finite real number (not a bool), else ``None``."""
+    value = getattr(result, name, None)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        as_float = float(value)
+    except OverflowError:
+        return None
+    return as_float if math.isfinite(as_float) else None
+
+
+def _sampling_mode_attr(result: object) -> Literal["calendar_asof", "present_steps"] | None:
+    """``result.metric_sampling`` if it is one of the two closed modes, else ``None``."""
+    value = getattr(result, "metric_sampling", None)
+    if value == "calendar_asof":
+        return "calendar_asof"
+    if value == "present_steps":
+        return "present_steps"
+    return None
+
+
+def _carried_slots_attr(result: object) -> int:
+    """``result.carried_slots`` if it is a non-negative int (not a bool), else ``0``."""
+    value = getattr(result, "carried_slots", 0)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0
+    return value
 
 
 def build_backtest_metrics(result: Any) -> BacktestMetricsResponse:
@@ -209,6 +321,8 @@ def build_backtest_metrics(result: Any) -> BacktestMetricsResponse:
         average_loss=str(result.average_loss),
         largest_win=str(result.largest_win),
         largest_loss=str(result.largest_loss),
+        # WP2.3 (SY-23-11): ``result.total_bars`` is the number of aligned TIMELINE steps
+        # minus the warm-up window (steps - W), not a per-symbol bar count.
         total_bars=result.total_bars,
         bars_in_market=result.bars_in_market,
         exposure_pct=result.exposure_pct,
@@ -231,6 +345,14 @@ def build_backtest_metrics(result: Any) -> BacktestMetricsResponse:
         psr=getattr(result, "psr", None),
         n_observations=getattr(result, "n_observations", 0),
         confidence_flag=getattr(result, "confidence_flag", None),
+        # WP2.5 (SY-25-12): the sampling behind the curve-derived numbers.  getattr guards
+        # keep stub results (tests) working; ``oos_start_at`` / ``metrics_version`` stay
+        # engine-level.
+        trading_start_at=_datetime_attr(result, "trading_start_at"),
+        trading_end_at=_datetime_attr(result, "trading_end_at"),
+        periods_per_year=_finite_float_attr(result, "periods_per_year"),
+        metric_sampling=_sampling_mode_attr(result),
+        carried_slots=_carried_slots_attr(result),
         # M6 (Sprint 49): currency labeling — getattr guards for pre-M6 BacktestResult objects
         quote_currency=getattr(result, "quote_currency", None),
         reporting_currency=getattr(result, "reporting_currency", None),
@@ -435,6 +557,45 @@ async def persist_paper_results(
 # ---------------------------------------------------------------------------
 
 
+class EmptyEquityCurveError(RuntimeError):
+    """A backtest produced open positions but no equity curve (internal invariant breach).
+
+    Deliberately a ``RuntimeError``, NOT a ``ValueError``: ``routers/runs.py`` maps
+    ``ValueError`` to HTTP 400 "data quality" (a caller-fixable date-range problem),
+    whereas this is a server-side defect and must take the generic HTTP 500 branch
+    (WP22-P3-R2-CR-01).  The message is a static string with no run data in it.
+    """
+
+
+def _final_bar_close(curve: Sequence[EquityCurvePoint]) -> datetime:
+    """End-of-run stamp for a backtest's position snapshots (WP2.2, SY-22-15).
+
+    The last equity point's stamp, i.e. the final bar close.  There is deliberately no
+    wall-time fallback: open positions without an equity curve is a broken result, and
+    a silent wall read would mix wall time into a bar-time table (T-06).  Raises
+    :class:`EmptyEquityCurveError` (a ``RuntimeError``) in that case.
+    """
+    if not curve:
+        raise EmptyEquityCurveError(
+            "cannot stamp position snapshots: the backtest result has no equity curve"
+        )
+    stamp: datetime = curve[-1].timestamp
+    return stamp
+
+
+async def _flush_in_chunks(
+    db: AsyncSession, items: Sequence[Any], make: Callable[[int, Any], Any]
+) -> None:
+    """Build, add and flush ``items`` in chunks; each chunk is released before the yield."""
+    for lo in range(0, len(items), _PERSIST_CHUNK_ROWS):
+        part = items[lo : lo + _PERSIST_CHUNK_ROWS]
+        chunk = [make(lo + i, item) for i, item in enumerate(part)]
+        db.add_all(chunk)
+        await db.flush()
+        del chunk
+        await _yield_to_loop()
+
+
 async def persist_backtest_results(
     db: AsyncSession,
     run_id: uuid.UUID,
@@ -450,6 +611,13 @@ async def persist_backtest_results(
     - ``TradeORM`` rows for every completed round-trip trade.
     - ``EquitySnapshotORM`` rows for every equity curve point.
     - Backtest metrics summary into ``run_orm.config["backtest_metrics"]``.
+
+    ``run_orm.config["bar_alignment"]`` (WP2.3, ``AlignmentReport.to_metadata()``) is set
+    by the caller before this runs and is carried through the config rebuild below.
+    Two runs on the same bars are compared by its ``presence_digest``, NOT by
+    ``fingerprint``: the optimizer aligns with warm-up 0 (a combination-independent
+    split), so ``fingerprint`` (which covers the ``holes_in_*`` diagnostics) differs
+    between a runner report and an optimizer report on identical data.
 
     Parameters
     ----------
@@ -467,9 +635,8 @@ async def persist_backtest_results(
     from sqlalchemy.orm.attributes import flag_modified  # noqa: E402
 
     # --- Persist trades ---
-    trade_orms: list[TradeORM] = []
-    for trade in result.trades:
-        trade_orm = TradeORM(
+    def _trade_row(_i: int, trade: TradeResult) -> TradeORM:
+        return TradeORM(
             id=trade.trade_id,
             run_id=run_id,
             symbol=trade.symbol,
@@ -489,16 +656,15 @@ async def persist_backtest_results(
             regime_at_entry=getattr(trade, "regime_at_entry", None),
             signal_context=getattr(trade, "signal_context", None),
         )
-        trade_orms.append(trade_orm)
 
-    if trade_orms:
-        db.add_all(trade_orms)
-        log.info("runs.backtest_trades_inserted", count=len(trade_orms))
+    n_trades = len(result.trades)
+    await _flush_in_chunks(db, result.trades, _trade_row)
+    if n_trades:
+        log.info("runs.backtest_trades_inserted", count=n_trades)
 
     # --- Persist equity curve ---
-    equity_orms: list[EquitySnapshotORM] = []
-    for bar_index, point in enumerate(result.equity_curve):
-        snapshot = EquitySnapshotORM(
+    def _equity_row(bar_index: int, point: EquityCurvePoint) -> EquitySnapshotORM:
+        return EquitySnapshotORM(
             run_id=run_id,
             equity=point.equity,
             # MVP approximation: cash and unrealised_pnl are not individually
@@ -512,66 +678,57 @@ async def persist_backtest_results(
             bar_index=bar_index,
             timestamp=point.timestamp,
         )
-        equity_orms.append(snapshot)
 
-    if equity_orms:
-        db.add_all(equity_orms)
-        log.info("runs.backtest_equity_snapshots_inserted", count=len(equity_orms))
+    n_equity = len(result.equity_curve)
+    await _flush_in_chunks(db, result.equity_curve, _equity_row)
+    if n_equity:
+        log.info("runs.backtest_equity_snapshots_inserted", count=n_equity)
 
-    # --- Persist orders and fills ---
-    order_orms: list[OrderORM] = []
-    fill_orms: list[FillORM] = []
+    # --- Persist orders and fills (all orders flushed before the first fill: FK order) ---
+    def _order_row(_i: int, order: Order) -> OrderORM:
+        return OrderORM(
+            id=order.order_id,
+            client_order_id=order.client_order_id,
+            run_id=run_id,
+            symbol=order.symbol,
+            side=order.side.value,
+            order_type=order.order_type.value,
+            quantity=order.quantity,
+            price=order.price,
+            status=order.status.value,
+            filled_quantity=order.filled_quantity,
+            average_fill_price=order.average_fill_price,
+            exchange_order_id=order.exchange_order_id,
+            created_at=order.created_at,
+            updated_at=order.updated_at,
+        )
 
-    if execution_engine is not None:
-        for order in execution_engine.get_all_orders():
-            order_orms.append(
-                OrderORM(
-                    id=order.order_id,
-                    client_order_id=order.client_order_id,
-                    run_id=run_id,
-                    symbol=order.symbol,
-                    side=order.side.value,
-                    order_type=order.order_type.value,
-                    quantity=order.quantity,
-                    price=order.price,
-                    status=order.status.value,
-                    filled_quantity=order.filled_quantity,
-                    average_fill_price=order.average_fill_price,
-                    exchange_order_id=order.exchange_order_id,
-                    created_at=order.created_at,
-                    updated_at=order.updated_at,
-                )
-            )
+    def _fill_row(_i: int, fill: Fill) -> FillORM:
+        return FillORM(
+            id=fill.fill_id,
+            order_id=fill.order_id,
+            symbol=fill.symbol,
+            side=fill.side.value,
+            quantity=fill.quantity,
+            price=fill.price,
+            fee=fill.fee,
+            fee_currency=fill.fee_currency,
+            is_maker=fill.is_maker,
+            executed_at=fill.executed_at,
+            # QT-009 (Sprint 42): execution-quality telemetry
+            expected_price=getattr(fill, "expected_price", None),
+            slippage_bps_realized=getattr(fill, "slippage_bps_realized", None),
+        )
 
-        for fill in execution_engine.get_all_fills():
-            fill_orms.append(
-                FillORM(
-                    id=fill.fill_id,
-                    order_id=fill.order_id,
-                    symbol=fill.symbol,
-                    side=fill.side.value,
-                    quantity=fill.quantity,
-                    price=fill.price,
-                    fee=fill.fee,
-                    fee_currency=fill.fee_currency,
-                    is_maker=fill.is_maker,
-                    executed_at=fill.executed_at,
-                    # QT-009 (Sprint 42): execution-quality telemetry
-                    expected_price=getattr(fill, "expected_price", None),
-                    slippage_bps_realized=getattr(fill, "slippage_bps_realized", None),
-                )
-            )
-
-    if order_orms:
-        db.add_all(order_orms)
-        await db.flush()
-    if fill_orms:
-        db.add_all(fill_orms)
-    if order_orms or fill_orms:
+    orders = list(execution_engine.get_all_orders()) if execution_engine is not None else []
+    fills = list(execution_engine.get_all_fills()) if execution_engine is not None else []
+    await _flush_in_chunks(db, orders, _order_row)
+    await _flush_in_chunks(db, fills, _fill_row)
+    if orders or fills:
         log.info(
             "runs.backtest_orders_fills_inserted",
-            orders=len(order_orms),
-            fills=len(fill_orms),
+            orders=len(orders),
+            fills=len(fills),
         )
 
     # --- Persist position snapshots ---
@@ -579,7 +736,7 @@ async def persist_backtest_results(
     # (CR-006 deferred cleanup; pre-existing before M3, not introduced here).
     position_orms: list[PositionSnapshotORM] = []
     if portfolio is not None and hasattr(portfolio, '_position_snapshots'):
-        now = datetime.now(tz=UTC)
+        # WP2.2 (SY-22-15): bar-time stamp, no wall-time fallback (see _final_bar_close).
         for pos in portfolio._position_snapshots.values():
             position_orms.append(
                 PositionSnapshotORM(
@@ -592,13 +749,31 @@ async def persist_backtest_results(
                     realised_pnl=pos.realised_pnl,
                     total_fees_paid=pos.total_fees_paid,
                     opened_at=pos.opened_at,
-                    snapshot_at=now,
+                    snapshot_at=_final_bar_close(result.equity_curve),
                 )
             )
 
     if position_orms:
         db.add_all(position_orms)
         log.info("runs.backtest_positions_inserted", count=len(position_orms))
+
+    # --- WP2.1: the result must carry the cost model the run's config froze ---
+    _frozen = (run_orm.config or {}).get("cost_profile")
+    _result_fp = getattr(result, "cost_profile_fingerprint", "")
+    if (
+        isinstance(_frozen, dict)
+        and isinstance(_result_fp, str)
+        and _result_fp
+        and _frozen.get("fingerprint") != _result_fp
+    ):
+        # Error log only (no raise): the numbers are already computed; the
+        # operator must know they were not produced under the frozen profile.
+        log.error(
+            "runs.cost_profile_fingerprint_mismatch",
+            run_id=str(run_id),
+            config_fingerprint=_loggable_fingerprint(_frozen.get("fingerprint")),
+            result_fingerprint=_result_fp[:32],
+        )
 
     # --- Merge metrics into run.config JSONB ---
     metrics_response = build_backtest_metrics(result)
@@ -622,8 +797,8 @@ async def persist_backtest_results(
 
     log.info(
         "runs.backtest_results_persisted",
-        trades=len(trade_orms),
-        equity_points=len(equity_orms),
+        trades=n_trades,
+        equity_points=n_equity,
         total_return=f"{result.total_return_pct:.4%}",
         sharpe=f"{result.sharpe_ratio:.3f}",
     )

@@ -1,0 +1,66 @@
+# =============================================================================
+# Grafana unified-alerting provisioning -- API process restart (CF-26-96)
+#
+# A separate file and group from trading-alerts.yml on purpose: the rule list of
+# trading-safety is pinned by tests/unit/test_wp21c_alert_scope.py and
+# tests/unit/test_cf2401_alerts.py, and this rule is infrastructure, not a
+# per-run safety gauge.
+#
+# Why this rule exists: the API container runs under a 768m memory limit with no
+# swap (infra/docker-compose.yml). A process that outgrows it is OOM-killed
+# (SIGKILL) and Docker restarts it (restart: unless-stopped). The restart takes
+# well under the 2 m "for" of trading-api-down, so that rule does not see it.
+# A killed process also skips the graceful shutdown: live runs come back
+# 'orphaned' and stay unprotected by the bot until an operator resumes them.
+#
+# Signal: app_uptime_seconds (apps/api/prometheus.py) is time since the process
+# started and drops to about 0 on every restart, so resets() over 15 m is > 0
+# for 15 m after any restart. It is process-level: it cannot tell an OOM kill
+# from a crash or from a planned deploy. The operator tells them apart with the
+# checks in docs/runbooks/api-container-memory.md (OOMKilled via a narrow
+# `docker inspect --format`). A planned restart also fires this rule.
+#
+# Alerts show in Grafana's alert list. No contact point is provisioned in this
+# repo, so nothing is pushed anywhere until the operator adds one (it needs a
+# secret, so it is not in the repo).
+# =============================================================================
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: trading-infra
+    folder: Trading
+    interval: 1m
+    rules:
+      - uid: trading-api-restarted
+        title: Trading API process restarted
+        condition: C
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        labels:
+          severity: critical
+        annotations:
+          summary: >-
+            The API process restarted in the last 15 min (app_uptime_seconds
+            reset). If it was not a planned deploy, treat it as a possible OOM
+            kill: live runs are 'orphaned' until resumed by hand. Run the checks
+            in docs/runbooks/api-container-memory.md now (OOMKilled, orphaned
+            live runs, open live positions at the exchange).
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              expr: max(resets(app_uptime_seconds{job="trading-bot-api"}[15m]))
+              instant: true
+          - refId: C
+            relativeTimeRange: { from: 0, to: 0 }
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [0.5] }

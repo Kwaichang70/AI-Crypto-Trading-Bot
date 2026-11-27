@@ -13,6 +13,15 @@ writes back:
   - ``confidence_flag``          (JSONB config.backtest_metrics -- M4)
   - ``quote_currency``           (JSONB config.backtest_metrics -- M6)
 
+WP2.5 guard (SY-25-18): a row whose ``config.engine_semantics.metrics`` is a known
+version (``trading.metrics.KNOWN_METRICS_VERSIONS``) already carries the per-bar numbers
+written by the runner.  It is skipped BEFORE any recompute and without any write (not even
+``metrics_v2_backfilled``), and counted as ``skipped_wp25``: this script's PSR recompute
+(sample-stdev moments, one return per snapshot) would overwrite correct evidence.  Legacy
+rows (no known marker) are processed exactly as before, including the timeframe fallback
+in ``_recompute_psr_from_snapshots`` (CR-08: it is reachable only for those rows, whose
+stored numbers it must keep reproducing).
+
 What this script CANNOT recompute from stored data (documented skip):
   - ``exposure_pct_per_symbol``  -- needs per-bar position tracking (not stored)
   - ``open_positions_mtm``       -- needs terminal-bar prices (not stored)
@@ -68,6 +77,7 @@ from sqlalchemy.orm import selectinload
 from api.db import RunORM, EquitySnapshotORM, get_session_factory
 from trading.backtest import _detect_quote_currency  # noqa: PLC2701
 from trading.metrics import (
+    KNOWN_METRICS_VERSIONS,
     _derive_confidence_flag,  # noqa: PLC2701 -- private helper, cross-module per M4 pattern
     compute_psr,
     compute_sharpe,
@@ -211,6 +221,8 @@ def _recompute_psr_from_snapshots(
         except ValueError:
             pass
 
+    # LEGACY rows only (the wp25 guard in ``_compute_diff`` skips marked rows before this
+    # point): the silent 1h fallback is kept on purpose so legacy output is unchanged (CR-08).
     periods_per_year = TIMEFRAME_PERIODS_PER_YEAR.get(tf_enum or TimeFrame.ONE_HOUR, 8_766.0)
 
     # Per-period (de-annualised) Sharpe for PSR formula
@@ -260,6 +272,7 @@ class _RunDiff:
         "confidence_flag",
         "quote_currency",
         "skip_reason",
+        "skipped_wp25",
     )
 
     def __init__(self, run_id: uuid.UUID) -> None:
@@ -271,6 +284,8 @@ class _RunDiff:
         self.confidence_flag: str | None = None
         self.quote_currency: str | None = None
         self.skip_reason: str | None = None
+        # WP2.5 (SY-25-18): skipped by the marker guard -- no recompute, no write at all.
+        self.skipped_wp25: bool = False
 
     @property
     def is_skip(self) -> bool:
@@ -288,6 +303,19 @@ class _RunDiff:
         )
 
 
+#: Fixed skip reason for the wp25 guard (no row data is echoed).
+_WP25_SKIP_REASON = "wp25 metrics marker present"
+
+
+def _has_known_metrics_marker(config: object) -> bool:
+    """True iff ``config["engine_semantics"]["metrics"]`` is a ``str`` in
+    ``KNOWN_METRICS_VERSIONS``.  Never raises; anything else (missing, malformed,
+    non-string, unknown) is a legacy row, processed as before."""
+    semantics = config.get("engine_semantics") if isinstance(config, dict) else None
+    marker = semantics.get("metrics") if isinstance(semantics, dict) else None
+    return isinstance(marker, str) and marker in KNOWN_METRICS_VERSIONS
+
+
 def _compute_diff(
     run: RunORM,
     snapshots: list[EquitySnapshotORM],
@@ -299,6 +327,13 @@ def _compute_diff(
     diff = _RunDiff(run.id)
 
     config = run.config or {}
+
+    # WP2.5 (SY-25-18): per-bar numbers are already correct -- never recompute or rewrite.
+    if _has_known_metrics_marker(config):
+        diff.skip_reason = _WP25_SKIP_REASON
+        diff.skipped_wp25 = True
+        return diff
+
     raw_metrics: Any = config.get("backtest_metrics")
 
     if not isinstance(raw_metrics, dict):
@@ -405,6 +440,7 @@ class _Stats:
     def __init__(self) -> None:
         self.total_found: int = 0
         self.total_skipped: int = 0
+        self.skipped_wp25: int = 0
         self.total_updated: int = 0
         self.n_trades_updated: int = 0
         self.pf_updated: int = 0
@@ -413,6 +449,9 @@ class _Stats:
         self.batch_errors: int = 0
 
     def record(self, diff: _RunDiff) -> None:
+        if diff.skipped_wp25:
+            self.skipped_wp25 += 1
+            return
         if diff.is_skip:
             self.total_skipped += 1
             return
@@ -433,6 +472,7 @@ class _Stats:
             "backfill.summary_line",
             runs_found=self.total_found,
             runs_skipped=self.total_skipped,
+            skipped_wp25=self.skipped_wp25,
             runs_processable=self.total_updated,
             **{f"{action}_n_closed_trades": self.n_trades_updated},
             **{f"{action}_profit_factor": self.pf_updated},
@@ -563,6 +603,9 @@ async def _run(
                     write_runs = {r.id: r for r in result3.scalars().all()}
 
                     for diff in batch_diffs:
+                        if diff.skipped_wp25:
+                            # WP2.5 (SY-25-18): untouched -- not even the backfilled flag.
+                            continue
                         if diff.is_skip:
                             # Even on skip: mark backfilled so we don't retry
                             wr = write_runs.get(diff.run_id)

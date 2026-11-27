@@ -45,12 +45,20 @@ from typing import Any
 
 import structlog
 
+from api.services import admission, egress_budget
+from common.logging import exc_log_fields
+
 __all__ = ["RetrainingService"]
 
 logger = structlog.get_logger(__name__)
 
 # Sentinel: beginning of time — all trades qualify on first run
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+
+# Allow-list of run modes whose trades may become training labels.  Backtest
+# (and optimize) trades are in-sample replays of the model's own history, so
+# they must never feed retraining (WP2.2 SY-22-11).
+TRAINING_RUN_MODES: tuple[str, ...] = ("paper", "live")
 
 
 class RetrainingService:
@@ -156,8 +164,13 @@ class RetrainingService:
                         "retraining_service.check_failed",
                         symbol=symbol,
                         timeframe=timeframe,
-                        error=str(exc),
-                        error_type=type(exc).__name__,
+                        **exc_log_fields(exc),
+                    )
+                    self._log.debug(
+                        "retraining_service.check_failed.trace",
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        exc_info=exc,
                     )
 
     # ------------------------------------------------------------------ #
@@ -189,7 +202,7 @@ class RetrainingService:
         """Count trades since last retrain; trigger retraining if threshold met."""
         from sqlalchemy import func, select
 
-        from api.db.models import TradeORM
+        from api.db.models import RunORM, TradeORM
 
         key = f"{symbol}::{timeframe}"
         last_at = self._last_retrain_at.get(key, _EPOCH)
@@ -198,10 +211,12 @@ class RetrainingService:
             count_result = await session.execute(
                 select(func.count())
                 .select_from(TradeORM)
+                .join(RunORM, RunORM.id == TradeORM.run_id)
                 .where(
                     TradeORM.strategy_id == "model_strategy",
                     TradeORM.symbol == symbol,
                     TradeORM.exit_at > last_at,
+                    RunORM.run_mode.in_(TRAINING_RUN_MODES),
                 )
             )
             trade_count = count_result.scalar_one()
@@ -222,7 +237,21 @@ class RetrainingService:
                 timeframe=timeframe,
                 trade_count=trade_count,
             )
-            await self._do_retrain(symbol=symbol, timeframe=timeframe, trigger="auto")
+            # CF-97-03 (P7a): a busy server skips this cycle (never waits); the job holds the slot
+            # until its pipeline ends, even if this loop is cancelled meanwhile.
+            try:
+                lease = admission.try_acquire("ml_retrain")
+            except admission.AdmissionRefused:
+                self._log.info("admission.skipped_busy", symbol=symbol, timeframe=timeframe)
+                return
+            job = asyncio.ensure_future(
+                self._do_retrain(symbol=symbol, timeframe=timeframe, trigger="auto")
+            )
+            lease.bind_thread(job)
+            try:
+                await asyncio.shield(job)
+            finally:
+                lease.release()  # CF-97-26: the scheduler task's research flag is reset here
 
     # ------------------------------------------------------------------ #
     # Retraining pipeline
@@ -266,7 +295,12 @@ class RetrainingService:
             self._log.error(
                 "retraining_service.ohlcv_fetch_failed",
                 symbol=symbol,
-                error=str(exc),
+                **exc_log_fields(exc),
+            )
+            self._log.debug(
+                "retraining_service.ohlcv_fetch_failed.trace",
+                symbol=symbol,
+                exc_info=exc,
             )
             return
 
@@ -299,7 +333,10 @@ class RetrainingService:
             except Exception as exc:
                 self._log.warning(
                     "retraining_service.fgi_history_fetch_failed",
-                    error=str(exc),
+                    **exc_log_fields(exc),
+                )
+                self._log.debug(
+                    "retraining_service.fgi_history_fetch_failed.trace", exc_info=exc
                 )
             try:
                 from data.market_signals import (
@@ -313,7 +350,10 @@ class RetrainingService:
             except Exception as exc:
                 self._log.warning(
                     "retraining_service.btc_dom_history_fetch_failed",
-                    error=str(exc),
+                    **exc_log_fields(exc),
+                )
+                self._log.debug(
+                    "retraining_service.btc_dom_history_fetch_failed.trace", exc_info=exc
                 )
 
         # 3. Train in thread (scikit-learn is CPU-bound + synchronous)
@@ -335,15 +375,24 @@ class RetrainingService:
             self._log.warning(
                 "retraining_service.dataset_error",
                 symbol=symbol,
-                error=str(exc),
+                **exc_log_fields(exc),
+            )
+            self._log.debug(
+                "retraining_service.dataset_error.trace",
+                symbol=symbol,
+                exc_info=exc,
             )
             return
         except Exception as exc:
             self._log.error(
                 "retraining_service.train_failed",
                 symbol=symbol,
-                error=str(exc),
-                error_type=type(exc).__name__,
+                **exc_log_fields(exc),
+            )
+            self._log.debug(
+                "retraining_service.train_failed.trace",
+                symbol=symbol,
+                exc_info=exc,
             )
             return
 
@@ -429,6 +478,7 @@ class RetrainingService:
 
         exc_instance = exchange_cls({"enableRateLimit": True})
         try:
+            egress_budget.reserve_history_blocking(self._exchange_id)  # CF-97-03 P7b
             raw: list[list[Any]] = exc_instance.fetch_ohlcv(
                 symbol=symbol,
                 timeframe=timeframe,
@@ -509,10 +559,10 @@ class RetrainingService:
     # ------------------------------------------------------------------ #
 
     async def _fetch_trade_dicts(self, symbol: str) -> list[dict[str, Any]]:
-        """Query all closed model_strategy trades for the symbol and return as dicts."""
+        """Query closed paper/live model_strategy trades for the symbol as dicts."""
         from sqlalchemy import select
 
-        from api.db.models import TradeORM
+        from api.db.models import RunORM, TradeORM
 
         async with self._db_session_factory() as session:
             result = await session.execute(
@@ -523,9 +573,11 @@ class RetrainingService:
                     TradeORM.quantity,
                     TradeORM.entry_at,
                 )
+                .join(RunORM, RunORM.id == TradeORM.run_id)
                 .where(
                     TradeORM.strategy_id == "model_strategy",
                     TradeORM.symbol == symbol,
+                    RunORM.run_mode.in_(TRAINING_RUN_MODES),
                 )
                 .order_by(TradeORM.entry_at)
             )
@@ -634,7 +686,12 @@ class RetrainingService:
                     self._log.warning(
                         "retraining_service.model_file_delete_failed",
                         path=str(model_file),
-                        error=str(exc),
+                        **exc_log_fields(exc),
+                    )
+                    self._log.debug(
+                        "retraining_service.model_file_delete_failed.trace",
+                        path=str(model_file),
+                        exc_info=exc,
                     )
             # Delete DB row
             async with self._db_session_factory() as session:

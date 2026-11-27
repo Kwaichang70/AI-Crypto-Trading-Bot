@@ -61,8 +61,11 @@
 # ---------------------------------------------------------------------------
 {{TAILSCALE_FQDN}} {
     # NextAuth OAuth callbacks MUST reach the UI container, not the FastAPI backend.
-    # This more-specific handle block MUST appear BEFORE handle /api/* because
-    # Caddy v2 evaluates handle blocks in source order and stops at the first match.
+    # This more-specific handle block wins over handle /api/*: Caddy sorts handle blocks
+    # that have a single path matcher by path length (a trailing `*` is ignored), longest
+    # first, and runs the catch-all without a matcher last, so source order does not decide
+    # which block answers. The file keeps the more specific blocks above the broader ones
+    # for readability, and the order pins in tests/unit enforce that layout.
     #
     # WP1.3a: capped at 1MB even though this path only ever carries small
     # next-auth OAuth callback payloads (state/code exchanges, session
@@ -82,10 +85,11 @@
     # and forward it as X-Admin-Key to the FastAPI backend. The browser never
     # holds the admin key.
     #
-    # This block MUST appear BEFORE the generic handle /api/* below (same
-    # first-match-wins rule as /api/auth/* above) so a request to
-    # /api/admin/... reaches ui:3000 (session/role gated) rather than being
-    # proxied straight to api:8000.
+    # This block is more specific than the generic handle /api/* below, so Caddy
+    # runs it first whatever the source order (see the sorting note at /api/auth/*
+    # above), and a request to /api/admin/... reaches ui:3000 (session/role gated)
+    # rather than being proxied straight to api:8000. It is kept above the generic
+    # block for readability.
     #
     # NOTE (WP17-D-01 design decision, see reports/vp2-wp1.7/devops-design.md):
     # FastAPI's own admin endpoints (e.g. /api/v1/emergency/kill-switch,
@@ -109,6 +113,39 @@
         reverse_proxy ui:3000
     }
 
+    # CF-97-34 (SE-2696-06), option A: the JSON metrics snapshot of the API is
+    # unauthenticated by design and carries per-run equity, drawdown, open
+    # positions, order/fill counters and safety state. Nothing in the UI, in
+    # Prometheus (it scrapes api:8000/metrics on the backend network) or in the
+    # healthchecks reads it through this proxy, so the edge answers 404 for it
+    # and for any sub-path, without contacting the API.
+    #
+    # This block is longer than the generic /api/* proxy block below, so Caddy sorts
+    # it first (see the sorting note at /api/auth/* above); it is kept above that
+    # block for readability. The trailing
+    # `*` makes it a prefix match, so the trailing-slash form and any sub-path
+    # are covered too. Edge only: the application route itself is unchanged and
+    # still answers on api:8000 from inside the compose network (the durable
+    # fix, an API key or removing the route, is CF-97-34 option B/C). See
+    # docs/runbooks/caddy-metrics-block.md.
+    handle /api/v1/metrics* {
+        respond 404
+    }
+
+    # CF-97-40-A (37-C2): the Next.js Image Optimizer answers on /_next/image and the UI
+    # middleware matcher excludes _next/static and _next/image, so it is reachable without a session while
+    # advisories are open for it in the locked `next` version. The dashboard uses no
+    # next/image and sets no `images:` option (pinned by tests/unit/test_cf9740a_next_image_block.py),
+    # so the edge answers 404 for it without contacting the UI. The prefix `*` also covers
+    # the trailing-slash form. It does NOT match /_next/static/* or any other /_next/ path.
+    # Order: the matchers are disjoint and Caddy runs the catch-all last whatever the
+    # source order; the block is kept above the catch-all for readability (a style rule
+    # pinned by tests/unit/test_cf9740a_next_image_block.py).
+    # See docs/runbooks/caddy-metrics-block.md section 5.
+    handle /_next/image* {
+        respond 404
+    }
+
     # All other /api/* routes go to the FastAPI backend.
     # handle /api/* preserves the full /api/v1/... prefix (NOT handle_path).
     #
@@ -123,6 +160,16 @@
             max_size 1MB
         }
         reverse_proxy api:8000
+    }
+
+    # CF-97-37 R2 (inert until the BFF ships): the dashboard's API calls will reach the UI
+    # server under /bff/api/v1/*, which adds the API key. The catch-all below has no body
+    # cap, so this block carries the same 1MB cap as /api/* (the Node handler buffers bodies).
+    handle /bff/* {
+        request_body {
+            max_size 1MB
+        }
+        reverse_proxy ui:3000
     }
 
     # Catch-all: everything else goes to the Next.js frontend.

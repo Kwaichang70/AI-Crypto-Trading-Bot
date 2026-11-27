@@ -22,9 +22,10 @@ from __future__ import annotations
 
 import math
 import uuid
+from collections.abc import Mapping
 from datetime import datetime
 from decimal import Decimal
-from typing import Any, Generic, Literal, Self, TypeVar
+from typing import Any, Final, Generic, Literal, Self, TypeVar
 
 from pydantic import (
     BaseModel,
@@ -38,13 +39,19 @@ from pydantic import (
 from pydantic.alias_generators import to_camel
 
 from common.types import OrderSide, OrderStatus, OrderType, RunMode, TimeFrame
+from trading.costs import CostProfile, FeeSource, is_leaderboard_cost_eligible
+from trading.metrics import KNOWN_METRICS_VERSIONS
+from trading.mtf_signals import KNOWN_MTF_CONTEXT_VERSIONS, MTF_CONTEXT_VERSION
 
+# Version constants ONLY (WP2.4): the one apps/ importer of this module, so the CF-P1-04 importer
+# allowlist grows by exactly this file.  ``cost_profiles`` takes both names from here.
 __all__ = [
     # Pagination
     "PaginationParams",
     "PaginatedResponse",
     # Runs
     "RunCreateRequest",
+    "CostProfileSummary",
     "RunResponse",
     "RunListResponse",
     "BacktestMetricsResponse",
@@ -87,6 +94,17 @@ __all__ = [
     # M5 (Sprint 49): leaderboard eligibility constants
     "LEADERBOARD_MIN_CLOSED_TRADES",
     "LEADERBOARD_ELIGIBLE_FLAGS",
+    "build_cost_profile_summary",
+    "KNOWN_MTF_CONTEXT_VERSIONS",
+    "MTF_CONTEXT_VERSION",
+    "is_leaderboard_metrics_eligible",
+    "is_leaderboard_mtf_eligible",
+    "is_legacy_mtf_context",
+    "LEGACY_MTF_CONSUMER_STRATEGIES",
+    "KNOWN_MTF_CONTEXT_STATUSES",
+    "stored_mtf_context_status",
+    "leaderboard_eligible",
+    "meets_trade_confidence_thresholds",
 ]
 
 # ---------------------------------------------------------------------------
@@ -269,6 +287,17 @@ class RunCreateRequest(BaseModel):
             "Ignored for paper and live modes."
         ),
     )
+    cost_profile: str | None = Field(
+        default=None,
+        max_length=64,
+        description=(
+            "WP2.1: cost-profile registry id (e.g. 'coinbase_advanced_d6').  None "
+            "(the default) uses the platform default profile.  backtest accepts "
+            "any registry id; paper only live-equivalent ids; live accepts none "
+            "(422 'cost_profile_not_allowed_for_live').  Unknown ids give 422 "
+            "'unknown_cost_profile'."
+        ),
+    )
     allow_pyramiding: StrictBool | None = Field(
         default=None,
         description=(
@@ -317,6 +346,11 @@ class RunCreateRequest(BaseModel):
                     f"Symbol {symbol!r} must follow CCXT format 'BASE/QUOTE' "
                     f"(e.g. 'BTC/USDT')"
                 )
+        # WP2.3 (CF-23-20, P3 critic ruling 3): a duplicate symbol double-counts exposure
+        # and the engine rejects it; fail at the API edge with a 422 instead.  Order is
+        # preserved (nothing is deduped); the message never echoes a request value.
+        if len(set(v)) != len(v):
+            raise ValueError("symbols must be unique")
         return v
 
 
@@ -336,6 +370,193 @@ LEADERBOARD_MIN_CLOSED_TRADES: int = 10
 LEADERBOARD_ELIGIBLE_FLAGS: frozenset[str] = frozenset({"high", "medium"})
 
 
+def meets_trade_confidence_thresholds(n_trades: object, confidence_flag: object) -> bool:
+    """The trade-count + confidence half of leaderboard eligibility (M5)."""
+    return (
+        isinstance(n_trades, int)
+        and not isinstance(n_trades, bool)
+        and n_trades >= LEADERBOARD_MIN_CLOSED_TRADES
+        and confidence_flag in LEADERBOARD_ELIGIBLE_FLAGS
+    )
+
+
+def is_leaderboard_metrics_eligible(config: Mapping[str, object] | None) -> bool:
+    """The metrics half of leaderboard eligibility (WP2.5, SY-25-15 / UD-1).
+
+    True iff ``config["engine_semantics"]["metrics"]`` is a ``str`` in
+    ``KNOWN_METRICS_VERSIONS``.  A run without the marker (missing, unknown, non-string,
+    ``None``, a malformed ``engine_semantics`` or ``config=None``) was scored on every
+    equity point, so its Sharpe scale and its confidence tier (derived from an inflated
+    n) are not comparable with current runs.  Fails closed; never raises, never logs.
+    """
+    semantics = config.get("engine_semantics") if isinstance(config, Mapping) else None
+    marker = semantics.get("metrics") if isinstance(semantics, Mapping) else None
+    return isinstance(marker, str) and marker in KNOWN_METRICS_VERSIONS
+
+
+#: WP2.4 (SY-24-08): the strategies that CONSUMED the C10 multi-timeframe signals at
+#: bbe7142 (``dca_rsi_hybrid`` / ``rsi_mean_reversion`` / ``model_strategy`` read the nine
+#: fields; the ensemble passes its subs' through).  A frozen HISTORIC fact -- it names who
+#: read boot-frozen provider values in a backtest BEFORE the ``mtf_context`` marker existed,
+#: so it must NOT follow later changes to ``consumes_mtf_signals``.  A test pins it equal to
+#: the registry derivation plus ``ensemble``.  Registry keys, as stored in
+#: ``config["strategy_name"]``.
+LEGACY_MTF_CONSUMER_STRATEGIES: Final[frozenset[str]] = frozenset(
+    {"rsi_mean_reversion", "dca_rsi_hybrid", "model_strategy", "ensemble"}
+)
+
+#: The same strategies by CLASS name.  ``optimization_runs.strategy_name`` stores
+#: ``strategy_cls.__name__`` (``result.strategy_name``), not the registry key, so the
+#: optimize read paths can only match on this spelling.  Kept in step with the set above by
+#: a test (registry class names plus ``EnsembleStrategy``).
+LEGACY_MTF_CONSUMER_CLASS_NAMES: Final[frozenset[str]] = frozenset(
+    {"RSIMeanReversionStrategy", "DCARSIHybridStrategy", "ModelStrategy", "EnsembleStrategy"}
+)
+
+#: The closed set of ``config["mtf_context"]["status"]`` values a response may echo
+#: (``trading.mtf_signals`` ``not_used`` / ``unavailable`` / ``partial`` / ``pit``).  A test
+#: pins it to the engine's constants.
+KNOWN_MTF_CONTEXT_STATUSES: Final[frozenset[str]] = frozenset(
+    {"not_used", "unavailable", "partial", "pit"}
+)
+
+
+def _is_mtf_consumer_name(name: object) -> bool:
+    """True iff ``name`` is a legacy consumer, or is not a usable ``str`` (fail-closed)."""
+    if not isinstance(name, str) or not name.strip():
+        return True
+    return (
+        name in LEGACY_MTF_CONSUMER_STRATEGIES
+        or name in LEGACY_MTF_CONSUMER_CLASS_NAMES
+        or name.lower().replace("-", "_") in LEGACY_MTF_CONSUMER_STRATEGIES
+    )
+
+
+def is_legacy_mtf_context(
+    config: Mapping[str, object] | None,
+    run_mode: str,
+    strategy_name: object = None,
+) -> bool:
+    """The ONE legacy-MTF-context predicate (WP2.4, SY-24-08).
+
+    True iff ALL of: ``run_mode`` is ``backtest`` / ``optimize``; ``engine_semantics.mtf_context``
+    is not a ``str`` in ``KNOWN_MTF_CONTEXT_VERSIONS``; and the strategy (the argument if
+    given, else ``config["strategy_name"]``) is a legacy consumer -- or its name is missing,
+    empty or whitespace-only, or not a ``str`` (fail-closed).  Lives here so
+    :func:`is_leaderboard_mtf_eligible` and ``cost_profiles.mtf_context_response_fields`` share
+    it without an import cycle.  Never raises, never logs.
+    """
+    if run_mode not in ("backtest", "optimize"):
+        return False
+    semantics = config.get("engine_semantics") if isinstance(config, Mapping) else None
+    marker = semantics.get("mtf_context") if isinstance(semantics, Mapping) else None
+    if isinstance(marker, str) and marker in KNOWN_MTF_CONTEXT_VERSIONS:
+        return False
+    if strategy_name is None:
+        strategy_name = config.get("strategy_name") if isinstance(config, Mapping) else None
+    return _is_mtf_consumer_name(strategy_name)
+
+
+def stored_mtf_context_status(config: Mapping[str, object] | None, run_mode: str) -> str | None:
+    """``config["mtf_context"]["status"]`` iff it is in the closed set, else ``None``.
+
+    Backtest / optimize only.  A tampered or malformed stored value is never echoed.  Reads
+    ``status`` ONLY (CF-P2-01 / CF-P2-02): neither ``reason`` nor ``source`` nor ``fields``.
+    Never raises, never logs.
+    """
+    if run_mode not in ("backtest", "optimize"):
+        return None
+    block = config.get("mtf_context") if isinstance(config, Mapping) else None
+    status = block.get("status") if isinstance(block, Mapping) else None
+    if isinstance(status, str) and status in KNOWN_MTF_CONTEXT_STATUSES:
+        return status
+    return None
+
+
+def is_leaderboard_mtf_eligible(config: Mapping[str, object] | None) -> bool:
+    """The MTF-context half of leaderboard eligibility (WP2.4, SY-24-11 / UD-3a).
+
+    False iff the run is a legacy-MTF-context consumer run (:func:`is_legacy_mtf_context`
+    in ``backtest`` mode).  Keys off the marker and the strategy name ONLY -- never off
+    ``mtf_context.status`` or ``reason`` (CF-P2-01 / CF-P2-02): ``partial`` /
+    ``unavailable`` / ``not_used`` runs stay eligible and carry a status label.
+    """
+    return not is_legacy_mtf_context(config, "backtest")
+
+
+def leaderboard_eligible(
+    n_trades: object,
+    confidence_flag: object,
+    config: Mapping[str, object] | None,
+) -> bool:
+    """The ONE leaderboard-eligibility rule (M5 + WP2.1 SY-21-10 + WP2.5 SY-25-15 + WP2.4 SY-24-11).
+
+    ``n_trades >= LEADERBOARD_MIN_CLOSED_TRADES`` AND ``confidence_flag`` in
+    the eligible tiers AND the run's cost model is a valid, persisted,
+    ``live_equivalent`` registry profile that is not legacy AND the run carries a known
+    ``engine_semantics.metrics`` marker AND the run is not a legacy-MTF-context consumer
+    run (WP2.4).  Legacy, stress, diagnostic, override and invalid cost models, pre-WP2.5
+    metrics and pre-WP2.4 consumer runs are never eligible.  Used by
+    ``RunResponse`` and by the portfolio aggregate so the two cannot drift.
+    """
+    return (
+        meets_trade_confidence_thresholds(n_trades, confidence_flag)
+        and is_leaderboard_cost_eligible(config)
+        and is_leaderboard_metrics_eligible(config)
+        and is_leaderboard_mtf_eligible(config)
+    )
+
+
+class CostProfileSummary(BaseModel):
+    """WP2.1: the cost model a run was (or, for live, is estimated to be) priced with."""
+
+    model_config = _API_MODEL_CONFIG
+
+    id: str
+    exchange: str
+    tier: str
+    maker_fee_bps: str
+    taker_fee_bps: str
+    slippage_bps: str
+    round_trip_bps: str = Field(description="2 * (taker fee + slippage), in bps")
+    source: Literal["registry", "override", "legacy_inferred"]
+    fingerprint: str
+    fee_source: Literal["model", "exchange_fills"] = Field(
+        description="'exchange_fills': live ledger uses the exchange's real fees"
+    )
+    live_equivalent: bool
+    diagnostic: bool
+    legacy: bool
+    stress: bool
+
+
+def build_cost_profile_summary(
+    profile: CostProfile, *, fee_source: FeeSource = "model"
+) -> CostProfileSummary:
+    """Wire summary of a :class:`CostProfile` (Decimals as plain strings)."""
+
+    def _s(value: Decimal) -> str:
+        return format(value.normalize(), "f")
+
+    round_trip_bps = 2 * (profile.taker_fee_bps + profile.slippage_bps)
+    return CostProfileSummary(
+        id=profile.id,
+        exchange=profile.exchange,
+        tier=profile.tier,
+        maker_fee_bps=_s(profile.maker_fee_bps),
+        taker_fee_bps=_s(profile.taker_fee_bps),
+        slippage_bps=_s(profile.slippage_bps),
+        round_trip_bps=_s(round_trip_bps),
+        source=profile.source,
+        fingerprint=profile.fingerprint(),
+        fee_source=fee_source,
+        live_equivalent=profile.live_equivalent,
+        diagnostic=profile.diagnostic,
+        legacy=profile.legacy,
+        stress=profile.stress,
+    )
+
+
 class RunResponse(BaseModel):
     """
     Response model for a single trading run.
@@ -353,7 +574,15 @@ class RunResponse(BaseModel):
     - ``psr``: extracted from config["backtest_metrics"] JSONB.
       NULL when not computable.
     - ``leaderboard_eligible``: computed field; True iff n_closed_trades >= 10
-      AND confidence_flag in {"high", "medium"}.
+      AND confidence_flag in {"high", "medium"} AND (WP2.1) the run's cost
+      model is a valid live-equivalent registry profile (not legacy / stress /
+      diagnostic / override).
+
+    WP2.1 adds the cost-model transparency fields ``cost_profile`` (the
+    inferred legacy profile for a legacy run), ``legacy_costs``,
+    ``cost_profile_invalid``, ``legacy_exit_semantics`` and (WP2.1b)
+    ``live_equivalent_costs``; they are computed server-side in
+    ``run_orm_to_response`` and never re-derived by the UI.
     """
 
     model_config = _API_MODEL_CONFIG
@@ -395,23 +624,107 @@ class RunResponse(BaseModel):
         default=False,
         description=(
             "True iff n_closed_trades >= 10 AND confidence_flag in {'high', 'medium'}. "
-            "False when data is missing or below threshold."
+            "False when data is missing, below threshold, the run's cost "
+            "model is not a live-equivalent registry profile (WP2.1), or the run "
+            "predates the per-bar metrics (legacy_metrics, WP2.5)."
+        ),
+    )
+
+    # WP2.1: cost-model transparency (server-computed; see run_orm_to_response)
+    cost_profile: CostProfileSummary | None = Field(
+        default=None,
+        description=(
+            "Cost profile the run was priced with.  For a legacy run (no persisted "
+            "profile) this is the inferred legacy profile with source='legacy_inferred'."
+        ),
+    )
+    legacy_costs: bool = Field(
+        default=False,
+        description=(
+            "True iff the run has no persisted cost profile, or its profile is a "
+            "legacy_* id, or the persisted value is invalid."
+        ),
+    )
+    cost_profile_invalid: bool = Field(
+        default=False,
+        description="True iff a cost profile was persisted but is malformed (treated as legacy).",
+    )
+    legacy_exit_semantics: bool = Field(
+        default=False,
+        description="True iff the run predates config['engine_semantics'] (CF-13b-16).",
+    )
+    legacy_timestamps: bool = Field(
+        default=False,
+        description=(
+            "WP2.2 (SY-22-09): True iff the run is a backtest persisted before bar-time "
+            "stamps (config['engine_semantics']['timestamp_clock'] missing or unknown), "
+            "so its row timestamps are wall-clock.  Always False for paper / live."
+        ),
+    )
+    legacy_bar_alignment: bool = Field(
+        default=False,
+        description=(
+            "WP2.3 (SY-23-16): True iff the run is a MULTI-symbol backtest persisted before "
+            "timestamp-based bar alignment (config['engine_semantics']['bar_alignment'] "
+            "missing or unknown), so its symbols were paired by list index and silently "
+            "truncated to the shortest series.  A missing or malformed symbol list counts "
+            "as not-single (fails closed).  Single-symbol runs are identical and are never "
+            "flagged; always False for paper / live."
+        ),
+    )
+    legacy_metrics: bool = Field(
+        default=False,
+        description=(
+            "WP2.5 (SY-25-13): True iff the run is a backtest whose Sharpe / Sortino / PSR / "
+            "n_observations / confidence_flag / CAGR were computed before the per-bar sampling "
+            "(config['engine_semantics']['metrics'] missing or unknown): equity points "
+            "(warm-up and fill points) were counted as periods, so those numbers are not "
+            "comparable with current runs.  Applies to every symbol count; always False for "
+            "paper / live.  Server-computed, never taken from a request."
+        ),
+    )
+    legacy_mtf_context: bool = Field(
+        default=False,
+        description=(
+            "WP2.4 (SY-24-08): True iff the run is a backtest of a strategy that consumed the "
+            "multi-timeframe signals (dca_rsi_hybrid, rsi_mean_reversion, model_strategy, "
+            "ensemble) and carries no known engine_semantics.mtf_context marker: its context "
+            "was boot-frozen provider values, not point-in-time ones.  A missing strategy name "
+            "fails closed.  Always False for paper / live.  Server-computed, never taken from "
+            "a request."
+        ),
+    )
+    mtf_context_status: str | None = Field(
+        default=None,
+        description=(
+            "WP2.4 (SY-24-07): config['mtf_context']['status'] -- not_used, unavailable, "
+            "partial or pit -- or None when absent, malformed or not one of those.  "
+            "unavailable / partial consumer runs stay leaderboard-eligible but are not "
+            "promotion evidence.  Server-computed, never echoed from a tampered value."
+        ),
+    )
+    live_equivalent_costs: bool = Field(
+        default=False,
+        description=(
+            "WP2.1b (SY-21-10): the cost half of leaderboard_eligible -- True iff the run "
+            "has a valid persisted live-equivalent REGISTRY cost profile that is not "
+            "legacy.  False for legacy, stress, diagnostic, override and invalid cost "
+            "models.  Independent of the trade-count / confidence thresholds, so the UI's "
+            "default 'live-equivalent costs' filter needs no client-side rule.  "
+            "leaderboard_eligible implies live_equivalent_costs."
         ),
     )
 
     @model_validator(mode="after")
     def _compute_leaderboard_eligible(self) -> Self:
-        """Compute leaderboard eligibility from n_closed_trades and confidence_flag.
+        """Compute leaderboard eligibility from n_closed_trades, confidence_flag
+        and the run's cost model.
 
-        Runs after all field population so both source fields are available.
+        Runs after all field population so the source fields are available.
         This executes even when constructed via model_validate(orm_object).
         """
-        n = self.n_closed_trades
-        flag = self.confidence_flag
-        self.leaderboard_eligible = (
-            n is not None
-            and n >= LEADERBOARD_MIN_CLOSED_TRADES
-            and flag in LEADERBOARD_ELIGIBLE_FLAGS
+        self.leaderboard_eligible = leaderboard_eligible(
+            self.n_closed_trades, self.confidence_flag, self.config
         )
         return self
 
@@ -489,7 +802,15 @@ class BacktestMetricsResponse(BaseModel):
     largest_loss: str
 
     # Exposure
-    total_bars: int
+    total_bars: int = Field(
+        description=(
+            "Trading steps after warm-up: aligned timeline steps minus the warm-up window "
+            "(WP2.3, SY-23-11).  A multi-symbol run counts one step per timestamp on which "
+            "at least one symbol has a bar, so it can differ from any single symbol's bar "
+            "count.  Single-symbol runs are unchanged.  Not the number of return "
+            "observations: see n_observations (WP2.5)."
+        ),
+    )
     bars_in_market: int
     exposure_pct: float
     exposure_pct_per_symbol: dict[str, float] = Field(
@@ -517,12 +838,15 @@ class BacktestMetricsResponse(BaseModel):
         description=(
             "Probabilistic Sharpe Ratio per Bailey & López de Prado (2012). "
             "Probability that the true Sharpe exceeds zero given observed sample. "
-            "None when fewer than 30 per-period return observations."
+            "None when fewer than 30 per-bar return observations."
         ),
     )
     n_observations: int = Field(
         default=0,
-        description="Number of per-period return observations (equity curve length - 1).",
+        description=(
+            "Number of per-bar return observations after warm-up (WP2.5: calendar as-of, "
+            "last equity point per bar stamp; fill points and warm-up are not counted)."
+        ),
     )
     confidence_flag: Literal["high", "medium", "low"] | None = Field(
         default=None,
@@ -531,6 +855,44 @@ class BacktestMetricsResponse(BaseModel):
             "'medium' (PSR>=0.80, trades>=30), 'low' (otherwise), "
             "None (PSR not computable)."
         ),
+    )
+
+    # WP2.5 (SY-25-12): the sampling behind the curve-derived numbers.  All optional, so
+    # stored pre-WP2.5 dicts validate unchanged.  ``oos_start_at`` and the metrics version
+    # are deliberately NOT exposed (engine-level / redundant with engine_semantics.metrics).
+    trading_start_at: datetime | None = Field(
+        default=None,
+        description=(
+            "Base point of the per-bar metric sample: the bar close that ends warm-up "
+            "(UTC).  Distinct from start_date (first bar OPEN).  None for pre-WP2.5 runs."
+        ),
+    )
+    trading_end_at: datetime | None = Field(
+        default=None,
+        description=(
+            "Last equity point of the run (UTC).  None for pre-WP2.5 runs and when the run "
+            "stopped before the sample had a point."
+        ),
+    )
+    periods_per_year: float | None = Field(
+        default=None,
+        description=(
+            "Annualisation factor behind sharpe_ratio / sortino_ratio (periods per "
+            "365.25-day year for the run's timeframe).  None for pre-WP2.5 runs."
+        ),
+    )
+    metric_sampling: Literal["calendar_asof", "present_steps"] | None = Field(
+        default=None,
+        description=(
+            "calendar_asof: one slot per timeframe between trading_start_at and "
+            "trading_end_at, an absent slot carries the previous value; present_steps: "
+            "off-grid fallback (distinct stamps only).  None for pre-WP2.5 runs."
+        ),
+    )
+    carried_slots: int = Field(
+        default=0,
+        ge=0,
+        description="Calendar slots without an own equity point that carried the previous value.",
     )
 
     # M6 (Sprint 49): currency labeling
@@ -963,8 +1325,35 @@ class AggregatePortfolioResponse(BaseModel):
         default=0,
         description=(
             "Number of backtest runs that satisfy leaderboard eligibility criteria "
-            "(n_closed_trades>=10, confidence_flag in {'high','medium'}). "
+            "(n_closed_trades>=10, confidence_flag in {'high','medium'}, a "
+            "live-equivalent registry cost profile, and per-bar WP2.5 metrics). "
             "Shows as denominator: 'best return from N of M runs'."
+        ),
+    )
+    legacy_cost_runs_excluded: int = Field(
+        default=0,
+        description=(
+            "WP2.1 (U-5): runs that meet the trade-count and confidence criteria but "
+            "were excluded from best/worst because their cost model is legacy, stress, "
+            "diagnostic, an override or invalid."
+        ),
+    )
+    legacy_metrics_runs_excluded: int = Field(
+        default=0,
+        description=(
+            "WP2.5 (UD-1): runs that meet the trade-count, confidence and cost criteria but "
+            "were excluded from best/worst because their metrics predate the per-bar "
+            "sampling (no known engine_semantics.metrics marker).  Counted after the cost "
+            "exclusion, so legacy_cost_runs_excluded is unaffected."
+        ),
+    )
+    legacy_mtf_context_runs_excluded: int = Field(
+        default=0,
+        description=(
+            "WP2.4 (SY-24-11): runs that meet the trade-count, confidence, cost and metrics "
+            "criteria but were excluded from best/worst because they are consumer-strategy "
+            "backtests without a known engine_semantics.mtf_context marker.  Counted last "
+            "(cost, then metrics, then mtf), so the other two counters are unaffected."
         ),
     )
 

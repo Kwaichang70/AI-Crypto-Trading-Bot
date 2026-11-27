@@ -59,10 +59,11 @@ from fastapi.responses import JSONResponse
 
 from api.auth import require_api_key
 from api.body_size_limit import BodySizeLimitMiddleware
-from api.config import get_settings, register_settings_secrets
+from api.config import get_settings, register_settings_secrets, warn_ignored_cost_profile_env
 from api.prometheus import setup_prometheus
 from api.rate_limit import setup_rate_limiting
-from common.logging import configure_logging
+from api.services import egress_budget
+from common.logging import configure_logging, exc_log_fields
 from common.metrics import metrics
 
 __all__ = ["app", "create_app", "get_telegram_notifier"]
@@ -106,10 +107,6 @@ _whale_alert_client: Any = None
 _equity_prune_task: Any = None
 _idempotency_prune_task: Any = None  # WP7.0 (SY-70-14)
 
-# S47-1: history cache warmer — keeps FGI + BTC-dom history caches warm
-# for the v2 feature pipeline's synchronous accessors.
-_history_cache_warmer: Any = None
-
 # ---------------------------------------------------------------------------
 # Module-level TelegramNotifier instance — DEPRECATED: mirror of
 # container.services.telegram_notifier — sunset by Sprint 41
@@ -146,16 +143,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     2.  Log application boot parameters
     2b. Create AppContainer and attach to app.state.container (Sprint 40 Stap 1c)
     3.  Initialise SQLAlchemy async engine and connection pool
+    3a. Load the persisted kill-switch latch (WP1.7a)
+    3b. Build the provider clients (FGI, CoinGecko, FRED, Whale Alert) and start the
+        context poller (CF-24-01 P5, SY-01-15). The lifespan never awaits a provider.
+    3c. Recover orphaned paper/live runs (Sprint 24), after the poller is running
     4.  Start RetrainingService if ml_auto_retrain=True (Sprint 23)
-    5.  Recover orphaned paper/live runs (Sprint 24)
-    6.  Start Fear & Greed Index client (Sprint 32)
     7.  Telegram notifier (optional — requires TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID)
-    8.  Start CoinGecko client (Sprint 37 — always-on, no key required)
-    9.  Start FRED client (Sprint 37 — requires FRED_API_KEY)
-    10. Start Whale Alert client (Sprint 37 — requires WHALE_ALERT_API_KEY)
 
     Shutdown (after yield)
     ----------------------
+    -1. context poller stop -> recorder flush (<= 5 s) -> (clients close in step 3 below)
     0. container.shutdown() — cancels background tasks + run registry
     1. Cancel all active paper/live trading engine tasks (belt-and-suspenders)
     2. Stop RetrainingService if running
@@ -165,7 +162,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """
     global _retraining_service, _telegram_notifier
     global _coingecko_client, _fred_client, _whale_alert_client
-    global _fgi_client, _equity_prune_task, _history_cache_warmer
+    global _fgi_client, _equity_prune_task
     global _idempotency_prune_task
 
     settings = get_settings()
@@ -175,13 +172,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log_level=settings.log_level,
         json_output=not settings.debug,
         service_name=settings.app_name,
-        environment="development" if settings.debug else "production",
+        environment=settings.environment,
     )
+    egress_budget.install_log_processor()  # CF-97-03 P7b: live 429s cool the history down
     # CF-36: register every configured secret for exact-match redaction BEFORE
     # the first application log line.
     register_settings_secrets(settings)
 
     log = structlog.get_logger(__name__)
+    if not settings.require_api_auth:
+        # CF-97-37: the validator makes this impossible in production.
+        log.warning("api.auth_disabled", environment=settings.environment)
+    # WP2.1 (SY-21-02): a cost-profile env var is ignored -- say so (names only).
+    warn_ignored_cost_profile_env()
     log.info(
         "api.starting",
         app=settings.app_name,
@@ -250,7 +253,122 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         _kill_switch.mark_unknown()
 
     # ------------------------------------------------------------------
-    # 3b. Recover orphaned paper/live runs (Sprint 24)
+    # 3b. Provider clients + context poller (CF-24-01 P5, SY-01-15).
+    #     The boot warm-ups and the history warmer are gone: nothing here awaits a
+    #     provider. The poller's first round is staggered 0-30 s, and an empty book is
+    #     a neutral context (SY-01-01). The clients are built WITHOUT ``session=`` so
+    #     they keep their verified, env-blind default session (CF-2401-33).
+    # ------------------------------------------------------------------
+    # A previous lifespan in this process (tests) must not leak its clients into this poller.
+    _fgi_client = _coingecko_client = _fred_client = _whale_alert_client = None
+
+    try:
+        from data.sentiment import FearGreedClient, set_global_client as _set_fgi
+
+        _fgi_client = FearGreedClient()
+        _set_fgi(_fgi_client)
+        container.services.fgi_client = _fgi_client  # LS-002
+        log.info("fgi_client.started")
+    except ImportError:
+        log.info("fgi_client.skipped", reason="aiohttp not installed")
+    except Exception as exc:
+        log.warning("fgi_client.startup_error", **exc_log_fields(exc))
+
+    try:
+        from data.market_signals import CoinGeckoClient, set_global_client as _set_cg
+
+        _coingecko_client = CoinGeckoClient()
+        _set_cg(_coingecko_client)
+        container.services.coingecko_client = _coingecko_client  # LS-002
+        log.info("coingecko_client.started")
+    except ImportError:
+        log.info("coingecko_client.skipped", reason="aiohttp not installed")
+    except Exception as exc:
+        log.warning("coingecko_client.startup_error", **exc_log_fields(exc))
+
+    if settings.fred_api_key is not None:
+        try:
+            from data.macro_data import FREDClient, set_global_client as _set_fred
+
+            _fred_client = FREDClient(api_key=settings.fred_api_key.get_secret_value())
+            _set_fred(_fred_client)
+            container.services.fred_client = _fred_client  # LS-002
+            log.info("fred_client.started")
+        except ImportError:
+            log.info("fred_client.skipped", reason="aiohttp not installed")
+        except Exception as exc:
+            log.warning("fred_client.startup_error", **exc_log_fields(exc))
+    else:
+        log.info("fred_client.disabled", reason="FRED_API_KEY not set")
+
+    if settings.whale_alert_api_key is not None:
+        try:
+            from data.whale_tracker import WhaleAlertClient, set_global_client as _set_whale
+
+            _whale_alert_client = WhaleAlertClient(
+                api_key=settings.whale_alert_api_key.get_secret_value()
+            )
+            _set_whale(_whale_alert_client)
+            container.services.whale_alert_client = _whale_alert_client  # LS-002
+            log.info("whale_alert_client.started")
+        except ImportError:
+            log.info("whale_alert_client.skipped", reason="aiohttp not installed")
+        except Exception as exc:
+            log.warning("whale_alert_client.startup_error", **exc_log_fields(exc))
+    else:
+        log.info("whale_alert_client.disabled", reason="WHALE_ALERT_API_KEY not set")
+
+    _alerts: Any = None  # CF-24-01 P6: its own try; the poller never depends on it (F5)
+    try:
+        from api.services.context_alerts import ContextAlertListener
+
+        _alerts = ContextAlertListener(lambda: container.services.telegram_notifier)  # step 7
+    except Exception as exc:
+        log.error("context_alerts.startup_error", **exc_log_fields(exc))
+
+    # CF-24-01 P7: recorder + boot seed (store read, bounded, never raises, empty book on failure),
+    # before the poller so a first sighting cannot pre-empt a stored bucket row.
+    _recorder: Any = None
+    try:
+        from api.services.context_recorder import ContextRecorder
+        from api.services.context_store import SqlContextStore
+
+        _recorder = ContextRecorder(SqlContextStore(get_session_factory()), _alerts)
+        await _recorder.seed(time.time_ns() // 1_000_000)
+    except Exception as exc:
+        log.error("context_recorder.startup_error", **exc_log_fields(exc))
+        _recorder = None
+
+    try:
+        from api.services.context_poller import ContextPoller
+
+        _context_poller = ContextPoller(
+            fgi=_fgi_client,
+            coingecko=_coingecko_client,
+            fred=_fred_client,
+            whale=_whale_alert_client,
+            listener=_alerts,
+            sink=_recorder,
+        )
+        _poller_task = _context_poller.start()
+        # N-5: a dead supervisor cannot report its own death; the done-callback does.
+        _poller_task.add_done_callback(_context_poller.on_supervisor_done)
+        if _recorder is not None:  # the writer runs only beside a running poller (flush_sink)
+            try:  # RK-P7-01: a recorder bug never fails the poller start or registration
+                _recorder.start()
+            except Exception as exc:
+                log.error("context_recorder.startup_error", **exc_log_fields(exc))
+        container.background_tasks.context_poller = _context_poller
+        log.info("context_poller.started")
+    except Exception as exc:
+        # Fail-closed: without a poller the book stays empty and the context is neutral.
+        log.error("context_poller.startup_error", **exc_log_fields(exc))
+        metrics.gauge("mtf_context_poller_alive", 0.0)  # CR-P5-09: the P6 rule sees it
+        if _alerts is not None:  # a failed start is a death too; the reminder delivers it
+            await _alerts.on_poller_dead()
+
+    # ------------------------------------------------------------------
+    # 3c. Recover orphaned paper/live runs (Sprint 24) -- after the poller (SY-01-15)
     # ------------------------------------------------------------------
     try:
         from api.routers.runs import recover_orphaned_runs
@@ -292,29 +410,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log.info("retraining_service.disabled", reason="ML_AUTO_RETRAIN=false")
 
     # ------------------------------------------------------------------
-    # 5. Start Fear & Greed Index client (Sprint 32)
-    # ------------------------------------------------------------------
-    try:
-        from data.sentiment import FearGreedClient, set_global_client as _set_fgi
-
-        _fgi_client_instance = FearGreedClient()
-        _set_fgi(_fgi_client_instance)
-        # Warm up the cache on startup (best-effort; never block startup)
-        try:
-            await _fgi_client_instance.get_latest()
-            log.info("fgi_client.warmed_up")
-        except Exception:
-            log.warning("fgi_client.warmup_failed", exc_info=True)
-
-        _fgi_client = _fgi_client_instance
-        container.services.fgi_client = _fgi_client_instance  # LS-002
-        log.info("fgi_client.started")
-    except ImportError:
-        log.info("fgi_client.skipped", reason="aiohttp not installed")
-    except Exception:
-        log.warning("fgi_client.startup_error", exc_info=True)
-
-    # ------------------------------------------------------------------
     # 6. Equity snapshot pruning (daily background task)
     # ------------------------------------------------------------------
     import asyncio as _asyncio
@@ -323,11 +418,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     async def _equity_prune_loop() -> None:
         """Delete equity snapshots older than retention period, once per day."""
-        from datetime import UTC as _UTC, datetime as _dt, timedelta as _td
-
-        from api.db.models import EquitySnapshotORM
         from api.db.session import get_session_factory as _get_sf
-        from sqlalchemy import delete as _sa_delete
+        from api.services.retention import prune_equity_snapshots
+        from common.logging import exc_log_fields
 
         _sf = _get_sf()
 
@@ -339,28 +432,22 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
         while True:
             try:
-                cutoff = _dt.now(_UTC) - _td(
-                    days=settings.equity_snapshot_retention_days
+                # SY-22-10: policy lives in api.services.retention
+                # (paper/live by snapshot timestamp, backtest by
+                # runs.created_at, other modes never). No inline DELETE
+                # here. The service emits the single ``equity_prune.completed``
+                # (per-mode counts, cutoff) or ``equity_prune.partial`` event;
+                # this loop deliberately logs nothing on success.
+                await prune_equity_snapshots(
+                    _sf,
+                    retention_days=settings.equity_snapshot_retention_days,
                 )
-                async with _sf() as session:
-                    del_result = await session.execute(
-                        _sa_delete(EquitySnapshotORM).where(
-                            EquitySnapshotORM.timestamp < cutoff
-                        )
-                    )
-                    deleted: int = del_result.rowcount  # type: ignore[attr-defined]
-                    await session.commit()
-                    if deleted > 0:
-                        log.info(
-                            "equity_prune.completed",
-                            deleted=deleted,
-                            cutoff=str(cutoff),
-                            retention_days=settings.equity_snapshot_retention_days,
-                        )
             except _asyncio.CancelledError:
                 break
-            except Exception:
-                log.warning("equity_prune.error", exc_info=True)
+            except Exception as exc:
+                # CF-36: type + code location at WARNING, traceback behind DEBUG.
+                log.warning("equity_prune.error", **exc_log_fields(exc))
+                log.debug("equity_prune.error.trace", exc_info=exc)
 
             try:
                 await _asyncio.sleep(86400)
@@ -454,107 +541,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 chat_id=settings.telegram_chat_id,
             )
             container.services.telegram_notifier = _telegram_notifier  # LS-002
-            log.info("telegram.configured", chat_id=settings.telegram_chat_id)
+            log.info("telegram.configured")  # CF-2401-110: no chat id, no token
         except ImportError:
             log.warning("telegram.skipped", reason="trading.telegram not importable")
-        except Exception:
-            log.warning("telegram.startup_error", exc_info=True)
+        except Exception as exc:
+            # CF-2401-110: type + code location only, no exc_info, no .trace sibling.
+            log.warning("telegram.startup_error", **exc_log_fields(exc))
     else:
         log.info("telegram.disabled", reason="TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set")
-
-    # ------------------------------------------------------------------
-    # 8. CoinGecko client — always-on, no API key required (Sprint 37)
-    # ------------------------------------------------------------------
-    try:
-        from data.market_signals import CoinGeckoClient, set_global_client as _set_cg
-
-        _cg_instance = CoinGeckoClient()
-        _set_cg(_cg_instance)
-        # Warm up cache on startup (best-effort; never block startup)
-        try:
-            await _cg_instance.get_latest()
-            log.info("coingecko_client.warmed_up")
-        except Exception:
-            log.warning("coingecko_client.warmup_failed", exc_info=True)
-
-        _coingecko_client = _cg_instance
-        container.services.coingecko_client = _cg_instance  # LS-002
-        log.info("coingecko_client.started")
-    except ImportError:
-        log.info("coingecko_client.skipped", reason="aiohttp not installed")
-    except Exception:
-        log.warning("coingecko_client.startup_error", exc_info=True)
-
-    # ------------------------------------------------------------------
-    # 11. History cache warmer (S47-1) — periodic FGI + BTC dom history.
-    # Without this, the v2 feature pipeline's 7d-ago lookups always
-    # return None and the model receives neutral defaults for
-    # fgi_delta_7d / btc_dom_delta_7d, silently nullifying half of QT-007.
-    # ------------------------------------------------------------------
-    try:
-        from api.services.history_cache_warmer import HistoryCacheWarmer
-
-        _history_cache_warmer = HistoryCacheWarmer(
-            fgi_client=_fgi_client,
-            coingecko_client=_coingecko_client,
-        )
-        await _history_cache_warmer.start()
-        container.background_tasks.history_cache_warmer = _history_cache_warmer  # LS-003
-        log.info("history_cache_warmer.wired")
-    except Exception:
-        log.warning("history_cache_warmer.startup_error", exc_info=True)
-
-    # ------------------------------------------------------------------
-    # 9. FRED macro client — requires FRED_API_KEY (Sprint 37)
-    # ------------------------------------------------------------------
-    if settings.fred_api_key is not None:
-        try:
-            from data.macro_data import FREDClient, set_global_client as _set_fred
-
-            _fred_instance = FREDClient(api_key=settings.fred_api_key.get_secret_value())
-            _set_fred(_fred_instance)
-            # Warm up cache on startup (best-effort; FRED data rarely changes)
-            try:
-                await _fred_instance.get_latest()
-                log.info("fred_client.warmed_up")
-            except Exception:
-                log.warning("fred_client.warmup_failed", exc_info=True)
-
-            _fred_client = _fred_instance
-            container.services.fred_client = _fred_instance  # LS-002
-            log.info("fred_client.started")
-        except ImportError:
-            log.info("fred_client.skipped", reason="aiohttp not installed")
-        except Exception:
-            log.warning("fred_client.startup_error", exc_info=True)
-    else:
-        log.info("fred_client.disabled", reason="FRED_API_KEY not set")
-
-    # ------------------------------------------------------------------
-    # 10. Whale Alert client — requires WHALE_ALERT_API_KEY (Sprint 37)
-    # ------------------------------------------------------------------
-    if settings.whale_alert_api_key is not None:
-        try:
-            from data.whale_tracker import WhaleAlertClient, set_global_client as _set_whale
-
-            _whale_instance = WhaleAlertClient(api_key=settings.whale_alert_api_key.get_secret_value())
-            _set_whale(_whale_instance)
-            # Warm up cache on startup (best-effort)
-            try:
-                await _whale_instance.get_latest()
-                log.info("whale_alert_client.warmed_up")
-            except Exception:
-                log.warning("whale_alert_client.warmup_failed", exc_info=True)
-
-            _whale_alert_client = _whale_instance
-            container.services.whale_alert_client = _whale_instance  # LS-002
-            log.info("whale_alert_client.started")
-        except ImportError:
-            log.info("whale_alert_client.skipped", reason="aiohttp not installed")
-        except Exception:
-            log.warning("whale_alert_client.startup_error", exc_info=True)
-    else:
-        log.info("whale_alert_client.disabled", reason="WHALE_ALERT_API_KEY not set")
 
     # ------------------------------------------------------------------
     # Future: Redis connection init goes here
@@ -567,6 +561,28 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # ------------------------------------------------------------------
     log.info("api.shutting_down")
 
+    # CF-2401-99: orphan flag first; the poller stop + recorder flush (<= 5 s) must not delay it.
+    from api.services.run_orchestrator import mark_shutdown_requested
+
+    # WP1.8a (S5): set BEFORE container.shutdown() cancels the run-registry tasks below, so each
+    # run's `except asyncio.CancelledError` branch can tell this graceful shutdown apart from a
+    # user-initiated stop_run and write status='orphaned' instead of 'stopped'.
+    mark_shutdown_requested()
+
+    # CF-24-01 P5 (SY-01-15): poller stop -> recorder flush (<= 5 s) -> client close (below).
+    _poller = container.background_tasks.context_poller
+    if _poller is not None:
+        try:
+            await _poller.stop()
+            await _poller.flush_sink(5.0)
+        except Exception as exc:
+            log.warning("context_poller.shutdown_error", **exc_log_fields(exc))
+    if _alerts is not None:  # after the poller and before the notifier closes
+        try:
+            await _alerts.aclose()
+        except Exception as exc:
+            log.warning("context_alerts.shutdown_error", **exc_log_fields(exc))
+
     # ------------------------------------------------------------------
     # 0. container.shutdown() — cancels background tasks + run registry
     #    (LS-004) Must run before the explicit _RUN_TASKS loop below so
@@ -574,14 +590,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     #    first.  The explicit loops beneath are belt-and-suspenders during
     #    the Stap 1c transition period.
     # ------------------------------------------------------------------
-    from api.services.run_orchestrator import mark_shutdown_requested
-
-    # WP1.8a (S5): set BEFORE container.shutdown() cancels the run-registry
-    # tasks below, so each run's `except asyncio.CancelledError` branch can
-    # tell this graceful shutdown apart from a user-initiated stop_run and
-    # write status='orphaned' instead of 'stopped'.
-    mark_shutdown_requested()
-
     await container.shutdown()
 
     # Cancel all active paper/live trading engine tasks
@@ -725,6 +733,8 @@ async def _request_timing_middleware(request: Request, call_next: Any) -> Respon
 def create_app() -> FastAPI:
     """Application factory."""
     settings = get_settings()
+    # CF-97-37: the docs pages are unauthenticated, so production serves none.
+    docs_on = settings.environment != "production"
 
     application = FastAPI(
         title=settings.app_name,
@@ -733,9 +743,9 @@ def create_app() -> FastAPI:
             "AI Crypto Trading Bot API  -- "
             "backtesting, paper trading, and live trading via CCXT"
         ),
-        docs_url="/docs",
-        redoc_url="/redoc",
-        openapi_url="/openapi.json",
+        docs_url="/docs" if docs_on else None,
+        redoc_url="/redoc" if docs_on else None,
+        openapi_url="/openapi.json" if docs_on else None,
         lifespan=lifespan,
     )
 

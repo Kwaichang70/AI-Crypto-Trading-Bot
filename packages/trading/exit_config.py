@@ -28,10 +28,17 @@ mean "unset" for the four bracket pct/multiplier fields and for
 ``trailing_stop_pct``.  ``bracket_atr_period`` is the one exception: it is
 never "off", so ``0`` is a hard 422 (E4), not a silent no-op.
 
-Cost model (SY-13a-01): ``ExitCostModel`` is always built from
-``RiskParameters()`` **defaults** (the paper/live cost model), in every run
-mode including backtest, so a config that passes a backtest can never later
-422 at promote.
+Cost model (SY-13a-01, re-based by WP2.1): ``ExitCostModel`` is derived from a
+``trading.costs.CostProfile`` (``side cost = taker fee + slippage``), never from
+``RiskParameters`` (which no longer carries any cost field).
+
+* **Create / promote / optimize (API)** validate at ``policy_cost_model(run
+  profile)`` = the model of whichever of the default profile and the run's own
+  profile has the larger taker side cost (SY-21-06).  A config that passes
+  there passes the engine (which parses at the run's own profile, SY-21-05),
+  and a config that passes create can never later 422 at promote.
+* **Resume / boot / salvage and the engines** use the run's OWN (resolved)
+  profile, so an old run is judged against the costs it was started with.
 """
 from __future__ import annotations
 
@@ -39,18 +46,24 @@ import math
 import reprlib
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Final, Literal
 
 import structlog
 
 from common.types import RunMode
 from trading.bracket_exit import ATR_MULTIPLIER_RANGE, ATR_PERIOD_MIN, FIXED_PCT_RANGE
+from trading.costs import (
+    DEFAULT_COST_PROFILE,
+    CostProfile,
+    policy_side_cost_profile,
+)
 from trading.risk import RiskParameters
 from trading.trailing_stop import TRAILING_PCT_RANGE
 
 __all__ = [
     "EXIT_CHECK_INTERVAL_MAX_S",
     "EXIT_CHECK_INTERVAL_MIN_S",
+    "EXIT_SEMANTICS_VERSION",
     "POLICY_ATR_PERIOD_MAX",
     "POLICY_FIXED_SL_MAX",
     "ExitCheckResolution",
@@ -62,6 +75,7 @@ __all__ = [
     "ExitCostModel",
     "OptimizeComboIssue",
     "parse_exit_config",
+    "policy_cost_model",
     "require_exit_manager",
     "resolve_allow_pyramiding",
     "resolve_exit_check_interval",
@@ -218,10 +232,19 @@ class ExitConfigError(ValueError):
         super().__init__(f"{code}: {reasons or strategy or hint}")
 
 
+#: Exit-semantics version (WP1.3b-a, SY-13b-16).  Moved here from the
+#: ``strategy_engine`` start-log literal so the value persisted in
+#: ``RunORM.config["engine_semantics"]`` and the one logged at start are ONE
+#: constant (closes CF-13b-16).
+EXIT_SEMANTICS_VERSION: Final = "wp13b-1"
+
+
 @dataclass(frozen=True, slots=True)
 class ExitCostModel:
-    """Round-trip cost inputs, always derived from paper/live defaults
-    (SY-13a-01) -- ``RiskParameters()`` with no overrides, even in backtest.
+    """Round-trip cost inputs, derived from a :class:`CostProfile`.
+
+    ``c_side`` = taker fee + slippage of ONE side, ``c_rt`` = two sides.
+    ``pos_cap`` / ``r`` (risk-budget warning W3) come from ``RiskParameters``.
     """
 
     c_side: float
@@ -230,18 +253,27 @@ class ExitCostModel:
     r: float
 
     @classmethod
-    def from_risk_parameters(cls, params: RiskParameters | None = None) -> ExitCostModel:
+    def from_cost_profile(
+        cls, profile: CostProfile, params: RiskParameters | None = None
+    ) -> ExitCostModel:
         p = params if params is not None else RiskParameters()
-        c_side = p.taker_fee_pct + p.slippage_bps / 1e4
+        # Decimal -> float exactly ONCE: 0.0130, not 0.012 + 0.001 in float
+        # (0.013000000000000001), so the E6/E7 floor has an exact boundary.
         return cls(
-            c_side=c_side,
-            c_rt=2 * c_side,
+            c_side=float(profile.side_cost_rate("taker")),
+            c_rt=float(2 * profile.side_cost_rate("taker")),
             pos_cap=p.max_position_size_pct,
             r=p.per_trade_risk_pct,
         )
 
 
-_DEFAULT_COST_MODEL = ExitCostModel.from_risk_parameters()
+_DEFAULT_COST_MODEL = ExitCostModel.from_cost_profile(DEFAULT_COST_PROFILE)
+
+
+def policy_cost_model(run_profile: CostProfile) -> ExitCostModel:
+    """API validation basis (SY-21-06): the stricter of the default and the
+    run's profile, so an API pass implies an engine pass."""
+    return ExitCostModel.from_cost_profile(policy_side_cost_profile(run_profile))
 
 
 @dataclass(frozen=True, slots=True)
@@ -342,6 +374,7 @@ def resolve_run_exit_check(
     bracket: Mapping[str, object] | None,
     trailing_stop_pct: object,
     exit_config_waived: bool = False,
+    cost: ExitCostModel,
 ) -> ExitCheckResolution:
     """Run-level wrapper of :func:`resolve_exit_check_interval` (WP1.3b-b).
 
@@ -351,12 +384,18 @@ def resolve_run_exit_check(
     bracket stop-loss or a trailing stop (an unparsable or waived exit config has
     none).  Used by the orchestrator (to configure the engine) and by the
     routers (to decide whether warning W8 applies).
+
+    ``cost`` is REQUIRED (WP21A-CR-01/SEC-01): the basis must equal the one the
+    caller validates (or the engine parses) the same exit config with.  Parsing
+    at a module default instead would reject a legacy run's fixed SL/TP that sits
+    between the legacy and the default floor, report "no protective exit" and
+    silently switch the live intra-bar check off.
     """
     has_protective_exit = False
     if not exit_config_waived:
         try:
             has_protective_exit = parse_exit_config(
-                bracket=bracket, trailing_stop_pct=trailing_stop_pct
+                bracket=bracket, trailing_stop_pct=trailing_stop_pct, cost=cost
             ).has_downside_exit
         except ExitConfigError:
             has_protective_exit = False
@@ -1027,7 +1066,10 @@ def _bounded_params_for_response(params: Mapping[str, object]) -> dict[str, obje
 
 
 def validate_param_grid_exit_config(
-    strategy_cls: type, param_grid: Mapping[str, Iterable[object]]
+    strategy_cls: type,
+    param_grid: Mapping[str, Iterable[object]],
+    *,
+    cost: ExitCostModel | None = None,
 ) -> None:
     """Pre-validate every combination in an optimizer parameter grid
     (SY-13a-17).  Raises the first ``ExitConfigError`` hit, with every
@@ -1042,7 +1084,9 @@ def validate_param_grid_exit_config(
 
     ``param_grid`` maps a parameter name to its list of grid values, in the
     ``itertools.product``-style shape ``ParameterOptimizer`` builds
-    combinations from.
+    combinations from.  ``cost`` is the validation basis (WP2.1: the optimize
+    router passes ``policy_cost_model(run profile)``); ``None`` means the
+    default profile's model.
 
     WP13a-S-R2-01 (security round 2): the caller (``apps.api.routers.
     optimize``) already rejects any grid whose FULL cross-product exceeds
@@ -1136,6 +1180,7 @@ def validate_param_grid_exit_config(
                     allow_pyramiding=(
                         allow_pyramiding if isinstance(allow_pyramiding, bool) else None
                     ),
+                    cost=cost,
                 )
                 exc = None
             except ExitConfigError as e:

@@ -1,10 +1,13 @@
 """
 tests/integration/test_wp16_cb_backtest.py
 --------------------------------------------
-WP1.6 / U-2 -- the circuit breaker in backtests is OPT-IN (default off).
+WP1.6 / U-2 -- the circuit breaker in backtests: opt-in in WP1.6, ON BY DEFAULT since WP2.1c
+(SY-21-13); ``enable_circuit_breaker=False`` is the explicit pre-2.1c path.
 
-    WP16-T-32  the default ``BacktestRunner`` builds no breaker and a reference
-               backtest is byte-identical to pre-WP1.6 (golden digest taken at HEAD 206eb12)
+    WP16-T-32  the default ``BacktestRunner`` builds a breaker (WP2.1c flip); an explicit
+               ``enable_circuit_breaker=False`` builds none and a reference backtest is
+               byte-identical to pre-WP1.6 (golden digest taken at HEAD 206eb12;
+               RE-PINNED once by WP2.1a-1 for the C25 fix, see GOLDEN_REFERENCE_DIGEST)
     WP16-T-33  ``enable_circuit_breaker=True`` through DAILY_LIMIT -> REDUCE -> OK
                and HALT -> REDUCE -> OK across 00:00 UTC: identical transitions, fills,
                equity and ``halt_since`` under two different wall clocks
@@ -30,6 +33,7 @@ from tests._wp15_logging import _structlog_unfiltered  # noqa: F401
 from tests.integration.fakes.bar_paths import scripted_path
 from tests.integration.fakes.scripted_strategy import ScriptedSequenceStrategy
 from trading.backtest import BacktestRunner
+from trading.costs import get_cost_profile
 from trading.risk import RiskParameters
 from trading.safety import CircuitBreaker, CircuitBreakerTransition
 
@@ -38,7 +42,9 @@ INITIAL = Decimal("10000")
 FIRST_OPEN = datetime(2026, 3, 10, 10, 0, tzinfo=UTC)
 
 #: 30% position that loses 52% (-15.6% NAV): DAILY_LIMIT on D (>8%), REDUCE after the roll
-#: (>= 15%), recovery to OK; later BUYs sized so the (unforwarded) 40% cluster cap never decides.
+#: (>= 15%), recovery to OK; later BUYs sized so the cluster cap never decides (``_RISK`` sets it
+#: to 1.0).  Since the C25 fix (WP2.1a-1) ``BacktestRunner`` forwards EVERY ``risk_params`` field,
+#: including ``max_cluster_exposure_pct``; before it the cap was silently reset to 0.40.
 _RD_CLOSES = [100, 100, 80, 48] + [48] * 10 + [48, 100] + [100] * 8
 _RD_SCRIPT = {0: "buy", 14: "buy", 21: "buy"}
 _RD_TARGETS = {0: "3000", 14: "300", 21: "600"}
@@ -58,7 +64,10 @@ SCENARIOS: dict[str, tuple[list[int], dict[int, str], dict[int, str]]] = {
 }
 
 
-def _runner(scenario: str, *, enable: bool) -> tuple[BacktestRunner, dict[str, list[Any]]]:
+def _runner(
+    scenario: str, *, enable: bool | None
+) -> tuple[BacktestRunner, dict[str, list[Any]]]:
+    """``enable=None`` leaves ``enable_circuit_breaker`` OUT, i.e. the runner's default."""
     closes, script, targets = SCENARIOS[scenario]
     strategy = ScriptedSequenceStrategy(
         "wp16-bt", {"script": script, "target_notional": "3000", "targets": targets}
@@ -71,14 +80,19 @@ def _runner(scenario: str, *, enable: bool) -> tuple[BacktestRunner, dict[str, l
         risk_params=_RISK,
         seed=7,
         allow_pyramiding=True,
-        **({"enable_circuit_breaker": True} if enable else {}),
+        # WP2.1: the goldens below are calibrated on the pre-WP2.1 backtest costs
+        # (maker 10 / taker 15 / slippage 5 bps); pinned explicitly because the default
+        # profile moved to coinbase_advanced_1.  Both T-32 scenarios and every T-33
+        # assertion run under this one profile, so the C25 re-pin stays single-cause.
+        cost_profile=get_cost_profile("legacy_backtest_v0"),
+        **({} if enable is None else {"enable_circuit_breaker": enable}),
     )
     bars = scripted_path(closes, first_open=FIRST_OPEN, symbol=SYMBOL, timeframe=TimeFrame.ONE_HOUR)
     return runner, {SYMBOL: bars}
 
 
 async def _run(
-    scenario: str, *, enable: bool, monkeypatch: pytest.MonkeyPatch
+    scenario: str, *, enable: bool | None, monkeypatch: pytest.MonkeyPatch
 ) -> dict[str, Any]:
     transitions: list[CircuitBreakerTransition] = []
     breakers: list[CircuitBreaker] = []
@@ -117,30 +131,69 @@ def _digest(payload: dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(stable, sort_keys=True).encode()).hexdigest()
 
 
-# Golden digest of the reference backtest (default: no breaker) taken at HEAD 206eb12,
-# i.e. BEFORE any WP1.6 change.  If this fails, the default backtest changed (U-2).
-GOLDEN_REFERENCE_DIGEST = "b130c79103652a460a093d4c28997de2ce2d56e3f1de5a434c7f8295b21f9eaa"
+# Golden digest of the reference backtest (``enable_circuit_breaker=False``, the pre-2.1c default).
+#
+# History: taken at HEAD 206eb12 (BEFORE any WP1.6 change) as
+# ``b130c79103652a460a093d4c28997de2ce2d56e3f1de5a434c7f8295b21f9eaa``.  RE-PINNED ONCE, with a
+# single cause, by WP2.1a-1 (C25): the old ``BacktestRunner`` rebuilt a caller-supplied
+# ``RiskParameters`` by hand and dropped ``max_cluster_exposure_pct`` (reset to 0.40), so the
+# 6.25-unit REDUCE-sized BUY at 48.024 was rejected by the cap.  With the field forwarded that
+# BUY is filled -- an extra fill and a different final equity (9992.7973 -> 10317.1970750).
+# The explicit fill lists below are asserted BEFORE the digest is compared, so the re-pin cannot
+# hide an unintended change.  If this fails, the default backtest changed (U-2).
+GOLDEN_REFERENCE_DIGEST = "5990ddc54bec8ff1bf9c3a46a52b66b3575cb4584b26d86650f7bca3bddae48d"
+
+#: Explicit post-C25 fills (side, quantity, price) of the two scenarios with the breaker OFF.
+_REDUCE_DAILY_FILLS_BREAKER_OFF = [
+    ("buy", "30.00000000", "100.05000000"),
+    ("buy", "6.25000000", "48.02400000"),
+    ("buy", "6.00000000", "100.05000000"),
+]
+_HALT_FILLS_BREAKER_OFF = [
+    ("buy", "38.00000000", "100.05000000"),
+    ("buy", "3.00000000", "100.05000000"),
+]
 
 
-async def test_wp16_t32_default_runner_builds_no_breaker(monkeypatch: pytest.MonkeyPatch) -> None:
-    runner, _bars = _runner("reduce_daily", enable=False)
-    engine, _pf, _rm, _ex = runner._build_engine("t32")
-    assert engine.circuit_breaker is None
+async def test_wp16_t32_default_runner_builds_a_breaker_and_explicit_false_builds_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """WP2.1c flip (SY-21-13): the DEFAULT runner has a breaker; only an explicit False has none."""
+    runner_default, _ = _runner("reduce_daily", enable=None)
+    engine_default, *_ = runner_default._build_engine("t32-default")
+    assert engine_default.circuit_breaker is not None
+    t = engine_default.circuit_breaker.thresholds
+    assert t is not None and t.halt_entry == Decimal("0.3")  # paper/backtest default limit
+    runner_off, _bars = _runner("reduce_daily", enable=False)
+    engine_off, _pf, _rm, _ex = runner_off._build_engine("t32-off")
+    assert engine_off.circuit_breaker is None
     runner_on, _ = _runner("reduce_daily", enable=True)
     engine_on, *_ = runner_on._build_engine("t32-on")
     assert engine_on.circuit_breaker is not None
-    t = engine_on.circuit_breaker.thresholds
-    assert t is not None and t.halt_entry == Decimal("0.3")  # paper/backtest default limit
 
 
-async def test_wp16_t32_reference_backtest_is_byte_identical_to_head(
+async def test_wp16_t32_reference_backtest_matches_the_c25_repinned_golden(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     out = await _run("reduce_daily", enable=False, monkeypatch=monkeypatch)
     assert out["breakers"] == [] and out["transitions"] == []
+    # C25: the explicit fills first (the extra 6.25 @ 48.024 BUY is the cluster cap no longer
+    # being reset), THEN the digest.
+    assert out["fills"] == _REDUCE_DAILY_FILLS_BREAKER_OFF
+    assert out["final_equity"] == "10317.1970750000000000"
     assert _digest(out) == GOLDEN_REFERENCE_DIGEST
     again = await _run("reduce_daily", enable=False, monkeypatch=monkeypatch)
     assert _digest(again) == _digest(out)  # deterministic run to run
+
+
+async def test_wp16_t32_halt_scenario_breaker_off_fills_are_explicit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C25: with the breaker off the halt scenario also gains the 3 @ 100.05 BUY."""
+    out = await _run("halt", enable=False, monkeypatch=monkeypatch)
+    assert out["breakers"] == [] and out["transitions"] == []
+    assert out["fills"] == _HALT_FILLS_BREAKER_OFF
+    assert out["final_equity"] == "9991.7969250000000000"
 
 
 def _clock(at: datetime) -> Any:

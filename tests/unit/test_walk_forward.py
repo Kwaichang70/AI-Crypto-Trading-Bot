@@ -89,9 +89,25 @@ class TestWalkForwardValidatorSplit:
         with pytest.raises(ValueError, match="at least one symbol"):
             v.split({})
 
-    def test_rejects_inconsistent_bar_counts(self) -> None:
+    def test_unequal_bar_counts_are_split_by_time(self) -> None:
+        """WP2.3 (SY-23-17): the equal-count requirement is gone; unequal counts are legal.
+
+        B misses three interior bars.  Every fold has the identical ``[start, end)``
+        window for both symbols and starts and ends on a full row.
+        """
+        a = _make_bars(100, "A")
+        b = [bar for i, bar in enumerate(_make_bars(100, "B")) if i not in (10, 40, 41)]
+        folds = WalkForwardValidator().split({"A": a, "B": b})
+        assert len(folds) == 4
+        for fold in folds:
+            for part in (fold.train_bars, fold.test_bars):
+                assert part["A"][0].timestamp == part["B"][0].timestamp
+                assert part["A"][-1].timestamp == part["B"][-1].timestamp
+
+    def test_window_without_a_full_row_is_an_explicit_error(self) -> None:
+        """B stops at bar 50, so no test window holds a row common to A and B."""
         v = WalkForwardValidator()
-        with pytest.raises(ValueError, match="same number of bars"):
+        with pytest.raises(ValueError, match="holds no full row"):
             v.split({"A": _make_bars(100, "A"), "B": _make_bars(50, "B")})
 
     def test_rejects_too_few_bars(self) -> None:

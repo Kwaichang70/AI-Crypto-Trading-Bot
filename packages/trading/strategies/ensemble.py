@@ -147,6 +147,17 @@ class EnsembleStrategy(BaseStrategy):
         # without falsely penalising multi-symbol subs.
         self._magnitude_history: dict[str, list[deque[float]]] = {}
 
+    def mtf_signal_fields(self) -> frozenset[str]:
+        """WP2.4 (SY-24-06): the union of the sub-strategies' consumed signal fields."""
+        fields: frozenset[str] = frozenset()
+        for sub in self._sub_strategies:
+            fields |= sub.mtf_signal_fields()
+        return fields
+
+    def context_trained(self) -> bool:
+        """SY-01-16 / SY-01-21g: the union over the sub-strategies."""
+        return any(sub.context_trained() for sub in self._sub_strategies)
+
     def _ensure_history_for_symbol(self, symbol: str) -> None:
         """Lazily allocate the per-sub deque list for a newly-seen symbol."""
         if symbol not in self._magnitude_history:

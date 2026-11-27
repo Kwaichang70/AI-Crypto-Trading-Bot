@@ -89,7 +89,9 @@ def _clean_run_tasks() -> Generator[None, None, None]:
 @pytest.fixture(autouse=True)
 def _reset_strategy_registry() -> Generator[None, None, None]:
     original = runs_module._STRATEGY_REGISTRY
-    runs_module._STRATEGY_REGISTRY = {"grid_trading": MagicMock()}
+    runs_module._STRATEGY_REGISTRY = {
+        "grid_trading": MagicMock(**{"mtf_signal_fields.return_value": frozenset()})
+    }
     yield
     runs_module._STRATEGY_REGISTRY = original
 

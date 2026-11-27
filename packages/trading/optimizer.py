@@ -15,11 +15,13 @@ Design principles:
 
 from __future__ import annotations
 
+import asyncio
 import itertools
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from decimal import Decimal
-from typing import Any
+from typing import Any, cast
 
 import statistics
 
@@ -27,11 +29,37 @@ import structlog
 
 from common.models import OHLCVBar
 from common.types import TimeFrame
-from trading.backtest import BacktestRunner
-from trading.exit_config import validate_param_grid_exit_config
+from data.bar_alignment import (
+    DEFAULT_ALIGNMENT_TOLERANCE,
+    AlignmentReport,
+    AlignmentTolerance,
+    BarAlignmentError,
+    Step,
+    align_bars,
+    check_alignment,
+    fold_check,
+)
+from trading.backtest import (
+    BacktestRunner,
+    record_bar_alignment,
+    record_bar_alignment_outcome,
+)
+from trading.costs import CostProfile, default_cost_profile
+from trading.exit_config import policy_cost_model, validate_param_grid_exit_config
 from trading.metrics import BacktestResult
+from trading.mtf_signals import (
+    BacktestSignalSource,
+    MtfContextReport,
+    check_backtest_source,
+    select_mtf_signals,
+)
+from trading.safety import BACKTEST_CIRCUIT_BREAKER_DEFAULT
 from trading.strategy import BaseStrategy
+from trading.strategy_engine import (
+    _TIMEFRAME_SECONDS,
+)
 from trading.walk_forward import (
+    WalkForwardFold,
     WalkForwardValidator,
     deflated_sharpe_ratio,
 )
@@ -99,6 +127,8 @@ class OptimizationResult:
     walk_forward: bool = False
     num_folds: int = 0
     deflated_sharpe: float | None = None
+    #: WP2.1: the ONE cost profile every combination was simulated with.
+    cost_profile: CostProfile | None = None
 
 
 class ParameterOptimizer:
@@ -124,6 +154,32 @@ class ParameterOptimizer:
         Number of top results to return. Default 10.
     max_combinations :
         Hard cap on total combinations. Default 500.
+    cost_profile :
+        WP2.1: the ONE ``CostProfile`` handed to every combination's
+        ``BacktestRunner`` (never a per-combination bps).  ``None`` -> the
+        current default profile.
+    enable_circuit_breaker :
+        WP2.1c (SY-21-13, GAP-05): forwarded to every combination's
+        ``BacktestRunner``.  Default ``True``; ``False`` reproduces the pre-WP2.1c
+        (no breaker) optimizer exactly.
+    alignment_tolerance :
+        WP2.3 (SY-23-03): tests and scripts only (never an API field).
+        ``None`` -> ``DEFAULT_ALIGNMENT_TOLERANCE``.
+    mtf_signals :
+        WP2.4 (SY-24-05, T-24): the point-in-time signal source (scripts and tests; never
+        an API field in Phase A).  ``None`` -> ``UNAVAILABLE``: results equal the pre-P2
+        ones.  Selected ONCE per ``run`` over the whole aligned window: every timeline
+        step ``k`` in ``[0, N)`` is a decision (warm-up 0), because the warm-up depends on
+        each combination.  This is a superset of every combination's trading decisions
+        ``[W_c, N)``.  It is PIT-safe (every served value is still ``asof(close_i)``; never
+        look-ahead) but NOT monotone.  When coverage holes are early (a late-starting
+        series, the QD-14 case), a field fails toward OFF.  With interior holes, a field
+        can be ON although its hole share in a combination's trading window exceeds 1%,
+        bounded by ``floor(0.01 * N) / (N - W_c)``.  So an optimize run's statuses can
+        differ from a single ``BacktestRunner`` run of the same combination on the same
+        data, in either direction.  Every combination and walk-forward fold then shares
+        the SAME immutable selected source, and the inner runners skip coverage.  The
+        consumed fields are the strategy CLASS's ``consumes_mtf_signals``.
     """
 
     def __init__(
@@ -136,14 +192,16 @@ class ParameterOptimizer:
         rank_by: str = "sharpe_ratio",
         top_n: int = 10,
         max_combinations: int = DEFAULT_MAX_COMBINATIONS,
-        maker_fee_bps: int = 10,
-        taker_fee_bps: int = 15,
-        slippage_bps: int = 5,
+        cost_profile: CostProfile | None = None,
         walk_forward: bool = False,
         walk_forward_folds: int = 4,
         walk_forward_train_fraction: float = 0.7,
         walk_forward_mode: str = "expanding",
+        enable_circuit_breaker: bool = BACKTEST_CIRCUIT_BREAKER_DEFAULT,
+        alignment_tolerance: AlignmentTolerance | None = None,
+        mtf_signals: BacktestSignalSource | None = None,
     ) -> None:
+        check_backtest_source(mtf_signals)  # CF-P1-01: type name only in the message
         if not param_grid:
             raise ValueError("param_grid must contain at least one parameter")
         if rank_by not in SUPPORTED_METRICS:
@@ -169,9 +227,17 @@ class ParameterOptimizer:
         self._rank_by = rank_by
         self._top_n = top_n
         self._max_combinations = max_combinations
-        self._maker_fee_bps = maker_fee_bps
-        self._taker_fee_bps = taker_fee_bps
-        self._slippage_bps = slippage_bps
+        self._cost_profile: CostProfile = (
+            cost_profile if cost_profile is not None else default_cost_profile()
+        )
+        self._enable_circuit_breaker: bool = enable_circuit_breaker
+        self._alignment_tolerance: AlignmentTolerance = (
+            alignment_tolerance if alignment_tolerance is not None else DEFAULT_ALIGNMENT_TOLERANCE
+        )
+        self._last_alignment: AlignmentReport | None = None
+        self._mtf_signals: BacktestSignalSource | None = mtf_signals
+        self._mtf_selected: BacktestSignalSource | None = None
+        self._last_mtf_context: MtfContextReport | None = None
         self._walk_forward = walk_forward
         self._walk_forward_folds = walk_forward_folds
         self._walk_forward_train_fraction = walk_forward_train_fraction
@@ -192,13 +258,42 @@ class ParameterOptimizer:
         # pre-validates the whole grid before the bar fetch; this covers any
         # caller that builds a ``ParameterOptimizer`` directly (a script,
         # or a future non-HTTP caller).
-        validate_param_grid_exit_config(self._strategy_cls, param_grid)
+        # WP2.1 (SY-21-06): validated at the policy basis of the run's profile,
+        # exactly like the router, so API pass => engine pass.
+        validate_param_grid_exit_config(
+            self._strategy_cls, param_grid, cost=policy_cost_model(self._cost_profile)
+        )
 
         self._log = structlog.get_logger(__name__).bind(
             component="parameter_optimizer",
             strategy=strategy_cls.__name__,
             total_combinations=len(self._combinations),
         )
+
+    @property
+    def circuit_breaker_enabled(self) -> bool:
+        """Whether every combination's runner builds a circuit breaker (WP2.1c)."""
+        return self._enable_circuit_breaker
+
+    @property
+    def last_alignment(self) -> AlignmentReport | None:
+        """The WP2.3 alignment report of the most recent ``run`` (even a rejected one).
+
+        ``None`` until the run has aligned (reset at every ``run`` entry).  It is computed
+        with warmup 0 (the warmup depends on each combination's strategy parameters), so
+        ``holes_in_warmup`` / ``holes_in_trading`` are diagnostic only.  Compare runs by
+        ``presence_digest``, not by ``fingerprint``: the fingerprint differs from a
+        runner report on identical data because of that warmup.
+        """
+        return self._last_alignment
+
+    @property
+    def last_mtf_context(self) -> MtfContextReport | None:
+        """The WP2.4 MTF-context report of the most recent ``run`` (one per run).
+
+        ``None`` until the run has selected its source (reset at every ``run`` entry).
+        """
+        return self._last_mtf_context
 
     @property
     def total_combinations(self) -> int:
@@ -208,6 +303,8 @@ class ParameterOptimizer:
     async def run(
         self,
         bars_by_symbol: dict[str, list[OHLCVBar]],
+        *,
+        requested_window: tuple[datetime, datetime] | None = None,
     ) -> OptimizationResult:
         """
         Execute the grid search.
@@ -217,6 +314,9 @@ class ParameterOptimizer:
         bars_by_symbol :
             Pre-fetched OHLCV bars keyed by symbol. Reused for every
             combination -- never re-fetched.
+        requested_window :
+            WP2.3 (SY-23-14): the requested ``[start, end)`` of bar open times.
+            Given: the tolerance is enforced even for one symbol (SY-23-05).
 
         Returns
         -------
@@ -225,7 +325,26 @@ class ParameterOptimizer:
             ranking is by out-of-sample metric and the result carries a
             Deflated Sharpe ratio so callers can gauge the multiple-
             testing bias eaten by the grid search.
+
+        Raises
+        ------
+        BarAlignmentError
+            WP2.3 (SY-23-18): the bars are aligned and checked ONCE, before any
+            combination (for walk-forward including every test-fold window).  It
+            is never swallowed into ``failed_combinations``.
+        PitError
+            WP2.4 (CF-P1-01): with a ``PitSignals`` source and a consuming strategy, a
+            naive bar timestamp (``pit_naive_time``) or an unknown consumed field
+            (``pit_unknown_series``).  Raised by the ONE selection before any combination
+            and never swallowed into ``failed_combinations``.  A ``ValueError``.
+        ValueError
+            WP2.4: ``mtf_signals`` is a ``BacktestSignalSource`` subclass other than
+            ``UnavailableSignals`` / ``PitSignals`` (type name only).  Raised before any
+            combination.
         """
+        self._last_alignment = None  # WP2.3 CR-04: no stale report from an earlier run
+        self._last_mtf_context = None  # WP2.4: same rule
+        self._mtf_selected = None
         self._log.info(
             "optimizer.starting",
             combinations=len(self._combinations),
@@ -234,10 +353,13 @@ class ParameterOptimizer:
         )
         start_time = time.monotonic()
 
+        aligned_bars, folds, timeline = self._align_once(bars_by_symbol, requested_window)
+        self._select_mtf(aligned_bars, timeline)  # once per run, before any combination (T-24)
+
         if self._walk_forward:
-            result = await self._run_walk_forward(bars_by_symbol, start_time)
+            result = await self._run_walk_forward(aligned_bars, start_time, folds=folds)
         else:
-            result = await self._run_in_sample(bars_by_symbol, start_time)
+            result = await self._run_in_sample(aligned_bars, start_time)
 
         self._log.info(
             "optimizer.complete",
@@ -255,6 +377,121 @@ class ParameterOptimizer:
         return result
 
     # ------------------------------------------------------------------
+    # WP2.3 alignment: once per run, before any combination (SY-23-18)
+    # ------------------------------------------------------------------
+
+    def _align_once(
+        self,
+        bars_by_symbol: dict[str, list[OHLCVBar]],
+        requested_window: tuple[datetime, datetime] | None,
+    ) -> tuple[dict[str, list[OHLCVBar]], list[WalkForwardFold] | None, tuple[Step, ...]]:
+        """Align, record and check the whole run (and every test fold) exactly once.
+
+        Returns the aligned (trimmed) bars every inner runner receives with
+        ``record_alignment=False`` (so telemetry and the tolerance check never
+        multiply by combinations x folds) and the walk-forward folds.
+        ``BarAlignmentError`` is recorded once and re-raised.
+        """
+        tf = self._timeframe
+        try:
+            tf_s = _TIMEFRAME_SECONDS[tf]
+        except KeyError:
+            raise ValueError("unsupported timeframe for bar alignment") from None
+        aligned = align_bars(
+            bars_by_symbol,
+            self._symbols,
+            tf_s,
+            window=requested_window,
+            tolerance=self._alignment_tolerance,
+        )
+        report = aligned.report
+        self._last_alignment = report
+        enforce = len(set(self._symbols)) > 1 or requested_window is not None
+        record_bar_alignment(report, timeframe=tf.value, enforced=enforce, log=self._log)
+        folds: list[WalkForwardFold] | None = None
+        try:
+            if enforce:
+                check_alignment(report)
+            if self._walk_forward:
+                folds = self._split_and_check_folds(aligned.bars_by_symbol, tf_s, enforce)
+        except BarAlignmentError as exc:
+            record_bar_alignment_outcome(report, log=self._log, rejected=exc)
+            raise
+        except ValueError:
+            # WP2.3 CR-03: the fold SPLIT failed (too few bars, a window without a
+            # full row), after the whole-run check passed.  This is not an alignment
+            # rejection (no closed ``reason`` code), and the closed outcome set
+            # {ok, ok_with_gaps, rejected} has no "split failed" value, so none is
+            # invented: the run is still counted once, with the verdict of the
+            # alignment that passed, and the ValueError propagates unchanged.
+            record_bar_alignment_outcome(report, log=self._log)
+            raise
+        record_bar_alignment_outcome(report, log=self._log)
+        return aligned.bars_by_symbol, folds, aligned.timeline
+
+    def _select_mtf(
+        self, bars_by_symbol: dict[str, list[OHLCVBar]], timeline: tuple[Step, ...]
+    ) -> None:
+        """WP2.4: choose the run's ONE signal source and report (a bad input raises here).
+
+        Runs outside the per-combination ``try`` (which swallows failures into
+        ``failed_combinations``), so a naive timestamp or a bad source fails the whole run
+        before any combination starts.  The decision of a step is computed from the BARS like
+        the engine's ``close_i`` (latest present bar timestamp + one timeframe): the timeline
+        stamps are always aware and would hide a naive bar.
+        """
+        step = timedelta(seconds=_TIMEFRAME_SECONDS[self._timeframe])
+        self._mtf_selected, self._last_mtf_context = select_mtf_signals(
+            self._mtf_signals,
+            (
+                max(bars_by_symbol[sym][idx].timestamp for sym, idx in item.present) + step
+                for item in timeline
+            ),
+            self._strategy_cls.consumes_mtf_signals,
+        )
+
+    def _split_and_check_folds(
+        self,
+        bars_by_symbol: dict[str, list[OHLCVBar]],
+        tf_s: int,
+        enforce: bool,
+    ) -> list[WalkForwardFold]:
+        """Split in time and check every TEST window ``[start, end)`` (SY-23-17).
+
+        The window of a fold is the timeline interval its test slice covers: the
+        open time of its first bar up to (exclusive) one timeframe after its last
+        bar (QA-07), so absent slots inside it are counted as missing.
+        """
+        validator = WalkForwardValidator(
+            num_folds=self._walk_forward_folds,
+            train_fraction=self._walk_forward_train_fraction,
+            mode=cast("Any", self._walk_forward_mode),
+        )
+        folds = validator.split(bars_by_symbol)
+        lead = self._symbols[0]
+        windows = [
+            (
+                f.test_bars[lead][0].timestamp,
+                f.test_bars[lead][-1].timestamp + timedelta(seconds=tf_s),
+            )
+            for f in folds
+        ]
+        try:
+            fold_check(
+                bars_by_symbol,
+                self._symbols,
+                tf_s,
+                windows,
+                tolerance=self._alignment_tolerance,
+            )
+        except BarAlignmentError:
+            if enforce:
+                raise
+            # Single symbol without a requested window: report-only (SY-23-05).
+            self._log.warning("optimizer.fold_alignment_report_only", folds=len(folds))
+        return folds
+
+    # ------------------------------------------------------------------
     # In-sample path (legacy default; preserved behavior)
     # ------------------------------------------------------------------
 
@@ -267,6 +504,7 @@ class ParameterOptimizer:
         failed = 0
 
         for idx, combo_values in enumerate(self._combinations):
+            await asyncio.sleep(0)
             combo_params = dict(zip(self._param_names, combo_values))
 
             self._log.debug(
@@ -285,6 +523,9 @@ class ParameterOptimizer:
                 metrics = self._extract_metrics(result)
                 results.append((combo_params, metrics))
 
+            except BarAlignmentError:
+                # WP2.3 (SY-23-08/18): a data error is never a failed combination.
+                raise
             except Exception:
                 self._log.warning(
                     "optimizer.combination_failed",
@@ -321,6 +562,7 @@ class ParameterOptimizer:
             walk_forward=False,
             num_folds=0,
             deflated_sharpe=None,
+            cost_profile=self._cost_profile,
         )
 
     # ------------------------------------------------------------------
@@ -331,15 +573,15 @@ class ParameterOptimizer:
         self,
         bars_by_symbol: dict[str, list[OHLCVBar]],
         start_time: float,
+        *,
+        folds: list[WalkForwardFold] | None = None,
     ) -> OptimizationResult:
-        from typing import cast
-
-        validator = WalkForwardValidator(
-            num_folds=self._walk_forward_folds,
-            train_fraction=self._walk_forward_train_fraction,
-            mode=cast("Any", self._walk_forward_mode),
-        )
-        folds = validator.split(bars_by_symbol)
+        if folds is None:  # direct caller: split (the fold check is run()'s job)
+            folds = WalkForwardValidator(
+                num_folds=self._walk_forward_folds,
+                train_fraction=self._walk_forward_train_fraction,
+                mode=cast("Any", self._walk_forward_mode),
+            ).split(bars_by_symbol)
 
         self._log.info(
             "optimizer.walk_forward_splits",
@@ -355,6 +597,7 @@ class ParameterOptimizer:
         failed = 0
 
         for idx, combo_values in enumerate(self._combinations):
+            await asyncio.sleep(0)
             combo_params = dict(zip(self._param_names, combo_values))
 
             try:
@@ -371,6 +614,7 @@ class ParameterOptimizer:
                 fold_returns: list[float] = []
                 fold_drawdowns: list[float] = []
                 for fold in folds:
+                    await asyncio.sleep(0)
                     fold_result = await self._run_single_backtest(
                         combo_params=combo_params,
                         strategy_id=f"opt-{idx}-fold{fold.index}",
@@ -402,6 +646,8 @@ class ParameterOptimizer:
 
                 results.append((combo_params, metrics))
 
+            except BarAlignmentError:
+                raise
             except Exception:
                 self._log.warning(
                     "optimizer.walk_forward_combination_failed",
@@ -460,6 +706,7 @@ class ParameterOptimizer:
             walk_forward=True,
             num_folds=len(folds),
             deflated_sharpe=dsr,
+            cost_profile=self._cost_profile,
         )
 
     # ------------------------------------------------------------------
@@ -510,15 +757,20 @@ class ParameterOptimizer:
             symbols=self._symbols,
             timeframe=self._timeframe,
             initial_capital=self._initial_capital,
-            maker_fee_bps=self._maker_fee_bps,
-            taker_fee_bps=self._taker_fee_bps,
-            slippage_bps=self._slippage_bps,
+            cost_profile=self._cost_profile,
             trailing_stop_pct=trailing_stop_pct,
             bracket_config=bracket_config,
             allow_pyramiding=allow_pyramiding,
+            enable_circuit_breaker=self._enable_circuit_breaker,
             seed=42,
+            mtf_signals=self._mtf_selected,
         )
-        return await runner.run(bars_by_symbol)
+        # WP2.3 (SY-23-18): the optimizer aligned and checked once; inner runners
+        # trim and build the timeline but record nothing and skip the check.
+        # WP2.4 (T-24): likewise the source was selected once; inner runners skip coverage.
+        return await runner.run(
+            bars_by_symbol, record_alignment=False, select_mtf_context=False
+        )
 
     def _extract_metrics(self, result: BacktestResult) -> dict[str, float | None]:
         """Extract the standard metric dict from a BacktestResult.

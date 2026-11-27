@@ -1,19 +1,29 @@
 /**
- * Strategy Leaderboard — aggregated performance metrics per strategy.
+ * Strategy Leaderboard — aggregated performance metrics per strategy x cost model.
  *
- * Fetches all runs (up to 1000), groups by strategy_name, and computes
- * per-strategy aggregates: run count, avg return, best/worst return,
- * avg Sharpe, avg win rate, total trades.
+ * Fetches all runs (in pages of 500), groups by strategy_name x cost profile
+ * (WP2.1b, SY-21-10), and computes per-group aggregates: run count, avg
+ * return, best/worst return, avg Sharpe, avg win rate, total trades.
+ *
+ * Default filter "Live-equivalent costs" hides legacy, stress and diagnostic
+ * runs; the "All cost models" toggle shows them with labels. The server flags
+ * (`legacyCosts`, `costProfile.liveEquivalent`) are rendered as-is.
  */
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { fetchRuns, formatPct } from "@/lib/api";
 import type { Run } from "@/lib/types";
 import { Header } from "@/components/layout/header";
 import { ExportCsvButton } from "@/components/ui/export-csv-button";
 import type { CsvColumn } from "@/lib/csv-export";
+import {
+  costGroupKey,
+  isLiveEquivalentCost,
+  type CostCarrier,
+} from "@/lib/cost-profile";
+import { CostProfileBadge } from "@/components/ui/cost-profile-badge";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -21,6 +31,10 @@ import type { CsvColumn } from "@/lib/csv-export";
 
 interface StrategyStats {
   name: string;
+  /** Grouping key: the cost profile id, or "legacy" for every legacy run. */
+  costKey: string;
+  /** Cost fields of the group's first run, used only to render the badge. */
+  cost: CostCarrier;
   runCount: number;
   avgReturnPct: number;
   bestReturnPct: number;
@@ -68,22 +82,39 @@ function getMetrics(run: Run): {
   };
 }
 
+function costFields(run: Run): CostCarrier {
+  return {
+    costProfile: run.costProfile ?? null,
+    ...(run.legacyCosts !== undefined ? { legacyCosts: run.legacyCosts } : {}),
+    ...(run.costProfileInvalid !== undefined
+      ? { costProfileInvalid: run.costProfileInvalid }
+      : {}),
+    ...(run.liveEquivalentCosts !== undefined
+      ? { liveEquivalentCosts: run.liveEquivalentCosts }
+      : {}),
+  };
+}
+
+/** Group runs by strategy_name x cost profile (legacy runs share one group). */
 function aggregateByStrategy(runs: readonly Run[]): StrategyStats[] {
-  const groups = new Map<string, Run[]>();
+  const groups = new Map<string, { name: string; costKey: string; runs: Run[] }>();
 
   for (const run of runs) {
     const name = run.config?.strategy_name ?? "unknown";
-    const list = groups.get(name);
-    if (list) {
-      list.push(run);
+    const costKey = costGroupKey(run);
+    const mapKey = `${name}\u0000${costKey}`;
+    const entry = groups.get(mapKey);
+    if (entry) {
+      entry.runs.push(run);
     } else {
-      groups.set(name, [run]);
+      groups.set(mapKey, { name, costKey, runs: [run] });
     }
   }
 
   const stats: StrategyStats[] = [];
 
-  for (const [name, group] of groups) {
+  for (const { name, costKey, runs: group } of groups.values()) {
+    const cost = costFields(group[0] as Run);
     const withMetrics = group
       .map((r) => ({ run: r, m: getMetrics(r) }))
       .filter((x): x is { run: Run; m: NonNullable<ReturnType<typeof getMetrics>> } => x.m != null);
@@ -91,6 +122,8 @@ function aggregateByStrategy(runs: readonly Run[]): StrategyStats[] {
     if (withMetrics.length === 0) {
       stats.push({
         name,
+        costKey,
+        cost,
         runCount: group.length,
         avgReturnPct: 0,
         bestReturnPct: 0,
@@ -113,6 +146,8 @@ function aggregateByStrategy(runs: readonly Run[]): StrategyStats[] {
 
     stats.push({
       name,
+      costKey,
+      cost,
       runCount: group.length,
       avgReturnPct: avg(returns),
       bestReturnPct: Math.max(...returns),
@@ -135,6 +170,7 @@ function aggregateByStrategy(runs: readonly Run[]): StrategyStats[] {
 
 const CSV_COLUMNS: CsvColumn<StrategyStats>[] = [
   { header: "Strategy", value: (s) => s.name },
+  { header: "Cost Profile", value: (s) => s.costKey },
   { header: "Runs", value: (s) => s.runCount },
   { header: "Avg Return %", value: (s) => (s.avgReturnPct * 100).toFixed(2) },
   { header: "Best Return %", value: (s) => (s.bestReturnPct * 100).toFixed(2) },
@@ -149,7 +185,7 @@ const CSV_COLUMNS: CsvColumn<StrategyStats>[] = [
 // Sort state
 // ---------------------------------------------------------------------------
 
-type SortKey = keyof Omit<StrategyStats, "name">;
+type SortKey = Exclude<keyof StrategyStats, "name" | "costKey" | "cost">;
 
 const SORT_OPTIONS: { value: SortKey; label: string }[] = [
   { value: "avgSharpe", label: "Avg Sharpe" },
@@ -188,7 +224,9 @@ function numCell(val: number, decimals = 2): React.ReactNode {
 // ---------------------------------------------------------------------------
 
 export default function LeaderboardPage() {
-  const [stats, setStats] = useState<StrategyStats[]>([]);
+  const [allRuns, setAllRuns] = useState<readonly Run[]>([]);
+  // SY-21-10: default "Live-equivalent costs"; true = "All cost models".
+  const [allCostModels, setAllCostModels] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [sortBy, setSortBy] = useState<SortKey>("avgSharpe");
@@ -198,7 +236,7 @@ export default function LeaderboardPage() {
       setIsLoading(true);
       setError(null);
       // Fetch all runs in pages of 500 (API max limit).
-      const allRuns: Run[] = [];
+      const collected: Run[] = [];
       let offset = 0;
       const PAGE = 500;
       while (true) {
@@ -207,15 +245,27 @@ export default function LeaderboardPage() {
           setError(result.error.message);
           break;
         }
-        allRuns.push(...result.data.items);
-        if (allRuns.length >= result.data.total) break;
+        collected.push(...result.data.items);
+        if (collected.length >= result.data.total) break;
         offset += PAGE;
       }
-      setStats(aggregateByStrategy(allRuns));
+      setAllRuns(collected);
       setIsLoading(false);
     }
     void load();
   }, []);
+
+  const hiddenRuns = useMemo(
+    () => allRuns.filter((r) => !isLiveEquivalentCost(r)).length,
+    [allRuns],
+  );
+  const stats = useMemo(
+    () =>
+      aggregateByStrategy(
+        allCostModels ? allRuns : allRuns.filter((r) => isLiveEquivalentCost(r)),
+      ),
+    [allRuns, allCostModels],
+  );
 
   // Re-sort when sortBy changes
   const sorted = [...stats].sort((a, b) => {
@@ -228,7 +278,7 @@ export default function LeaderboardPage() {
     <div className="space-y-6">
       <Header
         title="Strategy Leaderboard"
-        subtitle={`${stats.length} strategies ranked by performance`}
+        subtitle={`${stats.length} strategy × cost-model groups ranked by performance`}
         actions={
           <ExportCsvButton
             filename="strategy-leaderboard.csv"
@@ -239,6 +289,38 @@ export default function LeaderboardPage() {
           />
         }
       />
+
+      {/* Cost-model filter (SY-21-10) */}
+      <div className="flex flex-wrap items-center gap-3">
+        <span className="text-xs text-slate-500">Cost models</span>
+        <div className="flex flex-wrap gap-1.5">
+          {[
+            { all: false, label: "Live-equivalent costs" },
+            { all: true, label: "All cost models" },
+          ].map((opt) => (
+            <button
+              key={opt.label}
+              type="button"
+              aria-pressed={allCostModels === opt.all}
+              onClick={() => setAllCostModels(opt.all)}
+              className={[
+                "rounded-full px-3 py-1 text-xs font-medium transition-colors",
+                allCostModels === opt.all
+                  ? "bg-indigo-600 text-white"
+                  : "bg-slate-100 text-slate-600 hover:bg-slate-200 hover:text-slate-900 dark:bg-slate-800 dark:text-slate-400 dark:hover:bg-slate-700 dark:hover:text-slate-200",
+              ].join(" ")}
+            >
+              {opt.label}
+            </button>
+          ))}
+        </div>
+        {!allCostModels && !isLoading && hiddenRuns > 0 && (
+          <span className="text-xs text-slate-500" data-testid="leaderboard-hidden-count">
+            {hiddenRuns} run{hiddenRuns === 1 ? "" : "s"} on legacy, stress or diagnostic
+            costs hidden
+          </span>
+        )}
+      </div>
 
       {/* Sort control */}
       <div className="flex items-center gap-3">
@@ -275,7 +357,9 @@ export default function LeaderboardPage() {
         </div>
       ) : sorted.length === 0 ? (
         <div className="rounded-lg border border-slate-200 bg-slate-50 py-12 text-center text-sm text-slate-500 dark:border-slate-800 dark:bg-slate-900/40">
-          No runs with metrics found. Run some backtests first.
+          {!allCostModels && hiddenRuns > 0
+            ? 'No runs with live-equivalent costs. Choose "All cost models" to see legacy, stress and diagnostic runs.'
+            : "No runs with metrics found. Run some backtests first."}
         </div>
       ) : (
         <div className="overflow-x-auto rounded-xl border border-slate-200 dark:border-slate-800">
@@ -287,6 +371,9 @@ export default function LeaderboardPage() {
                 </th>
                 <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-slate-500">
                   Strategy
+                </th>
+                <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-slate-500">
+                  Cost profile
                 </th>
                 <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-slate-500">
                   Runs
@@ -317,7 +404,7 @@ export default function LeaderboardPage() {
             <tbody>
               {sorted.map((s, idx) => (
                 <tr
-                  key={s.name}
+                  key={`${s.name}|${s.costKey}`}
                   className="border-b border-slate-100 transition-colors hover:bg-slate-50 dark:border-slate-800/50 dark:hover:bg-slate-800/30"
                 >
                   <td className="px-4 py-3">
@@ -334,6 +421,9 @@ export default function LeaderboardPage() {
                     >
                       {s.name}
                     </Link>
+                  </td>
+                  <td className="px-4 py-3">
+                    <CostProfileBadge value={s.cost} showId />
                   </td>
                   <td className="px-4 py-3">
                     <span className="font-mono text-xs text-slate-400">{s.runCount}</span>

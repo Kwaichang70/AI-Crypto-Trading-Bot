@@ -28,6 +28,7 @@
 
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth-options";
+import { apiKeyHeader, retryAfterHeaders } from "@/lib/api-server";
 import { isAdmin } from "@/lib/auth";
 import { checkSameOriginJsonRequest } from "@/lib/admin-route-guards";
 
@@ -91,9 +92,11 @@ export async function POST(request: Request): Promise<Response> {
     process.env.INTERNAL_API_URL ?? "http://api:8000"
   ).replace(/\/$/, "");
 
-  // FE-002: undefined when unset (not empty string) — keeps the conditional spread
-  // semantics clean: an empty string is never forwarded as X-API-Key.
-  const apiKey = process.env.API_KEY;
+  // CF-97-37: the regular API key is mandatory once API auth is on; 503 when unset.
+  const keyHeader = apiKeyHeader();
+  if (!keyHeader) {
+    return Response.json({ error: "API key not configured on server" }, { status: 503 });
+  }
 
   // WP17b-S-04: `body.reason` is attacker-controlled JSON — a non-string
   // value (e.g. `{"reason": 12345}`) would otherwise crash
@@ -118,7 +121,7 @@ export async function POST(request: Request): Promise<Response> {
           "X-Admin-Key": adminKey,
           // Defence-in-depth: include the regular API key even though the admin
           // endpoint uses X-Admin-Key. The backend ignores extra headers safely.
-          ...(apiKey ? { "X-API-Key": apiKey } : {}),
+          ...keyHeader,
           // FE-SEC-002: use sanitised reason, not raw body.reason.
           ...(sanitisedReason ? { "X-Emergency-Reason": sanitisedReason } : {}),
         },
@@ -143,7 +146,7 @@ export async function POST(request: Request): Promise<Response> {
   if (!upstream.ok) {
     return Response.json(
       { error: `Upstream returned HTTP ${upstream.status}`, status: upstream.status },
-      { status: upstream.status }
+      { status: upstream.status, headers: retryAfterHeaders(upstream) }
     );
   }
 

@@ -8,6 +8,8 @@ import type { OptimizeResponse, OptimizeEntry } from "@/lib/types";
 import { Header } from "@/components/layout/header";
 import { DataTable } from "@/components/ui/data-table";
 import { buildResultColumns } from "../result-columns";
+import { CostProfileBadge } from "@/components/ui/cost-profile-badge";
+import { costProfileField, relaunchCostProfile } from "@/lib/cost-profile";
 import {
   classifyIdempotencyError,
   getStructuredErrorCode,
@@ -77,6 +79,10 @@ export default function OptimizationRunDetailPage() {
       initialCapital: launchCapital,
       backtestStart: null,
       backtestEnd: null,
+      // WP2.1b: price the launched backtest like the optimization (registry
+      // profiles, including the default id and explicit legacy_* ids, are
+      // pinned; inferred / invalid / unknown fall back to the platform default).
+      ...costProfileField(relaunchCostProfile(phase.data)),
     };
 
     try {
@@ -186,6 +192,11 @@ export default function OptimizationRunDetailPage() {
           <span className="text-slate-600">·</span>
           <span className="text-slate-400">
             Elapsed: <span className="text-slate-200">{data.elapsedSeconds}s</span>
+          </span>
+          <span className="text-slate-600">·</span>
+          {/* WP2.1b: NULL / missing costProfile reads as legacy costs */}
+          <span className="text-slate-400" data-testid="optimize-cost-line">
+            Costs: <CostProfileBadge value={data} showId />
           </span>
         </div>
       </div>

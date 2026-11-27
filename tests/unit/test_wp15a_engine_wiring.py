@@ -119,6 +119,13 @@ async def test_wp15_t15_run_backtest_pushes_bar_close_before_marks_every_bar() -
 
 
 async def test_wp15_t15_clock_value_is_the_max_timestamp_across_symbols() -> None:
+    """WP2.3 (WP23-T-14): on-grid symbols with a missing bar.
+
+    The engine walks the union timeline; under alignment every present bar of a step shares one
+    timestamp, so the ``max`` rule yields that timestamp.  ``advance_clock`` is pushed once per
+    TIMELINE step (4 here, not ``min(len)`` = 3) with ``step + tf``.  The 30-minute phase-offset
+    fixture this test used to carry is now an ``off_grid`` rejection (test_wp22_bar_clock T-05).
+    """
     events: list[tuple[str, object]] = []
     portfolio = _RecordingPortfolio(events)
     rm = DefaultRiskManager(run_id="wp15-wiring")
@@ -133,15 +140,14 @@ async def test_wp15_t15_clock_value_is_the_max_timestamp_across_symbols() -> Non
         run_mode=RunMode.BACKTEST,
         config={"warmup_bars": 1},
     )
-    btc = make_bars(3, seed=1, symbol=_SYMBOL)
-    eth = [
-        bar.model_copy(update={"timestamp": bar.timestamp + timedelta(minutes=30)})
-        for bar in make_bars(3, seed=2, symbol="ETH/USDT")
-    ]
+    btc = make_bars(4, seed=1, symbol=_SYMBOL)
+    # ETH lacks the third bar; its first and last bars are present (a full first/last row)
+    eth = [b for i, b in enumerate(make_bars(4, seed=2, symbol="ETH/USDT")) if i != 2]
+    assert len(eth) == 3
     await engine.start("wp15-wiring")
     await engine.run_backtest({_SYMBOL: btc, "ETH/USDT": eth})
     pushes = [at for name, at in events if name == "advance_clock"]
-    assert pushes == [e.timestamp + timedelta(hours=1) for e in eth]
+    assert pushes == [b.timestamp + timedelta(hours=1) for b in btc]
 
 
 def test_wp15_t15_every_timeframe_has_a_duration() -> None:

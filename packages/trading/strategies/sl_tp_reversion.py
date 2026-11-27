@@ -130,6 +130,8 @@ class SLTPReversionStrategy(BaseStrategy):
     # WP1.3a (SY-13a-06/08): explicit per-strategy declaration --
     # BUY-only; the engine's bracket/trailing exit is mandatory (SY-13a-06).
     requires_exit_manager: ClassVar[bool] = True
+    # WP2.4 (SY-24-06): on_bar reads no external signal field.
+    consumes_mtf_signals: ClassVar[frozenset[str]] = frozenset()
 
     def _validate_params(self, params: dict[str, Any]) -> dict[str, Any]:
         return _SLTPReversionParams(**params).model_dump()

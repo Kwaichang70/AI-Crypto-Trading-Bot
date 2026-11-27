@@ -318,6 +318,7 @@ import asyncio
 from decimal import Decimal
 from common.types import TimeFrame
 from trading.backtest import BacktestRunner
+from trading.costs import get_cost_profile
 
 async def run_backtest():
     runner = BacktestRunner(
@@ -327,9 +328,9 @@ async def run_backtest():
         symbols=["BTC/USDT"],
         timeframe=TimeFrame.ONE_HOUR,
         initial_capital=Decimal("10000"),
-        slippage_bps=5,          # 0.05% slippage
-        maker_fee_bps=5,         # 0.05% maker fee
-        taker_fee_bps=10,        # 0.10% taker fee
+        # WP2.1: one cost model per run (fees + slippage). Omit for the platform
+        # default (DEFAULT_COST_PROFILE_ID in trading/costs.py); any registry id works.
+        cost_profile=get_cost_profile("coinbase_advanced_d6"),
         seed=42,                  # deterministic
     )
 

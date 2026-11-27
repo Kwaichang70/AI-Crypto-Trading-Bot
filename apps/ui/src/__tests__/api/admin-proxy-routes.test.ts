@@ -31,6 +31,7 @@
 
 import { getServerSession } from "next-auth";
 import { isAdmin } from "@/lib/auth";
+import { dummySecret } from "@/__tests__/helpers/dummy-secrets";
 
 jest.mock("next-auth", () => ({ getServerSession: jest.fn() }));
 jest.mock("@/lib/auth-options", () => ({ authOptions: {} }));
@@ -39,7 +40,7 @@ jest.mock("@/lib/auth", () => ({ isAdmin: jest.fn() }));
 const mockGetServerSession = getServerSession as jest.Mock;
 const mockIsAdmin = isAdmin as jest.Mock;
 
-const ADMIN_KEY = "test-internal-admin-key-value";
+const ADMIN_KEY = dummySecret("dummy-admin-key");
 const VALID_ID = "11111111-1111-1111-1111-111111111111";
 
 const ORIGINAL_ENV = process.env;
@@ -582,5 +583,43 @@ describe("kill-switch clear route: reason validation", () => {
     const res = await POST(buildRequest("http://localhost/api/admin/kill-switch/clear", { reason: "x" }));
     expect(res.status).toBe(400);
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CF-97-37 (37-B): the regular API key is mandatory on every admin proxy, and a
+// 429's Retry-After reaches the browser (DR-9737-06).
+// ---------------------------------------------------------------------------
+
+describe.each(ROUTES)("$name: API key and Retry-After (CF-97-37)", ({ importRoute, makeRequest, ctx }) => {
+  it("sends X-API-Key next to X-Admin-Key", async () => {
+    const fetchMock = jest.fn().mockResolvedValue(okUpstream());
+    global.fetch = fetchMock as unknown as typeof fetch;
+    const { POST } = await importRoute();
+    await POST(makeRequest(), ctx() as never);
+    const headers = (fetchMock.mock.calls[0] as [string, RequestInit])[1].headers as Record<string, string>;
+    expect(headers["X-API-Key"]).toBe("test-api-key");
+    expect(headers["X-Admin-Key"]).toBe(ADMIN_KEY);
+  });
+
+  it("is 503 with no upstream call when API_KEY is not configured", async () => {
+    delete process.env.API_KEY;
+    const fetchMock = jest.fn();
+    global.fetch = fetchMock as unknown as typeof fetch;
+    const { POST } = await importRoute();
+    const res = await POST(makeRequest(), ctx() as never);
+    expect(res.status).toBe(503);
+    expect(await res.json()).toEqual({ error: "API key not configured on server" });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("passes Retry-After of a 429 through (the FE-SEC-003 body rewrite stays)", async () => {
+    const upstream = new Response('{"detail":"secret upstream detail"}', { status: 429, headers: { "retry-after": "23" } });
+    global.fetch = jest.fn().mockResolvedValue(upstream) as unknown as typeof fetch;
+    const { POST } = await importRoute();
+    const res = await POST(makeRequest(), ctx() as never);
+    expect(res.status).toBe(429);
+    expect(res.headers.get("retry-after")).toBe("23");
+    expect(await res.text()).not.toContain("secret upstream detail");
   });
 });

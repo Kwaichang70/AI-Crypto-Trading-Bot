@@ -14,13 +14,14 @@ from __future__ import annotations
 
 import math
 import uuid
+from collections.abc import Mapping
 from datetime import datetime
 from decimal import Decimal
 from typing import Annotated, Any
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic.alias_generators import to_camel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -28,14 +29,33 @@ from sqlalchemy.orm import selectinload
 
 from api.db import get_db
 from api.db.models import OptimizationEntryORM, OptimizationRunORM
+from api.schemas import CostProfileSummary
+from api.services import admission
+from api.services.cost_profiles import (
+    bar_alignment_http_error,
+    check_backtest_request_bounds,
+    cost_response_fields,
+    metrics_response_fields,
+    mtf_context_response_fields,
+    new_run_cost_profile_or_422,
+    requested_bar_window,
+    stamp_cost_config,
+)
 from common.types import TimeFrame
+from data.bar_alignment import BarAlignmentError
+from api.routers import runs as _runs_router  # module import: tests patch ``runs._window_now``
 # TODO(sprint-30): extract to api.services.market_data / api.services.strategy_registry
 from api.routers.runs import (
     _fetch_bars_for_backtest,
     _get_strategy_registry,
 )
-from trading.exit_config import ExitConfigError, validate_param_grid_exit_config
+from trading.exit_config import (
+    ExitConfigError,
+    policy_cost_model,
+    validate_param_grid_exit_config,
+)
 from trading.optimizer import SUPPORTED_METRICS, ParameterOptimizer
+from trading.safety import BACKTEST_CIRCUIT_BREAKER_DEFAULT
 
 __all__ = ["router"]
 
@@ -135,6 +155,27 @@ class OptimizeRequest(BaseModel):
         le=1000,
         description="Hard cap on total parameter combinations",
     )
+    cost_profile: str | None = Field(
+        default=None,
+        max_length=64,
+        description=(
+            "WP2.1: cost-profile registry id applied to EVERY combination "
+            "(any registry id, legacy / stress / diagnostic included).  None -> "
+            "the platform default profile.  Unknown ids give 422 'unknown_cost_profile'."
+        ),
+    )
+
+    @field_validator("symbols")
+    @classmethod
+    def _symbols_are_unique(cls, v: list[str]) -> list[str]:
+        """WP2.3 (CF-23-20): order-preserving uniqueness; a duplicate is a 422.
+
+        The engine rejects a duplicate symbol (it double-counts exposure); fail at the
+        API edge instead of as a 500.  Nothing is deduped and no value is echoed.
+        """
+        if len(set(v)) != len(v):
+            raise ValueError("symbols must be unique")
+        return v
 
 
 class OptimizeEntryResponse(BaseModel):
@@ -168,6 +209,64 @@ class OptimizationRunSummary(BaseModel):
     failed_combinations: int
     elapsed_seconds: float
     created_at: datetime
+    # WP2.1b (SY-21-08 / SY-21-10): cost-model transparency, server-computed from
+    # ``optimization_runs.run_metadata`` by the SAME helper the run endpoints use
+    # (``cost_response_fields``) -- identical field names and legacy semantics.
+    cost_profile: CostProfileSummary | None = Field(
+        default=None,
+        description=(
+            "Cost profile every combination was simulated with.  For a legacy run "
+            "(run_metadata NULL / no cost_profile key / malformed) this is the inferred "
+            "legacy profile (id 'legacy_backtest_v0', source 'legacy_inferred')."
+        ),
+    )
+    legacy_costs: bool = Field(
+        default=False,
+        description=(
+            "True iff run_metadata has no persisted cost profile, or its profile is a "
+            "legacy_* id, or the persisted value is invalid."
+        ),
+    )
+    cost_profile_invalid: bool = Field(
+        default=False,
+        description="True iff a cost profile was persisted but is malformed (treated as legacy).",
+    )
+    legacy_exit_semantics: bool = Field(
+        default=False,
+        description="True iff run_metadata carries no engine_semantics block.",
+    )
+    live_equivalent_costs: bool = Field(
+        default=False,
+        description=(
+            "True iff run_metadata holds a valid persisted live-equivalent REGISTRY cost "
+            "profile that is not legacy (same rule as RunResponse.live_equivalent_costs)."
+        ),
+    )
+    legacy_metrics: bool = Field(
+        default=False,
+        description=(
+            "WP2.5 (SY-25-13): True iff run_metadata has no known engine_semantics.metrics "
+            "marker, so the ranking metrics (Sharpe, Sortino, ...) were computed before the "
+            "per-bar sampling and are not comparable with current runs.  Server-computed."
+        ),
+    )
+    legacy_mtf_context: bool = Field(
+        default=False,
+        description=(
+            "WP2.4 (SY-24-08): True iff the strategy consumed the multi-timeframe signals "
+            "(dca_rsi_hybrid, rsi_mean_reversion, model_strategy, ensemble) and run_metadata "
+            "has no known engine_semantics.mtf_context marker, so the ranking was computed "
+            "on boot-frozen provider values.  Server-computed."
+        ),
+    )
+    mtf_context_status: str | None = Field(
+        default=None,
+        description=(
+            "WP2.4 (SY-24-07): run_metadata['mtf_context']['status'] (not_used, unavailable, "
+            "partial or pit) or None.  An optimize run's status can differ from a single "
+            "re-backtest of its best combination (CF-P2-05).  Server-computed."
+        ),
+    )
 
 
 class OptimizeResponse(BaseModel):
@@ -188,6 +287,78 @@ class OptimizeResponse(BaseModel):
     failed_combinations: int
     elapsed_seconds: float
     entries: list[OptimizeEntryResponse]
+    cost_profile: CostProfileSummary | None = Field(
+        default=None,
+        description=(
+            "WP2.1 / WP2.1b: the cost profile every combination was simulated with.  "
+            "POST returns the profile just persisted in run_metadata; GET returns the "
+            "persisted one.  For a legacy run (run_metadata NULL / no cost_profile key / "
+            "malformed) it is the inferred legacy profile (id 'legacy_backtest_v0', "
+            "source 'legacy_inferred') and legacy_costs is true."
+        ),
+    )
+    legacy_costs: bool = Field(
+        default=False,
+        description=(
+            "True iff run_metadata has no persisted cost profile, or its profile is a "
+            "legacy_* id, or the persisted value is invalid."
+        ),
+    )
+    cost_profile_invalid: bool = Field(
+        default=False,
+        description="True iff a cost profile was persisted but is malformed (treated as legacy).",
+    )
+    legacy_exit_semantics: bool = Field(
+        default=False,
+        description="True iff run_metadata carries no engine_semantics block.",
+    )
+    live_equivalent_costs: bool = Field(
+        default=False,
+        description=(
+            "True iff run_metadata holds a valid persisted live-equivalent REGISTRY cost "
+            "profile that is not legacy (same rule as RunResponse.live_equivalent_costs)."
+        ),
+    )
+    legacy_metrics: bool = Field(
+        default=False,
+        description=(
+            "WP2.5 (SY-25-13): True iff run_metadata has no known engine_semantics.metrics "
+            "marker, so the ranking metrics (Sharpe, Sortino, ...) were computed before the "
+            "per-bar sampling and are not comparable with current runs.  Server-computed."
+        ),
+    )
+    legacy_mtf_context: bool = Field(
+        default=False,
+        description=(
+            "WP2.4 (SY-24-08): True iff the strategy consumed the multi-timeframe signals "
+            "(dca_rsi_hybrid, rsi_mean_reversion, model_strategy, ensemble) and run_metadata "
+            "has no known engine_semantics.mtf_context marker, so the ranking was computed "
+            "on boot-frozen provider values.  Server-computed."
+        ),
+    )
+    mtf_context_status: str | None = Field(
+        default=None,
+        description=(
+            "WP2.4 (SY-24-07): run_metadata['mtf_context']['status'] (not_used, unavailable, "
+            "partial or pit) or None.  An optimize run's status can differ from a single "
+            "re-backtest of its best combination (CF-P2-05).  Server-computed."
+        ),
+    )
+
+
+def _scrub_non_finite(metrics: Mapping[str, Any]) -> dict[str, Any]:
+    """Entry metrics with every non-finite float replaced by ``None`` (SY-25-22).
+
+    Applied at the persistence and response edge only: PostgreSQL JSONB and the JSON
+    response encoder reject ``inf`` / ``nan``, and WP2.5 can now yield ``+inf`` CAGR /
+    Calmar (a short span, where HEAD raised) next to Sortino's existing ``+inf``.  The
+    optimizer's in-memory entries and ranking are untouched; finite values and ``None``
+    pass through unchanged (byte-identical).  Never logs.
+    """
+    return {
+        k: (None if isinstance(v, float) and not math.isfinite(v) else v)
+        for k, v in metrics.items()
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -234,6 +405,10 @@ async def run_optimization(
         )
 
     strategy_cls = registry[strategy_name]
+
+    # WP2.1 (U-2, SY-21-03): optimize accepts ANY registry id (the same rule
+    # as backtest).  Resolved first: it is the exit-validation basis below.
+    cost_profile = new_run_cost_profile_or_422(body.cost_profile, mode="optimize")
 
     # Validate rank_by metric
     if body.rank_by not in SUPPORTED_METRICS:
@@ -289,7 +464,10 @@ async def run_optimization(
     # subclass, so it MUST be caught before the generic ``except
     # ValueError`` below (G-3) or it would silently map to 400.
     try:
-        validate_param_grid_exit_config(strategy_cls, body.param_grid)
+        # WP2.1 (SY-21-06): the stricter of the default and the run's profile.
+        validate_param_grid_exit_config(
+            strategy_cls, body.param_grid, cost=policy_cost_model(cost_profile)
+        )
     except ExitConfigError as exc:
         log.warning(
             "optimize.exit_config_invalid",
@@ -303,104 +481,177 @@ async def run_optimization(
 
     timeframe = TimeFrame(body.timeframe)
 
-    # Step 1: Fetch OHLCV data ONCE
-    bars_by_symbol = await _fetch_bars_for_backtest(
-        symbols=body.symbols,
-        timeframe=timeframe,
+    # WP2.3 P0 SEC-02: fixed 422 codes for an oversized / pre-genesis / too-wide history
+    # request, before the (real) exchange round trips of the fetch below.
+    check_backtest_request_bounds(
         start=body.backtest_start,
         end=body.backtest_end,
-        log=log,
+        timeframe=timeframe,
+        n_symbols=len(body.symbols),
     )
 
-    # Step 2: Build and run optimizer
+    # CF-97-03 (P7a): one research slot per process (refuse-only); no claim exists here.
+    lease = admission.try_acquire("optimize")
     try:
-        optimizer = ParameterOptimizer(
-            strategy_cls=strategy_cls,
+        # WP2.3 (SY-23-14, SEC-01): read ``now`` ONCE, BEFORE the fetch (see create_run).
+        bar_window_now = _runs_router._window_now()
+
+        # Step 1: Fetch OHLCV data ONCE
+        bars_by_symbol = await _fetch_bars_for_backtest(
             symbols=body.symbols,
             timeframe=timeframe,
-            param_grid=body.param_grid,
-            initial_capital=Decimal(body.initial_capital),
+            start=body.backtest_start,
+            end=body.backtest_end,
+            log=log,
+            now=bar_window_now,
+        )
+
+        # Step 2: Build and run optimizer
+        try:
+            optimizer = ParameterOptimizer(
+                strategy_cls=strategy_cls,
+                symbols=body.symbols,
+                timeframe=timeframe,
+                param_grid=body.param_grid,
+                initial_capital=Decimal(body.initial_capital),
+                rank_by=body.rank_by,
+                top_n=body.top_n,
+                max_combinations=body.max_combinations,
+                cost_profile=cost_profile,
+                # WP2.1c (SY-21-13, GAP-05): every combination runs with the breaker;
+                # persisted below as ``run_metadata.engine_semantics``.  No API toggle.
+                enable_circuit_breaker=BACKTEST_CIRCUIT_BREAKER_DEFAULT,
+            )
+        except ExitConfigError as exc:
+            # Defence in depth: ParameterOptimizer.__init__ also validates.
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=_optimize_exit_config_error_detail(exc),
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(exc),
+            ) from exc
+
+        log.info(
+            "optimize.starting",
+            total_combinations=optimizer.total_combinations,
             rank_by=body.rank_by,
-            top_n=body.top_n,
-            max_combinations=body.max_combinations,
         )
-    except ExitConfigError as exc:
-        # Defence in depth: ParameterOptimizer.__init__ also validates.
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=_optimize_exit_config_error_detail(exc),
-        ) from exc
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(exc),
-        ) from exc
 
-    log.info(
-        "optimize.starting",
-        total_combinations=optimizer.total_combinations,
-        rank_by=body.rank_by,
-    )
+        # WP2.3 (SY-23-08/14/18): the requested window (``now`` read here, in the router,
+        # through the same seam as backtest) and a 422 for a rejected alignment.  The
+        # ``BarAlignmentError`` branch is the only one: the optimizer never swallows it into
+        # ``failed_combinations``, and no ``str(exc)`` reaches the log or the response.
+        try:
+            result = await optimizer.run(
+                bars_by_symbol,
+                requested_window=requested_bar_window(
+                    body.backtest_start,
+                    body.backtest_end,
+                    timeframe,
+                    bar_window_now,
+                ),
+            )
+        except BarAlignmentError as exc:
+            log.warning(
+                "optimize.bar_alignment_rejected",
+                code=exc.code,
+                error_type="BarAlignmentError",
+            )
+            raise bar_alignment_http_error(exc) from exc
 
-    result = await optimizer.run(bars_by_symbol)
-
-    # Step 3: Build response entry list
-    entries = [
-        OptimizeEntryResponse(
-            rank=e.rank,
-            params=e.params,
-            metrics=e.metrics,
-        )
-        for e in result.entries
-    ]
-
-    # Step 4: Persist optimization run + entries to DB
-    orm_run = OptimizationRunORM(
-        id=uuid.uuid4(),
-        strategy_name=result.strategy_name,
-        symbols=result.symbols,
-        timeframe=result.timeframe,
-        rank_by=result.rank_by,
-        total_combinations=result.total_combinations,
-        completed_combinations=result.completed_combinations,
-        failed_combinations=result.failed_combinations,
-        elapsed_seconds=float(result.elapsed_seconds),
-    )
-    db.add(orm_run)
-    await db.flush()  # Assign PK before inserting child rows
-
-    for e in result.entries:
-        db.add(
-            OptimizationEntryORM(
-                id=uuid.uuid4(),
-                optimization_run_id=orm_run.id,
+        # Step 3: Build response entry list
+        entries = [
+            OptimizeEntryResponse(
                 rank=e.rank,
                 params=e.params,
-                metrics=e.metrics,
+                metrics=_scrub_non_finite(e.metrics),
             )
+            for e in result.entries
+        ]
+
+        # Step 4: Persist optimization run + entries to DB
+        # WP2.1b (SY-21-08): freeze the cost model next to the ranking, so an optimizer
+        # result stays attributable to the profile that produced it.  Same two keys and
+        # the same writer as a backtest run's ``config`` (``stamp_cost_config``).
+        effective_profile = result.cost_profile if result.cost_profile is not None else cost_profile
+        run_metadata: dict[str, Any] = {}
+        stamp_cost_config(
+            run_metadata,
+            effective_profile,
+            mode="optimize",
+            backtest_circuit_breaker=optimizer.circuit_breaker_enabled,
+        )
+        # WP2.3 (SY-23-16): the alignment report of the whole run (aligned once, SY-23-18).
+        # Compare runs by ``presence_digest``, not ``fingerprint`` (warm-up 0 in the optimizer).
+        if optimizer.last_alignment is not None:
+            run_metadata["bar_alignment"] = optimizer.last_alignment.to_metadata()
+        # WP2.4 (SY-24-07): the run-level MTF-context report (one selection per run, not per
+        # combination).  Built from the run's bars and the source it was given -- none in Phase A,
+        # so ``source == "unavailable"`` -- never from the request.
+        if optimizer.last_mtf_context is not None:
+            run_metadata["mtf_context"] = optimizer.last_mtf_context.to_metadata()
+        # WP2.6 (SY-26-10/16): the data block of the cache path (see create_run); never a
+        # request field.
+        if isinstance(ohlcv_block := getattr(bars_by_symbol, "ohlcv_data", None), dict):
+            run_metadata["ohlcv_data"] = ohlcv_block
+
+        orm_run = OptimizationRunORM(
+            id=uuid.uuid4(),
+            strategy_name=result.strategy_name,
+            symbols=result.symbols,
+            timeframe=result.timeframe,
+            rank_by=result.rank_by,
+            total_combinations=result.total_combinations,
+            completed_combinations=result.completed_combinations,
+            failed_combinations=result.failed_combinations,
+            elapsed_seconds=float(result.elapsed_seconds),
+            run_metadata=run_metadata,
+        )
+        db.add(orm_run)
+        await db.flush()  # Assign PK before inserting child rows
+
+        for e in result.entries:
+            db.add(
+                OptimizationEntryORM(
+                    id=uuid.uuid4(),
+                    optimization_run_id=orm_run.id,
+                    rank=e.rank,
+                    params=e.params,
+                    metrics=_scrub_non_finite(e.metrics),
+                )
+            )
+
+        await db.commit()
+
+        log.info(
+            "optimize.persisted",
+            optimization_run_id=str(orm_run.id),
+            entries=len(result.entries),
         )
 
-    await db.commit()
+        return OptimizeResponse(
+            optimization_run_id=orm_run.id,
+            strategy_name=result.strategy_name,
+            symbols=result.symbols,
+            timeframe=result.timeframe,
+            rank_by=result.rank_by,
+            total_combinations=result.total_combinations,
+            completed_combinations=result.completed_combinations,
+            failed_combinations=result.failed_combinations,
+            elapsed_seconds=result.elapsed_seconds,
+            entries=entries,
+            # POST and GET share one code path: what is returned here is exactly what a
+            # later GET /optimize/{id} derives from the persisted ``run_metadata``.
+            **cost_response_fields(run_metadata, "optimize"),
+            **metrics_response_fields(run_metadata, "optimize"),
+            **mtf_context_response_fields(run_metadata, "optimize", orm_run.strategy_name),
+        )
 
-    log.info(
-        "optimize.persisted",
-        optimization_run_id=str(orm_run.id),
-        entries=len(result.entries),
-    )
-
-    return OptimizeResponse(
-        optimization_run_id=orm_run.id,
-        strategy_name=result.strategy_name,
-        symbols=result.symbols,
-        timeframe=result.timeframe,
-        rank_by=result.rank_by,
-        total_combinations=result.total_combinations,
-        completed_combinations=result.completed_combinations,
-        failed_combinations=result.failed_combinations,
-        elapsed_seconds=result.elapsed_seconds,
-        entries=entries,
-    )
-
+    finally:
+        lease.release()
 
 # ---------------------------------------------------------------------------
 # GET /api/v1/optimize — list all past optimization runs
@@ -453,6 +704,10 @@ async def list_optimization_runs(
             failed_combinations=row.failed_combinations,
             elapsed_seconds=float(row.elapsed_seconds),
             created_at=row.created_at,
+            # WP2.1b: NULL / missing / malformed run_metadata is legacy, never a 500.
+            **cost_response_fields(row.run_metadata, "optimize"),
+            **metrics_response_fields(row.run_metadata, "optimize"),
+            **mtf_context_response_fields(row.run_metadata, "optimize", row.strategy_name),
         )
         for row in rows
     ]
@@ -522,7 +777,9 @@ async def get_optimization_run(
         OptimizeEntryResponse(
             rank=e.rank,
             params=e.params,
-            metrics={k: (float(v) if v is not None else None) for k, v in e.metrics.items()},
+            metrics=_scrub_non_finite(
+                {k: (float(v) if v is not None else None) for k, v in e.metrics.items()}
+            ),
         )
         for e in row.entries
     ]
@@ -538,4 +795,8 @@ async def get_optimization_run(
         failed_combinations=row.failed_combinations,
         elapsed_seconds=float(row.elapsed_seconds),
         entries=entries,
+        # WP2.1b: NULL / missing / malformed run_metadata is legacy, never a 500.
+        **cost_response_fields(row.run_metadata, "optimize"),
+        **metrics_response_fields(row.run_metadata, "optimize"),
+        **mtf_context_response_fields(row.run_metadata, "optimize", row.strategy_name),
     )

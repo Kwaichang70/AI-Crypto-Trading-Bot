@@ -38,9 +38,12 @@ from sqlalchemy import (
     Index,
     Integer,
     Numeric,
+    PrimaryKeyConstraint,
+    SmallInteger,
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -62,6 +65,9 @@ __all__ = [
     "AuditEventORM",
     "IdempotencyKeyORM",
     "KillSwitchStateORM",
+    "ContextObservationORM",
+    "OhlcvBarORM",
+    "OhlcvCoverageORM",
 ]
 
 # ---------------------------------------------------------------------------
@@ -1339,6 +1345,12 @@ class OptimizationRunORM(Base):
         server_default=func.now(),
         comment="UTC timestamp when the optimization run was persisted",
     )
+    # WP2.1b (SY-21-08): additive, nullable JSONB written by POST /api/v1/optimize as
+    # ``{"cost_profile": CostProfile.to_metadata(), "engine_semantics": {...}}`` (the same
+    # shape as ``RunORM.config``).  NULL, a missing key or a malformed value all mean
+    # "legacy costs"; there is no backfill.  Deliberately NO ``comment=``: migration 020
+    # adds the column without a DB comment, so the model and the DB stay identical.
+    run_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
 
     # Relationship  -- ordered by rank ascending so entry[0] is the best result
     entries: Mapped[list[OptimizationEntryORM]] = relationship(
@@ -1715,3 +1727,219 @@ class KillSwitchStateORM(Base):
 
     def __repr__(self) -> str:
         return f"<KillSwitchStateORM active={self.active} reason={self.reason!r}>"
+
+
+# ---------------------------------------------------------------------------
+# 14. context_observations  -- WP2.4 point-in-time context series (append-only)
+# ---------------------------------------------------------------------------
+
+class ContextObservationORM(Base):
+    """One immutable point-in-time observation of a context series (SY-24-09).
+
+    See ``infra/alembic/versions/021_add_context_observations.py`` and
+    ``apps/api/services/context_store.py``.
+
+    The primary key ``(series_id, observed_at, available_at)`` makes a revision a
+    NEW row with a later ``available_at``. Backtests join on
+    ``available_at <= close_i`` only; ``ingested_at`` is audit data and never
+    decides visibility.
+
+    Append-only: application code never issues UPDATE or DELETE against this
+    table (pinned by tests). Rows are written through the store's
+    ``INSERT ... WHERE NOT EXISTS ... ON CONFLICT DO NOTHING`` statement, not
+    ``session.add`` (which would raise on a conflict). This class exists for
+    metadata / autogenerate parity and read queries.
+    """
+
+    __tablename__ = "context_observations"
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "series_id",
+            "observed_at",
+            "available_at",
+            name="pk_context_observations",
+        ),
+        CheckConstraint(
+            "available_at >= observed_at",
+            name="ck_context_obs_avail_after_obs",
+        ),
+        CheckConstraint("value <> 'NaN'", name="ck_context_obs_value_finite"),
+        CheckConstraint(
+            "available_at_basis IN ('recorded', 'estimated_lag', 'vintage')",
+            name="ck_context_obs_basis",
+        ),
+        CheckConstraint("series_id <> ''", name="ck_context_obs_series_id"),
+    )
+
+    series_id: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        comment="Namespaced series id, e.g. 'coingecko:btc_dominance'.",
+    )
+    observed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        comment="Period the value describes.",
+    )
+    available_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        comment="First instant a trader could have known the value (the join key).",
+    )
+    value: Mapped[Decimal] = mapped_column(
+        Numeric(24, 8),
+        nullable=False,
+        comment="Exact value; canonical digest text derives from it.",
+    )
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    available_at_basis: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        comment="recorded | estimated_lag | vintage.",
+    )
+    ingested_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        comment="Audit only; feeds ingest_cutoff, never the join.",
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<ContextObservationORM series={self.series_id!r} "
+            f"observed_at={self.observed_at!r} available_at={self.available_at!r}>"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 15. ohlcv_bars / ohlcv_coverage  -- WP2.6 OHLCV cache (first write wins)
+# ---------------------------------------------------------------------------
+
+# Constraint text is identical to ``infra/alembic/versions/022_add_ohlcv_cache.py``
+# (pinned by tests/unit/test_wp26_migration_022.py).
+_OHLCV_TF_LIST = "'1m', '3m', '5m', '15m', '30m', '1h', '4h', '1d'"
+_OHLCV_TF_CASE = (
+    "CASE timeframe WHEN '1m' THEN 60 WHEN '3m' THEN 180 WHEN '5m' THEN 300 "
+    "WHEN '15m' THEN 900 WHEN '30m' THEN 1800 WHEN '1h' THEN 3600 "
+    "WHEN '4h' THEN 14400 WHEN '1d' THEN 86400 END"
+)
+_OHLCV_IDENT = "exchange ~ '^[a-z0-9_]+$' AND symbol ~ '^[!-.0-{}~]+/[!-.0-{}~]+$'"
+
+
+def _ohlcv_epoch(column: str) -> str:
+    return f"CAST(extract(epoch FROM {column}) AS numeric)"
+
+
+class OhlcvBarORM(Base):
+    """One immutable closed OHLCV bar (SY-26-13).
+
+    See ``infra/alembic/versions/022_add_ohlcv_cache.py``. Application code never issues
+    UPDATE or DELETE here; rows are written with ``INSERT ... ON CONFLICT DO NOTHING``
+    through ``text()``. This class exists for metadata parity and read queries.
+    """
+
+    __tablename__ = "ohlcv_bars"
+    __table_args__ = (
+        PrimaryKeyConstraint("exchange", "symbol", "timeframe", "open_time", name="pk_ohlcv_bars"),
+        CheckConstraint(_OHLCV_IDENT, name="ck_ohlcv_bars_ident"),
+        CheckConstraint(f"timeframe IN ({_OHLCV_TF_LIST})", name="ck_ohlcv_bars_timeframe"),
+        CheckConstraint(
+            f"mod({_ohlcv_epoch('open_time')}, {_OHLCV_TF_CASE}) = 0", name="ck_ohlcv_bars_grid"
+        ),
+        CheckConstraint(
+            f"{_ohlcv_epoch('fetched_at')} >= {_ohlcv_epoch('open_time')} + {_OHLCV_TF_CASE}",
+            name="ck_ohlcv_bars_closed",
+        ),
+        CheckConstraint(
+            "low > 0 AND low <= open AND low <= close AND open <= high AND close <= high",
+            name="ck_ohlcv_bars_ohlc",
+        ),
+        CheckConstraint("volume >= 0", name="ck_ohlcv_bars_volume"),
+        CheckConstraint(
+            "open <> 'NaN' AND high <> 'NaN' AND low <> 'NaN' "
+            "AND close <> 'NaN' AND volume <> 'NaN'",
+            name="ck_ohlcv_bars_finite",
+        ),
+    )
+
+    exchange: Mapped[str] = mapped_column(String(32), nullable=False, comment="ccxt exchange id.")
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False, comment="ccxt unified symbol.")
+    timeframe: Mapped[str] = mapped_column(String(4), nullable=False, comment="1m .. 1d, no 1w.")
+    open_time: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        comment="Bar OPEN instant, UTC, on the timeframe grid.",
+    )
+    open: Mapped[Decimal] = mapped_column(Numeric(28, 12), nullable=False)
+    high: Mapped[Decimal] = mapped_column(Numeric(28, 12), nullable=False)
+    low: Mapped[Decimal] = mapped_column(Numeric(28, 12), nullable=False)
+    close: Mapped[Decimal] = mapped_column(Numeric(28, 12), nullable=False)
+    volume: Mapped[Decimal] = mapped_column(
+        Numeric(30, 12), nullable=False, comment="Base-asset volume."
+    )
+    fetched_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        comment="Audit only; never part of a hash.",
+    )
+    ingest_version: Mapped[int] = mapped_column(
+        SmallInteger(),
+        nullable=False,
+        server_default=text("1"),
+        comment="Writer semantics version (pager/quantiser).",
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<OhlcvBarORM {self.exchange!r} {self.symbol!r} {self.timeframe!r} "
+            f"open_time={self.open_time!r}>"
+        )
+
+
+class OhlcvCoverageORM(Base):
+    """One contiguous verified interval per series (SY-26-05, SY-26-13).
+
+    ``[covered_from, covered_to)`` was fully requested from the exchange; a missing bar
+    inside it is a true gap. The store extends it with a conditional UPDATE under a row
+    lock; this class exists for metadata parity and read queries.
+    """
+
+    __tablename__ = "ohlcv_coverage"
+    __table_args__ = (
+        PrimaryKeyConstraint("exchange", "symbol", "timeframe", name="pk_ohlcv_coverage"),
+        CheckConstraint(_OHLCV_IDENT, name="ck_ohlcv_cov_ident"),
+        CheckConstraint("covered_from <= covered_to", name="ck_ohlcv_cov_span"),
+        CheckConstraint(f"timeframe IN ({_OHLCV_TF_LIST})", name="ck_ohlcv_cov_timeframe"),
+        CheckConstraint(
+            f"mod({_ohlcv_epoch('covered_from')}, {_OHLCV_TF_CASE}) = 0 "
+            f"AND mod({_ohlcv_epoch('covered_to')}, {_OHLCV_TF_CASE}) = 0",
+            name="ck_ohlcv_cov_grid",
+        ),
+    )
+
+    exchange: Mapped[str] = mapped_column(String(32), nullable=False, comment="ccxt exchange id.")
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False, comment="ccxt unified symbol.")
+    timeframe: Mapped[str] = mapped_column(String(4), nullable=False, comment="1m .. 1d, no 1w.")
+    covered_from: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        comment="Inclusive start of the verified interval, on the grid.",
+    )
+    covered_to: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        comment="Exclusive end of the verified interval, on the grid.",
+    )
+    verified_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        comment="Audit only.",
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<OhlcvCoverageORM {self.exchange!r} {self.symbol!r} {self.timeframe!r} "
+            f"[{self.covered_from!r}, {self.covered_to!r})>"
+        )

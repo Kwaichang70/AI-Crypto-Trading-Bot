@@ -207,7 +207,9 @@ def race_app(monkeypatch: pytest.MonkeyPatch) -> Any:
     import api.routers.runs as runs_module
 
     original_registry = runs_module._STRATEGY_REGISTRY
-    runs_module._STRATEGY_REGISTRY = {"grid_trading": MagicMock()}
+    runs_module._STRATEGY_REGISTRY = {
+        "grid_trading": MagicMock(**{"mtf_signal_fields.return_value": frozenset()})
+    }
     runs_module._RUN_TASKS.clear()
 
     from api.main import create_app

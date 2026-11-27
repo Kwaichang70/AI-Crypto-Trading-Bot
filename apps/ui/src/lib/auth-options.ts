@@ -9,9 +9,14 @@
  *   - Test files can import authOptions without triggering NextAuth side effects
  *
  * Strategy: Google OAuth + JWT sessions (no DB tables needed).
- * Role determination: ADMIN_EMAILS env var (comma-separated).
- *   - If session.user.email is in the list → role "admin"
- *   - Otherwise                            → role "viewer"
+ * Access: the signIn callback admits only ADMIN_EMAILS ∪ VIEWER_EMAILS
+ * (both comma-separated, case-insensitive; both empty → nobody signs in).
+ * Sessions slide: they end after 24 h without use, and every session read
+ * re-checks both lists, so a removed address loses access at its next request
+ * and a demoted admin becomes a viewer.
+ * Role determination: ADMIN_EMAILS env var.
+ *   - If session.user.email is in ADMIN_EMAILS → role "admin"
+ *   - Otherwise (an admitted VIEWER_EMAILS address) → role "viewer"
  *
  * SR-003: Startup guards are in validateAuthConfig(), called from route.ts
  * at handler creation time (not at module import time) so that unit tests
@@ -26,14 +31,21 @@ import GoogleProvider from "next-auth/providers/google";
 // Helpers
 // ---------------------------------------------------------------------------
 
+/** The one email normalisation used by both callbacks and the list parser. */
+function normalizeEmail(raw: unknown): string {
+  return typeof raw === "string" ? raw.trim().toLowerCase() : "";
+}
+
+function getEmailSet(envName: "ADMIN_EMAILS" | "VIEWER_EMAILS"): Set<string> {
+  return new Set((process.env[envName] ?? "").split(",").map(normalizeEmail).filter(Boolean));
+}
+
 function getAdminEmails(): Set<string> {
-  const raw = process.env.ADMIN_EMAILS ?? "";
-  return new Set(
-    raw
-      .split(",")
-      .map((e) => e.trim().toLowerCase())
-      .filter(Boolean)
-  );
+  return getEmailSet("ADMIN_EMAILS");
+}
+
+function isAllowedEmail(email: string): boolean {
+  return email !== "" && (getAdminEmails().has(email) || getEmailSet("VIEWER_EMAILS").has(email));
 }
 
 // ---------------------------------------------------------------------------
@@ -87,8 +99,8 @@ export const authOptions: NextAuthOptions = {
 
   session: {
     strategy: "jwt",
-    // 24-hour sessions. Trade-off: server-side revocation not possible within
-    // the window, but acceptable for a single-admin internal dashboard.
+    // 24-hour sliding sessions; revocation takes effect at the next session read
+    // (jwt re-check, 37-S).
     maxAge: 60 * 60 * 24,
   },
 
@@ -107,16 +119,33 @@ export const authOptions: NextAuthOptions = {
 
   callbacks: {
     /**
+     * signIn callback (CF-97-37, UQ-97-12) — allow-list. Only a Google account
+     * with a verified email that is in ADMIN_EMAILS or VIEWER_EMAILS may sign
+     * in; everything else is denied (NextAuth answers AccessDenied). Fails
+     * closed: with both lists empty nobody is admitted.
+     */
+    async signIn({ user, account, profile }) {
+      if (account?.provider !== "google") return false;
+      if ((profile as { email_verified?: boolean } | undefined)?.email_verified !== true) {
+        return false;
+      }
+      return isAllowedEmail(normalizeEmail(user?.email));
+    },
+
+    /**
      * jwt callback — fires when a JWT is created or updated.
      * We store the role in the token so it survives across session reads
      * without a DB round-trip.
      * Type is inferred from NextAuthOptions — no explicit annotation needed.
      */
     async jwt({ token, user }) {
-      if (user?.email) {
-        const admins = getAdminEmails();
-        token.role = admins.has(user.email.toLowerCase()) ? "admin" : "viewer";
-      }
+      const email = normalizeEmail(user?.email ?? token.email);
+      // Sessions slide (next-auth re-issues the cookie on every session read),
+      // so every refresh (no `user`) re-checks both lists: an address that was
+      // removed ends the session (the throw clears the cookie; the message is
+      // fixed and carries no email), and a demoted admin becomes a viewer.
+      if (!user && !isAllowedEmail(email)) throw new Error("access_revoked");
+      if (email) token.role = getAdminEmails().has(email) ? "admin" : "viewer";
       return token;
     },
 

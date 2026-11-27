@@ -50,6 +50,7 @@ from tests.integration.fakes.bar_paths import scripted_path
 from tests.integration.fakes.scripted_strategy import ScriptedSequenceStrategy
 from trading.backtest import BacktestRunner
 from trading.bracket_exit import BracketExitManager
+from trading.costs import CostProfile, get_cost_profile
 from trading.models import Fill, Order, Position
 from trading.portfolio import PortfolioAccounting
 
@@ -485,6 +486,7 @@ def test_t15_blend_entry_price_matches_portfolio_accounting_goldens() -> None:
 def _bt_runner(
     script: dict[int, str], *, bracket: dict[str, Any] | None, trailing: float | None = None,
     allow_pyramiding: bool = False, targets: dict[int, str] | None = None,
+    cost_profile: CostProfile | None = None,
 ) -> BacktestRunner:
     strategy = ScriptedSequenceStrategy(
         "wp13b", {"script": script, "target_notional": "1000", "targets": targets or {}}
@@ -498,6 +500,7 @@ def _bt_runner(
         bracket_config=bracket,
         trailing_stop_pct=trailing,
         allow_pyramiding=allow_pyramiding,
+        cost_profile=cost_profile,
     )
 
 
@@ -530,7 +533,17 @@ async def test_t10_deferred_anchor_waits_for_a_computable_atr_then_freezes() -> 
         "bracket_atr_sl_multiplier": 20.0,
         "bracket_atr_period": 49,
     }
-    runner = _bt_runner({0: "buy"}, bracket=bracket, trailing=0.20)
+    # WP2.1 (X-15): the bracket basis E is the ALL-IN (fee-inclusive) average, so a higher
+    # taker pulls every stop closer to the market.  At the default profile (120 bps taker +
+    # 10 bps slippage) E = 101.30 and this test's 20 x ATR stop (~0.82 away) sits at 100.48,
+    # ABOVE the next close of 100: the lot stops out and the anchor is gone.  This test's
+    # numbers are calibrated on the pre-WP2.1 backtest costs, so it pins them explicitly.
+    runner = _bt_runner(
+        {0: "buy"},
+        bracket=bracket,
+        trailing=0.20,
+        cost_profile=get_cost_profile("legacy_backtest_v0"),
+    )
     engine = await _engine(runner)
     closes = [100] * 55 + [100 + ((i + 1) % 2) * 2 for i in range(75)]
     bars = scripted_path(

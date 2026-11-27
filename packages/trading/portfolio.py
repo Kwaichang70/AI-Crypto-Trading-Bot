@@ -42,6 +42,7 @@ from typing import Callable, Literal, TypedDict
 import structlog
 
 from common.types import OrderSide
+from trading import clock as _clock_module
 from trading.models import Fill, Position, TradeResult
 from trading.recovery import ResumeDailySeed, replay_sort_key
 
@@ -90,12 +91,23 @@ DayStartSource = Literal["run_start", "roll", "snapshot", "replay_estimate", "un
 
 
 def _utc_now() -> datetime:
-    """Default risk-day clock (wall clock, UTC).
+    """Default risk-day / stamp clock (wall clock, UTC).
 
-    Module-level on purpose: it is the one monkeypatch seam the determinism
-    tests (WP15-T-23) use to prove a backtest never reads the wall clock.
+    Module-level on purpose: it is the monkeypatch seam the determinism tests
+    (WP15-T-23) use to prove a backtest never reads the wall clock.  It
+    delegates to :func:`trading.clock._wall_now` (WP22-P2B-SEC-08), the one
+    ``datetime.now(tz=UTC)`` read, resolved at call time so patching either
+    name takes effect.
+
+    LOAD-BEARING (WP22-P2B1-CR-04 / SEC-08): the literal ``datetime.now`` in
+    this docstring is what keeps
+    ``test_wp15a_contracts::test_wp15_t18_the_single_clock_seam_is_the_module_function``
+    green -- that test does ``inspect.getsource(_utc_now)`` and looks for the
+    text.  Do not reword or drop it until that test is retargeted at delegation
+    to ``trading.clock._wall_now`` (carried as a CF); the real single-seam
+    guards are the WP2.2 AST allowlist and the call-time seam test.
     """
-    return datetime.now(tz=UTC)
+    return _clock_module._wall_now()
 
 
 def _utc_day(at: datetime) -> date:
@@ -258,7 +270,12 @@ class PortfolioAccounting:
     clock:
         Risk-day clock (UTC).  Defaults to the wall clock (:func:`_utc_now`);
         injectable for paper/live tests.  A backtest overrides it by pushing
-        bar time through :meth:`advance_clock`.
+        bar time through :meth:`advance_clock`.  WP2.2: the same seam stamps
+        the equity-curve seed point and every position / curve stamp;
+        ``BacktestRunner`` passes ``BarClock.now`` so the seed is the first
+        bar's open.  This stays an unguarded callable (SY-22-R2-03): the
+        control that keeps a bar clock out of paper/live is that no code in
+        ``apps/`` passes ``clock=`` (AST-pinned, R7).
     """
 
     def __init__(
@@ -305,9 +322,18 @@ class PortfolioAccounting:
         self._losing_trades = 0
 
         # Equity curve: list of (datetime, equity_value) tuples
+        # WP2.2: the seed point is stamped through the single ``_now()`` seam
+        # (a backtest injects ``clock=BarClock.now``, so this is the first bar's
+        # open ``t0``; paper/live resolve to the wall clock via ``_utc_now``).
         self._equity_curve: list[tuple[datetime, Decimal]] = [
-            (datetime.now(tz=UTC), initial_cash),
+            (self._now(), initial_cash),
         ]
+        # CF-26-97: lazy left-fold cursor of ``get_max_drawdown`` (written only there).
+        self._mdd_ref: list[tuple[datetime, Decimal]] | None = None
+        self._mdd_n = 0
+        self._mdd_peak = Decimal("0")
+        self._mdd_max = Decimal("0")
+        self._mdd_last: tuple[datetime, Decimal] | None = None
 
         # Completed trade history
         self._trade_history: list[TradeResult] = []
@@ -439,11 +465,11 @@ class PortfolioAccounting:
         current_price:
             Current market price of the asset (for unrealised PnL).
         """
-        # ``at`` (position/curve stamps) stays wall time until WP2.2; the risk
-        # day is resolved through the single ``_now()`` seam (WP1.5 C-06).
-        self._apply_fill(
-            fill, current_price, at=datetime.now(tz=UTC), day_at=self._now()
-        )
+        # WP2.2: position / curve stamps AND the risk day come from ONE read of
+        # the single ``_now()`` seam (WP1.5 C-06): bar close in a backtest, the
+        # wall clock in paper/live.
+        now = self._now()
+        self._apply_fill(fill, current_price, at=now, day_at=now)
 
     def _apply_fill(
         self,
@@ -745,8 +771,10 @@ class PortfolioAccounting:
         prices:
             Mapping of symbol -> current market price.
         """
-        self._ensure_daily_pnl_date(self._now())
-        now = datetime.now(tz=UTC)  # curve / position stamps stay wall time (WP2.2)
+        # WP2.2: one read of the ``_now()`` seam for the risk day AND the
+        # curve / position stamps.
+        now = self._now()
+        self._ensure_daily_pnl_date(now)
         for symbol, price in prices.items():
             position = self._position_snapshots.get(symbol)
             if position is not None and not position.is_flat:
@@ -852,8 +880,10 @@ class PortfolioAccounting:
         """
         Calculate the maximum drawdown from the equity curve.
 
-        Iterates through the entire equity curve to find the worst
-        peak-to-trough decline.
+        Folds the equity curve left to right to find the worst peak-to-trough
+        decline.  A private cursor (``_mdd_*``) remembers the fold of the points
+        already seen, so each call scans only the points appended since the last
+        one (CF-26-97); a replaced or truncated list, or a replaced last point, restarts the fold.
 
         Returns
         -------
@@ -863,16 +893,30 @@ class PortfolioAccounting:
         if len(self._equity_curve) < 2:
             return 0.0
 
-        peak = Decimal("0")
-        max_dd = Decimal("0")
+        curve = self._equity_curve
+        n = self._mdd_n
+        if (
+            curve is not self._mdd_ref
+            or len(curve) < n
+            or (n and curve[n - 1] is not self._mdd_last)
+        ):
+            self._mdd_ref, self._mdd_n, self._mdd_last = curve, 0, None
+            self._mdd_peak = self._mdd_max = Decimal("0")
+            n = 0
+        peak = self._mdd_peak
+        max_dd = self._mdd_max
 
-        for _, equity in self._equity_curve:
+        for i in range(n, len(curve)):
+            point = curve[i]
+            _, equity = point
             if equity > peak:
                 peak = equity
             if peak > Decimal("0"):
                 dd = (peak - equity) / peak
                 if dd > max_dd:
                     max_dd = dd
+            self._mdd_n, self._mdd_last = i + 1, point
+            self._mdd_peak, self._mdd_max = peak, max_dd
 
         return float(max_dd)
 
@@ -981,8 +1025,9 @@ class PortfolioAccounting:
     def _now(self) -> datetime:
         """The risk clock: simulated time if one was pushed, else the clock.
 
-        The single seam every risk-day decision goes through (WP2.2 reuses it
-        for curve / trade stamps).
+        The single seam every risk-day decision goes through; since WP2.2 it is
+        also the source of every curve / position stamp (bar close in a
+        backtest, the wall clock in paper/live).
         """
         if self._sim_now is not None:
             return self._sim_now

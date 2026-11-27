@@ -8,6 +8,7 @@ Architecture overview
 - Exchange I/O uses ``ccxt.async_support`` (HTTP, not WebSocket).
 - An asyncio Semaphore throttles concurrent outbound requests; a simple
   token-bucket style enforces minimum inter-request spacing per exchange.
+  ccxt's own throttler (``enableRateLimit``) is a second layer, on by default.
 - On HTTP 429 the request is retried with truncated binary exponential
   backoff plus uniform jitter (max 3 retries by default).
 - An in-process TTL dict cache (L1) short-circuits repeated identical
@@ -33,9 +34,10 @@ import math
 import random
 import re
 import time
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Any, Literal
 
 import ccxt.async_support as ccxt_async
 import structlog
@@ -51,7 +53,7 @@ from data.market_data import (
     TickerQuote,
 )
 
-__all__ = ["CCXTMarketDataService"]
+__all__ = ["CCXTMarketDataService", "EndReason", "RangeFetch"]
 
 # ---------------------------------------------------------------------------
 # Module-level logger
@@ -65,6 +67,9 @@ logger = structlog.get_logger(__name__)
 
 #: Default maximum number of candles per exchange request.
 #: Coinbase caps at 300; using a conservative default prevents silent truncation.
+#: ``page_limit`` must be <= the exchange's own maximum per request: after an empty
+#: page ``fetch_ohlcv_range`` jumps ``page_limit * tf``, which skips windows if the
+#: exchange answers fewer candles than that per request.
 _DEFAULT_PAGE_LIMIT: int = 300
 
 #: Maximum number of retry attempts on transient errors (429, NetworkError).
@@ -98,12 +103,41 @@ _TIMEFRAME_DURATION_MS: dict[str, int] = {
     "1w":  7 * 24 * 60 * 60 * 1_000,
 }
 
+
+def _now_ms() -> int:
+    """Wall-clock milliseconds since the Unix epoch (WP2.3 P0 test seam).
+
+    ``fetch_ohlcv_range`` reads the clock ONLY through this function so that
+    tests can patch ``data.services.ccxt_market_data._now_ms``.  The value is
+    used to stop paging at the forming bar (``floor_tf(now) + tf``) when the
+    requested ``end`` lies in the future.
+    """
+    return int(time.time() * 1000)
+
+
 # ---------------------------------------------------------------------------
 # Internal cache entry type alias
 # ---------------------------------------------------------------------------
 
 # (result_payload, expiry_epoch_float)
 _CacheEntry = tuple[list[OHLCVBar], float]
+
+EndReason = Literal["stop", "reached_end", "page_cap", "no_progress"]
+
+
+@dataclass(frozen=True, slots=True)
+class RangeFetch:
+    """Result of :meth:`CCXTMarketDataService.fetch_ohlcv_range_ex` (WP2.6 P5, SY-26-15).
+
+    ``complete`` is true iff the pager ended because the window was exhausted
+    (``stop`` or ``reached_end``), not because a safety limit cut it short.
+    """
+
+    bars: list[OHLCVBar]
+    complete: bool
+    end_reason: EndReason
+    pages: int
+    empty_pages: int
 
 
 class CCXTMarketDataService(BaseMarketDataService):
@@ -136,6 +170,11 @@ class CCXTMarketDataService(BaseMarketDataService):
     extra_exchange_config:
         Additional key/value pairs forwarded verbatim to the CCXT exchange
         constructor (e.g. ``{"options": {"defaultType": "spot"}}``).
+    enable_rate_limit:
+        Sets CCXT's ``enableRateLimit`` (its built-in request throttler).
+        Default ``True``; the semaphore and 100 ms spacing of this service
+        apply on top of it either way. ``extra_exchange_config={"enableRateLimit": ...}``
+        overrides it.
 
     Examples
     --------
@@ -159,7 +198,10 @@ class CCXTMarketDataService(BaseMarketDataService):
         max_concurrency: int = _DEFAULT_MAX_CONCURRENCY,
         sandbox: bool = False,
         extra_exchange_config: dict[str, Any] | None = None,
+        enable_rate_limit: bool = True,
     ) -> None:
+        if page_limit < 1:
+            raise ValueError("page_limit must be >= 1")
         super().__init__(exchange_id=exchange_id, cache_ttl_seconds=cache_ttl_seconds)
 
         self._api_key = api_key
@@ -191,7 +233,8 @@ class CCXTMarketDataService(BaseMarketDataService):
             )
 
         ccxt_config: dict[str, Any] = {
-            "enableRateLimit": False,  # We handle rate-limiting ourselves.
+            # ccxt's throttler runs in addition to our semaphore + _throttle.
+            "enableRateLimit": enable_rate_limit,
             "newUpdates": False,
         }
         if api_key is not None:
@@ -341,16 +384,50 @@ class CCXTMarketDataService(BaseMarketDataService):
         start: datetime,
         end: datetime,
     ) -> list[OHLCVBar]:
+        """Fetch all candles within ``[start, end)``; see :meth:`fetch_ohlcv_range_ex`."""
+        return (await self.fetch_ohlcv_range_ex(symbol, timeframe, start, end)).bars
+
+    def check_series(self, symbol: str, timeframe: TimeFrame) -> None:
+        """The symbol and timeframe checks the fetch methods run first (no request is made)."""
+        self._validate_symbol(symbol)
+        self._validate_timeframe(timeframe)
+
+    async def fetch_ohlcv_range_ex(
+        self,
+        symbol: str,
+        timeframe: TimeFrame,
+        start: datetime,
+        end: datetime,
+    ) -> RangeFetch:
         """
         Fetch all candles within the half-open interval ``[start, end)``.
 
-        Paginates automatically: issues repeated requests advancing the
-        ``since`` cursor until all candles up to ``end`` are retrieved or
-        the exchange returns an empty page.
+        No bar outside ``[start, min(end, floor_tf(now) + tf))`` is returned.
+
+        Paginates by advancing a ``since`` cursor until it reaches
+        ``stop = min(end, floor_tf(now) + tf)`` (WP2.3 P0, SY-23-12).
+
+        Cursor rule (correct for window-based exchanges such as Coinbase, which
+        omit buckets without trades, and for count-based exchanges):
+
+        * non-empty page: ``cursor = last_ts + tf``;
+        * empty page: ``cursor += page_limit * tf`` (an empty window in the
+          middle of a range is skipped, not treated as the end of the data).
+
+        A short page is never treated as the end.  The number of requests is
+        bounded by ``2 * ceil((stop - start) / (eff * tf)) + 2`` where ``eff`` is
+        ``max(page_limit // 4, min(page_limit, longest page so far))``
+        (``page_limit`` until a non-empty page is seen); when that cap is reached
+        ``fetch_ohlcv_range_page_cap`` is logged and the bars gathered so far are
+        returned.
 
         Duplicates at page boundaries (same timestamp appearing in two
         consecutive pages) are removed.  The result is always sorted
         ascending by timestamp.
+
+        Returns a :class:`RangeFetch`: ``fetch_ohlcv_range`` is its ``bars``.  ``complete``
+        is false when the page cap or the no-progress guard ended the fetch.  Exceptions
+        propagate unchanged.
         """
         self._validate_symbol(symbol)
         self._validate_timeframe(timeframe)
@@ -362,6 +439,20 @@ class CCXTMarketDataService(BaseMarketDataService):
 
         start_ms = self._datetime_to_ms(start)
         end_ms = self._datetime_to_ms(end)
+        tf_ms = self._timeframe_duration_ms(timeframe)
+        window_ms = self._page_limit * tf_ms
+        # Never page past the forming bar: an ``end`` in the future would
+        # otherwise issue requests for buckets that cannot exist yet.
+        stop_ms = min(end_ms, (_now_ms() // tf_ms) * tf_ms + tf_ms)
+        span_ms = max(stop_ms - start_ms, 0)
+        # Page cap.  Until a non-empty page is seen it assumes full pages; afterwards the
+        # effective page size is the longest page so far (an exchange whose own maximum is
+        # below ``page_limit`` is not cut off, CR-01 / SEC-04), floored at ``page_limit // 4``
+        # so a 1-bar-per-page answer costs at most ~4x the page_limit cap (WP23-P0-R2-SEC-01).
+        # Count-based exchanges with a maximum >= page_limit / 8 are still read in full.
+        max_pages = 2 * (-(-span_ms // window_ms)) + 2
+        eff_floor = max(1, self._page_limit // 4)
+        max_page_len = 0
 
         self._log.info(
             "fetch_ohlcv_range_start",
@@ -374,78 +465,95 @@ class CCXTMarketDataService(BaseMarketDataService):
         all_bars: list[OHLCVBar] = []
         seen_timestamps: set[int] = set()
         cursor_ms = start_ms
+        pages = 0
+        empty_pages = 0
+        end_reason: EndReason = "stop"
 
-        while True:
+        while cursor_ms < stop_ms:
+            if pages >= max_pages:
+                end_reason = "page_cap"
+                self._log.warning(
+                    "fetch_ohlcv_range_page_cap",
+                    symbol=symbol,
+                    timeframe=timeframe.value,
+                    pages=pages,
+                    max_pages=max_pages,
+                    cursor_ms=cursor_ms,
+                    stop_ms=stop_ms,
+                    bars_fetched=len(all_bars),
+                )
+                break
+
             page = await self._fetch_raw_with_retry(
                 symbol=symbol,
                 timeframe=timeframe,
                 since_ms=cursor_ms,
                 limit=self._page_limit,
             )
+            pages += 1
 
             if not page:
-                # Exchange returned nothing — we have exhausted available data.
+                # Window-based exchanges return nothing for a window without
+                # trades while later windows still hold data: skip the window.
+                empty_pages += 1
                 self._log.debug(
                     "fetch_ohlcv_range_empty_page",
                     symbol=symbol,
                     timeframe=timeframe.value,
                     cursor_ms=cursor_ms,
                 )
-                break
+                cursor_ms += window_ms
+                continue
+
+            max_page_len = max(max_page_len, len(page))
+            eff = max(eff_floor, min(self._page_limit, max_page_len))
+            max_pages = 2 * (-(-span_ms // (eff * tf_ms))) + 2
 
             new_bars_in_page = 0
-            last_ts_ms = cursor_ms
+            last_ts_ms = cursor_ms  # max new timestamp; floored at the cursor
+            reached_end = False
 
             for bar in page:
                 ts_ms = int(bar.timestamp.timestamp() * 1000)
 
-                if ts_ms >= end_ms:
-                    # Past the requested end boundary — stop pagination.
-                    # Bars before this boundary were already collected by the
-                    # normal path on earlier iterations; do NOT extend again.
+                if ts_ms < start_ms:
+                    # Never return a bar before the window (e.g. the bucket containing an
+                    # unaligned ``start``); a page of only such bars fails closed below.
+                    continue
+
+                if ts_ms >= stop_ms:
+                    # Past the requested end (or the forming bar) -- stop pagination.
                     self._log.debug(
                         "fetch_ohlcv_range_reached_end",
                         symbol=symbol,
                         last_ts=bar.timestamp.isoformat(),
                     )
-                    cursor_ms = end_ms
+                    reached_end = True
                     break
 
                 if ts_ms not in seen_timestamps:
                     all_bars.append(bar)
                     seen_timestamps.add(ts_ms)
                     new_bars_in_page += 1
-                    last_ts_ms = ts_ms
-            else:
-                # for-loop completed without break: all bars were before end_ms
-                if new_bars_in_page == 0:
-                    # All bars in this page were duplicates — no forward progress.
-                    self._log.warning(
-                        "fetch_ohlcv_range_no_progress",
-                        symbol=symbol,
-                        timeframe=timeframe.value,
-                        cursor_ms=cursor_ms,
-                    )
-                    break
+                    last_ts_ms = max(last_ts_ms, ts_ms)
 
-                if len(page) < self._page_limit:
-                    # Fewer rows than requested — no more data available.
-                    self._log.debug(
-                        "fetch_ohlcv_range_short_page",
-                        symbol=symbol,
-                        rows_returned=len(page),
-                        page_limit=self._page_limit,
-                    )
-                    break
+            if reached_end:
+                end_reason = "reached_end"
+                break
 
-                # Advance cursor past the last bar we received.
-                # Add one timeframe-duration to avoid refetching the same bar.
-                tf_ms = self._timeframe_duration_ms(timeframe)
-                cursor_ms = last_ts_ms + tf_ms
-                continue
+            if new_bars_in_page == 0:
+                end_reason = "no_progress"
+                # All bars in this page were duplicates -- no forward progress.
+                self._log.warning(
+                    "fetch_ohlcv_range_no_progress",
+                    symbol=symbol,
+                    timeframe=timeframe.value,
+                    cursor_ms=cursor_ms,
+                )
+                break
 
-            # for-loop broke via the ts_ms >= end_ms guard — stop outer loop.
-            break
+            # Advance past the last bar received (never backwards).
+            cursor_ms = max(last_ts_ms + tf_ms, cursor_ms + tf_ms)
 
         # Final sort + dedup pass (defensive; should already be clean)
         all_bars.sort(key=lambda b: b.timestamp)
@@ -455,8 +563,11 @@ class CCXTMarketDataService(BaseMarketDataService):
             symbol=symbol,
             timeframe=timeframe.value,
             bars_fetched=len(all_bars),
+            pages=pages,
+            empty_pages=empty_pages,
         )
-        return all_bars
+        complete = end_reason in ("stop", "reached_end")
+        return RangeFetch(all_bars, complete, end_reason, pages, empty_pages)
 
     @property
     def supports_ticker_quotes(self) -> bool:
@@ -469,9 +580,9 @@ class CCXTMarketDataService(BaseMarketDataService):
         Deliberately **no cache and no retry** (WP1.3b DEV-2 ruling): a stale
         or silently re-tried quote would defeat the engine's two-reading
         confirmation, whose second reading *is* the retry.  The call runs under
-        the service's own semaphore and 100 ms throttle (``enableRateLimit`` is
-        off on this handle), so it never queues ahead of an order on the
-        trading handle.
+        the service's own semaphore and 100 ms throttle and, by default, ccxt's
+        throttler on this market-data handle; the trading handle has its own
+        instance, so the ticker never queues ahead of an order.
 
         Errors are mapped like :meth:`_fetch_raw_with_retry` maps them, but the
         raised message is fixed text and the cause is not chained: neither the
@@ -671,7 +782,8 @@ class CCXTMarketDataService(BaseMarketDataService):
 
             except ccxt_async.RateLimitExceeded as exc:
                 retry_after = self._extract_retry_after(exc)
-                wait = retry_after if retry_after else self._backoff(attempt)
+                capped = min(retry_after, _BACKOFF_CAP) if retry_after else None
+                wait = capped if capped else self._backoff(attempt)
                 self._log.warning(
                     "rate_limit_hit",
                     symbol=symbol,

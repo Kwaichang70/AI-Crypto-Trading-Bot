@@ -15,7 +15,12 @@ Promotion gate (both must hold):
 Usage::
 
     python scripts/validate_sl_tp_reversion.py --exchange binance \
-        --symbols BTC/USDT,ETH/USDT --timeframe 1h --bars 4000 --folds 5
+        --symbols BTC/USDT,ETH/USDT --timeframe 1h --bars 4000 --folds 5 \
+        [--cost-profile coinbase_stress_t80] [--taker-bps 90] [--no-circuit-breaker]
+
+The cost model defaults to the platform default profile (WP2.1); the profile
+id / fingerprint / source is printed in the first output line.  Backtests build the
+circuit breaker by default (WP2.1c); ``--no-circuit-breaker`` reproduces the earlier numbers.
 """
 from __future__ import annotations
 
@@ -30,7 +35,25 @@ from typing import Any
 from common.models import OHLCVBar
 from common.types import TimeFrame
 from trading.backtest import BacktestRunner
+from trading.costs import DEFAULT_COST_PROFILE, CostProfile, CostProfileError
+from trading.costs_cli import (
+    add_circuit_breaker_arg,
+    add_cost_profile_args,
+    circuit_breaker_from_args,
+    circuit_breaker_header,
+    cost_header,
+    cost_profile_from_args,
+)
+from trading.safety import BACKTEST_CIRCUIT_BREAKER_DEFAULT
 from trading.strategies.sl_tp_reversion import SLTPReversionStrategy
+
+# WP2.1: the cost model every backtest of this script runs under; set in main()
+# from --cost-profile / --taker-bps / --maker-bps / --slippage-bps.
+_COST_PROFILE: CostProfile = DEFAULT_COST_PROFILE
+
+# WP2.1c (SY-21-13): backtests build the circuit breaker by default; ``--no-circuit-breaker``
+# switches it off (the pre-2.1c numbers).  Set in main().
+_ENABLE_CB: bool = BACKTEST_CIRCUIT_BREAKER_DEFAULT
 
 _PAGE_LIMIT = 300
 _TF_DURATION_MS = {
@@ -98,6 +121,8 @@ async def _run_fold(
     runner = BacktestRunner(
         strategies=[strat], symbols=[symbol], timeframe=tf,
         initial_capital=Decimal("10000"), bracket_config=bracket, seed=42,
+        cost_profile=_COST_PROFILE,
+        enable_circuit_breaker=_ENABLE_CB,
     )
     result = await runner.run({symbol: bars})
     pf = result.profit_factor
@@ -152,14 +177,30 @@ async def _evaluate(
     }
 
 
-def main() -> None:
+def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, CostProfile]:
+    """Parse the CLI; returns the namespace and the resolved cost profile (WP2.1)."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--exchange", default="binance")
     ap.add_argument("--symbols", default="BTC/USDT,ETH/USDT")
     ap.add_argument("--timeframe", default="1h")
     ap.add_argument("--bars", type=int, default=4000)
     ap.add_argument("--folds", type=int, default=5)
-    args = ap.parse_args()
+    add_cost_profile_args(ap)
+    add_circuit_breaker_arg(ap)
+    args = ap.parse_args(argv)
+    try:
+        profile = cost_profile_from_args(args)
+    except CostProfileError as exc:
+        ap.error(f"invalid cost override: {exc}")
+    return args, profile
+
+
+def main() -> None:
+    global _COST_PROFILE, _ENABLE_CB
+    args, _COST_PROFILE = parse_args()
+    _ENABLE_CB = circuit_breaker_from_args(args)
+    print(cost_header(_COST_PROFILE), flush=True)
+    print(circuit_breaker_header(_ENABLE_CB), flush=True)
 
     tf = _TF_ENUM[args.timeframe]
     symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
