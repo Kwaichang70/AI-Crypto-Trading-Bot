@@ -58,6 +58,39 @@ describe("middleware", () => {
     expect(re.test("/api/auth/session")).toBe(false);
   });
 
+  // CF-97-45: the matcher as Next compiles it (the same function `next build` uses for the manifest).
+  describe("the compiled matcher is anchored (CF-97-45)", () => {
+    const compiled = async () => {
+      const { config } = await import("@/middleware");
+      const { getMiddlewareMatchers } = await import("next/dist/build/analysis/get-page-static-info");
+      return new RegExp(getMiddlewareMatchers(config.matcher, {} as never)[0]!.regexp);
+    };
+
+    it.each([
+      "/", "/runs", "/runs/x.png", "/runs/x.pngfoo", "/runs/a.svg/b", "/optimize/a.webp", "/models/a.gif",
+      "/bff/api/v1/runs", "/bff/api/v1/runs/x.png", "/bff/x.svg/api/v1/runs",
+      "/api/admin/kill-switch", "/api/admin/runs/x.png/resume",
+      "/api/authx", "/api/auth-foo/x", "/_next/staticx", "/_next/imagex", "/favicon.icox", "/favicon.ico/x", "/a/favicon.ico", "/logo.png/",
+    ])("%s runs the middleware", async (p) => {
+      expect((await compiled()).test(p)).toBe(true);
+    });
+
+    it.each([
+      "/api/auth", "/api/auth/session", "/api/auth/callback/google",
+      "/_next/static/chunks/main.js", "/_next/image", "/_next/image/x",
+      "/favicon.ico", "/logo.png", "/logo.svg", "/x.jpg", "/x.jpeg", "/x.gif", "/x.webp",
+    ])("%s skips it (auth routes, Next internals, root-level assets)", async (p) => {
+      expect((await compiled()).test(p)).toBe(false);
+    });
+
+    it("an unauthenticated image-looking page or BFF path still gets the redirect or the JSON 401", async () => {
+      expect((await run("/runs/x.png")).status).toBe(307);
+      const bff = await run("/bff/api/v1/runs/x.png");
+      expect(bff.status).toBe(401);
+      expect(await bff.json()).toEqual({ error: "Unauthorized" });
+    });
+  });
+
   it("reads neither ADMIN_EMAILS nor VIEWER_EMAILS (its env is baked at build time)", () => {
     const source = fs.readFileSync(path.resolve(__dirname, "../../middleware.ts"), "utf8");
     expect(source).not.toMatch(/ADMIN_EMAILS|VIEWER_EMAILS/);

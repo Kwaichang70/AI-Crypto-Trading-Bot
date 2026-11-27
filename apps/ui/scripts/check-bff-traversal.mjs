@@ -89,6 +89,11 @@ const CASES = [
   // GHSA-xmf8-cvqr-rfgj: next-auth <= 4.24.14 answered a malformed Bearer value with 500.
   ["malformed Bearer on /bff/*", "GET", "/bff/api/v1/runs", "none", 401, null, { authorization: "Bearer %E0%A4%A" }],
   ["malformed Bearer on a page", "GET", "/runs", "none", 307, null, { authorization: "Bearer %E0%A4%A" }],
+  // CF-97-45: an image extension anywhere in the path used to skip the middleware (and the session check).
+  ["page id that looks like an image (.png)", "GET", "/runs/x.png", "none", 307, null],
+  ["page id that looks like an image (.webp)", "GET", "/optimize/a.webp", "none", 307, null],
+  ["page id that merely starts with an image extension", "GET", "/runs/x.pngfoo", "none", 307, null],
+  ["admin route id that looks like an image", "POST", "/api/admin/runs/x.png/resume", "none", 307, null],
 ];
 
 // Anything the upstream receives that matches one of these is a failure,

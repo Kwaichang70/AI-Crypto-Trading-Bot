@@ -74,6 +74,10 @@ describe("next-auth is pinned exactly (CF-97-40-B)", () => {
     expect(lock.packages["node_modules/next-auth"].version).toBe(manifest);
   });
 
+  it("the locked tarball URL is the registry URL of the manifest version (CF-97-50)", () => {
+    expect(lock.packages["node_modules/next-auth"].resolved).toBe(`https://registry.npmjs.org/next-auth/-/next-auth-${manifest}.tgz`);
+  });
+
   it("the installed next-auth is the manifest version, and it is at least the fixed 4.24.15", () => {
     const installed = json("node_modules", "next-auth", "package.json").version as string;
     expect(installed).toBe(manifest);

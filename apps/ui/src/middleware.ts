@@ -43,13 +43,16 @@ export default withAuth(
 export const config = {
   matcher: [
     /*
-     * Match every path EXCEPT:
-     *   - /api/auth/* (NextAuth routes)
-     *   - /_next/static/* and /_next/image/* (Next.js internals)
-     *   - /favicon.ico, /*.svg, /*.png, /*.jpg, /*.webp (static assets)
+     * Match every path EXCEPT (each alternative is anchored to whole segments or to the end):
+     *   - /api/auth and below (NextAuth routes)
+     *   - /_next/static and /_next/image, and below
+     *   - /favicon.ico
+     *   - a ROOT-level image file (/logo.png): one segment, ending in the extension.
+     *     Never a path with a further segment, so /runs/x.png, /bff/.../x.png and
+     *     /api/admin/runs/x.png/resume stay behind the session check (CF-97-45).
      */
     // MUST continue to match /api/admin/* — see Sprint 50 cycle 3 SEC-001 (frontend security audit).
     // Removing this coverage would silently bypass NextAuth on /api/admin/kill-switch.
-    "/((?!api/auth|_next/static|_next/image|favicon\\.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp)).*)",
+    "/((?!api/auth(?:/|$)|_next/static(?:/|$)|_next/image(?:/|$)|favicon\\.ico$|[^/]+\\.(?:svg|png|jpg|jpeg|gif|webp)$).*)",
   ],
 };
